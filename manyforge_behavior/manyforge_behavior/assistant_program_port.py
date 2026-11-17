@@ -630,7 +630,7 @@ def _parse_assistant(value: Mapping[str, Any]) -> _AssistantContract:
         _text(row["external_resource_alias"], field="external_resource_alias")
         _text(row["model_id"], field="model_id", maximum_bytes=4_096)
         contract = dict(_mapping(row["request_contract"], field="request_contract"))
-        # EXPERIMENTAL `reasoning: on|off` and `sampling` apply to the
+        # `reasoning: on|off` and `sampling` apply to the
         # bridge's chat only.
         contract.pop("reasoning", None)
         contract.pop("sampling", None)

@@ -410,8 +410,9 @@ public:
     return drained;
   }
 
-  // Installed once by the actual host. The callback acquires its existing
-  // owner call lease; it never borrows a raw replaceable component lifetime.
+  // Installed once by the actual host. The callback reaches the stable cell
+  // Kernel through a weak reference to the cell access; it never borrows a
+  // raw replaceable component lifetime.
   void SetRuleEvidenceProcessor(std::function<core::Result<bool>()> processor,
                                 InputLifecycleProcessor input_lifecycle = {}) {
     std::lock_guard lock(mutex_);

@@ -197,9 +197,17 @@ class IRuntimeUnitProgressPort {
 public:
   virtual ~IRuntimeUnitProgressPort() = default;
 
+  /// `answering_after` (OD-295 (1)(a)): only a report answering a progress
+  /// request numbered above it counts; an older one is consumed and absence
+  /// is returned. 0 accepts any report.
   [[nodiscard]] virtual std::optional<RuntimeUnitSourceReport>
   ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
-                  const manyforge::core::RuntimeEpoch &runtime_epoch) = 0;
+                  const manyforge::core::RuntimeEpoch &runtime_epoch,
+                  std::uint64_t answering_after) = 0;
+
+  /// The number of the last progress request sent so far: a request sent
+  /// after this call is numbered above it (OD-295 (1)(a)).
+  [[nodiscard]] virtual std::uint64_t ProgressRequestMark() = 0;
 };
 
 struct RuntimeUnitDependencyEpochDTO final {

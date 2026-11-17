@@ -862,6 +862,8 @@ def test_command_calls_bound_only_the_connection_and_reads_keep_their_limit() ->
         "/api/activation-preparations",
         "/api/manager/apply",
         "/api/manager/apply/release-for-new",
+        "/api/scene/runtime-latch",
+        "/api/scene/transactions",
     )
     try:
         for path in commands:

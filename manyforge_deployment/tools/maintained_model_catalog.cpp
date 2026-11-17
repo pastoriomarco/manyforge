@@ -470,22 +470,6 @@ void verify_urdf_projection(const FamilySource &family,
     }
     return;
   }
-  if (family.urdf_projection_kind == "remove_unused_xacro_namespace") {
-    constexpr std::string_view kNamespace =
-        " xmlns:xacro=\"http://www.ros.org/wiki/xacro\"";
-    const auto position = historical.find(kNamespace);
-    if (position == std::string::npos ||
-        historical.find(kNamespace, position + kNamespace.size()) !=
-            std::string::npos) {
-      fail("unused xacro namespace projection requires one exact declaration");
-    }
-    historical.erase(position, kNamespace.size());
-    if (historical != selected_urdf) {
-      fail(family.family_id +
-           " structural URDF differs beyond the unused xacro namespace");
-    }
-    return;
-  }
   if (family.urdf_projection_kind == "remove_unsupported_collision_materials") {
     constexpr std::string_view kMaterial = R"urdf(
       <material name="">

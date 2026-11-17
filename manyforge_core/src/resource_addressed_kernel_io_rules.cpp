@@ -653,8 +653,10 @@ void ResourceAddressedExecutionKernel::finalize_io_rule_outcomes_locked(
                      return value.participant_id == participant.slot_owner.participant_id;
                    });
   if (row == operation.state.participants.end()) return;
-  // The attempt ended: nothing of this participant is pending elsewhere.
-  if (!retire_participant_io_rules_locked(participant).ok()) return;
+  // The attempt ended: nothing of this participant is pending elsewhere. A
+  // failed retire is a defect: its error is kept on the outcomes and the
+  // finalization goes on.
+  const auto retired = retire_participant_io_rules_locked(participant);
   const auto result = stop.phase == StopPhase::kFailed ? StopEventResult::kSomeFailed
                       : stop.escalated                 ? StopEventResult::kStoppedEscalated
                                                        : StopEventResult::kStopped;
@@ -866,6 +868,7 @@ void ResourceAddressedExecutionKernel::finalize_io_rule_outcomes_locked(
       outcome.error = row->terminal_error.value_or(rule_error(
           kErrorMotionInterruptBackendStopFailed, "io_rule_nominal_stop_not_proved"));
     }
+    if (!retired.ok() && !outcome.error) outcome.error = retired.error();
   }
   // A Stop the Program's own configuration requested (carried object lost,
   // a rule trip), settled at its intended stage, is the Program's ordinary

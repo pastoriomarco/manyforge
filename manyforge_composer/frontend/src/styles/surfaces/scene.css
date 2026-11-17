@@ -255,10 +255,6 @@
   gap: 0.55rem;
 }
 
-.scene-quaternion-grid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-}
-
 .scene-pose-grid label,
 .scene-shape-select {
   display: grid;
@@ -319,8 +315,7 @@
     border-bottom: 1px solid var(--mf-border-neutral-19);
   }
 
-  .scene-pose-grid,
-  .scene-quaternion-grid {
+  .scene-pose-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

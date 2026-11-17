@@ -126,29 +126,26 @@
               "component_id": "lite6_robot",
               "frame_id": "base"
             },
-            "execution_timeout_s": 30.0,
+            "execution_timeout_s": 30,
             "goal": {
               "orientation": {
                 "rpy_deg": [
-                  180.0,
-                  0.0,
-                  0.0
+                  180,
+                  0,
+                  0
                 ]
               },
               "position_m": [
-                0.0,
-                0.0,
+                0,
+                0,
                 0.1
               ]
             },
             "offset_reference": {
-              "frame": {
-                "component_id": "lite6_robot",
-                "frame_id": "base"
-              },
-              "type": "component_frame"
+              "scene_resource_id": "graspable",
+              "type": "scene_resource"
             },
-            "planning_timeout_s": 10.0,
+            "planning_timeout_s": 10,
             "target": {
               "command_target_id": "arm",
               "component_id": "lite6_robot"
@@ -190,29 +187,26 @@
               "component_id": "lite6_robot",
               "frame_id": "base"
             },
-            "execution_timeout_s": 30.0,
+            "execution_timeout_s": 30,
             "goal": {
               "orientation": {
                 "rpy_deg": [
-                  180.0,
-                  0.0,
-                  0.0
+                  180,
+                  0,
+                  0
                 ]
               },
               "position_m": [
-                0.0,
-                0.0,
+                0,
+                0,
                 -0.0075
               ]
             },
             "offset_reference": {
-              "frame": {
-                "component_id": "lite6_robot",
-                "frame_id": "base"
-              },
-              "type": "component_frame"
+              "scene_resource_id": "graspable",
+              "type": "scene_resource"
             },
-            "planning_timeout_s": 10.0,
+            "planning_timeout_s": 10,
             "target": {
               "command_target_id": "arm",
               "component_id": "lite6_robot"

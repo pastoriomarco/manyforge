@@ -72,8 +72,6 @@ class Part(enum.IntEnum):
     NESTED_RESET = 3
     # Run (Program start).
     START_RACE_FORCED_END = 1
-    # Stop (level 1, selection).
-    SELECTION_CONTAINMENT_STOP = 1
     # Follow-ups on an operation, keyed on the key that started it.
     OPERATION_STOP = 8
     OPERATION_ACKNOWLEDGE_COMPLETED = 9

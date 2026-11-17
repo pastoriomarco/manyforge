@@ -140,8 +140,8 @@ are separate measured facts and change the authoritative scene only through a
 configured pose-source policy.
 
 Each Apply carries a Scene choice: `initialize` (reset the logical scene and
-seed it from the authored Program/Deployment) or `preserve` (keep it). Load,
-New and a Deployment Apply initialize it. A failed initialization, or a pose-apply failure after
+seed it from the authored Program/Deployment) or `preserve` (keep it). Load
+and New initialize it; Program and Deployment Apply and Revert preserve it. A failed initialization, or a pose-apply failure after
 readiness, is a typed condition, not a silent fallback.
 
 ### Scene Viewer data plane

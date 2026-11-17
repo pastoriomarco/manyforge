@@ -43,7 +43,7 @@ const char *ToString(const ManagementIdleState state) noexcept {
 }
 
 bool ManagerPlannedMaintenanceResult::valid() const noexcept {
-  if (entered_idle_maintenance()) {
+  if (entered_idle_maintenance() || admission_close_pending()) {
     return failure_code.empty() && failure_message.empty() &&
            effect_disposition == ManagerApplyEffectDisposition::kKnown;
   }
@@ -141,7 +141,8 @@ ManagerPlannedMaintenanceCoordinator::Preflight(
 ManagerPlannedMaintenanceResult
 ManagerPlannedMaintenanceCoordinator::EnterIdleMaintenance(
     const ManagerApplyIntentDTO &intent,
-    const manyforge::core::ProjectionRevisionDTO &expected_predecessor) {
+    const manyforge::core::ProjectionRevisionDTO &expected_predecessor,
+    const bool continue_posted) {
   // Repeat the observation-only check after the outer owner acquired its
   // exact admission. This closes the race between early refusal and teardown.
   if (auto refusal = Preflight(intent, expected_predecessor);
@@ -149,8 +150,17 @@ ManagerPlannedMaintenanceCoordinator::EnterIdleMaintenance(
     return *refusal;
   }
 
-  // Close admission and prove it is closed before runtime convergence.
-  if (!gate_.CloseAdmissionAndProveClosed()) {
+  // Close admission and prove it is closed before runtime convergence. The
+  // close is posted and its result observed on a later drive (OD-295 (3)(a)).
+  switch (gate_.CloseAdmissionAndProveClosed(continue_posted)) {
+  case AdmissionCloseState::kClosed:
+    break;
+  case AdmissionCloseState::kPending: {
+    ManagerPlannedMaintenanceResult pending;
+    pending.outcome = ManagerPlannedMaintenanceOutcome::kAdmissionClosePending;
+    return pending;
+  }
+  case AdmissionCloseState::kNotClosed:
     return RefusedBeforeEffect(
         "planned_maintenance_admission_not_closed",
         "planned reconfiguration could not prove admission closed");

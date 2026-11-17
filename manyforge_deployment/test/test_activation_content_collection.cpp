@@ -34,7 +34,8 @@ using manyforge::deployment::ActivationContentWriterLock;
 using manyforge::deployment::ActiveActivationContent;
 using manyforge::deployment::CanonicalValue;
 using manyforge::deployment::canonical_json;
-using manyforge::deployment::collect_unreferenced_activation_content;
+using manyforge::deployment::ActivationContentCollection;
+using manyforge::deployment::ActivationContentReferences;
 using manyforge::deployment::FilesystemCatalogArtifactStore;
 using manyforge::deployment::FilesystemProgramRepository;
 using manyforge::deployment::FilesystemRawArtifactStore;
@@ -113,6 +114,16 @@ make_program(const fs::path &root, const RetainedBundle &bundle, const std::stri
   return verify_program_binding_contract(
       canonical_json(with_program_revision(CanonicalValue(std::move(members)))),
       bundle, map, catalog);
+}
+
+/// A collection that knows no earlier references, as the first one after a
+/// start: it reads every live document.
+[[nodiscard]] ActivationContentCollection
+collect_unreferenced_activation_content(const fs::path &root,
+                                        const ActiveActivationContent &active) {
+  ActivationContentReferences fresh;
+  return manyforge::deployment::collect_unreferenced_activation_content(
+      root, active, fresh);
 }
 
 [[nodiscard]] fs::path program_path(const fs::path &root,
@@ -272,6 +283,74 @@ TEST(ActivationContentCollectionTest,
                   fixture->older->retained_bundle_id()),
               nullptr);
   }
+}
+
+TEST(ActivationContentCollectionTest,
+     LaterCollectionsReadOnlyNewLiveDocumentsAndForgetRetiredOnes) {
+  const auto fixture = make_two_bundle_root();
+  const auto &root = fixture->root.path();
+  const auto roots = active(*fixture->current);
+  write_prepared(root, "older",
+                 "{\"retained_bundle_id\":\"" +
+                     fixture->older->retained_bundle_id().value() + "\"}");
+  const auto collect = [&](ActivationContentReferences &known) {
+    return manyforge::deployment::collect_unreferenced_activation_content(
+        root, roots, known);
+  };
+
+  // The first collection (a start) reads every live document.
+  ActivationContentReferences known;
+  const auto first = collect(known);
+  ASSERT_TRUE(first.collected);
+  EXPECT_GT(first.read_bytes, 0U);
+  EXPECT_EQ(first.reused_documents, 0U);
+  const auto all_live = known.tokens_by_path.size();
+  ASSERT_GT(all_live, 0U);
+
+  // Nothing new: nothing is read again.
+  const auto unchanged = collect(known);
+  EXPECT_EQ(unchanged.read_bytes, 0U);
+  EXPECT_EQ(unchanged.reused_documents, all_live);
+  EXPECT_EQ(unchanged.removed_entries, 0U);
+
+  // An Apply's new content: only its documents are read.
+  const std::string blob = "artifact of the new Apply";
+  static_cast<void>(FilesystemRawArtifactStore(root).put_if_absent(blob));
+  const std::string prepared = "{\"raw\":\"" + sha256_digest(blob) + "\"}";
+  write_prepared(root, "new", prepared);
+  const auto added = collect(known);
+  EXPECT_EQ(added.read_bytes, blob.size() + prepared.size());
+  EXPECT_EQ(added.reused_documents, all_live);
+  EXPECT_EQ(added.removed_entries, 0U);
+  EXPECT_EQ(known.tokens_by_path.size(), all_live + 2U);
+
+  // Retired content is removed and forgotten, without reading anything.
+  fs::remove_all(root / "prepared-activations");
+  const auto retired = collect(known);
+  EXPECT_EQ(retired.read_bytes, 0U);
+  EXPECT_GT(retired.removed_entries, 0U);
+  for (const auto &file : fixture->older_files) {
+    if (!fixture->current_files.contains(file)) {
+      EXPECT_FALSE(known.tokens_by_path.contains((root / file).string()))
+          << "retired content still known: " << file;
+    }
+  }
+  EXPECT_FALSE(known.tokens_by_path.contains(
+      (root / "raw-artifacts" / "sha256" / (hex(sha256_digest(blob)) + ".blob"))
+          .string()));
+
+  // A start reads the remaining live documents in full again and agrees.
+  ActivationContentReferences restarted;
+  const auto full = collect(restarted);
+  EXPECT_GT(full.read_bytes, 0U);
+  EXPECT_EQ(full.removed_entries, 0U);
+  const auto paths = [](const ActivationContentReferences &references) {
+    std::set<std::string> result;
+    for (const auto &[path, tokens] : references.tokens_by_path)
+      result.insert(path);
+    return result;
+  };
+  EXPECT_EQ(paths(restarted), paths(known));
 }
 
 TEST(ActivationContentCollectionTest, LoadsBeyondTheStoreBoundKeepSucceeding) {

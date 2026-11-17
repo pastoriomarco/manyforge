@@ -980,8 +980,8 @@ def test_observed_move_is_one_revision_fenced_draft_mutation(tmp_path: Path, mon
 def test_observed_scene_save_preserves_program_metadata_and_source_identity() -> None:
     class Headless:
         def scene(self) -> dict:
-            return {
-                "logical_scene": {
+            return {"logical_scene": {
+                "available": True, "freshness": "fresh", "known_gaps": [], "payload": {
                     "access": {
                         "active_projection": {
                             "retained_bundle_id": "bundle",
@@ -1014,7 +1014,7 @@ def test_observed_scene_save_preserves_program_metadata_and_source_identity() ->
                         }],
                     },
                 }
-            }
+            }}
 
     catalog = build_node_environment().catalog
     document = Program(_SOURCE_PROGRAM, catalog).to_dict()
@@ -1043,7 +1043,7 @@ def test_observed_scene_save_preserves_program_metadata_and_source_identity() ->
 
 
 def _carried_scene() -> dict:
-    return {"logical_scene": {
+    return {"logical_scene": {"available": True, "freshness": "fresh", "known_gaps": [], "payload": {
         "access": {"active_projection": {"retained_bundle_id": "bundle"}},
         "snapshot": {"transaction_sequence": 7, "objects": [{
             "scene_resource_id": "part",
@@ -1056,7 +1056,7 @@ def _carried_scene() -> dict:
             "provider_evidence": None,
             "support_contacts": [],
         }]},
-    }}
+    }}}
 
 
 @pytest.mark.parametrize(
@@ -2191,6 +2191,24 @@ def test_reset_apply_context_is_bounded_logged_once_and_grants_nothing(
         assert client.post(
             "/api/authoring/reset-apply-contexts", json=invalid
         ).status_code == 422
+
+
+def test_reset_apply_context_names_the_revert_that_follows_the_reset(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = _client(tmp_path)
+    with caplog.at_level("INFO", logger="manyforge_composer.reset_apply"):
+        for action in ("revert", None):
+            body = _reset_apply_context(action=action) if action else _reset_apply_context()
+            assert client.post(
+                "/api/authoring/reset-apply-contexts", json=body
+            ).status_code == 200
+    records = [row for row in caplog.records if row.msg == "reset_apply_context"]
+    # Without the field the Reset is followed by an Apply, as before.
+    assert [record.action for record in records] == ["revert", "apply"]
+    assert client.post(
+        "/api/authoring/reset-apply-contexts", json=_reset_apply_context(action="load")
+    ).status_code == 422
 
 
 @pytest.mark.parametrize("correlation", [None, "reset-apply.1"])

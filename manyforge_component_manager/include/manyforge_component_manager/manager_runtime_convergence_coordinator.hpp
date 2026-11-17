@@ -17,8 +17,6 @@ namespace manyforge::component_manager {
 
 inline constexpr std::uint64_t kManagerRuntimeMaximumPresenceAgeNs =
     5'000'000'000ULL;
-inline constexpr std::uint64_t kManagerRuntimeMaximumReportAgeNs =
-    5'000'000'000ULL;
 
 class ManagerRuntimeConvergenceCoordinatorError : public std::runtime_error {
 public:
@@ -139,6 +137,15 @@ private:
   RuntimeObservationReducer::Clock clock_ns_;
   RuntimePreStartGuard pre_start_guard_;
   std::mutex operation_mutex_;
+  // Under `operation_mutex_` (OD-295 (1)(a)): the progress request mark
+  // taken at the current Apply's first convergence. Its convergence counts
+  // only reports answering a later request, never one sent before the Apply.
+  struct ApplyProgressMark final {
+    manyforge::core::ApplyId apply_id;
+    manyforge::core::ApplyGeneration apply_generation;
+    std::uint64_t mark{};
+  };
+  std::optional<ApplyProgressMark> apply_progress_mark_;
 };
 
 } // namespace manyforge::component_manager

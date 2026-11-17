@@ -17,6 +17,7 @@ from .models import (
     ManagerDeploymentCandidatePreviewRequest,
     ProjectionRevisionRequest,
     SceneResourcePoseQuery,
+    SceneRuntimeLatchRequest,
     SceneTransactionRequest,
 )
 from .native import (
@@ -56,6 +57,10 @@ _SCENE_UPDATE_STATUSES = {"geometry_changed", "freshness_only", "no_op"}
 
 class ManagerPort(Protocol):
     def scene_runtime_owner(self) -> dict[str, Any]: ...
+
+    def latch_scene_runtime_between_nodes(
+        self, request: SceneRuntimeLatchRequest
+    ) -> dict[str, Any]: ...
 
     def preview_deployment_candidate(
         self, request: ManagerDeploymentCandidatePreviewRequest
@@ -191,8 +196,15 @@ class ManagerCommandClient:
                 MANAGER_SOCKET_FILE
             ) as socket_address:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+                    # OD-298 (a): only the connection is limited, as for the
+                    # execution host (cell_admission.py). A connected command
+                    # waits for its answer, ended by the reply or by the
+                    # Manager closing the connection (its exit or stop); a
+                    # command held by a slow execution host shows as the
+                    # Manager's outstanding exchange, not as a time-out.
                     client.settimeout(self._timeout_seconds)
                     client.connect(socket_address)
+                    client.settimeout(None)
                     sent = client.send(encoded)
                     if sent != len(encoded):
                         raise HeadlessApiError(
@@ -214,10 +226,17 @@ class ManagerCommandClient:
                 "manager_command_unavailable",
                 f"Manager command transport failed: {exc}",
             ) from exc
-        if flags & socket.MSG_TRUNC or not payload:
+        if not payload:
+            # The Manager closed the connection before answering (it exited
+            # or is stopping); the command's outcome is unknown.
+            raise HeadlessApiError(
+                "manager_command_unavailable",
+                "Manager closed the connection before answering",
+            )
+        if flags & socket.MSG_TRUNC:
             raise HeadlessApiError(
                 "manager_command_response_invalid",
-                "Manager command response is empty or oversized",
+                "Manager command response is oversized",
             )
         try:
             text = payload.decode("utf-8", errors="strict")
@@ -259,6 +278,46 @@ class ManagerCommandClient:
                 or not isinstance(response.get("cell_id"), str)
                 or not isinstance(response.get("runtime_identity"), dict)):
             raise HeadlessApiError("manager_command_response_invalid", "Scene runtime owner response is invalid")
+        return response
+
+    def latch_scene_runtime_between_nodes(
+        self, request: SceneRuntimeLatchRequest
+    ) -> dict[str, Any]:
+        """Forward one between-nodes latch; the Runner checks the full answer.
+
+        Only the fields Headless itself reads (the committed count and the
+        projection revision it waits for) are checked here.
+        """
+
+        command: dict[str, Any] = {
+            "api_version": MANAGER_COMMAND_VERSION,
+            "command": "scene_runtime_latch_between_nodes",
+            "expected_runtime_identity": request.expected_runtime_identity.model_dump(),
+        }
+        if request.scene_resource_ids is not None:
+            command["scene_resource_ids"] = list(request.scene_resource_ids)
+        response = self._exchange(command)
+        if response.get("ok") is False:
+            typed = _manager_error(response.get("error"))
+            if typed is not None:
+                raise typed
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "between-nodes latch refusal is invalid",
+            )
+        count = response.get("committed_observation_count")
+        try:
+            ProjectionRevisionRequest.model_validate(response.get("projection_revision"))
+        except ValueError as exc:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "between-nodes latch projection revision is invalid",
+            ) from exc
+        if type(count) is not int or not 0 <= count <= _MAXIMUM_SAFE_INTEGER:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "between-nodes latch committed observation count is invalid",
+            )
         return response
 
     def preview_deployment_candidate(

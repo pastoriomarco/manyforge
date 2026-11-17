@@ -11,6 +11,7 @@ import type {
   ManagerApplyResponse,
   ManagerApplyStatus,
   ManagerDeploymentCandidatePreviewResponse,
+  ManagerOutstandingExchange,
   ManagerDeploymentImpact,
   ManagerDeploymentImpactComponent,
   ManagerDeploymentRecordDiff,
@@ -225,9 +226,12 @@ function parseManagerApplyRecord(
     ],
     path,
   );
-  // Status publishes the durable preparation receipt, even though this view
-  // only projects Apply progress. Validate it through the shared v3 contract.
-  parsePreparedActivationInput(record.prepared_activation, path + '.prepared_activation');
+  // Only the record of the Apply that installed the active configuration
+  // carries its preparation receipt; every other record carries null (OD-281).
+  // This view only projects Apply progress; validate a present receipt.
+  if (record.prepared_activation !== null) {
+    parsePreparedActivationInput(record.prepared_activation, path + '.prepared_activation');
+  }
   const phase = stringAt(record.phase, path + '.phase');
   if (!MANAGER_APPLY_PHASES.has(phase as ManagerApplyPhase)) {
     return fail(path + '.phase', 'a supported Manager Apply phase');
@@ -336,13 +340,42 @@ function parseManagerApplyRecord(
   };
 }
 
+function parseManagerOutstandingExchange(
+  value: unknown,
+  path: string,
+): ManagerOutstandingExchange {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['channel', 'exchange', 'peer', 'since_ns'], path);
+  const peer = nonEmptyStringAt(record.peer, path + '.peer');
+  if (peer !== 'execution_host' && peer !== 'program_runner') {
+    return fail(path + '.peer', 'execution_host or program_runner');
+  }
+  return {
+    peer,
+    channel: nonEmptyStringAt(record.channel, path + '.channel'),
+    exchange: nonEmptyStringAt(record.exchange, path + '.exchange'),
+    sinceNs: integerAt(record.since_ns, path + '.since_ns'),
+  };
+}
+
 function parseManagerRuntimeProjection(
   value: unknown,
   path: string,
 ): ManagerRuntimeProjection {
   const record = objectAt(value, path);
-  exactKeysAt(record, ['converged', 'desired_units', 'observed_units'], path);
+  allowedKeysAt(
+    record,
+    ['converged', 'desired_units', 'observed_units'],
+    ['outstanding_exchanges'],
+    path,
+  );
+  const outstanding = record.outstanding_exchanges === undefined
+    ? undefined
+    : boundedArrayAt(record.outstanding_exchanges, path + '.outstanding_exchanges', 8)
+      .map((item, index) => parseManagerOutstandingExchange(
+        item, path + '.outstanding_exchanges[' + index + ']'));
   return {
+    ...(outstanding === undefined ? {} : { outstandingExchanges: outstanding }),
     converged: booleanAt(record.converged, path + '.converged'),
     desiredUnits: boundedArrayAt(
       record.desired_units,

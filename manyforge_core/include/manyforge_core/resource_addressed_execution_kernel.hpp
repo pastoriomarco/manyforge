@@ -684,10 +684,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] std::optional<ErrorDTO> program_reset_position_disk_refusal() const;
   [[nodiscard]] std::optional<ProgramRunnerContactLossDTO> get_program_runner_loss() const;
   [[nodiscard]] Result<void> Publish(const ManagerLivenessObservationDTO& observation) override;
-  /// Retain the newest generation of one Alarm Lifecycle Owner epoch. A new
-  /// owner epoch replaces the retained one only with a strictly greater
-  /// incarnation from this host boot. A projection from another host boot, an
-  /// equal or smaller incarnation under another epoch, a lower generation, or
+  /// Retain the newest generation of the Alarm Lifecycle Owner's attention
+  /// projection. A projection from another host boot, a lower generation, or
   /// different content under the retained generation is refused; identical
   /// content refreshes the receipt time (heartbeat).
   [[nodiscard]] Result<OperatorAlarmAttentionAcceptedDTO> PublishOperatorAlarmAttention(
@@ -1138,8 +1136,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void report_journal_records_not_written(std::uint64_t undrained) noexcept;
 
   [[nodiscard]] Result<bool> record_operation_state_locked(
-      std::unique_lock<KernelStateMutex>& state_lock, OperationStateDTO& state,
-      const RuntimeScaleStatusDTO* scale, const char* reason,
+      OperationStateDTO& state, const RuntimeScaleStatusDTO* scale, const char* reason,
       std::span<const PreparedMotionDiagnosticsDTO> diagnostics = {},
       std::optional<RequestKey> request_key = std::nullopt);
   [[nodiscard]] Result<bool> confirm_prepared_command_no_effect(
@@ -1338,8 +1335,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       IResolvedParticipantExecutionEngine* engine,
       const ResolvedRuntimeScaleStatusDTO& resolved_status);
   [[nodiscard]] Result<void> retain_runtime_scale_observation_locked(
-      std::unique_lock<KernelStateMutex>& state_lock, ActiveOperation& operation,
-      RuntimeScaleStatusDTO status, const char* reason);
+      ActiveOperation& operation, RuntimeScaleStatusDTO status, const char* reason);
   /// Records the accepted value of one live operation and acknowledges it at
   /// its engine (run_runtime_scale_step, under the operation's try-locked
   /// `commit`, which it releases before the engine call). `value_sequence`:
@@ -1632,9 +1628,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   // Same ledger's current exact manual claim; also protects its operation
   // from diagnostic-history retirement until settlement/reconciliation.
   std::optional<CellAdmissionClaimDTO> manual_operation_claim_;
-  // Retained only as a compatibility/readiness source for a predecessor run
-  // admitted before Program-cycle transaction and ProgramRunNumber were unified.
-  std::optional<ProgramRunNumber> current_program_run_id_;
   // The loss in the last accepted readiness report: the Runner cannot be heard now.
   std::optional<ProgramRunnerContactLossDTO> program_runner_loss_;
   /// Canonical bounded resident operation table. Unresolved operations are

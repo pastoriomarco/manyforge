@@ -2,7 +2,9 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
+import type { InitialSceneReloadController } from '../hooks/useInitialSceneReload';
 import type { ResetApplyController } from '../hooks/useResetApply';
+import { RELOAD_INITIAL_SCENE_NOTE } from '../state/initialSceneApplied';
 import { applyPreviewFixture } from '../test/applyPreview';
 import { DeploymentDocumentEditor } from './DeploymentDocumentEditor';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
@@ -56,6 +58,7 @@ function controller(): DeploymentWorkspaceController {
     feedback: null,
     busyOperation: null,
     applyConfirmationOpen: false,
+    applyEnd: null,
     applyPreview: null,
     applyPreviewKind: 'apply',
     comparisonUnavailableReason: null,
@@ -75,9 +78,10 @@ function controller(): DeploymentWorkspaceController {
     discard: vi.fn(),
     applyDraft: vi.fn(),
     applyConfirmedScope: vi.fn(),
+    revertConfirmedScope: vi.fn(),
     addComponents: vi.fn(),
     previewApply: vi.fn(),
-    confirmApply: vi.fn(),
+    confirmApply: vi.fn(async () => null),
     cancelApplyConfirmation: vi.fn(),
   };
 }
@@ -300,6 +304,36 @@ describe('DeploymentDocumentEditor', () => {
     expect(markup).toContain('will not be executable after this Apply');
     expect(markup).toContain('<code>lite6_robot/arm</code>: the component is not in the Deployment');
     expect(markup).toContain('Confirm revert');
+  });
+
+  it('offers Reload initial scene, unchecked, with every Deployment Apply and Revert', () => {
+    const initialScene = { tracking: null, expect: vi.fn(), drop: vi.fn() } as unknown as InitialSceneReloadController;
+    const resetApply = {
+      runExists: true, deploymentRunReset: true, unavailableReason: () => null, confirm: vi.fn(),
+    } as unknown as ResetApplyController;
+    for (const kind of ['apply', 'revert'] as const) {
+      const previewed = controller();
+      previewed.applyConfirmationOpen = true;
+      previewed.applyPreviewKind = kind;
+      previewed.applyPreview = applyPreviewFixture([
+        { component_id: 'lite6_robot', disposition: 'retain', reasons: [], restarts: false },
+      ]);
+      const after = kind === 'revert' ? 'Revert' : 'Apply';
+      const markup = renderToStaticMarkup(
+        <ScenarioActionControls program={settledProgram} deployment={previewed} runtime={runtime}
+          initialScene={initialScene} />,
+      );
+      expect(markup).toContain('<input type="checkbox" name="reloadInitialScene"/>');
+      expect(markup).toContain(`After the ${after}, a Reset reloads the initial scene. ${RELOAD_INITIAL_SCENE_NOTE.split('\'')[0]}`);
+      const held = renderToStaticMarkup(
+        <ScenarioActionControls program={settledProgram} deployment={previewed} runtime={runtime}
+          initialScene={initialScene} resetApply={resetApply} />,
+      );
+      expect(held).toContain(`After the ${after}, a second Reset reloads the initial scene.`);
+      expect(held).toContain(`Reset run and ${after}`);
+      // Not offered without the reload controller.
+      expect(scenarioActions(previewed)).not.toContain('name="reloadInitialScene"');
+    }
   });
 
   it('opens the Apply confirmation at once with "Previewing impact…" and holds every Scenario action', () => {

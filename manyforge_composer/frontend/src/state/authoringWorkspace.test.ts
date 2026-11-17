@@ -291,6 +291,18 @@ describe('authoringWorkspace', () => {
     state.authoringAdmission.authoringAllowed = true;
     expect(authoringUnavailableCause(installed, state)).toBeNull();
     expect(requiredComponentFaultNotices(state)).toHaveLength(1);
+    // OD-281: a Manager section too large to send shows its typed cause.
+    state.componentOverview = {
+      components: [{
+        id: 'manager', label: 'Manager', required: true, status: 'offline',
+        detail: 'Manager graph or runtime convergence is not current',
+        reasonCode: 'manager_status_section_oversized',
+      }],
+    } as never;
+    expect(requiredComponentFaultNotices(state)).toEqual([expect.objectContaining({
+      title: 'Manager unavailable',
+      message: expect.stringContaining('status connection'),
+    })]);
   });
 
   it('shows a published containment as one persistent error, with and without a saved file', () => {

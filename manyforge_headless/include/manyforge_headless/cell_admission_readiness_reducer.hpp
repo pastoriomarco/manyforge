@@ -21,16 +21,25 @@ struct ManagerCellAdmissionReadinessFacts final {
 
 /// Attribute one failed contact to a previously qualified active cycle.
 /// Does not classify readiness, liveness expiry, or physical settlement.
+/// `fault_code` is the Runner fault's own code for `program_runner_fault`;
+/// every other predicate is a lost contact and carries
+/// `program_runner_contact_lost` (OD-296 (a)).
 [[nodiscard]] inline std::optional<manyforge::core::ProgramRunnerContactLossDTO>
 MakeProgramRunnerContactLoss(
     const std::optional<manyforge::core::ProgramCycleStatusDTO>
         &established_cycle,
-    const std::string_view predicate, const std::string_view message) {
+    const std::string_view predicate, const std::string_view message,
+    const std::optional<std::string_view> fault_code = std::nullopt) {
   if (!established_cycle)
     return std::nullopt;
   manyforge::core::ProgramRunnerContactLossDTO loss{
       *established_cycle, std::string(predicate),
-      std::string(message.substr(0U, 1024U))};
+      std::string(message.substr(0U, 1024U)),
+      fault_code ? std::optional<std::string>(*fault_code)
+      : predicate == "program_runner_fault"
+          ? std::nullopt
+          : std::optional<std::string>(
+                manyforge::core::kProgramRunnerContactLostCode)};
   if (!manyforge::core::ValidateProgramRunnerContactLoss(loss).ok()) {
     loss.message = "Program Runner contact failed";
     if (!manyforge::core::ValidateProgramRunnerContactLoss(loss).ok())
@@ -74,7 +83,11 @@ ReduceManagerCellAdmissionReadiness(
   if ((new_cycle.state != ProgramCycleStateDTO::kStarting &&
        new_cycle.state != ProgramCycleStateDTO::kRunning) ||
       old_cycle.cycle_generation != new_cycle.cycle_generation ||
-      !new_cycle.program_run_id || old_cycle.terminal_or_settlement_reference ||
+      // K-6: an unannounced Start (no run, no claim) is forward progress too.
+      (!new_cycle.program_run_id &&
+       (new_cycle.state != ProgramCycleStateDTO::kStarting ||
+        new_cycle.cycle_claim_generation)) ||
+      old_cycle.terminal_or_settlement_reference ||
       new_cycle.terminal_or_settlement_reference) {
     return false;
   }
@@ -85,7 +98,8 @@ ReduceManagerCellAdmissionReadiness(
       return false;
     }
   } else if (old_cycle.state != ProgramCycleStateDTO::kStarting ||
-             old_cycle.program_run_id != new_cycle.program_run_id ||
+             (old_cycle.program_run_id &&
+              old_cycle.program_run_id != new_cycle.program_run_id) ||
              !new_cycle.cycle_claim_generation ||
              (new_cycle.state == ProgramCycleStateDTO::kStarting &&
               old_cycle.cycle_claim_generation) ||

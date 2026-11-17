@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sqlite3
 from threading import Event, Thread
+import time
 from typing import Any, Callable
 
 import pytest
@@ -59,6 +60,19 @@ def _block_writer(journal: ProgramCycleJournal, monkeypatch) -> tuple[Event, Eve
 
     monkeypatch.setattr(journal._writer, "_apply", blocked)
     return entered, release
+
+
+def _wait_idle(writer: Any, timeout_s: float = 5.0) -> bool:
+    """True once the writer has handled every queued record and waits for the
+    next one (its thread is the only waiter on its condition)."""
+
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        with writer._condition:
+            if not writer._queue and writer._condition._waiters:
+                return True
+        time.sleep(0.001)
+    return False
 
 
 def _memory(journal: ProgramCycleJournal) -> tuple[Any, ...]:
@@ -162,12 +176,11 @@ def test_a_slow_writer_never_delays_journal_commands_or_reads(
     assert (record.state, record.cycle_generation) == ("idle_after_reset", 2)
     assert status == record and pending == ()
     assert runs == [_snapshot(7, 2, "stopped")] and not more
-    assert journal._writer.handled_sequence < journal._sequence
+    assert journal._writer._queue
     memory = _memory(journal)
 
     release.set()
-    assert journal._writer.wait_idle(5.0)
-    assert journal._writer.handled_sequence == journal._sequence
+    assert _wait_idle(journal._writer)
     journal.close()
     assert _file(tmp_path / "cycle.sqlite3") == memory
     assert journal._writer.failed_commits == 0
@@ -197,12 +210,12 @@ def test_a_failing_writer_leaves_every_journal_method_unchanged(
     journal: ProgramCycleJournal, tmp_path: Path, caplog
 ) -> None:
     caplog.set_level(logging.ERROR, logger=_WRITER_LOGGER)
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
     failing = _FailingCommit(journal._writer._database)
     journal._writer._database = failing
 
     _scripted_cycle(journal)
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
     posted = journal._sequence
     assert journal._writer.failed_commits == posted > 1
     errors = [r for r in caplog.records if "disk I/O error" in r.getMessage()]
@@ -216,7 +229,7 @@ def test_a_failing_writer_leaves_every_journal_method_unchanged(
         request_key=later, kind="runtime_blackboard_write", intent={}, cycle_generation=2
     ).disposition == "new"
     journal.begin_acquire(expected_generation=2, provisional_run_id=8, evidence={"e": 2})
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
     assert journal._writer.failed_commits == posted
     memory = _memory(journal)
     journal.close()
@@ -255,7 +268,7 @@ def test_records_from_many_threads_reach_the_file_in_sequence_order(
         thread.start()
     for thread in threads:
         thread.join(10.0)
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
 
     assert handled == list(range(1, journal._sequence + 1))
     memory = _memory(journal)
@@ -319,7 +332,7 @@ def test_no_file_work_runs_under_the_journal_lock(
     journal: ProgramCycleJournal, monkeypatch
 ) -> None:
     violations: list[str] = []
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
     journal._writer._database = _AuditedConnection(
         journal._writer._database, journal, violations
     )
@@ -343,16 +356,16 @@ def test_no_file_work_runs_under_the_journal_lock(
     _scripted_cycle(journal)
     journal.read()
     journal.status_snapshot()
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
     journal.close()
 
     assert violations == []
     assert journal._writer.failed_commits == 0
-    assert journal._writer.handled_sequence == journal._sequence
+    assert journal._writer.dropped_records == 0
 
 
 def test_a_full_writer_queue_drops_the_record_without_waiting(
-    journal: ProgramCycleJournal, monkeypatch, caplog
+    journal: ProgramCycleJournal, tmp_path: Path, monkeypatch, caplog
 ) -> None:
     caplog.set_level(logging.ERROR, logger=_WRITER_LOGGER)
     entered, release = _block_writer(journal, monkeypatch)
@@ -372,10 +385,13 @@ def test_a_full_writer_queue_drops_the_record_without_waiting(
     assert journal._writer.dropped_records == 1
     assert _k("caller", "dropped") in journal._inflight_rows()
     release.set()
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
     assert len([r for r in caplog.records if "(queue full)" in r.getMessage()]) == 1
-    assert journal._writer.handled_sequence == 2
     assert journal._writer.failed_commits == 0
+    journal.close()
+    inflight = _file(tmp_path / "cycle.sqlite3")[1]
+    assert _k("caller", "first") in inflight and _k("caller", "queued") in inflight
+    assert _k("caller", "dropped") not in inflight
 
 
 def test_a_replaced_parent_directory_is_logged_and_counted_by_the_writer(
@@ -393,7 +409,7 @@ def test_a_replaced_parent_directory_is_logged_and_counted_by_the_writer(
         assert journal.record_request(
             request_key=_k("caller", "start"), kind="start", intent={}, cycle_generation=1
         ).disposition == "new"
-        assert journal._writer.wait_idle(5.0)
+        assert _wait_idle(journal._writer)
 
         assert journal._writer.failed_commits == 1
         assert any("replaced or changed" in r.getMessage() for r in caplog.records)
@@ -418,7 +434,7 @@ def test_an_unexpected_rollback_sidecar_is_logged_and_counted_by_the_writer(
         assert journal.record_request(
             request_key=_k("caller", "start"), kind="start", intent={}, cycle_generation=1
         ).disposition == "new"
-        assert journal._writer.wait_idle(5.0)
+        assert _wait_idle(journal._writer)
 
         assert journal._writer.failed_commits == 1
         assert any(
@@ -491,7 +507,7 @@ def test_a_full_queue_starts_one_loss_episode_until_the_queue_is_written_empty(
         for index in range(drops):
             _completes(lambda: _post(journal, f"{prefix}-dropped-{index}"))
         gate.opened.set()
-        assert journal._writer.wait_idle(5.0)
+        assert _wait_idle(journal._writer)
 
     episode("first", 3)
     assert journal._writer.dropped_records == 3
@@ -515,7 +531,7 @@ def test_a_full_queue_starts_one_loss_episode_until_the_queue_is_written_empty(
     assert _records_lost(tmp_path / "cycle.sqlite3") == 1
     assert [r.getMessage() for r in caplog.records if "this start" in r.getMessage()] == [
         "Program-cycle journal records not written in this start: "
-        "queue full 5, failed 0, not drained 0"
+        "queue full 5, failed 0"
     ]
     assert journal._writer.failed_commits == 0
 
@@ -524,14 +540,14 @@ def test_failed_writes_start_one_episode_and_the_mark_is_retried_at_close(
     journal: ProgramCycleJournal, tmp_path: Path, monkeypatch, caplog
 ) -> None:
     caplog.set_level(logging.WARNING, logger=_WRITER_LOGGER)
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
     gate = _Gate(journal, monkeypatch)
     failing = _FailingCommit(journal._writer._database)
     journal._writer._database = failing
 
     for name in ("a", "b", "c"):
         _post(journal, name)
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
     assert journal._writer.failed_commits == 3
     assert len(_episode_lines(caplog)) == 1
     assert "failed write of record" in _episode_lines(caplog)[0].getMessage()
@@ -540,13 +556,13 @@ def test_failed_writes_start_one_episode_and_the_mark_is_retried_at_close(
 
     failing.fail = False
     _post(journal, "written")
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
     failing.fail = True
     _post(journal, "failed-again")
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
     failing.fail = False
     _post(journal, "written-again")
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
     assert journal._writer.failed_commits == 4
     assert len(_episode_lines(caplog)) == 2
     assert gate.marks == 1
@@ -556,7 +572,7 @@ def test_failed_writes_start_one_episode_and_the_mark_is_retried_at_close(
     assert _records_lost(tmp_path / "cycle.sqlite3") == 1
     assert [r.getMessage() for r in caplog.records if "this start" in r.getMessage()] == [
         "Program-cycle journal records not written in this start: "
-        "queue full 0, failed 4, not drained 0"
+        "queue full 0, failed 4"
     ]
 
 

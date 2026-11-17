@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <manyforge_core/types/strong_id.hpp>
@@ -30,6 +32,18 @@ struct ActivationContentCollection final {
   std::uint64_t removed_bytes{0U};
   /// Bytes of the live documents read to find the referenced entries.
   std::uint64_t read_bytes{0U};
+  /// Live documents whose references an earlier collection had read.
+  std::size_t reused_documents{0U};
+};
+
+/// The digest tokens of the live documents named by their content digest
+/// (store entries and prepared activations; immutable under their name), as
+/// the last collection found them. The next collection reads only the live
+/// documents not in here, and keeps exactly the documents it finds live.
+/// Owned by the one caller that runs the collections; starts empty, so the
+/// first collection reads every live document.
+struct ActivationContentReferences final {
+  std::unordered_map<std::string, std::vector<std::string>> tokens_by_path;
 };
 
 /// Delete the content-addressed entries of one activation root (retained
@@ -44,9 +58,11 @@ struct ActivationContentCollection final {
 /// The Manager calls this after each successful Apply. It holds the root's
 /// writer lock exclusively, so it never runs while a preparation is writing
 /// (it then returns `collected == false` and the next Apply collects).
+/// `known` carries the references already read (see
+/// `ActivationContentReferences`); it is left unchanged when deferred.
 [[nodiscard]] ActivationContentCollection collect_unreferenced_activation_content(
     const std::filesystem::path &activation_root,
-    const ActiveActivationContent &active);
+    const ActiveActivationContent &active, ActivationContentReferences &known);
 
 /// Shared hold of the activation root's writer lock for one preparation: from
 /// its first content write until its prepared activation is published (from

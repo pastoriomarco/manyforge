@@ -1410,12 +1410,10 @@ void ResourceAddressedExecutionKernel::complete_participant_stop_locked(
 
   if (stop.phase != StopPhase::kFailed) return;
   // F2: the component is stop-unconfirmed until its controller reports
-  // idle in a state observed after now; the existing latch holds meanwhile.
+  // idle in a state arriving after now; the existing latch holds meanwhile.
   if (const auto index =
-          stop_component_index_locked(participant.binding.value().controllable_component_id)) {
+          stop_component_index_locked(participant.binding.value().controllable_component_id))
     stop_unconfirmed_.marked[*index] = 1U;
-    stop_unconfirmed_.since_ns[*index] = completed_at_ns;
-  }
   refresh_cell_latch_locked(true);
   // F1: a failed Stop raises a Halt, once per failure; a failure of an
   // attempt started by such a Halt raises none (one-level bound). Admission
@@ -1592,6 +1590,11 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       auto* const operation_ptr = found.first;
       const auto ordinal = found.second;
       if (operation_ptr == nullptr) return;
+      // A candidate between its hand-over's "decide" and "close" steps
+      // (OD-175 D3, gates 2-3): the engine has not adopted it yet. Nothing is
+      // consumed here (escalation input stays pending); the close step's
+      // wake arms this lane again.
+      if (operation_ptr->participants[ordinal].handover_source_execution_id != 0U) return;
       auto& operation = *operation_ptr;
       auto& participant = operation.participants[ordinal];
       auto& item = participant.stop_work;

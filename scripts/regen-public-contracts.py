@@ -251,6 +251,20 @@ def gen_headless_rest_api() -> str:
         "result, until the Scene store folds its history into a snapshot; a "
         "request sent again after that is treated as a new request.\n\n"
     )
+    body.append(
+        "A successful Scene commit is answered once Headless's own view of the "
+        "logical scene shows the committed revision (or a newer one, or another "
+        "active bundle, graph or scene), so a read after the reply shows the "
+        "commit; when the Manager stops answering, or Headless shuts down, the "
+        "success reply is returned at once. This wait has no time limit.\n\n"
+    )
+    body.append(
+        "The Program runner latches pose observations into the scene between "
+        "nodes through `GET /api/scene/runtime-owner` and "
+        "`POST /api/scene/runtime-latch`. A latch that committed observations "
+        "is answered under the same rule as a Scene commit; one that committed "
+        "none is answered at once.\n\n"
+    )
     _append_openapi_routes(body, spec)
     return "".join(body)
 

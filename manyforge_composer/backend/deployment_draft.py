@@ -620,6 +620,75 @@ def _edit_compiled_controlled_stop_profile(
     return candidate
 
 
+def _rename_scene_resource(
+    document: dict[str, Any], previous: str, replacement: str
+) -> tuple[dict[str, Any], list[str]]:
+    """Rename one Program scene resource id where the Deployment names it.
+
+    The places are the declared scene-resource fields of the Deployment
+    codecs: `policies.scene_pose_sources[].scene_resource_id`, the matching
+    `policies.component_streams` row (`poses/<id>` of a linked pose source)
+    and a `geometric_contact` input's `provider.target_scene_resource_id`.
+    Returns the candidate and the changed paths.
+    """
+
+    candidate = deepcopy(document)
+    paths: list[str] = []
+    policies = candidate.get("policies")
+    if isinstance(policies, dict):
+        sources: set[Any] = set()
+        links = policies.get("scene_pose_sources")
+        if isinstance(links, list):
+            for index, link in enumerate(links):
+                if isinstance(link, dict) and link.get("scene_resource_id") == previous:
+                    link["scene_resource_id"] = replacement
+                    sources.add(link.get("source_id"))
+                    paths.append(f"policies.scene_pose_sources[{index}].scene_resource_id")
+            if sources:
+                links.sort(key=lambda row: (
+                    str(row.get("source_id")), str(row.get("scene_resource_id"))
+                ))
+        streams = policies.get("component_streams")
+        if isinstance(streams, list) and sources:
+            for index, row in enumerate(streams):
+                if (
+                    isinstance(row, dict)
+                    and row.get("controllable_component_id") in sources
+                    and row.get("stream_id") == f"poses/{previous}"
+                ):
+                    row["stream_id"] = f"poses/{replacement}"
+                    paths.append(f"policies.component_streams[{index}].stream_id")
+            streams.sort(key=lambda row: (
+                str(row.get("controllable_component_id")), str(row.get("stream_id"))
+            ))
+    graph = candidate.get("graph")
+    for collection, rows in (
+        ("components", candidate.get("components")),
+        ("graph.runtime_units", graph.get("runtime_units") if isinstance(graph, dict) else None),
+    ):
+        for index, row in enumerate(rows if isinstance(rows, list) else []):
+            configuration = row.get("configuration") if isinstance(row, dict) else None
+            path = f"{collection}[{index}].configuration"
+            if isinstance(configuration, dict) and isinstance(
+                configuration.get("runtime_configuration"), dict
+            ):
+                configuration = configuration["runtime_configuration"]
+                path = f"{path}.runtime_configuration"
+            signals = configuration.get("io_signals") if isinstance(configuration, dict) else None
+            for signal_index, signal in enumerate(signals if isinstance(signals, list) else []):
+                provider = signal.get("provider") if isinstance(signal, dict) else None
+                if (
+                    isinstance(provider, dict)
+                    and provider.get("profile") == "geometric_contact"
+                    and provider.get("target_scene_resource_id") == previous
+                ):
+                    provider["target_scene_resource_id"] = replacement
+                    paths.append(
+                        f"{path}.io_signals[{signal_index}].provider.target_scene_resource_id"
+                    )
+    return candidate, paths
+
+
 def _without_orphaned_members(
     before: dict[str, Any], candidate: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1040,6 +1109,27 @@ class DeploymentDraftSession:
                 command_target_id=command_target_id,
             )
         return self._compiler(_source(candidate))
+
+    def preview_scene_resource_rename(
+        self, previous: str, replacement: str
+    ) -> tuple[str, int, CompiledDeploymentDocument | None, list[str]]:
+        """Capture this Draft's fence and its candidate with one scene id renamed.
+
+        The candidate is None when no Deployment is open or it names no
+        renamed id; the caller installs it with :meth:`commit_compiled` under
+        the returned fence.
+        """
+
+        with self._lock:
+            draft_id, revision = self._draft_id, self._revision
+            if self._compiled is None:
+                return draft_id, revision, None, []
+            candidate, paths = _rename_scene_resource(
+                self._compiled.document, previous, replacement
+            )
+        if not paths:
+            return draft_id, revision, None, []
+        return draft_id, revision, self._compiler(_source(candidate)), paths
 
     def preview_motion_target_limit_update(
         self,

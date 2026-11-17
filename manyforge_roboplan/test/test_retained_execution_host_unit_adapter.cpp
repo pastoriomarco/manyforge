@@ -1157,107 +1157,6 @@ TEST(ExecutionHostUnitAdmission,
                component_manager::ExecutionHostUnitAdmissionError);
 }
 
-// The host Apply of one delta: every non-removed component, the retained
-// subset, the removed ones.
-[[nodiscard]] component_manager::HostApplyRequest
-HostApplyOf(const deployment::ApplyComponentDeltaDTO &delta) {
-  component_manager::HostApplyRequest request{
-      {core::ApplyId(1U), core::ApplyGeneration(1U)},
-      core::RetainedBundleId("timeout.bundle"), core::GraphRevision("timeout.graph"),
-      {}, {}, {}, {}, std::nullopt};
-  for (const auto &row : delta.components) {
-    if (row.disposition == deployment::ApplyComponentDisposition::kRemove) {
-      request.removed_components.push_back(row.controllable_component_id);
-      continue;
-    }
-    request.components.push_back(row.controllable_component_id);
-    if (row.disposition == deployment::ApplyComponentDisposition::kRetain)
-      request.retained_components.push_back(row.controllable_component_id);
-  }
-  for (auto *ids : {&request.components, &request.retained_components,
-                    &request.removed_components})
-    std::sort(ids->begin(), ids->end());
-  return request;
-}
-
-// Budget: the runtime-composition exchange waits for the sum of the
-// lifecycle time budgets of the added or replaced components (authored, else
-// the 10 s default; Manager passes one for every component) plus one default
-// stop budget per removed component, and the host's stop grace for each of
-// them (a launch it retires may hang until the group SIGKILL). An
-// exchange that installs and removes nothing (finalize, retain-only) waits
-// one default budget. Retained rows count nothing.
-TEST(RetainedExecutionHostUnitAdapter,
-     CompositionTimeoutGrowsWithComposedComponents) {
-  using deployment::ApplyComponentDisposition;
-  const auto row = [](const std::string &id,
-                      const ApplyComponentDisposition disposition) {
-    return deployment::ApplyComponentChangeDTO{
-        core::ControllableComponentId(id), disposition, std::nullopt,
-        std::nullopt, {}, {}, {}};
-  };
-  const auto timeout = [](const deployment::ApplyComponentDeltaDTO &delta) {
-    return component_manager::detail::HostApplyTimeout(HostApplyOf(delta), {});
-  };
-  constexpr auto kGrace = core::kControllerLaunchStopGrace;
-  deployment::ApplyComponentDeltaDTO delta;
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(10));
-  delta.components = {row("arm.2", ApplyComponentDisposition::kRetain),
-                      row("arm.3", ApplyComponentDisposition::kRemove)};
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(10) + kGrace);
-  delta.components.push_back(row("arm.1", ApplyComponentDisposition::kAdd));
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(20) + 2 * kGrace);
-  delta.components.push_back(
-      row("gripper.1", ApplyComponentDisposition::kReplace));
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(30) + 3 * kGrace);
-  delta.components.push_back(
-      row("gripper.2", ApplyComponentDisposition::kAdd));
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(40) + 4 * kGrace);
-}
-
-TEST(RetainedExecutionHostUnitAdapter,
-     CompositionTimeoutSumsInstalledComponentBudgets) {
-  using deployment::ApplyComponentDisposition;
-  const auto row = [](const std::string &id,
-                      const ApplyComponentDisposition disposition) {
-    return deployment::ApplyComponentChangeDTO{
-        core::ControllableComponentId(id), disposition, std::nullopt,
-        std::nullopt, {}, {}, {}};
-  };
-  // As component_composition_budgets_ns gives them: an authored 120 s
-  // robot, defaults (10 s) for a Real arm, an I/O device and a Mock robot,
-  // and an authored 2.5 s tool.
-  const std::map<std::string, std::int64_t, std::less<>> budgets{
-      {"arm", 120'000'000'000LL},
-      {"xarm", 10'000'000'000LL},
-      {"io", 10'000'000'000LL},
-      {"mock", 10'000'000'000LL},
-      {"kept", 600'000'000'000LL},
-      {"fast", 2'500'000'000LL}};
-  const auto timeout = [&](const deployment::ApplyComponentDeltaDTO &delta) {
-    return component_manager::detail::HostApplyTimeout(HostApplyOf(delta), budgets);
-  };
-  constexpr auto kGrace = core::kControllerLaunchStopGrace;
-  deployment::ApplyComponentDeltaDTO delta;
-  // A 120 s robot alone: not timed out at 10 or 30 s.
-  delta.components = {row("arm", ApplyComponentDisposition::kAdd)};
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(120) + kGrace);
-  // The sum: 120 + 10 + 10 + 10 s; a retained component's budget does not
-  // count.
-  delta.components = {row("arm", ApplyComponentDisposition::kReplace),
-                      row("xarm", ApplyComponentDisposition::kAdd),
-                      row("io", ApplyComponentDisposition::kAdd),
-                      row("kept", ApplyComponentDisposition::kRetain),
-                      row("mock", ApplyComponentDisposition::kAdd)};
-  EXPECT_EQ(timeout(delta), std::chrono::seconds(150) + 4 * kGrace);
-  // No floor once something is installed: an authored 2.5 s waits 2.5 s,
-  // and with a default component 12.5 s (each plus the stop grace).
-  delta.components = {row("fast", ApplyComponentDisposition::kAdd)};
-  EXPECT_EQ(timeout(delta), std::chrono::milliseconds(2'500) + kGrace);
-  delta.components.push_back(row("io", ApplyComponentDisposition::kAdd));
-  EXPECT_EQ(timeout(delta), std::chrono::milliseconds(12'500) + 2 * kGrace);
-}
-
 TEST(RetainedExecutionHostUnitAdapter,
      RejectsNestedStateAndRunCapabilityTreesBeforeLaunch) {
   NativeFixture fixture;
@@ -1317,7 +1216,7 @@ TEST(RetainedExecutionHostUnitAdapter,
   EXPECT_FALSE(empty_admission.authoring_allowed);
   EXPECT_TRUE(empty_admission.admission_generation.nonzero());
 
-  const auto first = adapter.ObserveProgress(*fixture.query, first_epoch);
+  const auto first = adapter.ObserveProgress(*fixture.query, first_epoch, 0U);
   ASSERT_TRUE(first.has_value());
   EXPECT_EQ(first->runtime_unit_id(),
             fixture.query->plan.runtime_unit_id.value());
@@ -1342,14 +1241,14 @@ TEST(RetainedExecutionHostUnitAdapter,
 
   const auto replay = adapter.EnsureRunning(*fixture.query);
   EXPECT_EQ(replay.process_incarnation(), first_epoch.value());
-  const auto second = adapter.ObserveProgress(*fixture.query, first_epoch);
+  const auto second = adapter.ObserveProgress(*fixture.query, first_epoch, 0U);
   ASSERT_TRUE(second.has_value());
   EXPECT_EQ(second->source_report_sequence(), 2U);
 
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
   EXPECT_FALSE(
-      adapter.ObserveProgress(*fixture.query, first_epoch).has_value());
+      adapter.ObserveProgress(*fixture.query, first_epoch, 0U).has_value());
   // One host per application start (Q1): its exit is reported to the Manager
   // and it is never launched again (OD-122 (1)).
   const auto exit = adapter.HostExit();
@@ -1357,7 +1256,7 @@ TEST(RetainedExecutionHostUnitAdapter,
   EXPECT_FALSE(exit->signaled);
   EXPECT_EQ(exit->value, 0);
   EXPECT_THROW(static_cast<void>(adapter.EnsureRunning(*fixture.query)),
-               component_manager::RetainedExecutionHostUnitAdapterError);
+               core::TypedError);
   EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
 }
@@ -1456,7 +1355,7 @@ TEST(RetainedExecutionHostUnitAdapter,
   EXPECT_TRUE(
       adapter
           .ObserveProgress(*fixture.query,
-                           core::RuntimeEpoch(process.process_incarnation()))
+                           core::RuntimeEpoch(process.process_incarnation()), 0U)
           .has_value());
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
@@ -1801,7 +1700,7 @@ TEST(RetainedExecutionHostUnitAdapter,
   const auto started = adapter.EnsureRunning(*fixture.query);
   ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
   const core::RuntimeEpoch epoch(started.process_incarnation());
-  const auto progress = adapter.ObserveProgress(*fixture.query, epoch);
+  const auto progress = adapter.ObserveProgress(*fixture.query, epoch, 0U);
   ASSERT_TRUE(progress.has_value());
   EXPECT_EQ(progress->product_identity(),
             fixture.query->plan.product_identity.value());
@@ -1839,7 +1738,7 @@ TEST(RetainedExecutionHostUnitAdapter,
     ASSERT_TRUE(adapter_a
                     .ObserveProgress(
                         *package.query,
-                        core::RuntimeEpoch(started_a.process_incarnation()))
+                        core::RuntimeEpoch(started_a.process_incarnation()), 0U)
                     .has_value());
     EXPECT_EQ(adapter_a.EnsureStopped(*package.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
@@ -1854,7 +1753,7 @@ TEST(RetainedExecutionHostUnitAdapter,
               component_manager::ProcessPresenceState::kPresent);
     const core::RuntimeEpoch first_epoch(first_b.process_incarnation());
     ASSERT_TRUE(
-        adapter_b.ObserveProgress(*package.query, first_epoch).has_value());
+        adapter_b.ObserveProgress(*package.query, first_epoch, 0U).has_value());
     EXPECT_EQ(adapter_b.EnsureStopped(*package.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
     EXPECT_EQ(adapter_b.ObserveProcess(*package.query).state(),
@@ -2111,8 +2010,11 @@ TEST(RetainedExecutionHostUnitAdapter,
   EXPECT_EQ(adapter.EnsureStopped(*successor.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
 }
+// OD-270: a projection rebuild has no time limit. One slower than the former
+// 10 s bound is answered and the host is not late; meanwhile the unit is
+// `rebuilding` and other calls answer busy at once instead of waiting.
 TEST(RetainedExecutionHostUnitAdapter,
-     TimedOutProjectionLeavesTheHostUpAnswersLateAndSettlesItsLateReply) {
+     SlowProjectionRebuildIsAnsweredWithoutATimeLimitAndOtherCallsAreBusy) {
   NativeFixture fixture;
   static_cast<void>(PublishActiveFixture(fixture));
   ScopedTemporaryRoot projection_control;
@@ -2141,57 +2043,42 @@ TEST(RetainedExecutionHostUnitAdapter,
       initial_revision,
       fixture.bundle->value().compiled_products.planning_collision_model,
       initial_scene};
-  // The held synchronous bootstrap does not answer within its bound. The
-  // host is late, not lost (OD-120 (4), OD-121 (4)): the call answers the
-  // typed execution_host_late and the child stays up.
-  try {
-    static_cast<void>(resolved.value()->RebuildBootstrapProjection(bootstrap));
-    ADD_FAILURE() << "held bootstrap rebuild returned a response";
-  } catch (const core::TypedError &error) {
-    EXPECT_EQ(error.code(), component_manager::kExecutionHostLateCode);
-    EXPECT_EQ(error.details().at("exchange"), "projection_bootstrap_rebuild");
-    EXPECT_EQ(error.details().at("bound_ms"), "10000");
-  }
-  EXPECT_TRUE(std::filesystem::exists(bootstrap_hold.Entered()));
-  const auto late = adapter.HostLate();
-  ASSERT_TRUE(late.has_value());
-  EXPECT_EQ(late->exchange, "projection_bootstrap_rebuild");
-  EXPECT_EQ(late->bound, std::chrono::milliseconds(10000));
-  EXPECT_FALSE(adapter.HostExit().has_value());
-  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
-            component_manager::ProcessPresenceState::kPresent);
+  auto rebuilt = std::async(std::launch::async, [&] {
+    return resolved.value()->RebuildBootstrapProjection(bootstrap);
+  });
+  const auto entered_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!std::filesystem::exists(bootstrap_hold.Entered()) &&
+         std::chrono::steady_clock::now() < entered_deadline)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  ASSERT_TRUE(std::filesystem::exists(bootstrap_hold.Entered()));
+  const auto entered = std::chrono::steady_clock::now();
 
-  // While late, a second call answers at once and sends nothing: had it been
-  // sent, its reply would be read as the answer to a later call below.
-  const auto second = std::chrono::steady_clock::now();
+  const auto busy = adapter.ResolveProjection(binding);
+  ASSERT_FALSE(busy.ok());
+  EXPECT_EQ(busy.error().code, component_manager::kRuntimeUnitLaunchInProgressCode);
+  EXPECT_EQ(busy.error().details.at("phase"), "rebuilding");
   try {
-    static_cast<void>(resolved.value()->ProjectionHealth());
-    ADD_FAILURE() << "a call was sent while the host is late";
+    static_cast<void>(adapter.ObserveAdmission(
+        core::ConfigurationFenceAdmissionQueryDTO{{}}));
+    ADD_FAILURE() << "fence observation waited for or passed the rebuild";
   } catch (const core::TypedError &error) {
-    EXPECT_EQ(error.code(), component_manager::kExecutionHostLateCode);
+    EXPECT_EQ(error.code(), component_manager::kRuntimeUnitLaunchInProgressCode);
   }
-  EXPECT_LT(std::chrono::steady_clock::now() - second, std::chrono::seconds(1));
+  EXPECT_TRUE(adapter.HasHostChild());
+  EXPECT_LT(std::chrono::steady_clock::now() - entered, std::chrono::seconds(1));
 
-  // The late reply is recognised and discarded; the channel is usable again
-  // and the same child answers the next call with its own reply.
+  // Past the former 10 s bound the rebuild still waits and the host is not
+  // late; its reply then answers the call.
+  std::this_thread::sleep_until(entered + std::chrono::milliseconds(10500));
+  EXPECT_EQ(rebuilt.wait_for(std::chrono::seconds(0)),
+            std::future_status::timeout);
+  EXPECT_FALSE(adapter.HostReplyOutstanding().has_value());
   ASSERT_TRUE(bootstrap_hold.Release());
-  std::optional<core::ProjectionHealthDTO> health;
-  const auto settle_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(20);
-  while (!health && std::chrono::steady_clock::now() < settle_deadline) {
-    try {
-      health = resolved.value()->ProjectionHealth();
-    } catch (const core::TypedError &error) {
-      ASSERT_EQ(error.code(), component_manager::kExecutionHostLateCode);
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-  }
-  ASSERT_TRUE(health.has_value());
-  // No latch: once the reply has arrived the host is no longer late.
-  EXPECT_FALSE(adapter.HostLate().has_value());
+  const auto result = rebuilt.get();
+  EXPECT_EQ(result.execution_host_binding, binding);
   EXPECT_NO_THROW(static_cast<void>(resolved.value()->ProjectionHealth()));
-  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).process_incarnation(),
-            first_epoch.value());
+  EXPECT_FALSE(adapter.HostReplyOutstanding().has_value());
   EXPECT_FALSE(adapter.HostExit().has_value());
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
@@ -2250,7 +2137,7 @@ TEST(RetainedExecutionHostUnitAdapter,
   EXPECT_EQ(after.state(), component_manager::ProcessPresenceState::kPresent);
   EXPECT_EQ(after.process_incarnation(), runtime_epoch.value());
   ASSERT_TRUE(
-      adapter.ObserveProgress(*fixture.query, runtime_epoch).has_value());
+      adapter.ObserveProgress(*fixture.query, runtime_epoch, 0U).has_value());
 }
 
 TEST(RetainedExecutionHostUnitAdapter,
@@ -2729,7 +2616,7 @@ int RunSelectedAdapterPacketChild(const int argc, char **argv) {
       if (std::filesystem::exists(run_root / "ready-hold.mode")) {
         std::ofstream(run_root / "ready-hold.entered") << "entered\n";
         const auto deadline =
-            std::chrono::steady_clock::now() + std::chrono::seconds(9);
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
         while (!std::filesystem::exists(run_root / "ready-hold.release") &&
                std::chrono::steady_clock::now() < deadline) {
           std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -2764,6 +2651,28 @@ int RunSelectedAdapterPacketChild(const int argc, char **argv) {
           rpc::KernelApplyFenceRpcFailure{
               {"packet_peer_refused", "fixture has no Kernel", {}}});
       hold_late_reply("fence");
+    } else if (rpc::IsSelectedRuntimeCompositionRpcPacket(packet) &&
+               std::holds_alternative<
+                   component_manager::ManagerComponentProcessInventoryRequestDTO>(
+                   rpc::DecodeSelectedRuntimeCompositionRpcRequestVariant(
+                       packet))) {
+      // Inspection mode: "exit" exits without a reply; "hold" answers a
+      // fixture failure only once the test releases it.
+      const auto mode = std::filesystem::exists(run_root / "inspection.mode")
+                            ? ReadFile(run_root / "inspection.mode")
+                            : std::string{};
+      if (mode == "exit") return 0;
+      if (mode == "hold") {
+        std::ofstream(run_root / "inspection.entered") << "entered\n";
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (!std::filesystem::exists(run_root / "inspection.release") &&
+               std::chrono::steady_clock::now() < deadline)
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      }
+      response = rpc::EncodeSelectedRuntimeCompositionRpcResponse(
+          rpc::SelectedRuntimeCompositionRpcFailure{
+              {"packet_peer_failure", "fixture has no component processes", {}}});
     } else if (!rpc::IsSelectedRuntimeCompositionRpcPacket(packet)) {
       const auto request = rpc::DecodeNativeProjectionRpcRequest(packet);
       const auto *prepare =
@@ -3079,11 +2988,19 @@ TEST(RetainedExecutionHostUnitAdapter,
   ASSERT_FALSE(failed.ok());
   EXPECT_EQ(failed.error().code, "packet_peer_failure");
   EXPECT_ANY_THROW((void)adapter.ApplyOnHost(unit, HostApplyAdapterRequest(fixture, HostApplyMarker::kMalformed)));
-  EXPECT_ANY_THROW((void)adapter.ApplyOnHost(unit, HostApplyAdapterRequest(fixture, HostApplyMarker::kClose)));
+  // The peer exits without a reply: the exchange ends on the host's exit,
+  // typed (OD-290 (a)).
+  const auto lost = adapter.ApplyOnHost(unit, HostApplyAdapterRequest(fixture, HostApplyMarker::kClose));
+  ASSERT_FALSE(lost.ok());
+  EXPECT_EQ(lost.error().code, component_manager::kExecutionHostExitedCode);
+  EXPECT_EQ(lost.error().details.at("exchange"), "host_apply");
+  EXPECT_TRUE(adapter.HostExit().has_value());
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
 }
 
+// OD-290 (a): the launch handshake has no time limit; past the former 10 s
+// bound it still completes on the host's readiness.
 TEST(RetainedExecutionHostUnitAdapter,
      SlowLaunchHandshakeAnswersFenceAndClaimCallsBusyWithoutWaiting) {
   NativeFixture fixture;
@@ -3130,6 +3047,9 @@ TEST(RetainedExecutionHostUnitAdapter,
   EXPECT_LT(std::chrono::steady_clock::now() - started,
             std::chrono::seconds(1));
 
+  std::this_thread::sleep_until(started + std::chrono::milliseconds(10500));
+  EXPECT_EQ(launch.wait_for(std::chrono::seconds(0)),
+            std::future_status::timeout);
   std::ofstream(run_root / "ready-hold.release") << "release\n";
   ASSERT_EQ(launch.get().state(),
             component_manager::ProcessPresenceState::kPresent);
@@ -3180,33 +3100,33 @@ private:
           core::ContentDigest(std::string(kIntentDigest)), std::nullopt};
 }
 
-// Settles the late reply through the status observation (which settles the
-// channel first) and returns once the host answers again.
+// Observes until a status reply is consumed: the host answers again.
 [[nodiscard]] bool WaitUntilAnswering(
     component_manager::RetainedExecutionHostUnitAdapter &adapter,
     const NativeFixture &fixture, const core::RuntimeEpoch &epoch) {
   const auto deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(20);
   while (std::chrono::steady_clock::now() < deadline) {
-    static_cast<void>(adapter.ObserveProgress(*fixture.query, epoch));
-    if (!adapter.HostLate().has_value()) return true;
+    if (adapter.ObserveProgress(*fixture.query, epoch, 0U).has_value()) return true;
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   return false;
 }
 
-// While the host is late every management call answers execution_host_late
-// at once and sends nothing (OD-121 (4)).
-void ExpectEveryManagementCallAnswersLate(
+// While an exchange's reply is outstanding every other management call is
+// answered execution_host_late at once and sends nothing (OD-290 (a)).
+void ExpectEveryManagementCallAnswersOutstanding(
     component_manager::RetainedExecutionHostUnitAdapter &adapter,
-    const NativeFixture &fixture, const core::RuntimeEpoch &epoch) {
+    const NativeFixture &fixture, const core::RuntimeEpoch &epoch,
+    const std::string_view exchange) {
   const auto started = std::chrono::steady_clock::now();
   const auto reset = adapter.ValidateProgramResetSceneAuthorization(
       LateTestResetAuthorization());
   ASSERT_FALSE(reset.ok());
   EXPECT_EQ(reset.error().code, component_manager::kExecutionHostLateCode);
-  // Refused because the host is late: nothing was sent, so the refusal is
-  // before any effect (the Apply journal reads `effect: none` as known).
+  EXPECT_EQ(reset.error().details.at("exchange"), exchange);
+  // Nothing was sent, so the refusal is before any effect (the Apply
+  // journal reads `effect: none` as known).
   EXPECT_EQ(reset.error().details.at("effect"), "none");
   const auto apply = adapter.ApplyOnHost(
       fixture.query->plan.runtime_unit_id,
@@ -3217,20 +3137,23 @@ void ExpectEveryManagementCallAnswersLate(
   try {
     static_cast<void>(adapter.ObserveAdmission(
         core::ConfigurationFenceAdmissionQueryDTO{{}}));
-    ADD_FAILURE() << "fence observation was sent while the host is late";
+    ADD_FAILURE() << "fence observation was sent behind an outstanding reply";
   } catch (const core::TypedError &error) {
     EXPECT_EQ(error.code(), component_manager::kExecutionHostLateCode);
   }
   // The status observation sends nothing and reports no new evidence.
-  EXPECT_FALSE(adapter.ObserveProgress(*fixture.query, epoch).has_value());
+  EXPECT_FALSE(adapter.ObserveProgress(*fixture.query, epoch, 0U).has_value());
   EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(1));
   EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
             component_manager::ProcessPresenceState::kPresent);
   EXPECT_FALSE(adapter.HostExit().has_value());
 }
 
+// OD-290 (a): a status reply slower than the former 750 ms bound is consumed
+// by a later observation. The observation never waits, nothing is halted or
+// faulted, and a call made meanwhile is sent behind the status and answered.
 TEST(RetainedExecutionHostUnitAdapter,
-     LateStatusFaultsTheHostOnlyUntilItsReplySettles) {
+     SlowStatusReplyIsConsumedLaterWithoutWaiting) {
   NativeFixture fixture;
   ScopedTemporaryRoot targets;
   static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
@@ -3239,50 +3162,56 @@ TEST(RetainedExecutionHostUnitAdapter,
   const auto started = adapter.EnsureRunning(*fixture.query);
   ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
   const core::RuntimeEpoch epoch(started.process_incarnation());
-  EXPECT_FALSE(adapter.HostLate().has_value());
+  ASSERT_TRUE(WaitUntilAnswering(adapter, fixture, epoch));
   LateReplyHold hold(run_root, "status");
 
-  // A status read past its bound: the host is late, not lost. It is not
-  // stopped and its unit is not erased.
-  EXPECT_FALSE(adapter.ObserveProgress(*fixture.query, epoch).has_value());
-  EXPECT_TRUE(hold.Entered());
-  const auto late = adapter.HostLate();
-  ASSERT_TRUE(late.has_value());
-  EXPECT_EQ(late->exchange, "status");
-  EXPECT_EQ(late->bound, std::chrono::milliseconds(750));
-  EXPECT_GE(late->waited, std::chrono::milliseconds(750));
-  ExpectEveryManagementCallAnswersLate(adapter, fixture, epoch);
-  EXPECT_EQ(hold.Received("cell_admission"), 0U);
-  EXPECT_EQ(hold.Received("host_apply"), 0U);
-  EXPECT_EQ(hold.Received("fence"), 0U);
+  // The observation that consumes the last reply sends the held status.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!hold.Entered() && std::chrono::steady_clock::now() < deadline) {
+    static_cast<void>(adapter.ObserveProgress(*fixture.query, epoch, 0U));
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(hold.Entered());
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+  // Past the former bound: each observation returns at once, without new
+  // evidence; the host is kept and the outstanding reply is published.
+  const auto observed = std::chrono::steady_clock::now();
+  for (int tick = 0; tick < 3; ++tick)
+    EXPECT_FALSE(adapter.ObserveProgress(*fixture.query, epoch, 0U).has_value());
+  EXPECT_LT(std::chrono::steady_clock::now() - observed,
+            std::chrono::milliseconds(100));
+  const auto outstanding = adapter.HostReplyOutstanding();
+  ASSERT_TRUE(outstanding.has_value());
+  EXPECT_EQ(outstanding->exchange, "status");
+  EXPECT_GE(outstanding->waited, std::chrono::milliseconds(1000));
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kPresent);
   EXPECT_EQ(hold.Received("status"), 1U);
 
-  // The late reply is recognised and discarded by the status observation;
-  // the host stops counting as late by itself: no Reset, no latch
-  // (maintainer 2026-11-13).
+  // A call is sent behind the status and answered once the host answers.
+  auto reset = std::async(std::launch::async, [&] {
+    return adapter.ValidateProgramResetSceneAuthorization(
+        LateTestResetAuthorization());
+  });
+  EXPECT_EQ(reset.wait_for(std::chrono::milliseconds(200)),
+            std::future_status::timeout);
   hold.Release();
-  ASSERT_TRUE(WaitUntilAnswering(adapter, fixture, epoch));
-  EXPECT_FALSE(adapter.HostLate().has_value());
-  EXPECT_EQ(hold.Received("cell_admission"), 0U);
-  EXPECT_TRUE(adapter.ObserveProgress(*fixture.query, epoch).has_value());
-  const auto refused = adapter.ApplyOnHost(
-      fixture.query->plan.runtime_unit_id,
-      HostApplyAdapterRequest(fixture, HostApplyMarker::kRpcFailure));
-  ASSERT_FALSE(refused.ok());
-  EXPECT_EQ(refused.error().code, "packet_peer_failure");
-  EXPECT_FALSE(adapter.HostLate().has_value());
-  EXPECT_TRUE(adapter.ValidateProgramResetSceneAuthorization(
-                         LateTestResetAuthorization())
-                  .ok());
-  EXPECT_EQ(hold.Received("host_apply"), 1U);
+  ASSERT_EQ(reset.wait_for(std::chrono::seconds(10)), std::future_status::ready);
+  EXPECT_TRUE(reset.get().ok());
+  // The status reply read behind it is the next observation's evidence.
+  EXPECT_TRUE(adapter.ObserveProgress(*fixture.query, epoch, 0U).has_value());
   EXPECT_EQ(hold.Received("cell_admission"), 1U);
   EXPECT_FALSE(adapter.HostExit().has_value());
   EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
 }
 
+// OD-290 (a): fence, cell-admission and Host Apply exchanges slower than the
+// former 750 ms bound are answered by the host's reply. Meanwhile every
+// other call is answered at once and sends nothing.
 TEST(RetainedExecutionHostUnitAdapter,
-     TimedOutFenceCellAdmissionAndHostApplyLeaveTheHostUpAndAnswerLate) {
+     SlowFenceCellAdmissionAndHostApplyAreAnsweredWithoutATimeLimit) {
   for (const std::string_view kind : {"fence", "cell_admission", "host_apply"}) {
     SCOPED_TRACE(kind);
     NativeFixture fixture;
@@ -3296,46 +3225,62 @@ TEST(RetainedExecutionHostUnitAdapter,
     LateReplyHold hold(run_root, kind);
 
     std::string_view exchange;
+    std::future<std::string> answered;
     if (kind == "fence") {
       exchange = "fence_observe_admission";
-      try {
-        static_cast<void>(adapter.ObserveAdmission(
-            core::ConfigurationFenceAdmissionQueryDTO{{}}));
-        ADD_FAILURE() << "held fence observation returned a response";
-      } catch (const core::TypedError &error) {
-        EXPECT_EQ(error.code(), component_manager::kExecutionHostLateCode);
-      }
+      answered = std::async(std::launch::async, [&]() -> std::string {
+        try {
+          static_cast<void>(adapter.ObserveAdmission(
+              core::ConfigurationFenceAdmissionQueryDTO{{}}));
+          return "answered";
+        } catch (const std::exception &error) {
+          return error.what();
+        }
+      });
     } else if (kind == "cell_admission") {
       exchange = "cell_admission_validate_program_reset_scene";
-      const auto reset = adapter.ValidateProgramResetSceneAuthorization(
-          LateTestResetAuthorization());
-      ASSERT_FALSE(reset.ok());
-      EXPECT_EQ(reset.error().code, component_manager::kExecutionHostLateCode);
+      answered = std::async(std::launch::async, [&]() -> std::string {
+        const auto reset = adapter.ValidateProgramResetSceneAuthorization(
+            LateTestResetAuthorization());
+        return reset.ok() ? "answered" : reset.error().code;
+      });
     } else {
-      // A late Host Apply's outcome is unknown; the Apply journal records it
-      // through its unknown-effect path (L-4).
       exchange = "host_apply";
-      const auto apply = adapter.ApplyOnHost(
-          fixture.query->plan.runtime_unit_id,
-          HostApplyAdapterRequest(fixture, HostApplyMarker::kSucceed));
-      ASSERT_FALSE(apply.ok());
-      EXPECT_EQ(apply.error().code, component_manager::kExecutionHostLateCode);
-      EXPECT_EQ(apply.error().details.at("exchange"), "host_apply");
-      // The exchange that timed out has an unknown outcome: no `effect`.
-      EXPECT_FALSE(apply.error().details.contains("effect"));
+      answered = std::async(std::launch::async, [&]() -> std::string {
+        const auto apply = adapter.ApplyOnHost(
+            fixture.query->plan.runtime_unit_id,
+            HostApplyAdapterRequest(fixture, HostApplyMarker::kSucceed));
+        return apply.ok() ? "answered" : apply.error().code;
+      });
     }
-    EXPECT_TRUE(hold.Entered());
-    const auto late = adapter.HostLate();
-    ASSERT_TRUE(late.has_value());
-    EXPECT_EQ(late->exchange, exchange);
-    ExpectEveryManagementCallAnswersLate(adapter, fixture, epoch);
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!hold.Entered() && std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    ASSERT_TRUE(hold.Entered());
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    EXPECT_EQ(answered.wait_for(std::chrono::seconds(0)),
+              std::future_status::timeout);
+    const auto outstanding = adapter.HostReplyOutstanding();
+    ASSERT_TRUE(outstanding.has_value());
+    EXPECT_EQ(outstanding->exchange, exchange);
+    ExpectEveryManagementCallAnswersOutstanding(adapter, fixture, epoch,
+                                                exchange);
     EXPECT_EQ(hold.Received(kind), 1U);
 
     hold.Release();
-    ASSERT_TRUE(WaitUntilAnswering(adapter, fixture, epoch));
+    ASSERT_EQ(answered.wait_for(std::chrono::seconds(10)),
+              std::future_status::ready);
+    const auto answer = answered.get();
+    if (kind == "fence") {
+      // The fixture's fence peer refuses; its refusal is the host's answer.
+      EXPECT_NE(answer.find("packet_peer_refused"), std::string::npos) << answer;
+    } else {
+      EXPECT_EQ(answer, "answered");
+    }
     EXPECT_EQ(hold.Received(kind), 1U);
-    // No latch: the host stopped counting as late when its reply arrived.
-    EXPECT_FALSE(adapter.HostLate().has_value());
+    EXPECT_FALSE(adapter.HostReplyOutstanding().has_value());
+    ASSERT_TRUE(WaitUntilAnswering(adapter, fixture, epoch));
     EXPECT_FALSE(adapter.HostExit().has_value());
     EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
               component_manager::ProcessPresenceState::kAbsent);
@@ -3343,7 +3288,7 @@ TEST(RetainedExecutionHostUnitAdapter,
 }
 
 TEST(RetainedExecutionHostUnitAdapter,
-     FailedChannelWithTheHostAliveKeepsItLateUntilItIsStopped) {
+     FailedChannelWithTheHostAliveKeepsItsExchangeOutstandingUntilItIsStopped) {
   NativeFixture fixture;
   ScopedTemporaryRoot targets;
   static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
@@ -3354,22 +3299,28 @@ TEST(RetainedExecutionHostUnitAdapter,
   std::ofstream(fixture.execution_run_root.path() / "status-fail.mode")
       << "close";
 
-  // The child closes its channel and stays alive: the host is late, not
-  // stopped, reaped or erased.
-  EXPECT_FALSE(adapter.ObserveProgress(*fixture.query, epoch).has_value());
-  const auto late = adapter.HostLate();
-  ASSERT_TRUE(late.has_value());
-  EXPECT_EQ(late->exchange, "status");
-  EXPECT_EQ(late->bound, std::chrono::milliseconds(750));
-  ExpectEveryManagementCallAnswersLate(adapter, fixture, epoch);
+  // The child closes its channel and stays alive: its status stays
+  // outstanding; the host is not stopped, reaped or erased.
+  std::optional<component_manager::ExecutionHostReplyOutstandingDTO> outstanding;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (std::chrono::steady_clock::now() < deadline) {
+    EXPECT_FALSE(adapter.ObserveProgress(*fixture.query, epoch, 0U).has_value());
+    outstanding = adapter.HostReplyOutstanding();
+    if (outstanding && outstanding->waited > std::chrono::milliseconds(100))
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+  ASSERT_TRUE(outstanding.has_value());
+  EXPECT_EQ(outstanding->exchange, "status");
+  ExpectEveryManagementCallAnswersOutstanding(adapter, fixture, epoch, "status");
 
-  // No reply can settle it: later observations send nothing and start no
-  // new episode, so the Manager requests no second Halt.
+  // No reply can settle it: later observations send nothing.
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
-  EXPECT_FALSE(adapter.ObserveProgress(*fixture.query, epoch).has_value());
-  const auto still = adapter.HostLate();
+  EXPECT_FALSE(adapter.ObserveProgress(*fixture.query, epoch, 0U).has_value());
+  const auto still = adapter.HostReplyOutstanding();
   ASSERT_TRUE(still.has_value());
-  EXPECT_EQ(still->episode, late->episode);
+  EXPECT_EQ(still->episode, outstanding->episode);
   EXPECT_FALSE(adapter.HostExit().has_value());
 
   // The operator's stop still ends the host (its shutdown cannot be
@@ -3400,7 +3351,7 @@ TEST(RetainedExecutionHostUnitAdapter,
       std::chrono::steady_clock::now() + std::chrono::seconds(10);
   while (!adapter.HostExit().has_value() &&
          std::chrono::steady_clock::now() < deadline) {
-    EXPECT_FALSE(adapter.ObserveProgress(*fixture.query, epoch).has_value());
+    EXPECT_FALSE(adapter.ObserveProgress(*fixture.query, epoch, 0U).has_value());
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
   const auto exit = adapter.HostExit();
@@ -3410,7 +3361,7 @@ TEST(RetainedExecutionHostUnitAdapter,
   EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
             component_manager::ProcessPresenceState::kAbsent);
   EXPECT_THROW(static_cast<void>(adapter.EnsureRunning(*fixture.query)),
-               component_manager::RetainedExecutionHostUnitAdapterError);
+               core::TypedError);
 }
 
 TEST(RetainedExecutionHostUnitAdapter, HostApplyWithoutARunningChildNeverStartsOne) {
@@ -3485,6 +3436,219 @@ TEST(RetainedExecutionHostUnitAdapter,
   EXPECT_EQ(snapshot_status.st_mode & 0777, 0600);
   // Child retirement and adapter destruction keep the run evidence.
   EXPECT_EQ(ReadFile(snapshot_path), site_document);
+}
+
+// The packet child's inspection mode: "hold" answers only once released,
+// "exit" exits without a reply. Declare it after the adapter.
+class InspectionHold final {
+public:
+  InspectionHold(std::filesystem::path run_root, const std::string_view mode)
+      : root_(std::move(run_root)) {
+    std::ofstream(root_ / "inspection.mode") << mode;
+  }
+  InspectionHold(const InspectionHold &) = delete;
+  InspectionHold &operator=(const InspectionHold &) = delete;
+  ~InspectionHold() { Release(); }
+
+  void Release() const noexcept {
+    try {
+      std::ofstream(root_ / "inspection.release") << "release\n";
+    } catch (...) {
+    }
+  }
+  [[nodiscard]] bool WaitEntered() const {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (!std::filesystem::exists(root_ / "inspection.entered") &&
+           std::chrono::steady_clock::now() < deadline)
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    return std::filesystem::exists(root_ / "inspection.entered");
+  }
+
+private:
+  std::filesystem::path root_;
+};
+
+[[nodiscard]] component_manager::ManagerComponentProcessInventoryRequestDTO
+InspectionRequest(const NativeFixture &fixture, const core::RuntimeEpoch &epoch) {
+  return {{fixture.bundle->retained_bundle_id(),
+           fixture.bundle->value().cell_graph.graph_revision,
+           MakeEmptyScene(fixture.bundle->value().cell_graph.cell_id, 1U)
+               .shared()
+               ->revision},
+          core::ActiveBundlePublicationGeneration(1U),
+          core::ContentDigest(std::string(kIntentDigest)),
+          fixture.query->plan.runtime_unit_id,
+          epoch,
+          true};
+}
+
+// OD-270: the process inspection has no time limit and holds no adapter lock;
+// meanwhile other calls answer busy at once. The stop's abandon signal ends it
+// typed at once; its reply, when it comes, is still settled; a later one is
+// refused before it is sent.
+TEST(RetainedExecutionHostUnitAdapter,
+     HeldInspectionAnswersOtherCallsBusyAndTheStopAbandonsIt) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  const auto run_root = fixture.execution_run_root.path();
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  const auto request = InspectionRequest(fixture, epoch);
+  ASSERT_TRUE(request.valid());
+  InspectionHold hold(run_root, "hold");
+  auto inspected = std::async(std::launch::async, [&] {
+    return adapter.InspectInstalledComponentProcesses(request);
+  });
+  ASSERT_TRUE(hold.WaitEntered());
+
+  const auto busy_started = std::chrono::steady_clock::now();
+  const auto resolved =
+      adapter.ResolveProjection(NativeProjectionBinding(fixture, epoch));
+  ASSERT_FALSE(resolved.ok());
+  EXPECT_EQ(resolved.error().code,
+            component_manager::kRuntimeUnitLaunchInProgressCode);
+  EXPECT_EQ(resolved.error().details.at("phase"), "inspecting");
+  try {
+    static_cast<void>(adapter.ObserveAdmission(
+        core::ConfigurationFenceAdmissionQueryDTO{{}}));
+    ADD_FAILURE() << "fence observation waited for or passed the inspection";
+  } catch (const core::TypedError &error) {
+    EXPECT_EQ(error.code(), component_manager::kRuntimeUnitLaunchInProgressCode);
+  }
+  EXPECT_TRUE(adapter.HasHostChild());
+  EXPECT_LT(std::chrono::steady_clock::now() - busy_started,
+            std::chrono::seconds(1));
+
+  adapter.AbandonExchanges();
+  ASSERT_EQ(inspected.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  const auto abandoned = inspected.get();
+  ASSERT_FALSE(abandoned.ok());
+  EXPECT_EQ(abandoned.error().code, component_manager::kApplicationStoppingCode);
+  EXPECT_EQ(abandoned.error().details.at("exchange"),
+            "component_process_inspection");
+  EXPECT_FALSE(abandoned.error().details.contains("effect"));
+  // Its reply is still outstanding (information only).
+  const auto outstanding = adapter.HostReplyOutstanding();
+  ASSERT_TRUE(outstanding.has_value());
+  EXPECT_EQ(outstanding->exchange, "component_process_inspection");
+  EXPECT_FALSE(adapter.HostExit().has_value());
+
+  // While the abandoned exchange is unsettled, other host calls send nothing
+  // and answer the typed stopping refusal.
+  const auto reset = adapter.ValidateProgramResetSceneAuthorization(
+      LateTestResetAuthorization());
+  ASSERT_FALSE(reset.ok());
+  EXPECT_EQ(reset.error().code, component_manager::kApplicationStoppingCode);
+  EXPECT_EQ(reset.error().details.at("effect"), "none");
+  const auto apply = adapter.ApplyOnHost(
+      fixture.query->plan.runtime_unit_id,
+      HostApplyAdapterRequest(fixture, HostApplyMarker::kSucceed));
+  ASSERT_FALSE(apply.ok());
+  EXPECT_EQ(apply.error().code, component_manager::kApplicationStoppingCode);
+  EXPECT_EQ(apply.error().details.at("effect"), "none");
+  try {
+    static_cast<void>(adapter.ObserveAdmission(
+        core::ConfigurationFenceAdmissionQueryDTO{{}}));
+    ADD_FAILURE() << "fence observation was sent behind the abandoned exchange";
+  } catch (const core::TypedError &error) {
+    EXPECT_EQ(error.code(), component_manager::kApplicationStoppingCode);
+    EXPECT_EQ(error.details().at("exchange"), "component_process_inspection");
+  }
+
+  // The reply that comes later is recognised and settled: the status read
+  // then sends again and answers.
+  hold.Release();
+  bool settled = false;
+  const auto settle_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!settled && std::chrono::steady_clock::now() < settle_deadline) {
+    settled = adapter.ObserveProgress(*fixture.query, epoch, 0U).has_value();
+    if (!settled) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  ASSERT_TRUE(settled);
+  const auto refused = adapter.InspectInstalledComponentProcesses(request);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, component_manager::kApplicationStoppingCode);
+  EXPECT_EQ(refused.error().details.at("effect"), "none");
+  EXPECT_EQ(adapter.EnsureStopped(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
+}
+
+// OD-270 with OD-187 (1): after the abandon signal the stop is not held
+// behind the exchange, and a second stop request kills a host that does not
+// stop.
+TEST(RetainedExecutionHostUnitAdapter,
+     AfterTheStopAbandonsAHeldExchangeASecondStopKillsTheHost) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  const auto run_root = fixture.execution_run_root.path();
+  auto adapter = MakeAdapter(fixture, targets.path());
+  g_shutdown_force_requested.store(false, std::memory_order_release);
+  adapter.SetShutdownForce(&ShutdownForceRequested);
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  InspectionHold hold(run_root, "hold");
+  auto inspected = std::async(std::launch::async, [&] {
+    return adapter.InspectInstalledComponentProcesses(
+        InspectionRequest(fixture, epoch));
+  });
+  ASSERT_TRUE(hold.WaitEntered());
+  adapter.AbandonExchanges();
+  auto stopped = std::async(std::launch::async, [&] {
+    return adapter.EnsureStopped(*fixture.query);
+  });
+  ASSERT_EQ(inspected.wait_for(std::chrono::seconds(2)),
+            std::future_status::ready);
+  EXPECT_EQ(inspected.get().error().code,
+            component_manager::kApplicationStoppingCode);
+  // The held host does not read its shutdown; the stop waits for its exit.
+  EXPECT_EQ(stopped.wait_for(std::chrono::milliseconds(300)),
+            std::future_status::timeout);
+  g_shutdown_force_requested.store(true, std::memory_order_release);
+  ASSERT_EQ(stopped.wait_for(std::chrono::seconds(10)),
+            std::future_status::ready);
+  EXPECT_EQ(stopped.get().state(),
+            component_manager::ProcessPresenceState::kAbsent);
+  g_shutdown_force_requested.store(false, std::memory_order_release);
+  EXPECT_TRUE(adapter.HostForceKilledPid().has_value());
+  const auto exit = adapter.HostExit();
+  ASSERT_TRUE(exit.has_value());
+  EXPECT_TRUE(exit->signaled);
+  EXPECT_EQ(exit->value, SIGKILL);
+}
+
+// OD-270: the host's exit ends an exchange without a time limit at once,
+// typed, and HostExit is set when it is answered.
+TEST(RetainedExecutionHostUnitAdapter,
+     HostExitDuringAnExchangeWithoutLimitIsTypedAndReportedAtOnce) {
+  NativeFixture fixture;
+  ScopedTemporaryRoot targets;
+  static_cast<void>(InstallSelectedPacketTestTargets(targets.path()));
+  auto adapter = MakeAdapter(fixture, targets.path());
+  const auto started = adapter.EnsureRunning(*fixture.query);
+  ASSERT_EQ(started.state(), component_manager::ProcessPresenceState::kPresent);
+  const core::RuntimeEpoch epoch(started.process_incarnation());
+  InspectionHold exits(fixture.execution_run_root.path(), "exit");
+  const auto result =
+      adapter.InspectInstalledComponentProcesses(InspectionRequest(fixture, epoch));
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().code, component_manager::kExecutionHostExitedCode);
+  EXPECT_EQ(result.error().details.at("exchange"),
+            "component_process_inspection");
+  const auto exit = adapter.HostExit();
+  ASSERT_TRUE(exit.has_value());
+  EXPECT_FALSE(exit->signaled);
+  EXPECT_EQ(exit->value, 0);
+  EXPECT_FALSE(adapter.HostReplyOutstanding().has_value());
+  EXPECT_EQ(adapter.ObserveProcess(*fixture.query).state(),
+            component_manager::ProcessPresenceState::kAbsent);
 }
 } // namespace manyforge::roboplan_backend
 

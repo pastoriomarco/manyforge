@@ -1587,6 +1587,10 @@ struct ResourceAddressedExecutionKernel::ProgramCycleClaimRun::MotionContinuatio
   ResolvedFrameDTO tcp_frame;
   PlannerCapabilityBindingDTO planner_capability;
   std::size_t authored_motion_kind{};
+  /// Set, with no intent, when a sent take-over newcomer's rest cannot be
+  /// captured: its next attempt is refused as Resume refuses a stopped
+  /// motion whose continuation cannot be captured (OD-269).
+  std::optional<ErrorDTO> resume_refusal{};
 };
 
 [[nodiscard]] inline bool conclusive_runtime_collision(const ErrorDTO& collision) {
@@ -1894,6 +1898,12 @@ struct ActiveOperationParticipant final {
   bool dispatch_effect_in_flight{};
   std::optional<ErrorDTO> last_subordinate_error;
   std::optional<ExecuteRequestDTO> motion_request;
+  /// The take-over's "hand-over pending" mark (OD-175 D3), on the candidate's
+  /// row from the "decide" step to the "close" step: the execution id of the
+  /// motion it took over, 0 = no mark. While set, the reconcile pass, a Stop's
+  /// progress, the speed step and the candidate's own take-over advance leave
+  /// this row alone; the close step clears it and wakes a waiting Stop.
+  std::uint64_t handover_source_execution_id{};
   std::shared_ptr<const detail::MotionResumeIntent> continuation{};
   std::size_t continuation_node_index{};
   /// Runtime collision observed outside an active Stop; its containment Stop
@@ -1932,6 +1942,10 @@ struct ActiveOperationParticipant final {
   // Authority is the exact returned engine session's irreversible precommit
   // cancellation, independently of the earlier historical Kernel release.
   bool prepared_engine_no_effect_confirmed{};
+  /// Take-over newcomer: a cold promotion retired its sent replacement (its
+  /// effect settled under the take-over's Stop) and gave the row an unsent
+  /// successor. The newcomer's record never claims "no effect" (OD-285).
+  bool sent_before_cold_promotion{};
   /// The exact handover commit detached this private physical owner. Its
   /// immutable public participant row remains part of the original operation.
   bool ownership_transferred{};

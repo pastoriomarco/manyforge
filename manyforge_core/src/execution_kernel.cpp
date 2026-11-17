@@ -61,6 +61,17 @@ struct ExecutionWorkerScope {
       : previous(current_execution_worker) { current_execution_worker = owner; }
   ~ExecutionWorkerScope() { current_execution_worker = previous; }
 };
+// Set only on this engine's motion worker (OD-175 D1): the take-over's
+// "prove" step runs there and nowhere else. `current_execution_worker` is
+// also set on the preparation thread, so it cannot tell the two apart. Read
+// only by its own thread: no shared read and no lock.
+thread_local const ExecutionKernel* current_motion_worker = nullptr;
+struct MotionWorkerScope {
+  const ExecutionKernel* previous;
+  explicit MotionWorkerScope(const ExecutionKernel* owner)
+      : previous(current_motion_worker) { current_motion_worker = owner; }
+  ~MotionWorkerScope() { current_motion_worker = previous; }
+};
 
 [[nodiscard]] bool resolved_scale_target_matches(const ResolvedRuntimeScaleCommandDTO& command,
                                                  const ResolvedExecutionBindingDTO& binding);
@@ -5672,9 +5683,12 @@ bool ExecutionKernel::service_motion_replacement(const std::stop_token stop_toke
   return adopted;
 }
 
-Result<bool> ExecutionKernel::CommitPreparedMotionReplacement(
-    const std::uint64_t candidate_id, const PreparedMotionReplacementSourceDTO& source,
-    const PreparedMotionReplacementCommitDTO commit) {
+Result<bool> ExecutionKernel::ProvePreparedMotionReplacement(
+    const std::uint64_t candidate_id, const PreparedMotionReplacementSourceDTO& source) {
+  // OD-175 D1, "prove": every check that can fail, with no Kernel lock. The
+  // session-pointer lock is taken alone for a copy of the three pointers; the
+  // rest is today's engine order minus that lock. No submission lock: a speed
+  // acceptance orders itself against "apply" by the scale lock.
   if (scheduler_detach_started_.load(std::memory_order_seq_cst))
     return Result<bool>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
                                       {{"reason", "scheduler_not_ready"}}});
@@ -5682,23 +5696,25 @@ Result<bool> ExecutionKernel::CommitPreparedMotionReplacement(
     return Result<bool>::Err(ErrorDTO{
         kErrorExecutionRejected, "Replacement adoption was refused", {{"reason", reason}}});
   };
-  if (!commit.owner_commit) return reject("motion_replacement_commit_missing");
-  // A scale acceptance in progress (its checks and bookkeeping; set_runtime_scale
-  // releases the lock before its backend call and event) and this adoption
-  // never interleave; adoption backs off rather than wait while the
-  // addressed owner's state lock is held by this handover.
-  std::unique_lock submission_lock(resolved_runtime_scale_submission_mutex_, std::try_to_lock);
-  if (!submission_lock.owns_lock()) return Result<bool>::Ok(false);
-  std::lock_guard owner_lock(prepared_motion_session_mutex_);
-  auto pending = pending_prepared_motion_session_;
-  auto incumbent = active_prepared_motion_session_;
-  auto* current = active_motion_execution_;
+  // No other writer changes these three pointers while the worker is between
+  // "prove" and "apply": the worker is parked inside this call and "apply"
+  // runs on it (OD-175 §3.1).
+  std::shared_ptr<PreparedMotionSession> pending;
+  std::shared_ptr<PreparedMotionSession> incumbent;
+  ActiveMotionExecution* current{};
+  {
+    std::lock_guard owner_lock(prepared_motion_session_mutex_);
+    pending = pending_prepared_motion_session_;
+    incumbent = active_prepared_motion_session_;
+    current = active_motion_execution_;
+  }
   if (!pending || !incumbent || !current || pending->execution_id != candidate_id ||
       incumbent->execution_id != source.execution_id ||
       current->execution_id != source.execution_id)
     return reject("motion_replacement_source_stale");
   std::scoped_lock session_lock(pending->mutex, incumbent->mutex);
-  if (!pending->worker_parked) return Result<bool>::Ok(false);
+  // Only this engine's motion worker, parked at its safe point.
+  if (current_motion_worker != this || !pending->worker_parked) return Result<bool>::Ok(false);
   const auto& retained = pending->authority.replacement->source;
   if (source.execution_id != retained.execution_id ||
       source.execution_generation != retained.execution_generation ||
@@ -5745,25 +5761,18 @@ Result<bool> ExecutionKernel::CommitPreparedMotionReplacement(
         return reject("motion_replacement_monitor_context_changed");
     }
   }
-  const auto* progress = execution_backend_.execution_progress_publication();
-  const auto hazard =
-      progress ? progress->hazard_authority_claimed(source.execution_generation) : std::nullopt;
-  if (!hazard || *hazard) return reject("motion_replacement_source_hazard_authority");
-  // All context copies and arm preparation happened before the CAS. The
-  // backend validates its exact goal/Stop/association proofs, then calls this
-  // immediate callback while holding its participant mutex.
+  // The source's hazard authority is no longer read here: the Kernel's
+  // "decide" step closes it (OD-175 D2, `CloseMotionReplacementHazard`).
   // The preparation budget ended at actual Replace submission. Recognition
   // and adoption retain the backend's existing effect-aware deadlines.
-  // Prepare timeout values before backend adoption / owner CAS.
+  // Prepare timeout values before backend adoption / owner decision.
   next.exec_timeout_ns = static_cast<std::int64_t>(next.request.timeouts.execution_timeout_s * 1e9);
   next.zero_speed_hold_timeout_ns =
       next.request.timeouts.zero_speed_hold_timeout_s
           ? static_cast<std::int64_t>(*next.request.timeouts.zero_speed_hold_timeout_s * 1e9)
           : 0;
   next.execution_progress_generation = pending->backend_execution_generation;
-  std::unique_lock scale_lock(resolved_runtime_scale_mutex_);
-  std::optional<ResolvedRuntimeScaleCommandDTO> successor_scale;
-  std::optional<ResolvedRuntimeScaleAcceptedDTO> successor_acceptance;
+  std::lock_guard scale_lock(resolved_runtime_scale_mutex_);
   if (next.request.initial_runtime_scale) {
     if (!accepted_resolved_runtime_scale_command_ ||
         !resolved_scale_target_matches(*accepted_resolved_runtime_scale_command_,
@@ -5773,6 +5782,51 @@ Result<bool> ExecutionKernel::CommitPreparedMotionReplacement(
       return reject("motion_replacement_scale_authority_stale");
     if (runtime_scale_acceptance_sequence_ == std::numeric_limits<std::uint64_t>::max())
       return reject("runtime_scale_acceptance_sequence_exhausted");
+  }
+  // The participant's proof reads (its own lock, the adapter's facts).
+  const auto proven = execution_backend_.ProveReplacement(source, candidate_id);
+  if (!proven.ok()) return Result<bool>::Err(proven.error());
+  return Result<bool>::Ok(true);
+}
+
+bool ExecutionKernel::CloseMotionReplacementHazard(
+    const PreparedMotionReplacementSourceDTO& source) noexcept {
+  // OD-175 D2: called by the Kernel's "decide" step under its state lock.
+  // One compare-and-swap in the progress publication; no engine or
+  // participant lock.
+  return execution_backend_.close_execution_progress_hazard(source.execution_generation);
+}
+
+void ExecutionKernel::ApplyPreparedMotionReplacement(const std::uint64_t candidate_id) {
+  // OD-175 D1, "apply": the swaps of a hand-over "prove" proved and the
+  // Kernel then decided, on the same parked worker, with no Kernel lock and
+  // no refusal. (1) The session-pointer lock alone, for the pointer writes.
+  std::shared_ptr<PreparedMotionSession> pending;
+  std::shared_ptr<PreparedMotionSession> incumbent;
+  ActiveMotionExecution* current{};
+  {
+    std::lock_guard owner_lock(prepared_motion_session_mutex_);
+    pending = pending_prepared_motion_session_;
+    incumbent = active_prepared_motion_session_;
+    current = active_motion_execution_;
+    // Adopted: its send outcome is known before it becomes the active session
+    // a Stop fence reads (no worker reports it).
+    pending->send_outcome_known.store(true, std::memory_order_seq_cst);
+    active_prepared_motion_session_ = pending;
+    pending_prepared_motion_session_.reset();
+  }
+  // (2) Today's pairs: both session locks, protection, scale (with the
+  // execution id), participant, lookahead.
+  std::scoped_lock session_lock(pending->mutex, incumbent->mutex);
+  auto& next = *pending->replacement_execution;
+  std::lock_guard protection_lock(runtime_collision_protection_mutex_);
+  std::unique_lock scale_lock(resolved_runtime_scale_mutex_);
+  // Derived here, under the scale lock that orders it with a speed
+  // acceptance: one accepted before this section is carried to the
+  // successor; one after it no longer matches the binding (OD-175 row 24).
+  std::optional<ResolvedRuntimeScaleCommandDTO> successor_scale;
+  std::optional<ResolvedRuntimeScaleAcceptedDTO> successor_acceptance;
+  if (next.request.initial_runtime_scale) {
     successor_scale = *next.request.initial_runtime_scale;
     successor_scale->expected_runtime_scale_generation = RuntimeScaleGeneration(0U);
     successor_scale->requested_runtime_scale_generation = RuntimeScaleGeneration(0U);
@@ -5780,16 +5834,10 @@ Result<bool> ExecutionKernel::CommitPreparedMotionReplacement(
     successor_acceptance = make_scale_acceptance(
         *successor_scale, runtime_scale_acceptance_sequence_ + 1U, clock_.now());
   }
-  const auto adopted = execution_backend_.AdoptReplacement(source, candidate_id, commit);
-  if (!adopted.ok()) return Result<bool>::Err(adopted.error());
+  execution_backend_.ApplyReplacement(candidate_id);
   static_assert(std::is_nothrow_swappable_v<ActiveMotionExecution>);
   std::swap(*current, next);
   current->prepared_session = pending;
-  // Adopted: its send outcome is known before it becomes the active session
-  // a Stop fence reads (no worker reports it).
-  pending->send_outcome_known.store(true, std::memory_order_seq_cst);
-  active_prepared_motion_session_ = pending;
-  pending_prepared_motion_session_.reset();
   sm_.set_execution_id(candidate_id);
   if (successor_scale) {
     static_assert(std::is_nothrow_swappable_v<decltype(successor_scale)>);
@@ -5813,7 +5861,6 @@ Result<bool> ExecutionKernel::CommitPreparedMotionReplacement(
   pending->replacement_lookahead_arm.reset();
   pending->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
   pending->replacement_observation->phase = PreparedMotionReplacementPhaseDTO::kCommitted;
-  return Result<bool>::Ok(true);
 }
 
 Result<PreparedMotionReplacementSourceDTO> ExecutionKernel::CaptureMotionReplacementSource(
@@ -6714,6 +6761,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
        prepared_session = std::move(prepared_session),
        worker_start_gate](std::stop_token st) mutable {
         ExecutionWorkerScope worker_scope(this);
+        MotionWorkerScope motion_worker_scope(this);
         if (!worker_start_gate->wait(st)) {
           return;
         }
@@ -9769,9 +9817,10 @@ Result<ResolvedRuntimeScaleAcceptedDTO> ExecutionKernel::set_runtime_scale(
   if (scheduler_detach_started_.load(std::memory_order_seq_cst))
     return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(ErrorDTO{kErrorExecutionRejected, "Participant scheduler is detached",
                                       {{"reason", "scheduler_not_ready"}}});
-  // Orders this acceptance against replacement adoption (which try-locks
-  // it): checks and bookkeeping only. Released before the backend call and
-  // the synchronous event, which use the values captured here.
+  // Orders acceptances among themselves: checks and bookkeeping only.
+  // Released before the backend call and the synchronous event, which use
+  // the values captured here. Replacement adoption does not take it: the
+  // two order themselves by the scale lock (OD-175 D1).
   std::unique_lock submission_lock(resolved_runtime_scale_submission_mutex_);
   if (!resolved_scale_command_well_formed(command)) {
     return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(
@@ -9806,8 +9855,23 @@ Result<ResolvedRuntimeScaleAcceptedDTO> ExecutionKernel::set_runtime_scale(
   }
 
   ResolvedRuntimeScaleAcceptedDTO accepted = make_scale_acceptance(command, 0U, 0);
+  std::uint64_t accepted_execution_id{};
   {
     std::lock_guard scale_lock(resolved_runtime_scale_mutex_);
+    // The binding again, in the section that a replacement adoption's swap
+    // of the binding and of the accepted command also holds (OD-175 D1): an
+    // acceptance after that swap gets today's binding mismatch, never the
+    // successor's "initial generation" refusal.
+    if (const auto current = active_correlation_.resolved_binding();
+        !current.has_value() || !resolved_scale_target_matches(command, *current)) {
+      return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(
+          ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                   "resolved runtime-scale command does not match the active binding",
+                   {{"reason", "resolved_runtime_scale_binding_mismatch"}}});
+    }
+    // The event names the execution this acceptance applied to, read in the
+    // same section (adoption sets the id inside it).
+    accepted_execution_id = sm_.status().execution_id;
     if (accepted_resolved_runtime_scale_command_.has_value() &&
         accepted_resolved_runtime_scale_command_->operation_id == command.operation_id) {
       if (*accepted_resolved_runtime_scale_command_ == command &&
@@ -9845,7 +9909,6 @@ Result<ResolvedRuntimeScaleAcceptedDTO> ExecutionKernel::set_runtime_scale(
     accepted_resolved_runtime_scale_command_ = command;
     accepted_resolved_runtime_scale_result_ = accepted;
   }
-  const auto accepted_execution_id = sm_.status().execution_id;
   submission_lock.unlock();
 
   execution_backend_.apply_runtime_velocity_scale(command.requested_scale, command.value_sequence);

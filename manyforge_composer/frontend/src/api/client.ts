@@ -594,14 +594,27 @@ function parseAssistantProfiles(value: unknown): AssistantProfiles {
 
 // The last command whose reply was lost (the connection dropped): a resend of
 // the same request carries its key, so the owner answers with that command's
-// row and runs nothing twice (OD-214). Any reply ends it.
+// row and runs nothing twice (OD-214). Any other reply ends it.
 let unansweredCommand: { fingerprint: string; requestKey: string } | null = null;
+
+// For a Runner command, a hop behind the Composer lost the Runner's reply
+// (it may have accepted): a resend keeps the key, so the Runner answers with
+// that row. Composer-owned commands (Apply, Load) answer 503 only before
+// acceptance and replay a kept refusal, so their key is not kept.
+const DOWNSTREAM_REPLY_LOST: ReadonlySet<string> = new Set([
+  'program_runner_unavailable', 'headless_http_unavailable', 'headless_http_timeout',
+]);
+function replyLostDownstream(error: unknown): boolean {
+  return error instanceof ApiError && error.status === 503
+    && DOWNSTREAM_REPLY_LOST.has(apiErrorCode(error) ?? '');
+}
 
 /** A command answered at acceptance; its body carries a `request_key`. */
 async function sendKeyedCommand<T>(
   path: string,
   body: object,
   parser: (value: unknown) => T,
+  runnerCommand = false,
 ): Promise<T> {
   const fingerprint = JSON.stringify([path, body]);
   const requestKey = unansweredCommand?.fingerprint === fingerprint
@@ -613,7 +626,8 @@ async function sendKeyedCommand<T>(
     unansweredCommand = null;
     return reply;
   } catch (error) {
-    unansweredCommand = connectionLost(error) ? { fingerprint, requestKey } : null;
+    unansweredCommand = connectionLost(error) || (runnerCommand && replyLostDownstream(error))
+      ? { fingerprint, requestKey } : null;
     throw error;
   }
 }
@@ -1189,6 +1203,7 @@ export const api = {
       persistentValuesPath('value' in body ? '' : '/reset'),
       body,
       parseProgramCommandReply,
+      true,
     ),
     clearPersistentValues: (
       body: PersistentKeyRequestIdentity & { project_path: string },
@@ -1196,6 +1211,7 @@ export const api = {
       persistentValuesPath('/clear'),
       body,
       parseProgramCommandReply,
+      true,
     ),
   },
   manager: {

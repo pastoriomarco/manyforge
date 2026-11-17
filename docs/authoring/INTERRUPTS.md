@@ -287,8 +287,10 @@ or qualify the measured-loss detector.
 
 The rule Stops `pick_retreat`; its node fails with `interrupt_fault` and the
 run continues. The example's Fallback checks that `part_lost` is still true,
-resets it to `false` (which clears the rule), moves to the safe pose,
-detaches `graspable` (the manual write did not detach it) and skips the item;
+resets it to `false` (which clears the rule), opens the gripper, detaches
+`graspable` unless the carry already did (the carry sets `part_detached`
+after its own detach; the manual write did not detach it), moves to the safe
+pose and skips the item;
 the Run continues with the next cycle. If the key is written while no carry
 move runs, the next carry move fails at once with `rule_holds` and the same
 Fallback runs. The `carry` group resolves to exact Applied motion subjects

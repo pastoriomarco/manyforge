@@ -78,10 +78,6 @@ Result<AuthoringAdmissionDTO> ResourceAddressedExecutionKernel::UpdateCellAdmiss
       const auto bb_current = reconcile_program_blackboard_cycle_locked(
           snapshot.program_cycle_status, actual_retired_service);
       if (!bb_current.ok()) return Result<AuthoringAdmissionDTO>::Err(bb_current.error());
-      current_program_run_id_ =
-          snapshot.program_cycle_status_current && snapshot.program_cycle_status
-              ? snapshot.program_cycle_status->program_run_id
-              : std::nullopt;
       if (program_cycle_claim_run_ && snapshot.program_cycle_status) {
         const auto& run = *program_cycle_claim_run_;
         const auto& status = *snapshot.program_cycle_status;

@@ -16,6 +16,8 @@ from typing import Any
 import rfc8785
 
 from .component_model import ComponentModel, owner_ids
+from .error_codes import MANAGER_STATUS_SECTION_OVERSIZED as _OVERSIZED_SECTION
+from .error_codes import MANAGER_STATUS_UNAVAILABLE as _MANAGER_NOT_ANSWERING
 
 
 COMPONENT_OVERVIEW_VERSION = "manyforge.component_overview.v3"
@@ -116,6 +118,10 @@ def _bounded_reason(value: object, fallback: str) -> str:
 
 
 def _source_status(source: Mapping[str, Any]) -> tuple[str, str | None]:
+    # OD-281: a section too large for the Manager status frame keeps its typed
+    # cause, whether or not an earlier value is still held.
+    if _OVERSIZED_SECTION in _sequence(source.get("known_gaps")):
+        return _OFFLINE, _OVERSIZED_SECTION
     if source.get("available") is not True:
         return _OFFLINE, "source_unavailable"
     freshness = source.get("freshness")
@@ -378,6 +384,11 @@ def build_component_overview(
     sections = _mapping(runtime.get("sections"))
     manager_section = _mapping(sections.get("manager"))
     manager_source_status, manager_source_reason = _source_status(manager_section)
+    # OD-284: a Manager not answering is the owner that cannot be reached, so
+    # its own tile is offline with the catalog code; the tiles of the other
+    # sections keep their stale presentation.
+    if _MANAGER_NOT_ANSWERING in _sequence(manager_section.get("known_gaps")):
+        manager_source_status, manager_source_reason = _OFFLINE, _MANAGER_NOT_ANSWERING
     manager_payload = _mapping(manager_section.get("payload"))
     manager_runtime = _mapping(manager_payload.get("runtime"))
     manager_apply = _mapping(manager_payload.get("apply"))

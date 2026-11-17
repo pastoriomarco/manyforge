@@ -17,6 +17,7 @@ from manyforge_program_runner.cycle_journal import (
     SCHEMA_VERSION,
     ProgramCycleJournal,
 )
+from manyforge_program_runner.tests.test_cycle_journal_writer import _wait_idle
 
 
 def _k(*parts: str) -> bytes:
@@ -47,7 +48,7 @@ def test_finished_history_byte_budget_prunes_oldest_and_keeps_current_and_inflig
     assert journal.read_run_snapshot(100000001) is not None
     assert journal.read_run_snapshot(1000000003) is not None
     # The WAL bound is a setting of the writer's connection.
-    assert journal._writer.wait_idle(5.0)
+    assert _wait_idle(journal._writer)
     assert journal._writer._database.execute("PRAGMA journal_size_limit").fetchone()[0] == 230
     journal.close()
 

@@ -10,6 +10,7 @@ import {
   type ProgramRuntimeController,
 } from '../hooks/useProgramRuntime';
 import { busyLabel, busyReason, type BusyOperation } from '../state/busyOperation';
+import { PERSISTENT_KEYS_RESET_NOTE, RELOAD_INITIAL_SCENE_NOTE } from '../state/initialSceneApplied';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type {
   AutomaticRetryAuditEvent,
@@ -2645,9 +2646,8 @@ export function ProgramTransportControls({
               <span>Reload initial scene</span>
             </label>
             <small className="transport-reset-option-note">
-              {reloadUnavailableReason
-                ?? 'Scene objects, including carried ones, are replaced by the Program\'s initial Scene.'}
-              {appliedPersistentKeys && ' Persistent keys return to their initial values.'}
+              {reloadUnavailableReason ?? RELOAD_INITIAL_SCENE_NOTE}
+              {appliedPersistentKeys && PERSISTENT_KEYS_RESET_NOTE}
             </small>
             <label className="toggle-control" title={positionUnavailableReason ?? undefined}>
               <input

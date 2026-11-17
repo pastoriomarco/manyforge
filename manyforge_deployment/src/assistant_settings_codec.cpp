@@ -710,7 +710,7 @@ make_registry_value() {
 parse_model_request_contract(const CanonicalValue& value,
                              std::string_view path) {
   const auto& object = require_object(value, path);
-  // `reasoning` (on|off, EXPERIMENTAL) and `sampling` are optional.
+  // `reasoning` (on|off, the model reasoning switch) and `sampling` are optional.
   require_fields(object,
                  {"default_timeout_s", "max_output_tokens",
                   "supports_response_tools", "supports_json_object",

@@ -167,9 +167,8 @@ struct AssistantModelEndpointRequestContractDTO final {
   bool supports_image_input{false};
   std::vector<AssistantImageTransport> supported_image_transports;
   AssistantToolCallFamily tool_call_family;
-  // EXPERIMENTAL (pending maintainer decision): `reasoning: on|off` asks the
-  // model server to enable or disable its reasoning (thinking) mode; absent
-  // keeps the model's default.
+  // `reasoning: on|off` asks the model server to enable or disable its
+  // reasoning (thinking) mode; absent keeps the model's default.
   std::optional<bool> reasoning;
   // Absent sends no sampling parameters at all.
   std::optional<AssistantModelSamplingDTO> sampling;

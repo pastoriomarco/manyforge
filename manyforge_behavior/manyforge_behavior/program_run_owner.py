@@ -730,6 +730,9 @@ class _RunEntry:
     state_after_finalize_details: Mapping[str, Any] | None = None
     state_after_finalize_origin: Mapping[str, Any] | None = None
     resources_released: bool = False
+    # The last cleanup attempt failed (OD-279): the tick does not retry it;
+    # only a Reset does (``retry_cleanup``), once per Reset.
+    cleanup_failed: bool = False
     reset_containment: ProgramRunScopeSnapshot | None = None
     # Preserve the exact terminal scope sample; the public terminal snapshot
     # normalizes its count to zero after settlement.
@@ -824,12 +827,38 @@ class ProgramRunOwner:
             if not entry.inbox:
                 return
             intents, entry.inbox = entry.inbox, deque()
-        for intent in intents:
+        while intents:
+            intent = intents[0]
             try:
                 intent.result = intent._apply()
             except Exception as error:
                 intent.error = error
-            self._publish_tick_facts(program_run_id)
+            try:
+                self._publish_tick_facts(program_run_id)
+            except Exception:
+                # The tick fails (a worker failure). This intent and the ones
+                # not applied yet go back to the inbox; the tick host answers
+                # them with its typed failure once no tick runs.
+                intent.result = None
+                intent.error = None
+                with self._lock:
+                    entry.inbox.extendleft(reversed(intents))
+                raise
+            intents.popleft()
+            intent.done.set()
+
+    def fail_tick_intents(self, error: Callable[[], Exception | None]) -> None:
+        """Once no tick runs any more: answer every intent still handed to a
+        tick with the tick host's typed refusal (OD-146)."""
+
+        with self._lock:
+            intents = [
+                intent for entry in self._runs.values() for intent in entry.inbox
+            ]
+            for entry in self._runs.values():
+                entry.inbox = deque()
+        for intent in intents:
+            intent.error = error()
             intent.done.set()
 
     def _tick_facts(self, run: ExecutableProgramRun) -> _TickFacts:
@@ -1082,17 +1111,19 @@ class ProgramRunOwner:
         return tuple(errors)
 
     def _reconcile_finalizing(self, program_run_id: int) -> ProgramRunSnapshot:
-        """On the run's tick."""
+        """On the run's tick. A failed cleanup is not attempted again on
+        later ticks, only after a Reset's ``retry_cleanup`` (OD-279)."""
 
         with self._lock:
             entry = self._entry(program_run_id)
-            if entry.state is not ProgramRunState.FINALIZING:
+            if entry.state is not ProgramRunState.FINALIZING or entry.cleanup_failed:
                 return self._snapshot(entry)
             already_released = entry.resources_released
         errors = () if already_released else self._release_resources(program_run_id)
         with self._lock:
             entry = self._entry(program_run_id)
             if errors:
+                entry.cleanup_failed = True
                 message = "; ".join(
                     str(error) or type(error).__name__ for error in errors
                 )
@@ -3457,6 +3488,23 @@ class ProgramRunOwner:
     def failure_pause_stop_pending(self, program_run_id: int) -> bool:
         with self._lock:
             return self._entry(program_run_id).failure_pause_stop_pending
+
+    def cleanup_failed(self, program_run_id: int) -> bool:
+        """The finalizing run's last cleanup attempt failed (OD-279)."""
+        with self._lock:
+            entry = self._entry(program_run_id)
+            return entry.state is ProgramRunState.FINALIZING and entry.cleanup_failed
+
+    def retry_cleanup(self, program_run_id: int) -> bool:
+        """A Reset, on its own thread: allow one more cleanup attempt of a
+        finalizing run whose cleanup failed. Memory only; the attempt runs on
+        the run's next tick. True when an attempt was allowed."""
+        with self._lock:
+            entry = self._entry(program_run_id)
+            if entry.state is not ProgramRunState.FINALIZING or not entry.cleanup_failed:
+                return False
+            entry.cleanup_failed = False
+            return True
 
     def _stop_motion_for_failure_pause(
         self, program_run_id: int, snapshot: ProgramRunSnapshot

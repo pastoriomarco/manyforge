@@ -1179,9 +1179,9 @@ class BridgeService:
         body.update(endpoint["request_contract"].get("sampling", {}))
         reasoning = endpoint["request_contract"].get("reasoning")
         if reasoning is not None:
-            # EXPERIMENTAL (pending maintainer decision): the common
-            # OpenAI-compatible chat-template switch for reasoning (thinking).
-            # `thinking=False` (the E1 regeneration) turns it off for that call.
+            # The profile's reasoning (thinking) switch, sent as the common
+            # OpenAI-compatible chat-template switch. `thinking=False` (the E1
+            # regeneration) turns it off for that call.
             body["chat_template_kwargs"] = {"enable_thinking": reasoning == "on" and thinking}
         if tools:
             body["tools"] = tools

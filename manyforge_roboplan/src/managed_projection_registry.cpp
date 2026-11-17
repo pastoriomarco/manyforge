@@ -113,25 +113,39 @@ public:
             candidate.planning_collision_model.product_id});
     Require(planning_model.has_value(),
             "native projection retained planning model is absent or invalid");
-    return ManagedProjectionCandidateInputs{std::move(bundle),
-                                            std::move(*model_map),
-                                            std::move(*planning_model)};
+    const auto started = std::chrono::steady_clock::now();
+    auto stage = RetainedPlanningModelStage::create_verified(
+        *planning_model, config_.execution_run_root);
+    // Scene meshes resolve only below the approved scene-asset root; the
+    // retained package root is never a scene-mesh search path.
+    auto collision_model =
+        collision::ManyForgeCollisionEngine::load_shared_model(
+            "manyforge_managed_native_projection", stage.loader_urdf_path(),
+            stage.srdf_path(), stage.package_paths(), std::string{},
+            config_.scene_asset_root_fd);
+    std::cerr << "native projection collision model loaded: retained_bundle="
+              << candidate.retained_bundle_id.value() << " load_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - started)
+                     .count()
+              << " (shared by every planning group)\n";
+    return ManagedProjectionCandidateInputs{
+        std::move(bundle),
+        std::move(*model_map),
+        std::move(*planning_model),
+        std::move(collision_model),
+        std::string(stage.loader_urdf_bytes()),
+        std::string(stage.srdf_bytes())};
   }
 
   [[nodiscard]] RetainedCollisionWorldProjector
   ConstructGroupProjector(const ManagedProjectionCandidateInputs &inputs,
                           const std::string &group) const override {
-    auto stage = RetainedPlanningModelStage::create_verified(
-        inputs.planning_model, config_.execution_run_root);
-    // Scene meshes resolve only below the approved scene-asset root; the
-    // retained package root is never a scene-mesh search path.
-    auto shared_model = collision::ManyForgeCollisionEngine::load_shared_model(
-        "manyforge_managed_native_projection", stage.loader_urdf_path(),
-        stage.srdf_path(), stage.package_paths(), group,
-        config_.scene_asset_root_fd);
     return RetainedCollisionWorldProjector::create_verified(
-        std::move(shared_model), *inputs.bundle, inputs.model_map,
-        inputs.planning_model);
+        collision::ManyForgeCollisionEngine::bind_shared_model_group(
+            inputs.collision_model, inputs.loader_urdf_bytes,
+            inputs.srdf_bytes, group),
+        *inputs.bundle, inputs.model_map, inputs.planning_model);
   }
 
 private:

@@ -16,6 +16,7 @@ function plan(patch: Partial<ResetApplyPlan> = {}): ResetApplyPlan {
   return {
     correlationId: 'reset-apply.1',
     document: 'program',
+    action: 'apply',
     programRunId: 1,
     cycleGeneration: 7,
     draftId: 'draft-1',
@@ -67,6 +68,7 @@ describe('Apply after Reset sequence', () => {
       schemaVersion: 'manyforge.composer_reset_apply_context.v2',
       correlationId: 'reset-apply.1',
       document: 'program',
+      action: 'apply',
       programRunId: 1,
       cycleGeneration: 7,
       draftId: 'draft-1',
@@ -195,5 +197,15 @@ describe('Deployment Reset and Apply', () => {
   });
   it('records the Deployment document in the Apply context', () => {
     expect(resetApplyContext(plan({ document: 'deployment', scope: { r: 1 } })).document).toBe('deployment');
+  });
+});
+
+describe('Reset and Revert', () => {
+  it('records the Revert in the context and names it in its phase text', () => {
+    expect(resetApplyContext(plan({ action: 'revert' })).action).toBe('revert');
+    expect(resetApplyPhaseText({ kind: 'applying', reset, idle: { cycleGeneration: 8 }, sent: false }, null, 'revert'))
+      .toBe('Idle reached; waiting for authoring admission to Revert.');
+    expect(resetApplyPhaseText({ kind: 'applied', apply: null }, null, 'revert'))
+      .toBe('Reverted to Saved; awaiting Execute/Run.');
   });
 });

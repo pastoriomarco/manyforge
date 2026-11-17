@@ -66,6 +66,7 @@ import {
 } from './components/authoringAdmission';
 import { useHeldNodePreview } from './hooks/useHeldNodePreview';
 import { useResetApply } from './hooks/useResetApply';
+import { useInitialSceneReload } from './hooks/useInitialSceneReload';
 import { useAppliedSettlementRefresh } from './hooks/useAppliedSettlementRefresh';
 import { appliedCartesianDefaults } from './state/robotControl';
 import {
@@ -808,6 +809,15 @@ export default function App() {
     authoringWorkspace.observeApply(activation.status);
   }, [authoringWorkspace, activation.status]);
   const authoringAdmissionOpen = headlessSnapshot?.authoringAdmission.authoringAllowed ?? null;
+  // An Apply or Revert keeps the live Scene: Reload initial scene when confirmed.
+  const initialSceneReload = useInitialSceneReload({
+    runtime: programRuntime,
+    snapshot: headlessSnapshot,
+    authoringAllowed: authoringAdmissionOpen,
+    deploymentApplyEnd: deploymentController.applyEnd,
+    stoppedResetApply: resetApply.sequence?.phase.kind === 'failed'
+      ? resetApply.sequence.plan.document : null,
+  });
   const authoringCause = headlessEnabled
     ? authoringUnavailableCause(authoringWorkspace.published, headlessSnapshot)
     : null;
@@ -926,10 +936,11 @@ export default function App() {
       ...authoringContainmentNotices(headlessSnapshot),
       ...isaacJointStreamNotices(headlessSnapshot?.runtime.sections.sceneRuntime ?? null),
     ];
-    const sceneNotice = initialSceneNotice(initialSceneFailure, () => {
+    const openResetReload = () => {
       setActiveWorkspace('program');
       setResetReloadRequest((value) => value + 1);
-    });
+    };
+    const sceneNotice = initialSceneNotice(initialSceneFailure, openResetReload);
     if (sceneNotice !== null) notices.push(sceneNotice);
     const label = pendingProgramAction === null
       ? undefined
@@ -1391,6 +1402,8 @@ export default function App() {
       deployment={deploymentController}
       runtime={programRuntime}
       authoringAdmissionAllowed={authoringAdmissionOpen}
+      authoringCause={authoringCause}
+      initialScene={initialSceneReload}
       resetApply={resetApply}
       localInvalidEdit={programInvalidEdit}
     />

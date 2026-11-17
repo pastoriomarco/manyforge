@@ -208,6 +208,9 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
           participant.subordinate_id = cold.reserved_execution_id;
           participant.prepared_participant.reset();
           participant.prepared_dispatch_released = false;
+          // The retired replacement was sent: attachment needs its committed
+          // send (attach_to_sent above). Kept for the newcomer's end (OD-285).
+          participant.sent_before_cold_promotion = true;
           superseded = source->takeover_cancelled;
         }
       }

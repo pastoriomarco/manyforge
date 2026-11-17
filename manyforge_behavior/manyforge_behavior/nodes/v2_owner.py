@@ -1020,10 +1020,12 @@ class OwnerTaskAdapter(_OwnerAdapter):
         return self._fail_to_tree(task)
 
     def _hold_stopped_unstarted(self, task: OwnerTaskSnapshot) -> bool:
-        """A Stop that holds this node ended its operation with no effect and
-        the Kernel already retired it (a take-over newcomer, OD-264): nothing
-        started, so the node holds exactly as a Stop-fence refusal at
-        admission does and Resume makes a fresh attempt."""
+        """A Stop that holds this node ended its operation and the Kernel
+        already retired it (a take-over newcomer). With no effect nothing
+        started (OD-264); with its effect settled the Kernel kept its rest
+        (OD-269). Either way the node holds exactly as a Stop-fence refusal at
+        admission does, and Resume's next attempt plans the rest (or a fresh
+        attempt when nothing started). An uncertain effect still fails."""
 
         state = self._operator_stop_state
         fact = task.metadata.get("operation_failure")
@@ -1037,7 +1039,8 @@ class OwnerTaskAdapter(_OwnerAdapter):
             or not isinstance(facts, (list, tuple))
             or not facts
             or any(
-                not isinstance(item, Mapping) or item.get("effect") != "no_effect"
+                not isinstance(item, Mapping)
+                or item.get("effect") not in ("no_effect", "effect_settled")
                 for item in facts
             )
         ):

@@ -669,6 +669,7 @@ class _Host:
         self.reset_containment_calls: list[str] = []
         self.retained_reset_calls: list[str] = []
         self.forgotten_reset_runs: list[str] = []
+        self.cleanup_retries: list[int] = []
         self.shutdowns = 0
 
     def start(self) -> None:
@@ -699,6 +700,9 @@ class _Host:
 
     def schedule(self, program_run_id: int) -> None:
         self.scheduled.append(program_run_id)
+
+    def retry_cleanup(self, program_run_id: int) -> None:
+        self.cleanup_retries.append(program_run_id)
 
     def stop_run(
         self,
@@ -2466,6 +2470,75 @@ def test_reset_publishes_resetting_until_motion_is_terminal(
     assert host.reset_containment_calls == [1]
     assert runtime.cycle_status()["state"] == "idle_after_reset"
     runtime.shutdown()
+
+
+def test_reset_fails_typed_on_failed_cleanup_and_the_next_reset_retries_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """OD-279: a failed run cleanup ends the Reset failed with its typed
+    cause (no wait without end); the next Reset retries the cleanup once."""
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: _PreparedRunAdmission(),
+    )
+    _bypass_scene_preparation(monkeypatch)
+    _bypass_reset_scene_preparation(monkeypatch)
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3")
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test", application_start_id=_A),
+        headless_client=_Headless(),  # type: ignore[arg-type]
+        execution_transport=_Headless(),  # type: ignore[arg-type]
+        admission_client=_Admission(),  # type: ignore[arg-type]
+        cycle_journal=journal,
+    )
+    runtime._host.shutdown()  # noqa: SLF001
+    owner = _ObservationOwner()
+    host = _Host(owner, owner_id=runtime.owner_id)
+    runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
+    runtime._host = host  # type: ignore[assignment]  # noqa: SLF001
+    runtime.start()
+    runtime.start_run(_start_request())
+    cleanup = {"fails": True}
+
+    def finalizing_stop(program_run_id, *, reason, stop_request_key=None):
+        del reason, stop_request_key
+        owner.rows[program_run_id] = _Snapshot(
+            program_run_id, owner_id=runtime.owner_id, state="finalizing",
+            revision=owner.rows[program_run_id].run_revision + 1,
+        )
+        return owner.rows[program_run_id]
+
+    def wait_terminal(program_run_id):
+        if cleanup["fails"]:
+            raise ProgramSchedulingError(
+                "context unbind failed", code="program_run_cleanup_failed"
+            )
+        owner.rows[program_run_id] = _Snapshot(
+            program_run_id, owner_id=runtime.owner_id, state="stopped",
+            revision=owner.rows[program_run_id].run_revision + 1,
+        )
+        return owner.rows[program_run_id]
+
+    host.stop_run = finalizing_stop  # type: ignore[method-assign]
+    host.wait_terminal = wait_terminal  # type: ignore[method-assign]
+    try:
+        with pytest.raises(ProgramRunnerError) as failed:
+            runtime.reset_cycle(_current_reset_request(runtime, journal, "reset.0"))
+        assert failed.value.code == "program_cycle_recovery_required"
+        assert failed.value.details == {"cause_code": "program_run_cleanup_failed"}
+        cycle = journal.read()
+        assert cycle.state == "recovery_required"
+        assert not cycle.reconciliation_required
+        assert cycle.failure["code"] == "program_run_cleanup_failed"
+        assert host.cleanup_retries == [1]
+
+        cleanup["fails"] = False
+        reset = runtime.reset_cycle(_current_reset_request(runtime, journal, "reset.1"))
+        assert reset["idle_cycle_generation"] == 2
+        assert host.cleanup_retries == [1, 1]
+        assert runtime.cycle_status()["state"] == "idle_after_reset"
+    finally:
+        runtime.shutdown()
 
 
 def test_run_does_not_compare_changed_authored_scene(
@@ -6108,7 +6181,7 @@ def test_liveness_projection_answers_while_the_writer_and_a_runner_command_are_h
         runtime.shutdown()
     # Released, the writer wrote every posted record before the file closed.
     assert writer.failed_commits == 0
-    assert writer.handled_sequence == journal._sequence  # noqa: SLF001
+    assert writer.dropped_records == 0
 
 
 def _last_row(

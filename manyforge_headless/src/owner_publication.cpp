@@ -246,6 +246,12 @@ RuntimeObservation(const component_manager::RuntimeUnitObservation &value) {
        RuntimeContractOfferDigest(
            value.observed_runtime_contract_offer_digest())},
   };
+  // OD-295 (1)(a): the age of the unit's newest report at this observation,
+  // information only (no limit applies to it); absent before a first report.
+  if (const auto age = value.report_age_ns())
+    fields.emplace_back("report_age_ns",
+                        Unsigned(std::min(*age, kMaximumSafeInteger),
+                                 "report_age_ns"));
   if (value.dropped_host_notice_lines()) {
     const auto count_value = [](const std::uint64_t count) {
       return count <= kMaximumSafeInteger
@@ -260,49 +266,15 @@ RuntimeObservation(const component_manager::RuntimeUnitObservation &value) {
   return CanonicalValue(std::move(fields));
 }
 
-CanonicalValue
-OptionalStrongId(const std::optional<core::ControlDomainRevision> &value) {
-  return value.has_value() ? CanonicalValue(value->value())
-                           : CanonicalValue(nullptr);
-}
-
-CanonicalValue
-OptionalStrongId(const std::optional<core::ControlBindingRevision> &value) {
-  return value.has_value() ? CanonicalValue(value->value())
-                           : CanonicalValue(nullptr);
-}
-
+// The status record carries only the component scope its readers use
+// (OD-281): the maintenance mapping in Headless and the component overview.
+// The full scope (domains, bindings, resources) stays in the Manager's Apply
+// journal; in the status it could make three records outgrow the frame.
 CanonicalValue FenceScope(const core::ConfigurationFenceScopeDTO &scope) {
   Require(scope.valid(), "Apply fence scope is invalid");
-  CanonicalValue::Array domains;
-  domains.reserve(scope.domains.size());
-  for (const auto &domain : scope.domains) {
-    domains.emplace_back(CanonicalValue(CanonicalValue::Object{
-        {"candidate_control_domain_revision",
-         OptionalStrongId(domain.candidate_control_domain_revision)},
-        {"control_domain_id", CanonicalValue(domain.control_domain_id.value())},
-        {"predecessor_control_domain_revision",
-         OptionalStrongId(domain.predecessor_control_domain_revision)},
-    }));
-  }
-  CanonicalValue::Array bindings;
-  bindings.reserve(scope.bindings.size());
-  for (const auto &binding : scope.bindings) {
-    bindings.emplace_back(CanonicalValue(CanonicalValue::Object{
-        {"candidate_control_binding_revision",
-         OptionalStrongId(binding.candidate_control_binding_revision)},
-        {"control_binding_id",
-         CanonicalValue(binding.control_binding_id.value())},
-        {"predecessor_control_binding_revision",
-         OptionalStrongId(binding.predecessor_control_binding_revision)},
-    }));
-  }
   return CanonicalValue(CanonicalValue::Object{
-      {"bindings", CanonicalValue(std::move(bindings))},
       {"controllable_component_ids",
        StrongIdArray(scope.controllable_component_ids)},
-      {"domains", CanonicalValue(std::move(domains))},
-      {"resources", StrongIdArray(scope.resources)},
   });
 }
 
@@ -387,18 +359,25 @@ ApplyFence(const component_manager::PersistedManagerApplyStatus &value) {
   });
 }
 
+// `installed_active`: this record's Apply installed the active configuration
+// (the active publication's named-Apply number and generation). Only that
+// record carries the preparation receipt, the one its readers use (OD-281);
+// every other record carries null. The journal keeps every receipt.
 CanonicalValue
-ApplyStatus(const component_manager::PersistedManagerApplyStatus &value) {
+ApplyStatus(const component_manager::PersistedManagerApplyStatus &value,
+            const bool installed_active) {
   const auto &intent = value.intent.intent;
-  CanonicalValue prepared_activation;
-  try {
-    prepared_activation = content_identity::parse_canonical_json(
-        intent.prepared_activation.canonical_receipt_json,
-        {component_manager::kMaximumManagerApplyPreparedReceiptBytes, 16U,
-         4096U});
-  } catch (const std::exception &error) {
-    throw std::runtime_error("stored Apply preparation receipt is invalid: " +
-                             std::string(error.what()));
+  CanonicalValue prepared_activation(nullptr);
+  if (installed_active) {
+    try {
+      prepared_activation = content_identity::parse_canonical_json(
+          intent.prepared_activation.canonical_receipt_json,
+          {component_manager::kMaximumManagerApplyPreparedReceiptBytes, 16U,
+           4096U});
+    } catch (const std::exception &error) {
+      throw std::runtime_error("stored Apply preparation receipt is invalid: " +
+                               std::string(error.what()));
+    }
   }
   const auto terminal_state =
       value.terminal_outcome.has_value()
@@ -867,7 +846,7 @@ CanonicalValue BuildManagerSourcePayload(
     }
     Require(intent.cell_id == apply_journal.cell_id(),
             "Apply status belongs to a different cell");
-    applies.emplace_back(ApplyStatus(apply));
+    applies.emplace_back(ApplyStatus(apply, installed_active));
   }
   const bool apply_in_progress = std::any_of(
       apply_inventory.begin(), apply_inventory.end(),

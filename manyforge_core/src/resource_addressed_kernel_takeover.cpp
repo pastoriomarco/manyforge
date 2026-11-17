@@ -151,6 +151,9 @@ ResourceAddressedExecutionKernel::try_accept_motion_takeover(
     const auto node_index = static_cast<std::size_t>(candidate_node - nodes.data());
     if (node_index < program_cycle_claim_run_->motion_continuations.size()) {
       const auto& continuation = program_cycle_claim_run_->motion_continuations[node_index];
+      // A sent take-over newcomer whose rest could not be captured (OD-269).
+      if (continuation && continuation->resume_refusal)
+        return Outcome::Err(*continuation->resume_refusal);
       if (continuation) {
         auto& row = candidate.participants.front();
         const auto& request = row.takeover_preparation->execution_request;
@@ -383,11 +386,20 @@ Result<void> ResourceAddressedExecutionKernel::commit_motion_takeover_owner_lock
   }
   stamp_operation_capture_locked(candidate, next_state);
   captures = {old_state, next_state};
+  // The "decide" step's last check before the transfer (OD-175 D2): close
+  // the source generation's collision-claim window, one compare-and-swap and
+  // no lock. A claim that won first refuses with the reason the engine's
+  // adoption proof gave for it; nothing is posted yet, so nothing is undone.
+  if (mode == ResourceSlotOwnerTransferMode::kMoving &&
+      (!candidate.takeover_source || !next_row->prepared_motion_engine ||
+       !next_row->prepared_motion_engine->CloseMotionReplacementHazard(*candidate.takeover_source)))
+    return reject<void>("Replacement adoption was refused",
+                        "motion_replacement_source_hazard_authority");
   const auto snapshot = resource_slots_->coherent_snapshot();
   const std::vector<ResourceSlotOwnerTransferDTO> rows{
       {old_row->slot_owner, next_row->slot_owner, old_row->resources}};
-  // This is the final fallible action. The existing worker/backend has already
-  // fenced its exact source and prebuilt its adoption context before invoking us.
+  // This is the final fallible action. In moving mode the engine's "prove"
+  // step has already checked its exact source before this "decide" step.
   auto transferred = resource_slots_->transfer_owners(snapshot, rows, mode);
   if (!transferred.ok()) return Result<void>::Err(std::move(transferred.error()));
 
@@ -452,8 +464,12 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
   {
     std::lock_guard lock(state_mutex_);
     auto* incumbent = find_active_operation_locked(incumbent_id);
+    // A candidate of an earlier hand-over between its "decide" and "close"
+    // steps (OD-175 D3, gate 5): its own take-over waits for the close.
     if (!incumbent || incumbent->pending_motion_takeover.empty() ||
-        incumbent->takeover_advance_in_flight)
+        incumbent->takeover_advance_in_flight ||
+        (!incumbent->participants.empty() &&
+         incumbent->participants.front().handover_source_execution_id != 0U))
       return Result<void>::Ok();
     auto& candidate = *incumbent->pending_motion_takeover.mapped();
     if (candidate.participants.empty() || incumbent->participants.empty())
@@ -492,15 +508,45 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
       next.prepare_in_flight = !cancelled_by_stop && !superseded_unsent && !original_unsent;
     }
   }
-  const ScopeExit release([&] {
-    std::lock_guard lock(state_mutex_);
-    auto* incumbent = find_active_operation_locked(incumbent_id);
-    if (incumbent && incumbent->commit_mutex == identity) {
-      incumbent->takeover_advance_in_flight = false;
-      if (auto* pending = find_pending_motion_operation_locked(candidate_id))
-        pending->participants.front().prepare_in_flight = false;
-      settle_completed_control_locked(incumbent_id);
+  // The hand-over's "close" step (OD-175 D3, K): today's release section,
+  // plus, keyed on the candidate and the mark's value (not on the
+  // incumbent's identity), the mark's clear and the wake of a Stop that
+  // found it. One `state_mutex_` hold; the rule hand-off (OD-223) is
+  // completed after the unlock. Runs once: explicitly after "apply", or from
+  // `release` on every other exit, including unwinding.
+  std::uint64_t handover_source{};
+  StopHandoff* rule_handoff{};
+  bool closed{};
+  const auto close = [&](Result<void> rules, const bool check_new_rule) -> Result<void> {
+    closed = true;
+    {
+      std::lock_guard lock(state_mutex_);
+      auto* incumbent = find_active_operation_locked(incumbent_id);
+      if (incumbent && incumbent->commit_mutex == identity) {
+        incumbent->takeover_advance_in_flight = false;
+        if (auto* pending = find_pending_motion_operation_locked(candidate_id))
+          pending->participants.front().prepare_in_flight = false;
+        settle_completed_control_locked(incumbent_id);
+      }
+      if (handover_source != 0U) {
+        auto* candidate = find_active_operation_locked(candidate_id);
+        if (candidate && !candidate->participants.empty() &&
+            candidate->participants.front().handover_source_execution_id == handover_source) {
+          candidate->participants.front().handover_source_execution_id = 0U;
+          wake_stop_after_preparation_borrow_locked(candidate_id);
+          // Handed over (OD-223): the new motion's rule, registered since its
+          // send, is acted on at once, with no engine or participant lock.
+          if (check_new_rule && rule_handoff && rules.ok() &&
+              !candidate->participants.front().io_rule_registrations.empty())
+            rules = process_io_rule_evidence_locked(*rule_handoff, &candidate_id);
+        }
+      }
     }
+    if (rule_handoff) complete_stop_handoff(*rule_handoff);
+    return rules;
+  };
+  const ScopeExit release([&] {
+    if (!closed) (void)close(Result<void>::Ok(), false);
   });
   if (cancelled_by_stop || superseded_unsent) {
     const auto ended = end_pending_motion_takeover(incumbent_id, candidate_id, std::nullopt);
@@ -686,86 +732,80 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
   if (snapshot.replacement->phase != PreparedMotionReplacementPhaseDTO::kReadyToCommit || !source)
     return Result<void>::Ok();
 
-  struct Commit final {
-    ResourceAddressedExecutionKernel* owner;
-    ActiveOperation* incumbent;
-    ActiveOperation* candidate;
-    std::pair<OperationStateDTO, OperationStateDTO> captures;
-    Result<void> allocation_failure;
-  };
+  // P (prove, OD-175 D1): every engine and participant check that can fail,
+  // on the incumbent's motion worker at its parked safe point only, with no
+  // Kernel lock and no commit guard held. A Stop accepted meanwhile is not
+  // held up by it; P or D then refuses.
+  const auto proven =
+      prepared_engine->ProvePreparedMotionReplacement(candidate_execution_id, *source);
+  if (!proven.ok()) return begin_motion_takeover_fallback(incumbent_id, candidate_id, proven.error());
+  if (!proven.value()) return Result<void>::Ok();
+
   // Obtained before the Kernel lock (it may allocate on the thread's first
   // Stop) and completed after it, as for every rule Stop; only a hand-over
-  // whose motions watch a signal uses it.
-  StopHandoff* const rule_handoff = rule_bearing ? &thread_stop_handoff() : nullptr;
-  OperationCommitGuard commit(*this, incumbent_id);
-  std::unique_lock lock(state_mutex_);
-  auto* incumbent = find_active_operation_locked(incumbent_id);
-  auto* candidate = find_pending_motion_operation_locked(candidate_id);
-  if (!incumbent || !candidate || incumbent->pending_motion_takeover.empty() ||
-      incumbent->pending_motion_takeover.key() != candidate_id || incumbent->state.stop_event_id)
-    return Result<void>::Ok();
-  // The old motion's rule counts until the hand-over (OD-223): a trip acted
-  // on here stops the old motion and there is no hand-over; the Stop cancels
-  // the take-over through its ordinary path.
-  if (rule_handoff && !incumbent->participants.front().io_rule_registrations.empty()) {
-    const auto acted = process_io_rule_evidence_locked(*rule_handoff, &incumbent_id);
-    if (!acted.ok() || incumbent->state.stop_event_id) {
-      lock.unlock();
-      commit.release();
-      complete_stop_handoff(*rule_handoff);
-      return acted;
-    }
-  }
-  Commit context{this,
-                 incumbent,
-                 candidate,
-                 {empty_takeover_capture_storage(), empty_takeover_capture_storage()},
-                 reject<void>("takeover commit could not preallocate its state",
-                              "motion_takeover_commit_capacity")};
-  const PreparedMotionReplacementCommitDTO callback{
-      &context, [](void* value) noexcept -> Result<void> {
-        auto& state = *static_cast<Commit*>(value);
-        try {
-          return state.owner->commit_motion_takeover_owner_locked(
-              *state.incumbent, *state.candidate, ResourceSlotOwnerTransferMode::kMoving,
-              state.captures);
-        } catch (...) {
-          return std::move(state.allocation_failure);
-        }
-      }};
-  const auto adopted =
-      prepared_engine->CommitPreparedMotionReplacement(candidate_execution_id, *source, callback);
+  // whose motions watch a signal uses it (OD-223).
+  rule_handoff = rule_bearing ? &thread_stop_handoff() : nullptr;
+  // D (decide): under `state_mutex_` alone, memory only (plus the slot-table
+  // leaf inside the transfer and, for a hand-over with rules, OD-223's rule
+  // calls): ownership moves, the records are posted, the mark is set.
+  std::pair<OperationStateDTO, OperationStateDTO> captures{empty_takeover_capture_storage(),
+                                                           empty_takeover_capture_storage()};
+  Result<void> decided = Result<void>::Ok();
   Result<void> rules = Result<void>::Ok();
-  if (adopted.ok() && adopted.value()) {
-    post_operation_state_locked(*incumbent,
-                                JournalOperationState{std::move(context.captures.first),
-                                                      std::nullopt, "motion_takeover_committed", {}},
-                                "motion_takeover_committed");
-    post_operation_state_locked(*candidate,
-                                JournalOperationState{std::move(context.captures.second),
-                                                      std::nullopt, "motion_takeover_committed", {}},
-                                "motion_takeover_committed");
-    // Handed over (OD-223): the old motion's rule ends here; the new motion's
-    // rule, registered since its send, is acted on at once. Both after the
-    // engine's adoption returned, so no rule call runs under its locks.
-    if (rule_handoff) {
+  {
+    std::unique_lock lock(state_mutex_);
+    auto* incumbent = find_active_operation_locked(incumbent_id);
+    auto* candidate = find_pending_motion_operation_locked(candidate_id);
+    if (!incumbent || !candidate || incumbent->pending_motion_takeover.empty() ||
+        incumbent->pending_motion_takeover.key() != candidate_id || incumbent->state.stop_event_id)
+      return Result<void>::Ok();
+    // The old motion's rule counts until the hand-over (OD-223): a trip acted
+    // on here, before "decide", stops the old motion and there is no
+    // hand-over; the Stop cancels the take-over through its ordinary path.
+    if (rule_handoff && !incumbent->participants.front().io_rule_registrations.empty()) {
+      const auto acted = process_io_rule_evidence_locked(*rule_handoff, &incumbent_id);
+      if (!acted.ok() || incumbent->state.stop_event_id) {
+        lock.unlock();
+        complete_stop_handoff(*rule_handoff);
+        return acted;
+      }
+    }
+    try {
+      decided = commit_motion_takeover_owner_locked(
+          *incumbent, *candidate, ResourceSlotOwnerTransferMode::kMoving, captures);
+    } catch (...) {
+      decided = reject<void>("takeover commit could not preallocate its state",
+                             "motion_takeover_commit_capacity");
+    }
+    if (decided.ok()) {
+      post_operation_state_locked(*incumbent,
+                                  JournalOperationState{std::move(captures.first), std::nullopt,
+                                                        "motion_takeover_committed", {}},
+                                  "motion_takeover_committed");
+      post_operation_state_locked(*candidate,
+                                  JournalOperationState{std::move(captures.second), std::nullopt,
+                                                        "motion_takeover_committed", {}},
+                                  "motion_takeover_committed");
+      // The mark (OD-175 D3): until the close, the reconcile pass, a Stop's
+      // progress, the speed step and this candidate's own take-over leave it
+      // alone. Keyed on the old motion's execution id.
+      candidate->participants.front().handover_source_execution_id = source_id;
+      handover_source = source_id;
+      // Handed over (OD-223): the old motion's rule ends here.
       auto& old_row = incumbent->participants.front();
-      if (!old_row.io_rule_registrations.empty())
+      if (rule_handoff && !old_row.io_rule_registrations.empty())
         rules = retire_participant_io_rules_locked(old_row);
-      if (rules.ok() && !candidate->participants.front().io_rule_registrations.empty())
-        rules = process_io_rule_evidence_locked(*rule_handoff, &candidate_id);
     }
   }
-  lock.unlock();
-  if (rule_handoff) {
-    commit.release();
-    complete_stop_handoff(*rule_handoff);
+  if (!decided.ok()) {
+    if (rule_handoff) complete_stop_handoff(*rule_handoff);
+    return begin_motion_takeover_fallback(incumbent_id, candidate_id, decided.error());
   }
-  if (!adopted.ok()) {
-    commit.release();
-    return begin_motion_takeover_fallback(incumbent_id, candidate_id, adopted.error());
-  }
-  return rules;
+  // A (apply): the engine's and participant's swaps, no Kernel lock, no
+  // refusal. A defect that throws here leaves K to `release`.
+  prepared_engine->ApplyPreparedMotionReplacement(candidate_execution_id);
+  // K (close).
+  return close(std::move(rules), true);
 }
 
 Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover(
@@ -934,6 +974,18 @@ Result<bool> ResourceAddressedExecutionKernel::end_pending_motion_takeover(
   bool source_settled{};
   bool reset_cleanup{};
   bool stop_cancelled{};
+  // The incumbent's Stop attempt ended, settled or not (OD-272).
+  bool source_stop_ended{};
+  // OD-269: a sent newcomer that an operator Stop ends keeps its rest for
+  // the node's next attempt, as Resume keeps it for any stopped motion. The
+  // rest and its storage are made with no Kernel lock held; under the lock
+  // the remaining fields are only moved out of the retiring newcomer. What
+  // is left over, or displaced from the slot, is freed after the lock.
+  bool sent_motion{};
+  std::shared_ptr<const detail::MotionResumeIntent> kept_intent;
+  std::optional<ErrorDTO> kept_refusal;
+  std::shared_ptr<std::optional<ProgramCycleClaimRun::MotionContinuation>> kept_storage;
+  std::shared_ptr<const ProgramCycleClaimRun::MotionContinuation> displaced_continuation;
   {
     std::lock_guard lock(state_mutex_);
     const auto* source = find_active_operation_locked(incumbent_id);
@@ -943,6 +995,8 @@ Result<bool> ResourceAddressedExecutionKernel::end_pending_motion_takeover(
     auto& candidate = *find_active_operation_locked(incumbent_id)->pending_motion_takeover.mapped();
     const auto& row = candidate.participants.front();
     if (row.prepare_in_flight || row.dispatch_effect_in_flight) return Result<bool>::Ok(false);
+    sent_motion = row.payload_kind == OperationParticipantPayloadKind::kMotion &&
+                  row.prepared_dispatch_released && row.prepared_participant.has_value();
     engine = row.prepared_motion_engine;
     local_engine = row.engine;
     preparation_id = row.preparation_id;
@@ -963,8 +1017,8 @@ Result<bool> ResourceAddressedExecutionKernel::end_pending_motion_takeover(
     const auto* source_fact = selected_cause_terminal_fact(source->state.participants.front());
     // The incumbent's Stop attempt ended (K11; the outcome itself is the
     // participant's phase, read by the commit).
-    source_settled = source->state.stop_event_id &&
-                     source->terminal_stop_result().has_value() && source_fact &&
+    source_stop_ended = source->state.stop_event_id && source->terminal_stop_result().has_value();
+    source_settled = source_stop_ended && source_fact &&
                      source_fact->effect == ParticipantEffectKnowledge::kEffectSettled &&
                      terminal(source->state.participants.front().state);
     // Accepted Reset completion already retired pending membership first in
@@ -982,6 +1036,13 @@ Result<bool> ResourceAddressedExecutionKernel::end_pending_motion_takeover(
         candidate_fact->effect == ParticipantEffectKnowledge::kEffectUncertain &&
         source->next_motion_takeover.empty())
       return Result<bool>::Ok(false);
+    // OD-272: already shown stopping under this Stop, which has not ended:
+    // nothing changes until it does (a later pass decides).
+    if (stop_cancelled && !failure && !reset_cleanup && !source_stop_ended &&
+        candidate.state.state == OperationStateKind::kStopping &&
+        candidate.state.stop_event_id == source->state.stop_event_id &&
+        source->next_motion_takeover.empty())
+      return Result<bool>::Ok(false);
   }
   if (preparation_id != 0U && !reset_cleanup) {
     if (!engine)
@@ -989,9 +1050,10 @@ Result<bool> ResourceAddressedExecutionKernel::end_pending_motion_takeover(
                           ErrorCode::kInvariantViolation);
     // Sent replacements refuse pre-dispatch cancellation. Their exact Stop
     // owner still runs independently; retirement below requires its proof.
-    // A takeover cancelled by a Stop does not wait for that proof: its sent
-    // (or possibly sent) candidate ends below as intervention required with
-    // its effect uncertain, as a failed takeover does.
+    // A takeover cancelled by a Stop does not wait here: its sent (or
+    // possibly sent) candidate stays stopping below until the old motion's
+    // Stop ends (OD-272), then ends settled, or as intervention required
+    // with its effect uncertain, as a failed takeover does.
     const auto cancelled = engine->CancelPreparedMotion(preparation_id);
     if (!cancelled.ok() && !source_settled && !failure && !stop_cancelled)
       return Result<bool>::Ok(false);
@@ -1009,6 +1071,34 @@ Result<bool> ResourceAddressedExecutionKernel::end_pending_motion_takeover(
         observed.value().state == ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed ||
         (observed.value().replacement &&
          observed.value().replacement->phase == PreparedMotionReplacementPhaseDTO::kNoEffect);
+    if (sent_motion && stop_cancelled && !failure && source_settled && !no_effect) {
+      // Captured as Resume's recovery captures it (`apply_operation_recovery_action`),
+      // before the retirement below drops the session; refused alike when not
+      // capturable (the refusal then waits in the slot for the next attempt).
+      const auto refused = [](ErrorDTO error) {
+        error.details["continuation_error_code"] = error.code;
+        error.code = "operation_recovery_invalid";
+        return error;
+      };
+      kept_storage = std::make_shared<std::optional<ProgramCycleClaimRun::MotionContinuation>>();
+      const auto& dispatched = observed.value().last_dispatched_participant;
+      const auto* motion =
+          dispatched ? std::get_if<PreparedMotionExecutionDTO>(&dispatched->payload) : nullptr;
+      if (!motion) {
+        kept_refusal = refused(error("motion_continuation_dispatch_unsettled",
+                                     "motion dispatch outcome is not settled",
+                                     "motion_continuation_dispatch_unsettled"));
+      } else {
+        auto captured = detail::capture_motion_resume_intent(
+            motion->plan_request.motion, motion->trajectory,
+            observed.value().stopped_trajectory_time_s);
+        if (captured.ok())
+          kept_intent =
+              std::make_shared<const detail::MotionResumeIntent>(std::move(captured.value()));
+        else
+          kept_refusal = refused(captured.error());
+      }
+    }
     if (no_effect || source_settled) {
       // May join a completed computation. Never hold the addressed writer or
       // state mutex over this call; an on-stack candidate callback returns false.
@@ -1045,6 +1135,11 @@ Result<bool> ResourceAddressedExecutionKernel::end_pending_motion_takeover(
 
   OperationCommitGuard commit(*this, incumbent_id);
   const bool terminal_cleanup = no_effect || source_settled;
+  // OD-272: a sent (or possibly sent) newcomer that a Stop cancelled stays
+  // stopping, as any moving motion under a Stop, until the old motion's Stop
+  // ends; then it ends settled, or unsettled (intervention required).
+  const bool stop_pending =
+      !terminal_cleanup && stop_cancelled && !failure && !reset_cleanup && !source_stop_ended;
   {
     std::lock_guard lock(state_mutex_);
     auto* source = find_active_operation_locked(incumbent_id);
@@ -1072,28 +1167,35 @@ Result<bool> ResourceAddressedExecutionKernel::end_pending_motion_takeover(
     }
     auto state = candidate.state;
     auto& participant = state.participants.front();
-    const auto effect = no_effect        ? ParticipantEffectKnowledge::kNoEffect
-                        : source_settled ? ParticipantEffectKnowledge::kEffectSettled
-                                         : ParticipantEffectKnowledge::kEffectUncertain;
+    // OD-285: after a cold promotion `no_effect` describes only the unsent
+    // successor; the newcomer's sent replacement was retired settled.
+    const bool unstarted = no_effect && !row.sent_before_cold_promotion;
+    const auto effect = unstarted                     ? ParticipantEffectKnowledge::kNoEffect
+                        : no_effect || source_settled ? ParticipantEffectKnowledge::kEffectSettled
+                                                      : ParticipantEffectKnowledge::kEffectUncertain;
     state.state = participant.state =
-        terminal_cleanup ? (failure ? OperationStateKind::kFailed : OperationStateKind::kStopped)
-                         : OperationStateKind::kInterventionRequired;
+        stop_pending       ? OperationStateKind::kStopping
+        : terminal_cleanup ? (failure ? OperationStateKind::kFailed : OperationStateKind::kStopped)
+                           : OperationStateKind::kInterventionRequired;
     participant.terminal_error = failure;
-    if (!terminal_cleanup && !participant.terminal_error)
+    if (!terminal_cleanup && !stop_pending && !participant.terminal_error)
       participant.terminal_error =
           error("motion_takeover_cleanup_unsettled", "The pending goal has not been proved ended",
                 "motion_takeover_cleanup_unsettled");
-    participant.terminal_fact = ParticipantExecutionFact{
-        participant.terminal_error ? ParticipantExecutionFactKind::kLocalFailure
-        : no_effect                ? ParticipantExecutionFactKind::kCancelledBeforeDispatch
-                                   : ParticipantExecutionFactKind::kPreemptedByAddressedStop,
-        effect, participant.terminal_error};
+    if (stop_pending)
+      participant.terminal_fact.reset();
+    else
+      participant.terminal_fact = ParticipantExecutionFact{
+          participant.terminal_error ? ParticipantExecutionFactKind::kLocalFailure
+          : unstarted                ? ParticipantExecutionFactKind::kCancelledBeforeDispatch
+                                     : ParticipantExecutionFactKind::kPreemptedByAddressedStop,
+          effect, participant.terminal_error};
     state.stop_event_id = source->state.stop_event_id;
     state.updated_at_ns = clock_.now();
     stamp_operation_capture_locked(candidate, state);
-    post_operation_state_locked(
-        candidate, JournalOperationState{state, std::nullopt, "motion_takeover_ended", {}},
-        "motion_takeover_ended");
+    const char* const reason = stop_pending ? "motion_takeover_stopping" : "motion_takeover_ended";
+    post_operation_state_locked(candidate, JournalOperationState{state, std::nullopt, reason, {}},
+                                reason);
     // A failed predecessor never prepares its next slot. The next identity has
     // no engine membership and receives its own factual NoEffect failure.
     const bool ordinary_stop =
@@ -1126,6 +1228,40 @@ Result<bool> ResourceAddressedExecutionKernel::end_pending_motion_takeover(
       next.state = std::move(next_state);
     }
     candidate.state = std::move(state);
+    if (kept_storage && terminal_cleanup && program_cycle_claim_run_ &&
+        program_cycle_claim_run_->capture &&
+        program_cycle_claim_run_->program_run_id == candidate.state.program_run_id &&
+        row.prepared_participant &&
+        std::holds_alternative<PreparedMotionExecutionDTO>(row.prepared_participant->payload) &&
+        candidate.intent.participants.front().execution_scope) {
+      // OD-269: the node's slot, as Resume's recovery fills it. Moves only:
+      // the newcomer and its product are retired below.
+      auto& origin = *candidate.intent.participants.front().execution_scope;
+      const auto& nodes = program_cycle_claim_run_->capture->table->nodes;
+      const auto node =
+          std::lower_bound(nodes.begin(), nodes.end(), origin.node_instance_id,
+                           [](const auto& value, const auto& id) { return value.instance_id < id; });
+      const auto index = static_cast<std::size_t>(node - nodes.begin());
+      if (node != nodes.end() && node->instance_id == origin.node_instance_id &&
+          node->owner_api == "kernel.operation" &&
+          index < program_cycle_claim_run_->motion_continuations.size()) {
+        const auto authored_motion_kind =
+            std::get<MotionParticipantIntentDTO>(candidate.intent.participants.front().payload)
+                .motion.index();
+        auto& product = *row.prepared_participant;
+        auto& request = std::get<PreparedMotionExecutionDTO>(product.payload).plan_request;
+        kept_storage->emplace(ProgramCycleClaimRun::MotionContinuation{
+            std::move(origin), candidate_id, std::move(product.participant_id),
+            std::move(product.prepared_contract_digest), std::move(row.binding),
+            std::move(kept_intent), std::move(request.base_frame), std::move(request.tcp_frame),
+            std::move(request.planner_capability_binding), authored_motion_kind,
+            std::move(kept_refusal)});
+        displaced_continuation = std::exchange(
+            program_cycle_claim_run_->motion_continuations[index],
+            std::shared_ptr<const ProgramCycleClaimRun::MotionContinuation>(kept_storage,
+                                                                            &**kept_storage));
+      }
+    }
     if (terminal_cleanup) {
       row.prepared_engine_no_effect_confirmed = no_effect;
       row.preparation_id = row.subordinate_id = 0U;

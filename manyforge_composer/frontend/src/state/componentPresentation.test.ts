@@ -181,7 +181,6 @@ describe('component model v2 presentation', () => {
     const cause = (kind: string, sourceLabel: string | null = null) => haltCauseText({ kind, sourceLabel });
     expect(cause('halt')).toBe('Halted by the operator.');
     expect(cause('halt', 'composer_ui')).toBe('Halted by the operator.');
-    expect(cause('halt', 'manager.execution_host_late')).toBe('Halted: the execution host was late.');
     expect(cause('halt', 'headless.disk_cannot_keep_records'))
       .toBe("Halted: the disk cannot keep ManyForge's records.");
     expect(cause('internal_fault')).toBe('Halted: internal fault.');

@@ -22,7 +22,7 @@ import time
 import uuid
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-from scripts.lib.export_retention import _LEGACY_SESSION_ENTRIES, run_session
+from scripts.lib.export_retention import run_session
 
 _check_root_identity = run_session._check_root_identity
 _marker = run_session._marker
@@ -32,7 +32,6 @@ _write = run_session._write
 claim_selected = run_session.claim_selected
 record_stopped = run_session.record_stopped
 
-_LEGACY = _LEGACY_SESSION_ENTRIES
 # The dev state root's own kept entries besides the session entries.
 STABLE_ENTRIES = frozenset({
     "evidence",
@@ -55,10 +54,9 @@ def prepare_session(root: Path, session_id: str, *, lock_fd: int,
     is checked (run_session.DiskBelowFloor), before anything is written.
     ``disk_limits`` come from the site settings file (default: the defaults).
     """
-    run_session.prepare_disk(_safe_path(root), lock_fd, disk_limits or run_session.DiskLimits(),
-                             legacy_entries=_LEGACY)
+    run_session.prepare_disk(_safe_path(root), lock_fd, disk_limits or run_session.DiskLimits())
     return run_session.prepare_session(root, session_id, lock_fd=lock_fd, stable_entries=STABLE_ENTRIES,
-                            legacy_entries=_LEGACY, process_boundary=process_boundary)
+                            process_boundary=process_boundary)
 
 
 def _docker_boundary_stopped(root: Path, marker: dict) -> None:
@@ -97,11 +95,10 @@ def prepare_docker_session(root: Path, session_id: str, *, lock_fd: int,
     _check_root_identity(root, lock_fd)
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     marker = _marker(_safe_path(root / "current", root))
-    previous_material = (root / "current").exists() or bool(set(os.listdir(root)) & _LEGACY)
     if marker is not None:
         if marker.get("disposition") != "stopped" or marker.get("shutdown") != "clean":
             _docker_boundary_stopped(root, marker)
-    elif previous_material and not (root / ".legacy-session-transition.json").exists() and not (root / ".session-selection.json").exists():
+    elif (root / "current").exists() and not (root / ".session-selection.json").exists():
         if stopped_container_receipt is None:
             raise ValueError("previous session has no exact stopped process-set proof; preserved")
         receipt = _read(stopped_container_receipt)
@@ -173,8 +170,6 @@ class Session:
                     if marker is None:
                         raise ValueError("direct startup cannot prove the previous unclosed process set stopped; preserve its exact stopped-process evidence")
                     _docker_boundary_stopped(root, marker)
-            elif set(os.listdir(root)) & _LEGACY:
-                raise ValueError("direct startup cannot prove legacy process termination; preserve its exact stopped-process evidence")
             marker = claim_selected(root, prepare_session(root, uuid.uuid4().hex, lock_fd=descriptor,
                                                           disk_limits=disk_limits))
             instance = cls.__new__(cls)

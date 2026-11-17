@@ -241,11 +241,19 @@ def _live_manager(monkeypatch, *, ends_on_request: bool):
         raise AssertionError("a live Manager is not signalled as a group")
 
     monkeypatch.setattr("manyforge_operator.orchestrator.os.killpg", no_group_signal)
-    monkeypatch.setattr(
-        "manyforge_operator.orchestrator.request_manager_shutdown",
-        lambda *_args, **_kwargs: pytest.fail("stop sends a signal, not shutdown_runtime"),
-    )
     return signals, signal_module.SIGTERM
+
+
+def test_recovery_cleanup_is_one_stop_request_followed_to_the_manager_end(
+    tmp_path: Path, monkeypatch
+):
+    # Start-failure and recovery cleanup: one SIGTERM (the Manager would count
+    # a second request as a forced stop), then wait for its end, no time limit.
+    launcher = NativeLauncher(_config(tmp_path))
+    signals, sigterm = _live_manager(monkeypatch, ends_on_request=True)
+
+    assert launcher._cleanup_authenticated({"manager": _mechanical_process()})
+    assert signals == [(999999, sigterm)]
 
 
 def test_stop_sends_one_sigterm_to_a_live_manager_and_follows_it_to_its_end(

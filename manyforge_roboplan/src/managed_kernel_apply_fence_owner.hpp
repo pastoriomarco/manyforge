@@ -88,12 +88,6 @@ public:
   void ReleaseFence(const manyforge::core::ConfigurationFenceId &fence_id,
                     const manyforge::core::ConfigurationFenceScopeDTO &scope);
 
-  /// Selected release checks the effect pin before committing its ledger row.
-  void
-  ReleaseFenceDurably(const manyforge::core::ConfigurationFenceId &fence_id,
-                      const manyforge::core::ConfigurationFenceScopeDTO &scope,
-                      const std::function<void()> &commit_durable_release);
-
   /// Execute one bounded in-process installation step only while the exact
   /// durable fence remains held. This is an Apply interlock, not caller
   /// authorization; the fence owner separately validates its generation.

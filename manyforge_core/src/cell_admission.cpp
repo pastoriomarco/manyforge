@@ -549,7 +549,12 @@ Result<void> ValidateProgramRunnerContactLoss(const ProgramRunnerContactLossDTO&
       (loss.failure_predicate != "program_runner_liveness_probe" &&
        loss.failure_predicate != "program_runner_liveness_renewal" &&
        loss.failure_predicate != "program_runner_reconciliation_renewal" &&
-       loss.failure_predicate != "program_runner_publication_fault") ||
+       loss.failure_predicate != "program_runner_fault") ||
+      !loss.fault_code || loss.fault_code->empty() || loss.fault_code->size() > 128U ||
+      // A Runner fault carries its own code; a lost contact carries
+      // program_runner_contact_lost (OD-296 (a)).
+      ((loss.failure_predicate == "program_runner_fault") ==
+       (*loss.fault_code == kProgramRunnerContactLostCode)) ||
       loss.message.size() > 1024U || !content_identity::is_utf8_nfc(loss.message)) {
     return Invalid<void>("program_runner_contact_loss_invalid");
   }

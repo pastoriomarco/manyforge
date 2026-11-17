@@ -1069,7 +1069,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         )
         base_intent = {
             "schema_version": "manyforge.composer_authoring_effect.v2",
-            "scene_initialization": "initialize",
+            "scene_initialization": "preserve",
             "operation_kind": "revert_deployment",
             "effect_class": "external",
             "external_kind": "revert_deployment",
@@ -1368,7 +1368,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 "graph_revision": current_graph,
             },
             "expected_admission_generation": body.expected_admission_generation,
-            "scene_initialization": "initialize",
+            "scene_initialization": "preserve",
             "application_start_id": body.application_start_id,
             "request_key": new_request_key().hex(),
             "confirmation_token": None,
@@ -1734,9 +1734,10 @@ class HeadlessApplyPorts:
     def wait_for_manager_apply(self, result: dict[str, Any]) -> None:
         """Wait for an accepted Manager Apply to be terminal.
 
-        No limit of its own (OD-214): the Manager ends every Apply, at the
-        latest after its own bound (`apply_timed_out`); a status read that
-        fails ends the wait with its error.
+        No limit of its own (OD-214): an Apply step ends only on its own
+        events, and the Manager's stop or the execution host's exit ends the
+        application (OD-270); a status read that fails ends the wait with its
+        error.
         """
 
         if result.get("status") != "accepted":

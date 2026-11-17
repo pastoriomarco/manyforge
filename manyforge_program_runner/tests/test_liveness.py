@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import socket
+import time
 
 import pytest
 
@@ -72,9 +73,7 @@ def test_starts_unreconciled_and_accepts_only_fresh_exact_heartbeat(tmp_path: Pa
     acknowledgement = receiver._handle(_heartbeat())  # noqa: SLF001
 
     assert acknowledgement["state"] == "current"
-    assert acknowledgement["last_accepted_heartbeat_sequence"] == 1
     assert acknowledgement["receiver_status_sequence"] == 2
-    assert acknowledgement["manager_runtime_unit_id"] == "component-manager.cell"
     assert acknowledgement["program_cycle_status"]["state"] == "idle_after_reset"
     receiver.require_current()
     with pytest.raises(ProgramRunnerLivenessError):
@@ -154,6 +153,34 @@ def test_listener_answers_a_probe(tmp_path: Path):
             connection.close()
     finally:
         receiver.close()
+
+
+def test_listener_waits_for_a_request_without_a_time_limit_and_close_ends_it(
+    tmp_path: Path,
+):
+    # OD-296 (a): a request that comes later than the former 0.2 s limit is
+    # still answered, and close() ends a wait for a request that never comes.
+    path = tmp_path / "runner.sock"
+    receiver = _receiver(tmp_path)
+    receiver.start()
+    idle = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as connection:
+            connection.settimeout(5.0)
+            connection.connect(str(path))
+            time.sleep(0.4)
+            connection.send(
+                receiver._encode(  # noqa: SLF001
+                    {"api_version": API_VERSION, "cell_id": "cell", "kind": "probe"}
+                )
+            )
+            acknowledgement = receiver._decode(connection.recv(4096))  # noqa: SLF001
+            assert acknowledgement["kind"] == "probe_ack"
+        idle.connect(str(path))
+        time.sleep(0.1)
+    finally:
+        receiver.close()
+        idle.close()
 
 
 def test_listener_pins_run_root_and_cleans_its_original_socket(

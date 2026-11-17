@@ -195,19 +195,14 @@ def test_motion_trace_files_remain_stable_across_cold_sessions(tmp_path):
     assert not (root / "previous-runs" / FIRST / "motion-traces").exists()
 
 
-def test_legacy_layout_moves_all_journals_without_opening_or_checkpointing_owners(tmp_path):
+def test_an_old_pre_session_layout_is_refused_and_preserved(tmp_path):
     root = tmp_path / "runtime"
     root.mkdir()
     original = evidence(root)
-    history = root / "history.sqlite3"
-    history.write_bytes(b"historian survives legacy transition")
-    marker = select(root, FIRST)
-    archive = root / marker["previous_session"]["archive_relative_path"]
-    assert_evidence(archive, original)
-    assert all(not (root / name).exists() for name in original)
-    assert history.read_bytes() == b"historian survives legacy transition"
-    assert not (root / ".legacy-session-transition.json").exists()
-    assert {p.name for p in (root / "current").iterdir()} == {"session.json"}
+    with pytest.raises(ValueError, match="unknown state-root entries preserved"):
+        select(root, FIRST)
+    assert_evidence(root, original, sealed=False)
+    assert not (root / "current").exists() and not (root / "previous-runs").exists()
 
 
 @pytest.mark.parametrize("phase", ["after_archive_rename", "before_current_marker", "after_current_marker"])
@@ -252,62 +247,6 @@ def test_crash_during_selection_preserves_old_owner_bytes_and_recovers_one_fresh
     assert json.loads((root / "current/session.json").read_text())["session_id"] == THIRD
     assert not (root / ".session-selection.json").exists()
     assert not (root / "previous-runs" / THIRD).exists()
-
-
-def test_legacy_partial_rename_resumes_without_losing_journal_or_wal(tmp_path, monkeypatch):
-    root = tmp_path / "runtime"
-    root.mkdir()
-    original = evidence(root)
-    rename = sessions.os.rename
-    crashed = False
-
-    def interrupted(source, destination):
-        nonlocal crashed
-        result = rename(source, destination)
-        if Path(source) == root / "execution-state" and not crashed:
-            crashed = True
-            raise OSError("injected legacy move crash")
-        return result
-
-    monkeypatch.setattr(sessions.os, "rename", interrupted)
-    with pytest.raises(OSError, match="injected legacy"):
-        select(root, FIRST)
-    monkeypatch.setattr(sessions.os, "rename", rename)
-    marker = select(root, SECOND)
-    assert_evidence(root / marker["previous_session"]["archive_relative_path"], original)
-    assert not (root / ".legacy-session-transition.json").exists()
-
-
-def test_crash_after_legacy_archival_before_selection_keeps_unclean_previous_session(tmp_path, monkeypatch):
-    root = tmp_path / "runtime"
-    root.mkdir()
-    original = evidence(root)
-    write = sessions.run_session._write
-
-    def interrupted(path, value):
-        if path == root / ".session-selection.json":
-            raise OSError("injected crash before successor selection is durable")
-        return write(path, value)
-
-    monkeypatch.setattr(sessions.run_session, "_write", interrupted)
-    with pytest.raises(OSError, match="injected crash"):
-        select(root, FIRST)
-    assert not (root / "current").exists()
-    archives = list((root / "previous-runs").iterdir())
-    assert len(archives) == 1
-    archive = archives[0]
-    assert_evidence(archive, original)
-    report_path = root / "session-reports/pending" / (archive.name + ".json")
-    preserved_report = report_path.read_bytes()
-    assert json.loads(preserved_report)["shutdown"] == "unknown"
-
-    monkeypatch.setattr(sessions.run_session, "_write", write)
-    marker = select(root, SECOND)
-    assert marker["previous_session"] == json.loads(preserved_report)
-    assert marker["previous_session"]["archive_relative_path"] == "previous-runs/" + archive.name
-    assert report_path.read_bytes() == preserved_report
-    assert_evidence(archive, original)
-    assert {p.name for p in (root / "current").iterdir()} == {"session.json"}
 
 
 def test_lifetime_lock_prevents_competing_session_selection(tmp_path):

@@ -3333,7 +3333,7 @@ struct ComponentBuildInput final {
   ComponentBuildHost host;
 };
 
-/// The bring-up bound (the Manager's `HostApplyTimeout`): the sum of the
+/// The bring-up bound: the sum of the
 /// lifecycle command times of the components this composition installs or
 /// removes (every component at start-up); one default when it changes none.
 [[nodiscard]] std::chrono::nanoseconds LaunchSettleBound(const CompositionBuildInput &input) {
@@ -6625,15 +6625,41 @@ void ConfigureProgramResetPositionAccess(ExecutionCompositionAccess& access,
   };
 }
 
+// A gripper-only component's measured source. Missing measurement is logged,
+// never an Apply or Enable failure.
+void PrepareGripperMeasuredSource(const core::ControllableComponentId &component,
+                                  const Composition &view) {
+  const auto prepared = view.gripper_runtime->PrepareCurrentMeasuredSources();
+  if (!prepared.ok()) std::cerr << "manyforge measured gripper source unavailable: component="
+      << component.value() << " code=" << prepared.error().code << " message=" << prepared.error().message << '\n';
+}
+
+/// Enable publishes a gripper-only component's route, and that route re-seal
+/// drops its measured association (RetainedGripperRuntime::RebindRoute); stage
+/// the producer for the new route, as an arm's route publication does.
+void PrepareGripperMeasuredSourceAfterRouteOpen(
+    const Composition &composition, const core::ControllableComponentId &component) noexcept {
+  try {
+    const auto views = IndexNativeComponentCompositions(composition);
+    const auto found = views.find(component);
+    if (found != views.end() && found->second && !found->second->runtime &&
+        found->second->gripper_runtime)
+      PrepareGripperMeasuredSource(component, *found->second);
+  } catch (const std::exception &error) {
+    try { std::cerr << "manyforge measured gripper source preparation failed: " << error.what() << '\n'; }
+    catch (...) {}
+  } catch (...) {
+    try { std::cerr << "manyforge measured gripper source preparation failed: unknown exception\n"; }
+    catch (...) {}
+  }
+}
+
 void PrepareInstalledMeasuredSourcesAfterContext(const Composition &composition) noexcept {
   try {
     for (const auto &[component, view] : IndexNativeComponentCompositions(composition)) {
-      static_cast<void>(component);
       if (!view) continue;
       if (!view->runtime && view->gripper_runtime) {
-        auto prepared = view->gripper_runtime->PrepareCurrentMeasuredSources();
-        if (!prepared.ok()) std::cerr << "manyforge measured gripper source unavailable: component="
-            << component.value() << " code=" << prepared.error().code << " message=" << prepared.error().message << '\n';
+        PrepareGripperMeasuredSource(component, *view);
         continue;
       }
       if (!view->runtime) continue;
@@ -7025,6 +7051,10 @@ void RefreshRetainedPublicationView(
 
 [[nodiscard]] int
 RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
+  // Start-up steps are logged (OD-214): the Manager waits for this host's
+  // readiness with no time limit (OD-290 (a)).
+  std::cerr << "execution host start-up: pid=" << ::getpid()
+            << " runtime_unit=" << config.runtime_unit_id << '\n';
   // This host's site facts (its site settings snapshot, fixed for the
   // process): every component spec it derives uses them, as the Manager does.
   const auto site_facts = component_manager::SiteFactsOf(config.site_settings);
@@ -7553,16 +7583,18 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
             const auto package =
                 LoadManagedBundleAtPinnedRoot(config, product->bundle->retained_bundle_id());
             if (!package) return unavailable("The installed product's package is unavailable.");
-            if (product->runtime)
-              return OpenComponentRoutes(*product->bundle, package->package_root,
-                                         product->publication_generation, *product->runtime,
-                                         *stable_cell_runtime_owner, component,
-                                         component_manager::SiteFactsOf(config.site_settings));
-            return OpenComponentRoutes(*product->bundle, package->package_root,
-                                       product->publication_generation,
-                                       *product->gripper_route_owner,
-                                       *stable_cell_runtime_owner, component,
-                                       component_manager::SiteFactsOf(config.site_settings));
+            const auto opened = product->runtime
+                ? OpenComponentRoutes(*product->bundle, package->package_root,
+                                      product->publication_generation, *product->runtime,
+                                      *stable_cell_runtime_owner, component,
+                                      component_manager::SiteFactsOf(config.site_settings))
+                : OpenComponentRoutes(*product->bundle, package->package_root,
+                                      product->publication_generation,
+                                      *product->gripper_route_owner,
+                                      *stable_cell_runtime_owner, component,
+                                      component_manager::SiteFactsOf(config.site_settings));
+            if (opened.ok()) PrepareGripperMeasuredSourceAfterRouteOpen(*product, component);
+            return opened;
           },
           [] { core::execution_event_change_signal().Notify(); },
           [generic_io_fault, adapter_transport_fault, &installed_generic_io_membership,
@@ -8119,6 +8151,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     Require(execution_surface_control.ready,
             "managed execution command surface did not become ready");
   }
+  std::cerr << "execution host start-up: command surface ready\n";
   // The last Apply this host installed (the Manager then
   // publishes it); the liveness rebind to its successor checks it.
   std::optional<HostApplySelection> installed_apply;
@@ -9650,6 +9683,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
   // facade/publication/product source. No additional recovery owner or poller.
   restore_current_logical_product = restore_empty_startup_globals;
   bool process_inventory_owner_changing_logged = false;
+  std::cerr << "execution host start-up: serving the Manager channel\n";
   while (g_stop_requested == 0) {
     rethrow_manager_liveness_failure();
     rethrow_composition_failure(true);
@@ -9750,7 +9784,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         // Process-fixture synchronization, absent from ordinary hosts: when
         // `<run_root>/reply-late.mode` reads `status`, the first status reply
         // after it appears is sent only once `reply-late.release` exists, so
-        // the Manager's bounded status exchange times out and this one reply
+        // the status reply stays outstanding and
         // arrives late. No lock is held here. The fixed diagnostic deadline
         // (or a stop request) sends the reply anyway rather than leaving the
         // fixture child held when its test cannot publish the release.

@@ -71,13 +71,31 @@ operator launcher's `standard` profile):
   malformed or unexpected message from the Manager and latched its internal
   fault (`manager_liveness_packet_refused`); motion stays blocked until the
   application is started again.
-- `{"code":"execution_host_late_reply","exchange":"…","bound_ms":…,"waited_ms":…,"halt":"…"}`:
-  the execution host did not answer a Manager request (`exchange`) within its
-  bound. The host keeps running; the Manager sent one Halt (`halt` is
-  `accepted`, `refused` or `unavailable`). The host counts as faulted until
-  its reply arrives, which the Manager logs as `execution host late reply
-  settled: pid=… exchange=…`; the Halt stays until Execute or Reset. A late
-  host is a defect: keep the log and report it.
+- `{"code":"execution_host_late_reply","exchange":"…","waited_ms":…}`:
+  a Manager request to the execution host (`exchange`) was still unanswered
+  at the Manager's next tick, `waited_ms` after it was sent. Information
+  only: nothing is halted, the host keeps running and does not count as
+  faulted; meanwhile other requests to it answer `execution_host_late`. Its
+  answer is logged as `{"code":"execution_host_late_reply_settled","exchange":"…"}`.
+  A long Host Apply logs it as a matter of course; a status or liveness
+  request that stays unanswered points to a stalled host: keep the log and
+  report it.
+- `execution host start-up: …` (`pid=… runtime_unit=…`, `command surface
+  ready`, `serving the Manager channel`), then the Manager's `execution host
+  launched: pid=…; waiting for its readiness` and `execution host ready:
+  pid=…`: the host's start-up steps; the launch has no time limit, so the
+  last line names where it waits.
+- `kernel rpc timing: command=… pid=… elapsed_us=…`: one Manager request to
+  the host that took more than 200 ms (at most one line per second per
+  request kind).
+- `native projection preparation started: pid=… binding=…`, then
+  `native projection preparation answered: … elapsed_ms=…` (or `ended
+  without its reply`): one projection preparation, which has no time limit.
+- `execution host exchanges abandoned: the application is stopping`: the
+  stop ended the host requests that were waiting for their answers; a
+  reply that arrives later is logged as `abandoned exchange reply settled:
+  pid=… exchange=…` (`abandoned liveness reply settled: …` on the liveness
+  channel).
 - `manyforge_fault code=<code> …`: an internal fault or stall, named by its
   code. Keep the log and report it.
 
@@ -153,7 +171,7 @@ these points, the point writes one `program_runner_heap_settled` line with
 clean up) and, except at `run_start`, `frozen_objects`.
 
 The History file is named by its event format, `history.v<N>.sqlite3`
-(currently `history.v7.sqlite3`), in the History directory (`history/` under
+(currently `history.v8.sqlite3`), in the History directory (`history/` under
 the development state root and in an operator instance). Only the file of the
 current format is opened. An earlier History file
 (`history.sqlite3`, or a `history.v<N>.sqlite3` with a lower number) stays on

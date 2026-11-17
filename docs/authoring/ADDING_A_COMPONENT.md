@@ -618,6 +618,10 @@ long a robot may take to come up after activation. An Apply that installs or
 replaces the component also waits for it.
 
 - **Default.** 10 s, for every component kind and lane.
+- **AI assistant.** Its Enable and Disable have no time limit: they wait until
+  the host reports the bridge serving or stopped, the host exits, or a Stop
+  interrupts them, and stay visible as running meanwhile. An Enable that does
+  not complete stops the bridge again.
 - **Override.** Set `lifecycle_command_timeout_s` (seconds, above 0, at most
   3600) in the component's `configuration`, or on its Components page
   ("Lifecycle command time limit"; blank keeps the default). An I/O device

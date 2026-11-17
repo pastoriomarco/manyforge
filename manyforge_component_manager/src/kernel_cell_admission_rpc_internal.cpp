@@ -372,6 +372,8 @@ void Readiness(Writer &w, const core::CellAdmissionReadinessSnapshotDTO &x) {
     ProgramCycle(w, loss.established_cycle);
     w.String(loss.failure_predicate);
     w.String(loss.message);
+    Opt(w, loss.fault_code,
+        [](Writer &w, const std::string &code) { w.String(code); });
   }
 }
 
@@ -391,7 +393,9 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(Reader &r) {
   if (r.HasRemaining()) {
     if (!r.Bool())
       Fail("Program Runner loss extension must be present or omitted");
-    core::ProgramRunnerContactLossDTO loss{ProgramCycle(r), r.String(), r.String()};
+    core::ProgramRunnerContactLossDTO loss{
+        ProgramCycle(r), r.String(), r.String(),
+        Opt<std::string>(r, [](Reader &r) { return r.String(); })};
     if (!core::ValidateProgramRunnerContactLoss(loss).ok())
       Fail("invalid Program Runner contact loss");
     x.program_runner_loss = std::move(loss);

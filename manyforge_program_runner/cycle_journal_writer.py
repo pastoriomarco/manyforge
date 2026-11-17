@@ -73,8 +73,7 @@ class CycleJournalWriter:
     """Applies posted records in order, one SQLite transaction each, on its own thread.
 
     It never takes the journal's lock. A record that is not written (queue
-    full, failed commit, not drained at shutdown) is counted and the writer
-    carries on. A loss episode starts at the first record not written and ends
+    full or failed commit) is counted and the writer carries on. A loss episode starts at the first record not written and ends
     when the queue has been written empty again; the writer logs one line when
     an episode starts and, in the first episode, writes the file's
     ``records_lost`` mark. ``close`` logs one line with the counts.
@@ -94,12 +93,9 @@ class CycleJournalWriter:
         self._maximum_queued_records = maximum_queued_records
         self._queue: deque[Any] = deque()
         self._condition = Condition()
-        self._busy = False
         self._ended = False
         self.failed_commits = 0
         self.dropped_records = 0
-        self.not_drained_records = 0
-        self.handled_sequence = 0
         # Set by `post` under the queue lock; the writer thread reports it.
         self._drops_unreported = False
         # Writer thread only.
@@ -127,16 +123,8 @@ class CycleJournalWriter:
             self._queue.append(record)
             self._condition.notify()
 
-    def wait_idle(self, timeout_s: float | None = None) -> bool:
-        """Wait until every posted record was handled (tests and shutdown)."""
-
-        with self._condition:
-            return self._condition.wait_for(
-                lambda: not self._queue and not self._busy, timeout_s
-            )
-
-    def close(self, timeout_s: float) -> bool:
-        """Drain, close the file and stop; False when the bound is exceeded.
+    def close(self) -> None:
+        """Drain, close the file and stop.
 
         Logs one line when records of this start were not written.
         """
@@ -146,35 +134,21 @@ class CycleJournalWriter:
                 self._ended = True
                 self._queue.append(_END)
                 self._condition.notify()
-        self._thread.join(timeout_s)
-        finished = not self._thread.is_alive()
+        self._thread.join()
         with self._condition:
-            if not finished:
-                self.not_drained_records = sum(
-                    1 for record in self._queue if record is not _END
-                )
-            counts = (self.dropped_records, self.failed_commits, self.not_drained_records)
-        if not finished:
-            _LOGGER.warning(
-                "Program-cycle journal writer did not finish within %.1f s; records "
-                "not written: queue full %d, failed %d, not drained %d",
-                timeout_s,
-                *counts,
-            )
-        elif any(counts):
+            counts = (self.dropped_records, self.failed_commits)
+        if any(counts):
             _LOGGER.warning(
                 "Program-cycle journal records not written in this start: "
-                "queue full %d, failed %d, not drained %d",
+                "queue full %d, failed %d",
                 *counts,
             )
-        return finished
 
     def _run(self) -> None:
         while True:
             with self._condition:
                 self._condition.wait_for(lambda: bool(self._queue))
                 record = self._queue.popleft()
-                self._busy = True
                 dropped = self._drops_unreported
                 self._drops_unreported = False
             if dropped:
@@ -187,9 +161,6 @@ class CycleJournalWriter:
                     self._close_storage()
                 except Exception:
                     _LOGGER.exception("Program-cycle journal file did not close cleanly")
-                with self._condition:
-                    self._busy = False
-                    self._condition.notify_all()
                 return
             try:
                 self._apply(record)
@@ -204,9 +175,6 @@ class CycleJournalWriter:
             with self._condition:
                 if written and not self._queue and not self._drops_unreported:
                     self._in_episode = False
-                self.handled_sequence = record.sequence
-                self._busy = False
-                self._condition.notify_all()
 
     def _record_lost(self, cause: str) -> None:
         """Writer thread only: the first loss of an episode logs one line and marks the file."""

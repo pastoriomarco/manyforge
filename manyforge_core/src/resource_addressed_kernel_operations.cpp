@@ -1245,6 +1245,9 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       const auto index = static_cast<std::size_t>(node - nodes.begin());
       if (index < program_cycle_claim_run_->motion_continuations.size()) {
         const auto& pending = program_cycle_claim_run_->motion_continuations[index];
+        // A sent take-over newcomer whose rest could not be captured (OD-269).
+        if (pending && pending->resume_refusal)
+          return Result<OperationAcceptedDTO>::Err(*pending->resume_refusal);
         if (pending) {
           if (node->owner_api != "kernel.operation" ||
               pending->origin.node_instance_id != scope.node_instance_id ||
@@ -1373,7 +1376,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
             planning_state.participants.front().state = OperationStateKind::kPlanning;
             planning_state.updated_at_ns = clock_.now();
             auto durable_state =
-                record_operation_state_locked(state_lock, planning_state,
+                record_operation_state_locked(planning_state,
                                               active_operation->runtime_scale_status.has_value()
                                                   ? &*active_operation->runtime_scale_status
                                                   : nullptr,
@@ -1479,7 +1482,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       failed_state.participants.front().terminal_error = dispatch_result.error();
       failed_state.updated_at_ns = clock_.now();
       auto durable_failure =
-          record_operation_state_locked(state_lock, failed_state,
+          record_operation_state_locked(failed_state,
                                         active_operation->runtime_scale_status.has_value()
                                             ? &*active_operation->runtime_scale_status
                                             : nullptr,
@@ -1921,6 +1924,8 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
         if (node_index >= program_cycle_claim_run_->motion_continuations.size()) continue;
         const auto& pending = program_cycle_claim_run_->motion_continuations[node_index];
         if (!pending) continue;
+        // A sent take-over newcomer whose rest could not be captured (OD-269).
+        if (pending->resume_refusal) return Result<OperationAcceptedDTO>::Err(*pending->resume_refusal);
         const auto& admission = admissions[index];
         if (node == nodes.end() || node->owner_api != "kernel.operation" ||
             pending->origin.node_instance_id != scope.node_instance_id ||
@@ -2160,8 +2165,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                              : OperationStateKind::kPrepared;
             captured.state = aggregate_participant_state(captured.participants);
             captured.updated_at_ns = clock_.now();
-            auto durable = record_operation_state_locked(
-                state_lock, captured, nullptr,
+            auto durable = record_operation_state_locked(captured, nullptr,
                 admission.payload_kind == OperationParticipantPayloadKind::kMotion
                     ? "coordinated_participant_motion_admitted"
                     : "coordinated_participant_command_admitted");
@@ -2210,7 +2214,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
         stamp_operation_capture_locked(*operation, operation->state);
         if (!operation->state.stop_event_id.has_value()) {
           auto captured = operation->state;
-          auto durable = record_operation_state_locked(state_lock, captured, nullptr,
+          auto durable = record_operation_state_locked(captured, nullptr,
                                                        "coordinated_late_prepare_cancel_failed");
           if (durable.ok() && durable.value()) operation->state = std::move(captured);
         }
@@ -4782,6 +4786,13 @@ void ResourceAddressedExecutionKernel::run_runtime_scale_step(
       std::unique_lock state_lock(state_mutex_);
       auto* operation = find_active_operation_locked(operation_id);
       if (operation == nullptr || !operation->pending_runtime_scale.has_value()) return;
+      // A candidate between its hand-over's "decide" and "close" steps
+      // (OD-175 D3, gate 4): the step stays pending, as for a busy commit
+      // guard, and the host's next reconcile pass after the close runs it.
+      // Other operations' steps are not held up.
+      if (std::any_of(operation->participants.begin(), operation->participants.end(),
+                      [](const auto& row) { return row.handover_source_execution_id != 0U; }))
+        return;
       // A recorded failure first, then the latest value (if any).
       auto failure = std::move(operation->pending_runtime_scale->failure);
       operation->pending_runtime_scale->failure.reset();
@@ -4805,7 +4816,7 @@ void ResourceAddressedExecutionKernel::run_runtime_scale_step(
           row->state = RuntimeScaleApplicationState::kFailed;
           row->error = std::move(failure->error);
         }
-        (void)retain_runtime_scale_observation_locked(state_lock, *operation, std::move(status),
+        (void)retain_runtime_scale_observation_locked(*operation, std::move(status),
                                                       failure->reason);
       }
     }
@@ -4817,8 +4828,7 @@ void ResourceAddressedExecutionKernel::run_runtime_scale_step(
 }
 
 Result<void> ResourceAddressedExecutionKernel::retain_runtime_scale_observation_locked(
-    std::unique_lock<KernelStateMutex>& state_lock, ActiveOperation& operation,
-    RuntimeScaleStatusDTO status, const char* reason) {
+    ActiveOperation& operation, RuntimeScaleStatusDTO status, const char* reason) {
   const auto& prior = *operation.runtime_scale_status;
   // Freshness and virtual time are live observations, not journal events.
   // Keep every current sample but persist only a change of scale/application
@@ -4839,7 +4849,7 @@ Result<void> ResourceAddressedExecutionKernel::retain_runtime_scale_observation_
                  });
   if (!unchanged) {
     auto captured = operation.state;
-    auto durable = record_operation_state_locked(state_lock, captured, &status, reason);
+    auto durable = record_operation_state_locked(captured, &status, reason);
     if (!durable.ok()) {
       return Result<void>::Err(durable.error());
     }
@@ -4906,7 +4916,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_runtime_scale_status(
               "participant engine returned runtime-scale status for another binding",
               "runtime_scale_status_identity_mismatch");
     status.updated_at_ns = clock_.now();
-    return retain_runtime_scale_observation_locked(state_lock, *active_operation, std::move(status),
+    return retain_runtime_scale_observation_locked(*active_operation, std::move(status),
                                                    "runtime_scale_status_identity_mismatch");
   }
   if (resolved_status.accepted_generation < status.runtime_scale_generation) {
@@ -4919,7 +4929,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_runtime_scale_status(
                               "participant engine advanced an unrequested runtime-scale generation",
                               "runtime_scale_status_generation_mismatch");
     status.updated_at_ns = clock_.now();
-    return retain_runtime_scale_observation_locked(state_lock, *active_operation, std::move(status),
+    return retain_runtime_scale_observation_locked(*active_operation, std::move(status),
                                                    "runtime_scale_status_generation_mismatch");
   }
   const auto valid_scale = [](const double scale) {
@@ -4944,7 +4954,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_runtime_scale_status(
                               "participant engine returned invalid runtime-scale values",
                               "runtime_scale_status_invalid");
     status.updated_at_ns = clock_.now();
-    return retain_runtime_scale_observation_locked(state_lock, *active_operation, std::move(status),
+    return retain_runtime_scale_observation_locked(*active_operation, std::move(status),
                                                    "runtime_scale_status_invalid");
   }
   participant.commanded_scale = resolved_status.commanded_scale;
@@ -4989,7 +4999,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_runtime_scale_status(
         std::abs(item.applied_scale - status.requested_scale) > 1e-12)
       status.state = RuntimeScaleApplicationState::kPending;
   }
-  return retain_runtime_scale_observation_locked(state_lock, *active_operation, std::move(status),
+  return retain_runtime_scale_observation_locked(*active_operation, std::move(status),
                                                  "runtime_scale_status_observed");
 }
 

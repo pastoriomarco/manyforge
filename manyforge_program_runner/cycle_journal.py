@@ -26,8 +26,6 @@ from .cycle_journal_writer import CYCLE_COLUMNS, CycleJournalWriter, JournalComm
 # v12: `program_cycle_metadata.records_lost`, set by the writer when records of
 # this start were not written.
 SCHEMA_VERSION: Final = 12
-# Bound on draining the writer and closing the file at shutdown.
-CLOSE_TIMEOUT_SECONDS: Final = 1.0
 # How many of the most recent completed persistent-value requests are kept.
 MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS: Final = 16_384
 MAXIMUM_FINISHED_HISTORY_BYTES: Final = 256 * 1024 * 1024
@@ -1666,17 +1664,14 @@ class ProgramCycleJournal:
                 self._delete_inflight(stage, key)
             self._prune_finished_history_locked()
 
-    def close(self, timeout_s: float = CLOSE_TIMEOUT_SECONDS) -> None:
-        """Stop changes, let the writer drain and close the file, bounded by ``timeout_s``.
-
-        On timeout the records not yet written are lost and the file keeps its WAL.
-        """
+    def close(self) -> None:
+        """Stop changes, let the writer drain and close the file."""
 
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-        self._writer.close(timeout_s)
+        self._writer.close()
 
 
 __all__ = [

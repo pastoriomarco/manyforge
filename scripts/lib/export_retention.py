@@ -51,12 +51,6 @@ _safe_inventory_path = run_session._safe_inventory_path
 CONSOLE_TAIL_BYTES = 10_000_000
 _MAX_DELETIONS = 8
 _MAX_SCAN_ENTRIES = 100_000
-_LEGACY_SESSION_ENTRIES = frozenset({
-    "manager", "manager-run", "execution-state", "execution-run", "publications",
-    "artifacts", "composer-authoring", "installed-targets", "workbench-startup-timing.json",
-    *(name + suffix for name in ("program-cycle.sqlite3", "logical-scene.sqlite3")
-      for suffix in ("", "-wal", "-shm", "-journal")),
-})
 _RECEIPT_PARTIAL = re.compile(r"\.mounted-[0-9a-f]{64}\.partial\Z")
 _EXPORT_NAME = re.compile(r"[0-9]{8}T[0-9]{6}Z(?:\.[0-9]{9})?(?:\.partial)?\Z")
 
@@ -460,7 +454,7 @@ def rotate_retained_logs(root: Path, policy: SiteRetentionPolicy, *,
         root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         fcntl.flock(root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         pruned, session_warning = run_session.prune_own_files(
-            root, root_fd, policy, reader=disk_facts, legacy_entries=_LEGACY_SESSION_ENTRIES)
+            root, root_fd, policy, reader=disk_facts)
         deleted.extend(pruned)
         for _ in range(_MAX_DELETIONS + 1):
             _check_root_identity(root, root_fd)

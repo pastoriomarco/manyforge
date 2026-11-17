@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
 import itertools
+import logging
 from pathlib import Path
 import threading
 from threading import Event, Thread
@@ -54,6 +55,7 @@ from manyforge_behavior.request_keys import (
 )
 from manyforge_behavior import program_scheduling
 from manyforge_behavior.program_scheduling import (
+    PROGRAM_TICK_WORKER_FAILED_CODE,
     PROGRAM_TICKS_LATE_CODE,
     ProgramRunHoldFacts,
     ProgramInterventionRegistry,
@@ -1225,7 +1227,9 @@ def test_slow_admission_does_not_block_existing_program_run_reads() -> None:
     assert len(second_results) == 1
 
 
-def test_terminal_cleanup_is_retryable_before_the_run_claims_completion() -> None:
+def test_failed_terminal_cleanup_is_retried_only_after_a_reset_allows_it() -> None:
+    """OD-279: a failed cleanup is not retried on later ticks; a Reset's
+    ``retry_cleanup`` allows exactly one more attempt on the next tick."""
     class _RetryingContext(_ContextPort):
         failures = 1
 
@@ -1253,6 +1257,13 @@ def test_terminal_cleanup_is_retryable_before_the_run_claims_completion() -> Non
     assert observed.state is ProgramRunState.FINALIZING
     assert context_port.unbound == [1]
 
+    held = owner.advance_once(started.capture.program_run_id)
+    assert held == first
+    assert owner.cleanup_failed(started.capture.program_run_id)
+    assert context_port.unbound == [1]
+
+    assert owner.retry_cleanup(started.capture.program_run_id)
+    assert not owner.retry_cleanup(started.capture.program_run_id)
     completed = owner.advance_once(started.capture.program_run_id)
     assert completed.state is ProgramRunState.SUCCEEDED
     assert completed.reason_code is None
@@ -1365,6 +1376,46 @@ def test_tick_host_advances_each_scheduled_run_and_removes_terminal_work() -> No
         ProgramRunState.SUCCEEDED
     )
     host.shutdown()
+
+
+def test_tick_host_ends_the_wait_on_a_failed_cleanup_until_a_reset_retries_it():
+    """OD-279: a failed cleanup leaves the tick schedule and ends
+    ``wait_terminal`` with its typed cause; ``retry_cleanup`` makes one more
+    attempt on the next tick, and the run settles when it succeeds."""
+
+    class _FailingContext(_ContextPort):
+        failures = 2
+
+        def unbind(self, program_run_id: int) -> None:
+            super().unbind(program_run_id)
+            if self.failures:
+                self.failures -= 1
+                raise RuntimeError("context release failed")
+
+    context_port = _FailingContext([])
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.SUCCEEDED, context_port=context_port
+    )
+    host = ProgramRunTickHost(owner, tick_interval_s=0.01)
+    try:
+        run_id = host.start_run(admission).capture.program_run_id
+        _host_scene_step_sent(host)
+        for attempt in (1, 2):
+            (held,) = host.advance_ready_once()
+            assert held.state is ProgramRunState.FINALIZING
+            assert host.advance_ready_once() == ()  # No retry on a tick.
+            assert context_port.unbound == [run_id] * attempt
+            with pytest.raises(ProgramSchedulingError) as failed:
+                host.wait_terminal(run_id)
+            assert failed.value.code == "program_run_cleanup_failed"
+            assert "context release failed" in str(failed.value)
+            host.retry_cleanup(run_id)
+        (settled,) = host.advance_ready_once()
+        assert settled.state is ProgramRunState.SUCCEEDED
+        assert context_port.unbound == [run_id] * 3
+        assert host.wait_terminal(run_id) == settled
+    finally:
+        host.shutdown()
 
 
 @pytest.mark.parametrize(
@@ -4321,14 +4372,26 @@ def test_first_intervention_is_published_before_host_becomes_idle():
         host.shutdown()
 
 
+def _tick_worker_failure_lines(caplog) -> list[logging.LogRecord]:
+    return [
+        record
+        for record in caplog.records
+        if record.getMessage()
+        == f"manyforge_fault code={PROGRAM_TICK_WORKER_FAILED_CODE}"
+    ]
+
+
 @pytest.mark.parametrize("background", [False, True])
-def test_tick_host_latches_terminal_observer_failure(background) -> None:
+def test_tick_host_latches_terminal_observer_failure(background, caplog) -> None:
     owner, admission, _task, _scope, _events = _fixture(
         initial_task_state=OwnerTaskState.SUCCEEDED
     )
+    caplog.set_level("ERROR", logger=program_scheduling.__name__)
+    failure = RuntimeError("journal unavailable")
+    failures: list[Exception] = []
 
     def reject(_snapshot) -> None:
-        raise RuntimeError("journal unavailable")
+        raise failure
 
     delivered, records = Event(), []
 
@@ -4338,7 +4401,12 @@ def test_tick_host_latches_terminal_observer_failure(background) -> None:
             records.append(record)
             delivered.set()
 
-    host = ProgramRunTickHost(owner, terminal_observer=reject, state_observer=observe)
+    host = ProgramRunTickHost(
+        owner,
+        terminal_observer=reject,
+        state_observer=observe,
+        failure_observer=failures.append,
+    )
     if background:
         host.start()
     try:
@@ -4349,10 +4417,95 @@ def test_tick_host_latches_terminal_observer_failure(background) -> None:
                 host.advance_ready_once()
         assert delivered.wait(timeout=2)
         assert len(records) == 1 and records[0]["state"] == "succeeded"
-        with pytest.raises(ProgramSchedulingError, match="worker failed"):
+        with pytest.raises(ProgramSchedulingError, match="worker failed") as refused:
             host.schedule(99)
+        # OD-267: the refusal carries the typed code; the latch was logged
+        # once, with its traceback, and reported once.
+        assert refused.value.code == PROGRAM_TICK_WORKER_FAILED_CODE
+        [line] = _tick_worker_failure_lines(caplog)
+        assert line.levelname == "ERROR" and line.exc_info[1] is failure
+        assert failures == [failure]
     finally:
         host.shutdown()
+
+
+def test_tick_host_latches_and_logs_a_failed_tick_worker(caplog) -> None:
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    caplog.set_level("ERROR", logger=program_scheduling.__name__)
+    failure = RuntimeError("tick failed")
+    failures: list[Exception] = []
+    reported = Event()
+
+    def fail(_program_run_id: int) -> None:
+        raise failure
+
+    def report(error: Exception) -> None:
+        failures.append(error)
+        reported.set()
+
+    host = ProgramRunTickHost(owner, failure_observer=report)
+    host._advance = fail  # type: ignore[method-assign]  # noqa: SLF001
+    host.start()
+    try:
+        host.start_run(admission)
+        assert reported.wait(timeout=2)
+        with pytest.raises(ProgramSchedulingError, match="worker failed") as refused:
+            host.schedule(99)
+        assert refused.value.code == PROGRAM_TICK_WORKER_FAILED_CODE
+        assert refused.value.__cause__ is failure
+        [line] = _tick_worker_failure_lines(caplog)
+        assert line.levelname == "ERROR" and line.exc_info[1] is failure
+        assert failures == [failure]
+    finally:
+        host.shutdown()
+
+
+def test_a_command_taken_by_a_failing_tick_gets_the_typed_refusal() -> None:
+    # The tick fails after applying a command (its facts cannot be
+    # published): the command is still answered, with the latched worker
+    # failure's typed refusal, once the tick loop has ended.
+    owner, admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    failure = RuntimeError("facts unavailable")
+    applied = Event()
+    publish = owner._publish_tick_facts  # noqa: SLF001
+
+    def publish_or_fail(program_run_id: int) -> None:
+        if applied.is_set():
+            raise failure
+        publish(program_run_id)
+
+    owner._publish_tick_facts = publish_or_fail  # type: ignore[method-assign]  # noqa: SLF001
+    host = ProgramRunTickHost(owner)
+    host.start()
+    try:
+        started = host.start_run(admission)
+        thread, outcome = _post(
+            host,
+            lambda: host._through_tick(  # noqa: SLF001
+                started.capture.program_run_id, applied.set
+            ),
+        )
+        with pytest.raises(ProgramSchedulingError, match="worker failed") as refused:
+            _answer(thread, outcome)
+        assert refused.value.code == PROGRAM_TICK_WORKER_FAILED_CODE
+        assert refused.value.__cause__ is failure
+    finally:
+        host.shutdown()
+
+
+def test_other_scheduling_refusals_carry_no_code() -> None:
+    owner, _admission, _task, _scope, _events = _fixture(
+        initial_task_state=OwnerTaskState.ACTIVE
+    )
+    host = ProgramRunTickHost(owner)
+    host.shutdown()
+    with pytest.raises(ProgramSchedulingError, match="shut down") as refused:
+        host.schedule(1)
+    assert refused.value.code is None
 
 
 class _TickClock:
@@ -6407,7 +6560,7 @@ def test_a_run_without_a_mock_port_runs_through_halt_resume_and_stop():
 def test_an_unconfirmed_mock_end_holds_the_run_short_of_terminal_until_unbind_succeeds():
     """The native unbind fails while a Mock END is unanswered.
     The Run stays FINALIZING (not terminal: no terminal record, readiness or
-    claim release can follow), and the finalizing tick re-enters unbind."""
+    claim release can follow); each Reset's retry re-enters unbind (OD-279)."""
     from manyforge_behavior.production_ports import ProductionPortError
 
     class _PendingEndContext(_ContextPort):
@@ -6429,11 +6582,14 @@ def test_an_unconfirmed_mock_end_holds_the_run_short_of_terminal_until_unbind_su
     )
     run_id = owner.start(admission).capture.program_run_id
     _scene_step_sent(owner, run_id)
-    for _ in range(2):
+    for attempt in range(2):
+        if attempt:
+            assert owner.retry_cleanup(run_id)
         held = owner.advance_once(run_id)
         assert held.state is ProgramRunState.FINALIZING
         assert held.reason_code == "program_run_cleanup_failed"
         assert "unconfirmed Mock simulation ends" in held.message
+    assert owner.retry_cleanup(run_id)
     completed = owner.advance_once(run_id)
     assert completed.state is ProgramRunState.SUCCEEDED
     assert context_port.unbound == [run_id] * 3

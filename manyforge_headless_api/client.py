@@ -46,8 +46,10 @@ _OBSERVATION_CREDIT_SCHEMA = "manyforge.execution_observation_credit.v2"
 _MAXIMUM_OBSERVATION_FRAME_BYTES = 4 * 1024 * 1024
 # Command calls (OD-214): runner commands, stored-value edits, control
 # commands, activation preparation and the Apply's Manager submissions answer
-# at acceptance and are followed through their published status. Only the
-# connection is bounded; the wait for the reply is not.
+# at acceptance and are followed through their published status. The
+# Runner's between-nodes Scene latch is answered once Headless's mirror shows
+# what it committed (OD-294), a wait with no time limit. Only the connection
+# is bounded; the wait for the reply is not.
 _COMMAND_PATH = re.compile(
     r"^/api/(?:"
     r"program/runs(?:/[1-9][0-9]*/(?:motion-start|resume-motion|resume-halt"
@@ -56,6 +58,7 @@ _COMMAND_PATH = re.compile(
     r"|program/persistent-values(?:/reset|/clear)?"
     r"|control/commands|activation-preparations"
     r"|manager/apply(?:/release-for-new)?"
+    r"|scene/runtime-latch|scene/transactions"
     r")$"
 )
 
@@ -651,13 +654,6 @@ class HeadlessHttpClient:
     def settle_authoring_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request(
             "POST", "/api/program/authoring-transactions/settle", body=body
-        )
-
-    def recover_authoring_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request(
-            "POST",
-            "/api/program/authoring-transactions/recovery-receipt",
-            body=body,
         )
 
     # Component model v2.
@@ -1320,6 +1316,12 @@ class HeadlessHttpClient:
 
     def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/scene/transactions", body=body)
+
+    def scene_runtime_owner(self) -> dict[str, Any]:
+        return self.request("GET", "/api/scene/runtime-owner")
+
+    def latch_scene_runtime_between_nodes(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/scene/runtime-latch", body=body)
 
     def scene_transaction_status(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/scene/transactions/status", body=body)

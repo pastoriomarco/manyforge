@@ -1,15 +1,7 @@
 {
   "api_version": "manyforge.program.v3",
   "blackboard": {
-    "keys": [
-      {
-        "access": "read_write",
-        "description": "Intentionally simulated gripper closed/open state.",
-        "key": "gripper_closed",
-        "persistence": "run",
-        "type": "bool"
-      }
-    ],
+    "keys": [],
     "namespaces": []
   },
   "catalog": {
@@ -27,7 +19,7 @@
       "ur5"
     ]
   },
-  "description": "Pick-and-place demo for the UR5 source model. It preserves the original approach, pick, retreat, drop, detach, and rest motion sequence while keeping the intentionally simulated gripper state as ordinary Program data. Exact scene and attachment revisions now invalidate planning automatically.",
+  "description": "Pick-and-place demo for the UR5e with a Robotiq 2F-85. It keeps the original approach, pick, retreat, drop, detach, and rest motion sequence; the gripper closes on the part before attach and opens before detach. The TCP is the gripper mount (the UR5e `tool0`), so pick targets sit 0.14 m above the part, where the open fingers straddle it. Exact scene and attachment revisions invalidate planning automatically.",
   "forest": [
     {
       "children": [
@@ -52,7 +44,7 @@
               "position_m": [
                 0.0,
                 0.0,
-                0.1
+                0.19
               ]
             },
             "planning_timeout_s": 10.0,
@@ -97,7 +89,7 @@
               "position_m": [
                 0.0,
                 0.0,
-                0.05
+                0.14
               ]
             },
             "planning_timeout_s": 10.0,
@@ -124,10 +116,17 @@
         {
           "children": [],
           "instance_id": "close_gripper",
-          "node_id": "logic.set_value",
+          "node_id": "gripper.command_position",
           "parameters": {
-            "key": "gripper_closed",
-            "value": true
+            "position": {
+              "kind": "named_preset",
+              "name": "closed"
+            },
+            "target": {
+              "command_target_id": "gripper",
+              "component_id": "robotiq_2f_85"
+            },
+            "completion_timeout_s": 15.0
           }
         },
         {
@@ -136,18 +135,18 @@
           "node_id": "scene.attach_carried_object",
           "parameters": {
             "carrier_frame_ref": {
-              "component_id": "ur5_robot",
+              "component_id": "robotiq_2f_85",
               "frame_id": "tcp"
             },
             "scene_resource_id": "graspable",
             "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
+              "command_target_id": "gripper",
+              "component_id": "robotiq_2f_85"
             },
             "touch_bodies": [
               {
-                "component_id": "ur5_robot",
-                "collision_body_id": "tool_collision"
+                "component_id": "robotiq_2f_85",
+                "collision_body_id": "gripper_collision"
               }
             ]
           }
@@ -181,7 +180,7 @@
             "target_reference": {
               "type": "component_frame",
               "frame": {
-                "component_id": "ur5_robot",
+                "component_id": "robotiq_2f_85",
                 "frame_id": "tcp"
               }
             },
@@ -322,10 +321,17 @@
         {
           "children": [],
           "instance_id": "open_gripper",
-          "node_id": "logic.set_value",
+          "node_id": "gripper.command_position",
           "parameters": {
-            "key": "gripper_closed",
-            "value": false
+            "position": {
+              "kind": "named_preset",
+              "name": "open"
+            },
+            "target": {
+              "command_target_id": "gripper",
+              "component_id": "robotiq_2f_85"
+            },
+            "completion_timeout_s": 15.0
           }
         },
         {
@@ -335,8 +341,8 @@
           "parameters": {
             "scene_resource_id": "graspable",
             "target": {
-              "component_id": "ur5_robot",
-              "command_target_id": "arm"
+              "command_target_id": "gripper",
+              "component_id": "robotiq_2f_85"
             }
           }
         },

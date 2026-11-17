@@ -332,7 +332,7 @@ def test_a_cleanup_whose_file_write_fails_is_made_in_memory_and_written_later(
     assert register.reconcile(removed).outcome == "duplicate"
     monkeypatch.setattr(persistent_keys.os, "replace", replace)
     # The close writes the latest state again.
-    assert register.close(5.0)
+    register.close()
     reopened = PersistentKeyRegister(tmp_path, application_start_id=_A)
     assert reopened.values("/cells/a/cell.scenario") == {}
     assert reopened.activation["record_digest"] == "h.apply.2"

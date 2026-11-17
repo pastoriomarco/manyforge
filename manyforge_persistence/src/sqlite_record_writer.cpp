@@ -27,11 +27,6 @@ SqliteRecord& SqliteRecord::Bind(const int index, const std::int64_t value) {
   return *this;
 }
 
-SqliteRecord& SqliteRecord::BindReal(const int index, const double value) {
-  Add(index, value, 0U);
-  return *this;
-}
-
 SqliteRecord& SqliteRecord::Bind(const int index, const std::string_view text) {
   Add(index, std::string(text), text.size());
   return *this;
@@ -60,8 +55,6 @@ std::string_view ToString(const SqliteRecordNotWrittenReason reason) noexcept {
       return "queue_full";
     case SqliteRecordNotWrittenReason::kWriteFailed:
       return "write_failed";
-    case SqliteRecordNotWrittenReason::kNotDrained:
-      return "not_drained";
   }
   return {};
 }
@@ -83,7 +76,6 @@ SqliteRecordWriter::StoreSlot SqliteRecordWriter::RegisterConnection(
       false,
       false,
       LossMark::kNone,
-      0U,
       0U,
       0U});
   return StoreSlot{slots_.size() - 1U};
@@ -112,12 +104,10 @@ bool SqliteRecordWriter::Post(const StoreSlot slot, SqliteRecord record) {
   return false;
 }
 
-void SqliteRecordWriter::DrainAndStop(
-    const std::optional<std::chrono::steady_clock::time_point> deadline) {
+void SqliteRecordWriter::DrainAndStop() {
   {
     std::lock_guard lock(mutex_);
     stopping_ = true;
-    deadline_ = deadline;
   }
   work_available_.notify_one();
   if (thread_.joinable()) {
@@ -143,19 +133,7 @@ void SqliteRecordWriter::Run() {
       continue;
     }
     if (queue_.empty()) {
-      FinishStop(lock, true);
-      return;
-    }
-    if (stopping_ && deadline_.has_value() &&
-        std::chrono::steady_clock::now() >= *deadline_) {
-      for (const auto& queued : queue_) {
-        ++slots_[queued.slot].not_drained;
-      }
-      records_not_written_.fetch_add(
-          queue_.size(), std::memory_order_relaxed);
-      queue_.clear();
-      queued_bytes_ = 0U;
-      FinishStop(lock, false);
+      FinishStop(lock);
       return;
     }
     auto queued = std::move(queue_.front());
@@ -211,8 +189,6 @@ std::optional<std::string> SqliteRecordWriter::Write(
               return sqlite3_bind_null(statement, index);
             } else if constexpr (std::is_same_v<Held, std::int64_t>) {
               return sqlite3_bind_int64(statement, index, held);
-            } else if constexpr (std::is_same_v<Held, double>) {
-              return sqlite3_bind_double(statement, index, held);
             } else if constexpr (std::is_same_v<Held, std::string>) {
               return sqlite3_bind_text(
                   statement,
@@ -293,31 +269,26 @@ void SqliteRecordWriter::OnRecordNotWritten(
   }
 }
 
-void SqliteRecordWriter::FinishStop(
-    std::unique_lock<std::mutex>& lock,
-    const bool drained) {
-  if (drained) {
-    for (std::size_t index = 0U; index < slots_.size(); ++index) {
-      if (slots_[index].mark != LossMark::kPending) {
-        continue;
-      }
-      sqlite3* const connection = slots_[index].connection;
-      const std::string records_lost_mark = slots_[index].records_lost_mark;
-      lock.unlock();
-      const bool written = WriteMark(connection, records_lost_mark);
-      lock.lock();
-      if (written) {
-        slots_[index].mark = LossMark::kWritten;
-      }
+void SqliteRecordWriter::FinishStop(std::unique_lock<std::mutex>& lock) {
+  for (std::size_t index = 0U; index < slots_.size(); ++index) {
+    if (slots_[index].mark != LossMark::kPending) {
+      continue;
+    }
+    sqlite3* const connection = slots_[index].connection;
+    const std::string records_lost_mark = slots_[index].records_lost_mark;
+    lock.unlock();
+    const bool written = WriteMark(connection, records_lost_mark);
+    lock.lock();
+    if (written) {
+      slots_[index].mark = LossMark::kWritten;
     }
   }
   std::string counts;
   for (const auto& store : slots_) {
-    if (store.dropped + store.failed + store.not_drained != 0U) {
+    if (store.dropped + store.failed != 0U) {
       counts += " store=" + store.store_name +
                 " queue_full=" + std::to_string(store.dropped) +
-                " write_failed=" + std::to_string(store.failed) +
-                " not_drained=" + std::to_string(store.not_drained) + ";";
+                " write_failed=" + std::to_string(store.failed) + ";";
     }
   }
   lock.unlock();

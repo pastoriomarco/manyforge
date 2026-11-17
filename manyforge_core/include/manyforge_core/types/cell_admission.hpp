@@ -327,6 +327,12 @@ struct ProgramResetPositionAuthorizationDTO final {
 [[nodiscard]] Result<void> ValidateProgramResetPositionAuthorization(
     const ProgramResetPositionAuthorizationDTO& authorization);
 
+/// The typed code of a lost Program Runner contact (OD-296 (a)): the Manager's
+/// exchange with the Runner ended because the connection was refused or
+/// closed before the reply. A Runner that is slow to answer is not lost.
+inline constexpr std::string_view kProgramRunnerContactLostCode =
+    "program_runner_contact_lost";
+
 /// Owner-produced O(1) reduction. Counts are complete bounded aggregates, not
 /// collections to be rescanned by admission or Stop.
 /// Manager's first failed contact with an established active Program owner.
@@ -335,6 +341,10 @@ struct ProgramRunnerContactLossDTO final {
   ProgramCycleStatusDTO established_cycle;
   std::string failure_predicate;
   std::string message;
+  /// The loss's typed code, always present: the Runner fault's own error code
+  /// for program_runner_fault, kProgramRunnerContactLostCode for every other
+  /// predicate (OD-296 (a)).
+  std::optional<std::string> fault_code{};
 
   friend bool operator==(const ProgramRunnerContactLossDTO&,
                          const ProgramRunnerContactLossDTO&) = default;

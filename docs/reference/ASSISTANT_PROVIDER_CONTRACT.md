@@ -41,7 +41,7 @@ The bridge then sends `POST {base_url}/chat/completions` with:
   `top_p` above 0 up to 1, `top_k` a positive integer; at least one field;
   the maintained profiles set none);
 - `chat_template_kwargs: {enable_thinking: true|false}` when the request
-  contract sets the optional `reasoning: on|off` (experimental; absent keeps
+  contract sets the optional `reasoning: on|off` (absent keeps
   the model's default; the maintained chat profile sets `off`);
 - `Authorization: Bearer <value of $api_key_env>` when `api_key_env` is set.
   An unset variable fails the request with `ai_model_token_unavailable`

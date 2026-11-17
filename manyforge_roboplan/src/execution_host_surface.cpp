@@ -4663,14 +4663,14 @@ void ExecutionCommandSurface::SendResponse(
   ///   FIFO in host enqueue order, one in flight; the Kernel admits each
   ///   write when it starts, and a started write completes.
   ///
-  /// Cross-lane fences: Reset, recovery and Stop-fence release name the
-  /// exact operation revision, Stop id and generation they act on, and their
+  /// Cross-lane fences: Reset and recovery name the exact operation
+  /// revision, Stop id and generation they act on, and their
   /// clients issue them only after reading that state on the control or
   /// component socket. A stale name is refused (the Program owner also
   /// refuses a cycle Reset while its Stop is not terminal); a Kernel Reset of
   /// a participant still stopping hard-stops it first, so no ordering of the
   /// sockets lets Reset restart motion or release a newer Stop. Alarm
-  /// attention is fenced by owner epoch, incarnation and monotonic generation
+  /// attention is fenced by host boot and monotonic generation
   /// and evaluated at admission only by age, so admission on another lane
   /// observes either the previous or the new publication, both valid. Event
   /// pages are journal-sequence ordered.

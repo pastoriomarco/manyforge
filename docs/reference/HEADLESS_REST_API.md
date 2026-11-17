@@ -13,6 +13,10 @@ This is the independent headless projection over Manager, logical-scene, scene-r
 
 The `request_key` of a Scene request (`/api/scene/transactions`) is recognised, and the request sent again is answered with its first result, until the Scene store folds its history into a snapshot; a request sent again after that is treated as a new request.
 
+A successful Scene commit is answered once Headless's own view of the logical scene shows the committed revision (or a newer one, or another active bundle, graph or scene), so a read after the reply shows the commit; when the Manager stops answering, or Headless shuts down, the success reply is returned at once. This wait has no time limit.
+
+The Program runner latches pose observations into the scene between nodes through `GET /api/scene/runtime-owner` and `POST /api/scene/runtime-latch`. A latch that committed observations is answered under the same rule as a Scene commit; one that committed none is answered at once.
+
 The live schema is available at `/openapi.json` and `/docs` while the API process is running.
 
 OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
@@ -91,7 +95,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/program/applied` |  | Program Applied |
 | `GET` | `/api/program/applied/status` |  | Program Applied Status |
 | `POST` | `/api/program/authoring-transactions` |  | Acquire Authoring Transaction |
-| `POST` | `/api/program/authoring-transactions/recovery-receipt` |  | Recover Authoring Transaction |
 | `POST` | `/api/program/authoring-transactions/settle` |  | Settle Authoring Transaction |
 | `GET` | `/api/program/committed-activation` |  | Program Committed Activation |
 | `POST` | `/api/program/component-frame-lookup` |  | Lookup Component Frame |
@@ -123,6 +126,8 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/runtime` |  | Runtime |
 | `GET` | `/api/scene` |  | Scene |
 | `POST` | `/api/scene/resource-poses/query` |  | Scene Resource Poses |
+| `POST` | `/api/scene/runtime-latch` |  | Scene Runtime Latch |
+| `GET` | `/api/scene/runtime-owner` |  | Scene Runtime Owner |
 | `POST` | `/api/scene/transactions` |  | Scene Commit |
 | `POST` | `/api/scene/transactions/status` |  | Scene Transaction Status |
 | `GET` | `/api/skills` |  | Skills |

@@ -842,12 +842,21 @@ class ComposerState:
         ]
         if failed:
             diagnostics = _manager_projection_diagnostics(phase, failed, row, payload)
+            # OD-281: a Manager section too large for its status frame is
+            # refused with its own typed cause, not as a missing Manager.
+            gaps = row.get("known_gaps")
+            code = (
+                "manager_status_section_oversized"
+                if isinstance(gaps, list) and "manager_status_section_oversized" in gaps
+                else "manager_projection_unavailable"
+            )
             _LOGGER.warning(
-                "manager_projection_unavailable %s",
+                "%s %s",
+                code,
                 json.dumps(diagnostics, sort_keys=True, default=str)[:_MAX_DIAGNOSTIC_LOG_LINE],
             )
             raise DraftSessionError(
-                "manager_projection_unavailable",
+                code,
                 "activation requires one fresh Manager projection",
                 status_code=503,
                 detail=diagnostics,

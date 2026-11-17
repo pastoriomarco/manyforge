@@ -722,6 +722,24 @@ TEST(KernelCellAdmissionOwner,
             CellAdmissionOwnerTransactionId(ProgramRunNumber(105U)));
 }
 
+// K-6: `starting` names no run before its claim; the run number is the cycle
+// generation, so only that run's claim matches.
+TEST(KernelCellAdmissionOwner, UnannouncedStartingProgramCycleAdmitsOnlyItsOwnRunClaim) {
+  for (const std::uint64_t run : {105U, 145U}) {
+    FixedClock clock;
+    AdmissionJournal journal;
+    auto owner = Owner(clock, journal);
+    auto starting = Ready();
+    starting.program_cycle_status = ProgramCycleStatusDTO{105U, ProgramCycleStateDTO::kStarting,
+        std::nullopt, std::nullopt, std::nullopt};
+    ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(starting).ok());
+    auto intent = Intent(CellAdmissionClaimKindDTO::kProgramCycle,
+                         owner.GetAuthoringAdmission().admission_generation, "program.unannounced");
+    intent.owner_transaction_id = ProgramRunNumber(run);
+    EXPECT_EQ(owner.AcquireCellAdmissionClaim(intent).ok(), run == 105U) << run;
+  }
+}
+
 TEST(KernelCellAdmissionOwner,
      StartingProgramCycleExceptionIsExactAndFailsClosedForEveryOtherCase) {
   const auto rejected = [](auto mutate_readiness, auto mutate_intent) {

@@ -739,10 +739,11 @@ describe('Program runtime projection', () => {
     expect(halted).toContain('<strong>Stopped</strong>');
     // The cause of the current Halt shows while the run is halted.
     expect(halted).toMatch(/aria-label="Halt cause"[^>]*><span>Halted by the operator\.<\/span>/);
-    const lateHost = controller('halted');
-    lateHost.state.run!.halt = { kind: 'halt', sourceLabel: 'manager.execution_host_late' };
-    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={lateHost} />))
-      .toContain('Halted: the execution host was late.');
+    const diskFull = controller('halted');
+    diskFull.state.run!.halt = { kind: 'halt', sourceLabel: 'headless.disk_cannot_keep_records' };
+    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={diskFull} />))
+      // The static markup escapes the apostrophe.
+      .toContain('Halted: the disk cannot keep ManyForge&#x27;s records.');
     // Unknown or no-text kinds show nothing; the line goes with the Halt.
     const planned = controller('halted');
     planned.state.run!.halt = { kind: 'planned_stop', sourceLabel: null };

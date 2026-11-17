@@ -45,8 +45,8 @@ struct ManagedProjectionCandidate final {
 
 /// One candidate's verified inputs and its immutable per-group models.
 ///
-/// Verification and model construction run once per candidate and compiled
-/// group, not once per provider. The per-request group selection (which also
+/// Verification and the collision-model load run once per candidate; each
+/// compiled group's model is bound once, not once per provider. The per-request group selection (which also
 /// performs that provider's binding checks) runs on every Acquire. Exactly
 /// one candidate is held: a different candidate replaces it and Release()
 /// drops it.
@@ -98,6 +98,12 @@ struct ManagedProjectionCandidateInputs final {
   std::shared_ptr<const deployment::RetainedBundle> bundle;
   deployment::VerifiedRetainedModelMap model_map;
   deployment::VerifiedRetainedPlanningModel planning_model;
+  /// The full-cell collision model, loaded once per candidate without a
+  /// group; every group's model is bound from it with the staged loader URDF
+  /// and SRDF text it was loaded from.
+  collision::ManyForgeCollisionEngine::SharedModelPtr collision_model;
+  std::string loader_urdf_bytes;
+  std::string srdf_bytes;
 };
 
 /// Retained-input verification and shared collision-model construction.
@@ -105,7 +111,8 @@ class IManagedProjectionAssetSource {
 public:
   virtual ~IManagedProjectionAssetSource() = default;
 
-  /// Verifies the candidate's retained bundle, model map and planning model.
+  /// Verifies the candidate's retained bundle, model map and planning model
+  /// and loads its group-independent collision model.
   [[nodiscard]] virtual ManagedProjectionCandidateInputs
   VerifyCandidate(const ManagedProjectionCandidate &candidate) const = 0;
 

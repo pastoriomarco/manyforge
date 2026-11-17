@@ -178,9 +178,11 @@ public:
     return Presence(query, id);
   }
 
+  [[nodiscard]] std::uint64_t ProgressRequestMark() override { return 0U; }
+
   [[nodiscard]] std::optional<RuntimeUnitSourceReport>
   ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
-                  const RuntimeEpoch &runtime_epoch) override {
+                  const RuntimeEpoch &runtime_epoch, std::uint64_t) override {
     const auto id = query.plan.runtime_unit_id.value();
     events.push_back("progress:" + id);
     const auto found = epochs.find(id);
@@ -234,14 +236,21 @@ public:
     return state_;
   }
 
-  [[nodiscard]] bool CloseAdmissionAndProveClosed() override {
-    events->push_back("close_admission");
+  [[nodiscard]] AdmissionCloseState
+  CloseAdmissionAndProveClosed(const bool continue_posted) override {
+    events->push_back(continue_posted ? "close_admission_result"
+                                      : "close_admission");
     ++close_calls;
-    return close_succeeds;
+    if (close_pending_until_continued && !continue_posted)
+      return AdmissionCloseState::kPending;
+    return close_succeeds ? AdmissionCloseState::kClosed
+                          : AdmissionCloseState::kNotClosed;
   }
 
   ManagementIdleState state_;
   bool close_succeeds{true};
+  // The close's result comes in only on a later drive (OD-295 (3)(a)).
+  bool close_pending_until_continued{false};
   mutable int idle_reads{0};
   int close_calls{0};
   std::vector<std::string> *events{nullptr};
@@ -302,12 +311,14 @@ public:
 
   [[nodiscard]] ManagerPlannedMaintenanceResult Enter(
       const manyforge::core::ProjectionRevisionDTO *predecessor = nullptr,
-      const ManagerApplyIntentDTO *intent = nullptr) {
+      const ManagerApplyIntentDTO *intent = nullptr,
+      const bool continue_posted = false) {
     const auto accepted = intent == nullptr ? Intent() : *intent;
     const auto &expected =
         predecessor == nullptr ? accepted.expected_active_projection_revision
                                : *predecessor;
-    auto result = coordinator_.EnterIdleMaintenance(accepted, expected);
+    auto result =
+        coordinator_.EnterIdleMaintenance(accepted, expected, continue_posted);
     for (const auto &event : ports_.events) {
       events.push_back(event);
     }
@@ -339,6 +350,28 @@ TEST(ManagerPlannedMaintenanceCoordinator,
   EXPECT_TRUE(fixture.ports_.stop_calls.empty());
   EXPECT_TRUE(fixture.ports_.start_calls.empty());
   EXPECT_EQ(fixture.gate_.close_calls, 1);
+}
+
+// OD-295 (3)(a): the close is posted and its result picked up on the next
+// drive; a pending close is neither entered nor a terminal failure.
+TEST(ManagerPlannedMaintenanceCoordinator,
+     PostedAdmissionCloseIsPendingUntilItsResultIsPickedUp) {
+  MaintenanceFixture fixture;
+  fixture.gate_.close_pending_until_continued = true;
+
+  const auto pending = fixture.Enter();
+
+  EXPECT_TRUE(pending.admission_close_pending());
+  EXPECT_FALSE(pending.terminal_failure());
+  EXPECT_FALSE(pending.entered_idle_maintenance());
+  EXPECT_TRUE(pending.valid());
+
+  const auto entered = fixture.Enter(nullptr, nullptr, true);
+
+  EXPECT_TRUE(entered.entered_idle_maintenance());
+  EXPECT_EQ(fixture.events, (std::vector<std::string>{
+                                "close_admission", "close_admission_result"}));
+  EXPECT_TRUE(fixture.ports_.stop_calls.empty());
 }
 
 TEST(ManagerPlannedMaintenanceCoordinator,

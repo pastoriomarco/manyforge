@@ -108,7 +108,7 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   EXPECT_EQ(catalog.catalog_version(), "2.13.0");
   EXPECT_EQ(catalog.descriptor_digest(),
             "sha256:"
-            "9b3af691c1019f307d403a15195c90d240dd604c62fa135a51a59563beb82f0e");
+            "5d3199014adcc6b3dba1fc832cccf09e6ec195178668b51a70780a15e17e5a9e");
   ASSERT_FALSE(catalog.definitions().empty());
   // The dedicated carried-object alarm repeats its error row's compact text,
   // needs acknowledgement and gates no motion.

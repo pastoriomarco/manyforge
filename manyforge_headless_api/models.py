@@ -338,14 +338,6 @@ class AuthoringMutationSettlementRequest(StartIdentityRequest):
     evidence_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
 
 
-class AuthoringMutationRecoveryRequest(StartIdentityRequest):
-    """Private Composer-owner lookup for one exact durable claim intent."""
-
-    intent: dict[str, Any]
-    expected_claim: dict[str, Any] | None
-    expected_release: dict[str, Any] | None
-
-
 class AcknowledgeAlarmRequest(CallerAttributionRequest):
     activation_id: str
     expected_record_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
@@ -1450,6 +1442,33 @@ class SceneResourcePoseQuery(StrictRequest):
         if normalized != sorted(set(normalized)):
             raise ValueError("scene_resource_ids must be strictly sorted and unique")
         return normalized
+
+
+class SceneRuntimeIdentityRequest(StrictRequest):
+    """The Manager's scene-runtime identity, as `GET /api/scene/runtime-owner` reads it."""
+
+    retained_bundle_id: Annotated[str, Field(min_length=1, max_length=MAX_IDENTITY_BYTES)]
+    graph_revision: Annotated[str, Field(min_length=1, max_length=MAX_IDENTITY_BYTES)]
+    deployment_generation: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)]
+    program_generation: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)]
+    runtime_generation: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
+
+
+class SceneRuntimeLatchRequest(StrictRequest):
+    """One Program Runner between-nodes latch of pose observations (OD-294)."""
+
+    expected_runtime_identity: SceneRuntimeIdentityRequest
+    scene_resource_ids: (
+        Annotated[list[str], Field(min_length=1, max_length=MAX_SCENE_POSE_QUERY_RESOURCES)]
+        | None
+    ) = None
+
+    @field_validator("scene_resource_ids")
+    @classmethod
+    def validate_scene_resource_ids(cls, values: list[str] | None) -> list[str] | None:
+        if values is not None and values != sorted(set(values)):
+            raise ValueError("scene_resource_ids must be strictly sorted and unique")
+        return values
 
 
 class Vector3Request(StrictRequest):

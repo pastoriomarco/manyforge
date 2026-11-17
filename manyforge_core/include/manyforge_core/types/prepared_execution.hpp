@@ -59,15 +59,6 @@ struct PreparedMotionReplacementObservationDTO final {
   std::optional<ErrorDTO> error{};
 };
 
-/// Called under the participant mutex with the addressed state lock already
-/// held. The callback must not wait or acquire that lock. All preparation and
-/// validation precede it; successful owner CAS is the last fallible action.
-/// After success, backend and worker adoption perform prebuilt noexcept swaps.
-struct PreparedMotionReplacementCommitDTO final {
-  void* context{};
-  Result<void> (*owner_commit)(void*) noexcept {};
-};
-
 enum class PreparedParticipantPayloadKindDTO : std::uint8_t {
   kMotionExecution = 0,
   kCapabilityCommand,

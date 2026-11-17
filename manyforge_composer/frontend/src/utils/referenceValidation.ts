@@ -1,5 +1,5 @@
 /** The server hashes the exact authoring body using RFC 8785 canonical JSON. */
-function canonical(value: unknown): string {
+export function canonical(value: unknown): string {
   if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value);
   if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;

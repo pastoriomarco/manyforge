@@ -236,7 +236,7 @@ the chat mode's behaviour:
 |---|---|---|
 | `request_contract.default_timeout_s` | Time limit of one model call (`upstream_timeout`); at most 3600 | 180 |
 | `request_contract.max_output_tokens` | `max_tokens` of each model call; at most 65536 | 8192 |
-| `request_contract.reasoning` | Optional, experimental: `on`/`off` sends `chat_template_kwargs: {enable_thinking: true/false}`; absent sends nothing, so the server's default applies. A constrained-regeneration call always sends `false` when `on` | `off` |
+| `request_contract.reasoning` | Optional: `on`/`off` sends `chat_template_kwargs: {enable_thinking: true/false}`; absent sends nothing, so the server's default applies. A constrained-regeneration call always sends `false` when `on` | `off` |
 | `request_contract.sampling` | Optional: `{temperature?, top_p?, top_k?}` (`temperature` 0–2, `top_p` above 0 up to 1, `top_k` a positive integer; at least one field) sends exactly the fields set; absent sends no sampling parameters, so the model's or server's defaults apply | not set |
 | `stuck_loop_recovery` | Hints after repeated failures and a clarification stop ([§5](#5-what-the-assistant-does-for-you)); default on | on |
 | `constrained_regeneration` | Experimental: one schema-constrained repair of an invalid edit ([§5](#5-what-the-assistant-does-for-you)); default off | on |

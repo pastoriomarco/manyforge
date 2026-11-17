@@ -23,16 +23,22 @@ DecodeProgramRunnerManagerState(std::string_view state) {
   throw std::invalid_argument("Program Runner liveness state is invalid");
 }
 
+/// A Runner fault (OD-267) has one of these codes: a failed BB key
+/// publication or a failed Program tick worker.
+[[nodiscard]] inline bool IsProgramRunnerFaultCode(std::string_view code) {
+  return code == "program_bbkey_publication_failed" ||
+         code == "program_tick_worker_failed";
+}
+
 /// Decode only after the existing heartbeat receiver/set/sequence identity
 /// checks. The body supplies no predicate or operation/Run authority.
 [[nodiscard]] inline std::optional<core::ErrorDTO>
-DecodeProgramRunnerPublisherFault(
-    const content_identity::CanonicalValue &value) {
+DecodeProgramRunnerFault(const content_identity::CanonicalValue &value) {
   if (value.is_null())
     return std::nullopt;
   const auto invalid = [] {
     throw std::invalid_argument(
-        "Program Runner publisher fault has an invalid closed shape");
+        "Program Runner fault has an invalid closed shape");
   };
   if (!value.is_object() || value.as_object().size() != 3U)
     invalid();
@@ -40,7 +46,7 @@ DecodeProgramRunnerPublisherFault(
   const auto *message = value.find_object_member("message");
   const auto *details = value.find_object_member("details");
   if (!code || !code->is_string() ||
-      code->as_string() != "program_bbkey_publication_failed" || !message ||
+      !IsProgramRunnerFaultCode(code->as_string()) || !message ||
       !message->is_string() || message->as_string().size() > 1024U ||
       !content_identity::is_utf8_nfc(message->as_string()) || !details ||
       !details->is_object() || !details->as_object().empty())
@@ -48,41 +54,30 @@ DecodeProgramRunnerPublisherFault(
   return core::ErrorDTO{code->as_string(), message->as_string(), {}};
 }
 
-/// The existing retained Runner-loss diagnostic has a 1024-byte bound. Keep
-/// its typed cause when clipping a multibyte message at that boundary.
-[[nodiscard]] inline std::string
-ProgramRunnerPublisherFaultMessage(const core::ErrorDTO &error) {
-  auto message = error.code + ": " + error.message;
-  if (message.size() > 1024U) {
-    message.resize(1024U);
-    while (!content_identity::is_utf8_nfc(message))
-      message.pop_back();
-  }
-  return message;
-}
-
-class ProgramRunnerPublisherFault final : public std::runtime_error {
+/// The Runner fault keeps its typed error; the text is only the diagnostic.
+class ProgramRunnerFault final : public std::runtime_error {
 public:
-  ProgramRunnerPublisherFault(core::ErrorDTO error,
+  ProgramRunnerFault(core::ErrorDTO error,
                               core::ProgramCycleStatusDTO cycle)
-      : std::runtime_error(ProgramRunnerPublisherFaultMessage(error)),
-        cycle_(std::move(cycle)) {}
+      : std::runtime_error(error.code + ": " + error.message),
+        error_(std::move(error)), cycle_(std::move(cycle)) {}
+  const core::ErrorDTO &error() const noexcept { return error_; }
   const core::ProgramCycleStatusDTO &cycle() const noexcept { return cycle_; }
 
 private:
+  core::ErrorDTO error_;
   core::ProgramCycleStatusDTO cycle_;
 };
 
 /// This check precedes ordinary current/reconciliation acceptance and effects.
-inline void CheckProgramRunnerPublicationHealth(
+inline void CheckProgramRunnerHealth(
     const content_identity::CanonicalValue &value,
     const core::ProgramCycleStatusDTO &cycle,
     bool command_fenced) {
-  if (auto fault = DecodeProgramRunnerPublisherFault(value)) {
+  if (auto fault = DecodeProgramRunnerFault(value)) {
     if (!command_fenced)
-      throw std::invalid_argument(
-          "Program Runner publisher fault must fence commands");
-    throw ProgramRunnerPublisherFault(std::move(*fault), cycle);
+      throw std::invalid_argument("Program Runner fault must fence commands");
+    throw ProgramRunnerFault(std::move(*fault), cycle);
   }
 }
 

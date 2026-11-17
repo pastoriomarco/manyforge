@@ -635,6 +635,27 @@ exported references. Do not use Save As as an asset-collection operation.
 - **Apply** (Deployment) makes the Draft the running configuration. Replaced
   and removed components are disabled and stopped first; affected components
   come back prepared. Apply is refused while a Program run is in progress.
+- **Apply** and **Revert**, of the Program or the Deployment, keep the live
+  Scene: objects stay where they are; only Load and New initialize it. The
+  confirmation offers **Reload initial scene** (off by default) on every
+  Deployment Apply and Revert, and on a Program Apply or Revert when the
+  Program's initial scene changes. Once the Apply or Revert is Applied, a
+  Reset with **Reload initial scene** follows, which puts every object back
+  to its start pose and returns persistent keys to their initial values.
+  While it waits for the cycle to be Idle, the notice **Initial scene reload
+  pending** is shown. If a run or another command starts first, the Reset is
+  not sent and **Initial scene not reloaded** stays until acknowledged. If
+  that Reset is refused or fails, the Apply stays and the Reset's error is
+  shown. An Apply or Revert that is refused or fails reloads nothing.
+  Without the option, the live cell keeps its current scene until a
+  Reset with **Reload initial scene**. While a finished, stopped or held run
+  exists, Apply and Revert Reset it first (**Reset run and Apply**, **Reset
+  run and Revert**).
+  - A Deployment Apply that removes a component carrying an object fails
+    (`configuration_preservation_failed`). Reset with **Reload initial
+    scene** first, then apply.
+  - Objects placed relative to a component that the Apply moves keep their
+    old cell pose until a Reset with **Reload initial scene**.
 - **Prepare** and **Enable** run on one component (its page) or on all of them
   (**Prepare all**, **Enable all** in the Components list). On a machine,
   Prepare the owner first; Enable acts on members. On a real xArm the motors
@@ -731,12 +752,22 @@ included, and the Program is not held. The node succeeds when that Stop is
 complete, and fails with `stop_not_contained` when a robot's Stop was not
 contained.
 
-If the execution host does not answer one of the Manager's requests in time,
-ManyForge keeps it running. The Manager logs `execution_host_late_reply` once
-and sends one Halt. While the reply is outstanding, the execution host counts
-as faulted, so the cell is not ready, and further requests to it answer
-`execution_host_late`; Stops still work. When the host answers, the fault
-clears by itself; the Halt stays until you release it with Execute or Reset.
+No request from the Manager to the execution host has a time limit: its
+launch, its status, the Apply fence, cell admission, Host Apply, projection
+requests and the liveness reports all wait for the host's answer however long
+it takes. A slow answer halts nothing and does not make the execution host
+count as faulted. While one request waits, other requests to the host answer
+`execution_host_late` at once (refused before any effect; try again), and
+while it prepares projections, reads its component processes during an Apply
+or rebuilds a projection they answer `runtime_unit_launch_in_progress`. The
+Manager's own loop never waits on the host: it reads each status answer at a
+later tick. A request still unanswered at the Manager's next tick is logged as
+`execution_host_late_reply`, and its answer as
+`execution_host_late_reply_settled`. Stops never wait on these requests. A
+wait ends early only when the host exits (`execution_host_exited`; ManyForge
+stops the application) or ManyForge stops (`application_stopping`). An Apply has no overall time
+limit either; while one runs, a new Apply, New or a failed-Apply release
+answers `apply_busy` and nothing is done.
 
 ### Components and Deployment
 

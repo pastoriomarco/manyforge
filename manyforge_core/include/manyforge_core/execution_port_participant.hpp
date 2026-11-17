@@ -216,9 +216,9 @@ class ExecutionPortParticipant final : public IExecutionBackend {
       const ReplacementSendRecheck& recheck_before_send = {}) override;
   Result<PreparedMotionReplacementObservationDTO> ObserveReplacement(
       const PreparedMotionReplacementSourceDTO& source, std::uint64_t candidate_id) const override;
-  Result<void> AdoptReplacement(const PreparedMotionReplacementSourceDTO& source,
-                                std::uint64_t candidate_id,
-                                PreparedMotionReplacementCommitDTO commit) override;
+  Result<void> ProveReplacement(const PreparedMotionReplacementSourceDTO& source,
+                                std::uint64_t candidate_id) override;
+  void ApplyReplacement(std::uint64_t candidate_id) override;
   Result<void> ApplyToolContext(const PreparedOperationParticipantDTO& participant) override;
   ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& participant,
                            const ControllerGoalId& controller_goal_id) override;
@@ -244,6 +244,7 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   void retire_execution_progress_generation(std::uint64_t execution_generation) noexcept override;
   ExecutionProgressHazardClaimResult claim_execution_progress_hazard(
       std::uint64_t execution_generation) noexcept override;
+  bool close_execution_progress_hazard(std::uint64_t execution_generation) noexcept override;
   void set_runtime_velocity_scale(double scale) override;
   void apply_runtime_velocity_scale(double scale, std::uint64_t sequence) override;
   RuntimeScaleMechanismStatusDTO runtime_velocity_scale_status() const override;
@@ -386,6 +387,10 @@ class ExecutionPortParticipant final : public IExecutionBackend {
   /// The worker's "released" line from ObserveSample, printed by
   /// WaitForCompletion after `mutex_` (guarded by `mutex_`).
   std::optional<ScaleHoldTrace> released_scale_hold_trace_;
+  /// A take-over's "adopted" line from `ApplyReplacement`, printed by the
+  /// worker's next `WaitForCompletion` after `mutex_` (guarded by `mutex_`;
+  /// OD-175: no Kernel, engine or participant lock held while printing).
+  std::optional<ScaleHoldTrace> adopted_scale_hold_trace_;
 
   /// The factor moves linearly toward its target.
   struct ScaleRamp {

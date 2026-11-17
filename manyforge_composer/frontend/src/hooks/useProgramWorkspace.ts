@@ -603,10 +603,22 @@ export function useProgramWorkspace(
     );
   }, [mutationUnavailableReason, published, run, snapshot]);
 
-  const revert = useCallback(() => {
-    const requestFence = localFence('document');
-    if (!requestFence) return;
-    void run(
+  /**
+   * Revert Draft and Applied to Saved, like `apply`: also the step a
+   * Reset-and-Revert chain sends once the run has ended, then with
+   * `expectedDraft` (the Draft the operator confirmed it on).
+   */
+  const revert = useCallback((
+    options: { expectedDraft?: ExpectedProgramDraft } = {},
+  ): Promise<ProgramWorkspaceRunResult | null> => {
+    let requestFence: LocalWorkspaceFenceRequest | null;
+    try {
+      requestFence = localFence('document', options.expectedDraft);
+    } catch (error: unknown) {
+      return Promise.reject(error);
+    }
+    if (!requestFence) return Promise.resolve(null);
+    return run(
       'revert',
       () => programApplyCommand('revert', () => api.programWorkspace.revert(requestFence),
         requestFence.applicationStartId),

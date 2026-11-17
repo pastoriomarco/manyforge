@@ -1621,6 +1621,8 @@ def test_runner_loss_during_admitted_motion_alarms_stops_the_program_run_and_kee
                 "program_runner_liveness_probe", "program_runner_liveness_renewal",
                 "program_runner_reconciliation_renewal",
             }
+            # OD-296 (a): a lost contact is typed end to end.
+            assert first_alarm["details"]["fault_code"] == "program_runner_contact_lost"
             # With the Runner silent, the Kernel stops this Program run's
             # motion once (one `runner_loss` Stop event, no operator level)
             # when it latches the Runner loss.

@@ -291,6 +291,10 @@ struct ExecutionPortParticipant::Replacement {
   double source_cursor_s{};
   double divergence_cursor_s{};
   std::optional<std::int64_t> recognition_budget_ns;
+  /// The take-over's "prove" step's own controller sample and its read time
+  /// (OD-175 D1), published by "apply" (guarded by `mutex_`).
+  std::optional<ExecutionControllerSampleDTO> proven_sample;
+  TimePoint proven_at{0};
 };
 
 ExecutionPortParticipant::ExecutionPortParticipant(
@@ -1473,14 +1477,14 @@ Result<PreparedMotionReplacementObservationDTO> ExecutionPortParticipant::Observ
   return Result<PreparedMotionReplacementObservationDTO>::Ok(ObserveReplacementLocked());
 }
 
-Result<void> ExecutionPortParticipant::AdoptReplacement(
-    const PreparedMotionReplacementSourceDTO& source, const std::uint64_t candidate_id,
-    const PreparedMotionReplacementCommitDTO commit) {
+Result<void> ExecutionPortParticipant::ProveReplacement(
+    const PreparedMotionReplacementSourceDTO& source, const std::uint64_t candidate_id) {
+  // OD-175 D1, "prove": every check that can fail; changes no ownership.
   std::unique_lock lock(mutex_);
   if (!replacement_ || replacement_->candidate_id != candidate_id ||
       !same_replacement_source(replacement_->source, source) || !SourceMatchesLocked(source) ||
       execution_->terminal || execution_->stopping || execution_->critical_fault ||
-      stop_stages_in_flight_ != 0U || !commit.owner_commit ||
+      stop_stages_in_flight_ != 0U ||
       !prepared_membership_.can_adopt(source.execution_id, candidate_id) ||
       ObserveReplacementLocked().phase != PreparedMotionReplacementPhaseDTO::kReadyToCommit)
     return Result<void>::Err(fault(ErrorCode::kExecutionRejected,
@@ -1506,26 +1510,35 @@ Result<void> ExecutionPortParticipant::AdoptReplacement(
   ObserveSample(*replacement_->execution, *sample,
                 original_path_cursor(replacement_->execution->delivery_clock, sample->cursor_s),
                 now, false);
-  // Retaining the paired sample after the owner CAS must not allocate.
-  auto published_sample = *sample;
-  // All proof reads/allocation precede this last-fallible ownership CAS. The
-  // caller rechecks its exact gate/deadline inside the callback before CAS.
-  auto accepted = commit.owner_commit(commit.context);
-  if (!accepted.ok()) return accepted;
+  // Kept for "apply", which must not allocate: the paired sample it
+  // publishes (OD-175 D1). A controller result for the successor that
+  // arrives before "apply" no longer refuses the hand-over (decision OD-175
+  // (1) (a)): the adopted execution reports it as its own result.
+  replacement_->proven_sample = *sample;
+  replacement_->proven_at = now;
+  return Result<void>::Ok();
+}
+
+void ExecutionPortParticipant::ApplyReplacement(const std::uint64_t candidate_id) {
+  // OD-175 D1, "apply": the swaps of the candidate "prove" proved and the
+  // Kernel then decided. No refusal.
+  std::unique_lock lock(mutex_);
+  const auto now = replacement_->proven_at;
   static_assert(std::is_nothrow_swappable_v<PreparedGoalRecord>);
   execution_->terminal = true;
   execution_->snapshot.state = ExecutionState::kStopped;
   execution_->snapshot.timestamp_ns = now;
   ++execution_->snapshot.sequence_number;
   execution_ = replacement_->execution;
-  std::optional<ScaleHoldTrace> adopted_trace;
   {
     std::lock_guard scale_lock(scale_mutex_);
     if (preparation_scale_hold_ && preparation_scale_hold_->candidate_id == candidate_id) {
-      adopted_trace = ScaleHoldTrace{"adopted", candidate_id, execution_->key,
-                                     preparation_scale_hold_->factor,
-                                     *execution_->scale_hold_until_cursor_s,
-                                     ramp_ ? ramp_->rate_per_s : 0.0};
+      // OD-221/OD-175: printed by the worker after every lock is released
+      // (`WaitForCompletion`), never under this or the engine's locks.
+      adopted_scale_hold_trace_ = ScaleHoldTrace{"adopted", candidate_id, execution_->key,
+                                                 preparation_scale_hold_->factor,
+                                                 *execution_->scale_hold_until_cursor_s,
+                                                 ramp_ ? ramp_->rate_per_s : 0.0};
       preparation_scale_hold_.reset();
     } else
       execution_->scale_hold_until_cursor_s.reset();
@@ -1536,18 +1549,15 @@ Result<void> ExecutionPortParticipant::AdoptReplacement(
   helper_->AdoptReplacement(replacement_->stop_goal);
   // The retained receipt is still the committed candidate; execution_ is its
   // only live presenter. No old handle can publish into this generation.
+  auto& sample = *replacement_->proven_sample;
   progress_.invalidate();
   const auto published = progress_.publish(
       execution_->generation, static_cast<std::int64_t>(execution_->cursor_s * 1e9),
-      sample->source_stamp_ns, sample->local_receipt_stamp_ns);
-  execution_->RecordProgressSample(published, std::move(published_sample));
+      sample.source_stamp_ns, sample.local_receipt_stamp_ns);
+  execution_->RecordProgressSample(published, std::move(sample));
+  replacement_->proven_sample.reset();
   // Legacy compatible evolving ramps continue unchanged. A prepared hold
   // stays pinned until this adopted execution observes its connector end.
-  lock.unlock();
-  // OD-221: printed after the participant's locks are released (the
-  // Kernel's commit still holds its own locks around this call).
-  if (adopted_trace) trace_scale_hold(*adopted_trace);
-  return Result<void>::Ok();
 }
 
 ExecutionPortCommandResultDTO ExecutionPortParticipant::CancelExecution(
@@ -2060,25 +2070,37 @@ ExecutionProgressHazardClaimResult ExecutionPortParticipant::claim_execution_pro
   return progress_.claim_hazard_authority(execution_generation);
 }
 
+bool ExecutionPortParticipant::close_execution_progress_hazard(
+    const std::uint64_t execution_generation) noexcept {
+  // OD-175 D2: no participant lock; one compare-and-swap in the publication.
+  return progress_.close_hazard_authority(execution_generation);
+}
+
 // --- Monitoring ---------------------------------------------------------------
 
 bool ExecutionPortParticipant::WaitForCompletion(const std::shared_ptr<Execution>& execution,
                                                  const std::int64_t timeout_ns) {
-  // OD-221: ObserveSample's "released" line is printed after `mutex_`.
+  // OD-221: ObserveSample's "released" line is printed after `mutex_`; so
+  // is a take-over's "adopted" line (OD-175: never under the engine's or
+  // the Kernel's locks either), on this worker's first call after it.
   std::optional<ScaleHoldTrace> released;
+  std::optional<ScaleHoldTrace> adopted;
   {
     std::unique_lock lock(mutex_);
     if (replacement_ && replacement_->execution == execution && execution_ != execution &&
         prepared_membership_.active_execution_id() != replacement_->candidate_id)
       return false;
+    adopted = std::exchange(adopted_scale_hold_trace_, std::nullopt);
     Evaluate(*execution, lock);
     released = std::exchange(released_scale_hold_trace_, std::nullopt);
     if (execution->terminal) {
       lock.unlock();
+      if (adopted) trace_scale_hold(*adopted);
       if (released) trace_scale_hold(*released);
       return true;
     }
   }
+  if (adopted) trace_scale_hold(*adopted);
   if (released) trace_scale_hold(*released);
   waiter_(clock_.now() + std::max<std::int64_t>(0, timeout_ns), std::stop_token{});
   std::unique_lock lock(mutex_);

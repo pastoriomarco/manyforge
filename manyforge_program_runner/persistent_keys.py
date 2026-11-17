@@ -366,24 +366,13 @@ class PersistentKeyRegister:
                 lambda: not self._writer_wanted and not self._writer_busy, timeout_s
             )
 
-    def close(self, timeout_s: float) -> bool:
-        """Write the latest state and stop the writer, within ``timeout_s``.
-
-        False when the writer has not finished in time: the file then holds
-        the last complete state written, without the newest changes.
-        """
+    def close(self) -> None:
+        """Write the latest state and stop the writer."""
 
         with self._writer_cv:
             self._writer_closing = True
             self._writer_cv.notify_all()
-        self._writer.join(timeout_s)
-        if self._writer.is_alive():
-            _LOGGER.warning(
-                "stored values: the last changes were not written within %.1f s",
-                timeout_s,
-            )
-            return False
-        return True
+        self._writer.join()
 
     def _writer_loop(self) -> None:
         while True:

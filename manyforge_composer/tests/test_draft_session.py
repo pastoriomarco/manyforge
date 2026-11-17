@@ -2988,3 +2988,144 @@ def test_reused_instance_id_refusal_says_where_the_existing_node_is() -> None:
         })
     assert str(wrapped.value).startswith("main_sequence already exists (sequence, top-level node 0): ")
     assert session.snapshot() == before
+
+
+def _rename_fixture_session() -> ComposerDraftSession:
+    """The minimal Program with every scene-resource reference kind to `table`."""
+
+    catalog = build_node_environment().catalog
+    document = _program().to_dict()
+    table = document["scene"][0]
+    box = deepcopy(table)
+    box["scene_resource_id"] = "box"
+    box["metadata"] = {"support_contacts": [{"support_object_id": "table"}]}
+    document["scene"] = [box, table]
+    on_table = {
+        "frame_ref": {"kind": "scene_resource", "scene_resource_id": "table"},
+        "position_m": [0.0, 0.0, 0.1],
+        "orientation": {"xyzw": [0.0, 0.0, 0.0, 1.0]},
+    }
+    document["parameters"].append(
+        {"parameter_id": "work_object", "type": "scene_resource", "default": "table"}
+    )
+    document["blackboard"] = {
+        "namespaces": [],
+        "keys": [
+            {
+                "key": "place_pose",
+                "type": "stored_pose",
+                "access": "read_write",
+                "persistence": "run",
+                "initial": on_table,
+                "allowed_frames": [
+                    {"kind": "cell_frame"},
+                    {"kind": "scene_resource", "scene_resource_id": "table"},
+                ],
+            },
+            {
+                "key": "target_object",
+                "type": "scene_resource",
+                "access": "read_write",
+                "persistence": "run",
+                "initial": "table",
+            },
+        ],
+    }
+    document["viewer"] = {"scene_resource_visibility": {"box": True, "table": False}}
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v3",
+    )
+    return ComposerDraftSession(Program.from_dict(document, catalog))
+
+
+def test_scene_rename_updates_every_reference_in_one_revision() -> None:
+    session = _rename_fixture_session()
+    revision = session.revision
+
+    result = _mutate(
+        session,
+        "scene_draft_rename_object",
+        {"scene_resource_id": "table", "new_scene_resource_id": "a_table"},
+    )
+
+    assert session.revision == revision + 1
+    authoring = session.snapshot()["authoring"]
+    assert [row["scene_resource_id"] for row in authoring["scene"]] == ["a_table", "box"]
+    assert authoring["scene"][1]["metadata"]["support_contacts"] == [
+        {"support_object_id": "a_table"}
+    ]
+    assert authoring["viewer"]["scene_resource_visibility"] == {"a_table": False, "box": True}
+    assert authoring["parameters"][-1]["default"] == "a_table"
+    pose_key, object_key = authoring["blackboard"]["keys"]
+    assert pose_key["initial"]["frame_ref"]["scene_resource_id"] == "a_table"
+    assert pose_key["allowed_frames"][1]["scene_resource_id"] == "a_table"
+    assert object_key["initial"] == "a_table"
+    remove = authoring["forest"][0]["children"][1]
+    assert remove["parameters"]["scene_resource_id"] == "a_table"
+    assert len(result.details["references"]) == 8
+    assert session.snapshot()["diagnostics"] == []
+
+    # Renaming to the same id is a validated no-op.
+    _mutate(
+        session,
+        "scene_draft_rename_object",
+        {"scene_resource_id": "a_table", "new_scene_resource_id": "a_table"},
+    )
+    assert session.revision == revision + 1
+
+
+@pytest.mark.parametrize(
+    ("replacement", "code"),
+    [("box", "draft_scene_resource_exists"), ("Table 2", "draft_arguments_invalid")],
+)
+def test_scene_rename_refuses_used_or_invalid_id(replacement: str, code: str) -> None:
+    session = _rename_fixture_session()
+    before = session.snapshot()
+
+    with pytest.raises(DraftSessionError) as refused:
+        _mutate(
+            session,
+            "scene_draft_rename_object",
+            {"scene_resource_id": "table", "new_scene_resource_id": replacement},
+        )
+
+    assert refused.value.code == code
+    assert session.snapshot() == before
+
+
+def test_scene_rename_renames_deployment_pose_links_and_contact_inputs() -> None:
+    from manyforge_composer.backend.deployment_draft import _rename_scene_resource
+
+    document = {
+        "policies": {
+            "scene_pose_sources": [
+                {"scene_resource_id": "table", "source_id": "isaac"},
+                {"scene_resource_id": "box", "source_id": "isaac"},
+            ],
+            "component_streams": [
+                {"controllable_component_id": "isaac", "stream_id": "poses/table", "budget_ns": 1},
+                {"controllable_component_id": "other", "stream_id": "poses/table", "budget_ns": 1},
+            ],
+        },
+        "components": [
+            {"configuration": {"runtime_configuration": {"io_signals": [
+                {"provider": {"profile": "geometric_contact", "target_scene_resource_id": "table"}},
+            ]}}},
+        ],
+    }
+
+    renamed, paths = _rename_scene_resource(document, "table", "a_table")
+
+    policies = renamed["policies"]
+    assert [row["scene_resource_id"] for row in policies["scene_pose_sources"]] == ["a_table", "box"]
+    assert [row["stream_id"] for row in policies["component_streams"]] == [
+        "poses/a_table", "poses/table"
+    ]
+    provider = renamed["components"][0]["configuration"]["runtime_configuration"][
+        "io_signals"][0]["provider"]
+    assert provider["target_scene_resource_id"] == "a_table"
+    assert len(paths) == 3
+    assert document["policies"]["scene_pose_sources"][0]["scene_resource_id"] == "table"

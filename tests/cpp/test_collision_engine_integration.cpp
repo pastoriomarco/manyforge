@@ -310,6 +310,76 @@ TEST(CollisionEngineSelfCoverage, MasterOnlyGroupIncludesItsCrossBranchMimic) {
   }
 }
 
+// A dual-arm cell loads its collision model once and binds each group to it
+// (OD-286). Each bound model must behave exactly like a fresh load for that
+// group: motion relevance per body and the unnamed-state joint order, for a
+// joint-list group and for a chain group.
+TEST(CollisionEngineSelfCoverage, GroupBoundFromOneLoadEqualsFreshGroupLoad) {
+  namespace core = manyforge::core;
+  namespace collision = manyforge::collision;
+  TemporaryModel temporary;
+  const auto urdf = temporary.root / "model.urdf";
+  const auto srdf = temporary.root / "model.srdf";
+  const std::string urdf_xml = R"(<robot name="dual">
+      <link name="base"><collision><geometry><sphere radius="0.05"/></geometry></collision></link>
+      <link name="left"><collision><geometry><sphere radius="0.05"/></geometry></collision></link>
+      <link name="right"><collision><geometry><sphere radius="0.05"/></geometry></collision></link>
+      <joint name="l" type="prismatic"><parent link="base"/><child link="left"/>
+        <origin xyz="1 0 0"/><axis xyz="0 1 0"/><limit lower="0" upper="1" effort="10" velocity="1"/></joint>
+      <joint name="r" type="prismatic"><parent link="base"/><child link="right"/>
+        <origin xyz="-1 0 0"/><axis xyz="0 1 0"/><limit lower="0" upper="1" effort="10" velocity="1"/></joint>
+      </robot>)";
+  const std::string srdf_xml =
+      R"(<robot name="dual"><group name="left_arm"><joint name="l"/></group>)"
+      R"(<group name="right_arm"><chain base_link="base" tip_link="right"/></group></robot>)";
+  std::ofstream(urdf) << urdf_xml;
+  std::ofstream(srdf) << srdf_xml;
+  std::vector<collision::RetainedComponentCollisionBodyProjectionInput> bodies;
+  for (const auto* frame : {"base", "left", "right"})
+    bodies.push_back({core::ControllableComponentId("dual"), core::ModelInstanceId("model"),
+                      core::ModelRevision("r1"), core::CollisionBodyRoleId(frame), 0, frame});
+  const std::vector<collision::RetainedComponentModelFrameProjectionInput> frames{
+      {core::ControllableComponentId("dual"), core::ModelInstanceId("model"),
+       core::ModelRevision("r1"), core::FrameRoleId("base"), "base"}};
+  // Per body: static w.r.t. the group; then whether an unnamed one-joint
+  // state is accepted and collides.
+  const auto observe = [&](const ManyForgeCollisionEngine::SharedModelPtr& shared) {
+    const auto projection = ManyForgeCollisionEngine::project_retained_component_collision(
+        shared, "base", bodies, frames);
+    EXPECT_TRUE(projection.ok());
+    auto snapshot = minimal_snapshot();
+    snapshot.bodies = projection.value().component_bodies;
+    snapshot.component_model_frames = projection.value().component_model_frames;
+    snapshot.body_count = snapshot.bodies.size();
+    snapshot.geometry_count = snapshot.bodies.size();
+    ManyForgeCollisionEngine engine(shared,
+                                    ManyForgeCollisionEngine::make_shared_scene_cache(shared));
+    EXPECT_EQ(engine.prepare_runtime_snapshot(snapshot),
+              core::RuntimeCollisionQueryPrepareStatus::kReady);
+    std::vector<std::optional<bool>> observed;
+    for (const auto& body : snapshot.bodies)
+      observed.push_back(engine.IsBodyStaticWrtGroup(snapshot, body.body_id));
+    CollisionQuery query;
+    query.query_id = "unnamed";
+    query.robot_state.positions_rad = {0.5};
+    const auto result = check(engine, snapshot, query);
+    observed.push_back(result.engine_status == CollisionEngineStatus::kOk);
+    observed.push_back(result.in_collision);
+    return observed;
+  };
+  const auto loaded = ManyForgeCollisionEngine::load_shared_model("dual", urdf, srdf, {}, "");
+  std::vector<std::vector<std::optional<bool>>> per_group;
+  for (const auto* group : {"left_arm", "right_arm"}) {
+    const auto bound =
+        ManyForgeCollisionEngine::bind_shared_model_group(loaded, urdf_xml, srdf_xml, group);
+    per_group.push_back(observe(bound));
+    EXPECT_EQ(per_group.back(),
+              observe(ManyForgeCollisionEngine::load_shared_model("dual", urdf, srdf, {}, group)))
+        << group;
+  }
+  EXPECT_NE(per_group.front(), per_group.back());
+}
+
 // Coordinates are identified by joint name against the engine's current
 // model. A named state whose length equals model.nq is still mapped by name,
 // so a reordered (or foreign) state can never be read positionally.

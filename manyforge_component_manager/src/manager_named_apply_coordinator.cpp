@@ -155,8 +155,9 @@ MaintenanceBoundary(const ManagerPlannedMaintenanceResult &result) {
 AdmissionRefusalBoundary(const std::exception &error) {
   const auto *typed = dynamic_cast<const core::TypedError *>(&error);
   if (typed == nullptr) return ManagerApplyEffectBoundary::kUnknown;
-  // A late host refuses a call before sending anything (`effect: none`); the
-  // exchange that itself timed out carries no such detail and stays unknown.
+  // A call that meets an outstanding exchange is refused before anything is
+  // sent (`effect: none`); an exchange that ended without its reply carries
+  // no such detail and stays unknown.
   const auto effect = typed->details().find("effect");
   const bool late_host_refusal = typed->code() == core::error_codes::kExecutionHostLate &&
                                  effect != typed->details().end() && effect->second == "none";
@@ -662,23 +663,6 @@ bool ReleaseAdmission(
 
 } // namespace
 
-std::chrono::nanoseconds ManagerApplyBound(const deployment::RetainedBundle &predecessor,
-                                           const deployment::RetainedBundle &candidate) {
-  namespace host_contract = deployment::ros2_control_execution_runtime_contract;
-  // The candidate's budget wins over the predecessor's (the Composer's
-  // `_timeouts`); the keys are every component of either graph.
-  auto budgets = host_contract::component_composition_budgets_ns(candidate.value().cell_graph);
-  for (const auto &[component, budget] :
-       host_contract::component_composition_budgets_ns(predecessor.value().cell_graph))
-    budgets.try_emplace(component, budget);
-  std::chrono::nanoseconds total{0};
-  for (const auto &[component, budget] : budgets) {
-    static_cast<void>(component);
-    total += std::chrono::nanoseconds(budget) + core::kControllerLaunchStopGrace;
-  }
-  return std::max(total, std::chrono::nanoseconds(deployment::kDefaultLifecycleBudgetNs));
-}
-
 core::Result<void> ValidateManagerPneumaticNoneProcessOwner(
     const deployment::RetainedBundle &predecessor, const deployment::SiteFacts &site_facts,
     const ManagerComponentProcessInventoryRequestDTO &request,
@@ -818,7 +802,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
       initial_scene_source_(std::move(initial_scene_source)),
       apply_progress_observer_(std::move(apply_progress_observer)),
       successful_settlement_preparation_(std::move(successful_settlement_preparation)),
-      site_facts_(std::move(site_facts)), clock_ns_(clock_ns),
+      site_facts_(std::move(site_facts)),
       fence_coordinator_(apply_journal_, kernel_fence_, site_facts_),
       planned_maintenance_(planned_maintenance),
       active_runtime_coordinator_(active_plan_source, process_port,
@@ -907,15 +891,27 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::EndApplyByManager(
                                ManagerApplyEffectDisposition::kUnknown, true);
 }
 
-std::unique_lock<std::mutex> ManagerNamedApplyCoordinator::LockUnlessStepInProgress() {
+std::unique_lock<std::mutex> ManagerNamedApplyCoordinator::TryLockUnlessStepInProgress() {
   // One look, no wait: the flag shows a lane step; the single try also
   // refuses when the lane took the lock between that look and this one.
   std::unique_lock lock(operation_mutex_, std::defer_lock);
-  if (step_in_progress_.load(std::memory_order_acquire) || !lock.try_lock())
-    throw core::TypedError("apply_busy",
-                           "An Apply step is in progress; nothing was done. "
-                           "Try again when it ends.",
-                           {{"effect", "none"}}, std::string(kApplyProducer));
+  if (!step_in_progress_.load(std::memory_order_acquire))
+    static_cast<void>(lock.try_lock());
+  return lock;
+}
+
+namespace {
+[[noreturn]] void ThrowApplyBusy() {
+  throw core::TypedError("apply_busy",
+                         "An Apply step is in progress; nothing was done. "
+                         "Try again when it ends.",
+                         {{"effect", "none"}}, std::string(kApplyProducer));
+}
+} // namespace
+
+std::unique_lock<std::mutex> ManagerNamedApplyCoordinator::LockUnlessStepInProgress() {
+  auto lock = TryLockUnlessStepInProgress();
+  if (!lock.owns_lock()) ThrowApplyBusy();
   return lock;
 }
 
@@ -1251,18 +1247,29 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::FinishOriginalConfiguratio
 ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
     const ManagerNamedApplyRequestDTO &request,
     OriginalPrepareAcknowledgement original_prepare_acknowledgement) {
-  std::lock_guard lock(operation_mutex_);
   Require(request.valid(), "named Apply request is invalid");
-
-  if (const auto existing = apply_journal_.ReadRequest(
-          request.request_context.request_key);
-      existing.has_value()) {
+  // OD-270: never waits behind an Apply lane step. The journal guards its
+  // own reads, so a replay is answered without operation_mutex_ unless it
+  // needs the pending settlement, which only the lock shows; any other
+  // request is refused `apply_busy` with `effect: none`.
+  const auto lock = TryLockUnlessStepInProgress();
+  const auto existing =
+      apply_journal_.ReadRequest(request.request_context.request_key);
+  std::optional<PersistedManagerApplyTerminalOutcome> terminal;
+  if (existing.has_value()) {
     Require(MatchesRequest(existing->intent, request),
             "public request identity is already bound to another Apply");
-    const auto terminal = apply_journal_.ReadTerminalOutcome(
+    terminal = apply_journal_.ReadTerminalOutcome(
         existing->intent.apply_id, existing->intent.apply_generation);
+  }
+  const bool settlement_unknown =
+      terminal.has_value() && terminal->terminal_outcome.succeeded();
+  if (!lock.owns_lock() && (!existing.has_value() || settlement_unknown))
+    ThrowApplyBusy();
+  if (existing.has_value()) {
     // A failure whose release is pending replays as the failure it is.
-    if (pending_settlement_ == core::NamedApplyPublicationTransactionDTO{
+    if (lock.owns_lock() &&
+        pending_settlement_ == core::NamedApplyPublicationTransactionDTO{
             existing->intent.apply_id, existing->intent.apply_generation} &&
         (!terminal || terminal->terminal_outcome.succeeded()))
       return PendingSettlementResult(existing->intent, true);
@@ -1363,8 +1370,6 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
       std::move(original_prepare_acknowledgement)});
   captured_apply_inputs_->original_parent_claim = accepted_claim;
   captured_apply_inputs_->original_predecessor_publication = active_plan.active_publication;
-  captured_apply_inputs_->deadline_ns =
-      clock_ns_() + static_cast<std::uint64_t>(ManagerApplyBound(*predecessor, *candidate).count());
   if (apply_progress_observer_) {
     apply_progress_observer_(durable_intent.intent);
   }
@@ -1515,8 +1520,11 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
            .ReadRuntimeConvergenceIntent(intent.apply_id,
                                          intent.apply_generation)
            .has_value()) {
+    // A posted admission close (OD-295 (3)(a)): this incarnation already
+    // holds the fence; only the close's result is picked up.
+    const bool close_posted = captured_apply_inputs_->maintenance_close_pending;
     std::optional<ManagerApplyFenceAcquireResult> acquired_fence;
-    try {
+    if (!close_posted) try {
       acquired_fence.emplace(fence_coordinator_.AcquireOrRecoverFence(
           intent, predecessor, candidate, *expectation));
     } catch (const ManagerApplyFenceEffectUncertainError &error) {
@@ -1530,7 +1538,8 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
           error, ManagerApplyEffectDisposition::kKnown,
           request_replayed);
     }
-    if (acquired_fence->path !=
+    if (!close_posted &&
+        acquired_fence->path !=
             ManagerApplyFenceAcquirePath::kAcquiredFromNewAttempt &&
         acquired_fence->path !=
             ManagerApplyFenceAcquirePath::kRetriedAfterAuthoritativeNotSeen) {
@@ -1542,7 +1551,16 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
     }
 
     const auto maintenance = planned_maintenance_.EnterIdleMaintenance(
-        intent, intent.expected_active_projection_revision);
+        intent, intent.expected_active_projection_revision, close_posted);
+    captured_apply_inputs_->maintenance_close_pending =
+        maintenance.admission_close_pending();
+    if (maintenance.valid() && maintenance.admission_close_pending()) {
+      // Re-driven when the close's result is in (the host-liveness lane
+      // requests the next pass), or at the lane's next pass.
+      return {intent.apply_id, intent.apply_generation,
+              ManagerNamedApplyResultState::kPending, request_replayed,
+              std::nullopt};
+    }
     if (!maintenance.valid()) {
       return RetainTerminalFailure(
           apply_journal_, durable_intent,
@@ -1627,13 +1645,6 @@ ManagerNamedApplyCoordinator::RecoverIncompleteApply() {
             "apply_progression_failed", "an Apply step failed with a non-standard error"));
       }
     }();
-    // OD-188 P2: one deadline per Apply, checked on each pending pass.
-    if (result.state == ManagerNamedApplyResultState::kPending && !result.settlement_pending &&
-        clock_ns_() >= captured_apply_inputs_->deadline_ns) {
-      result = EndApplyByManager(pending->intent, "apply_timed_out", PlainCause(
-          "apply_timed_out",
-          "the Apply did not reach a terminal state within its bound"));
-    }
     if (result.state == ManagerNamedApplyResultState::kFailed ||
         result.state == ManagerNamedApplyResultState::kUnknownEffect) {
       // No Scene adoption outlives its Apply. The Apply's answer is written;

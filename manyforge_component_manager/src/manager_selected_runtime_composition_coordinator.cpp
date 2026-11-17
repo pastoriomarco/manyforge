@@ -70,12 +70,17 @@ HostApplyResult ManagerSelectedRuntimeCompositionCoordinator::ApplyOnHost(
   const auto &runtime_unit =
       status->latest_runtime_staged_ready->staged_ready.runtime_units.front();
   auto result = runtime_composition_.ApplyOnHost(runtime_unit.runtime_unit_id, request);
-  // A late host's answer is the Manager adapter's own (the host never
-  // answered), so it names the Manager as producer, as the adapter does.
-  if (!result.ok())
-    throw core::TypedError(result.error(), result.error().code == kExecutionHostLateCode
+  // An answer the host never gave (an outstanding earlier exchange, the
+  // host's exit, the application's stop) is the Manager adapter's own, so
+  // it names the Manager as producer, as the adapter does.
+  if (!result.ok()) {
+    const auto &code = result.error().code;
+    throw core::TypedError(result.error(), code == kExecutionHostLateCode ||
+                                                   code == kExecutionHostExitedCode ||
+                                                   code == kApplicationStoppingCode
                                                ? std::string("component_manager")
                                                : std::string(kExecutionHostProducer));
+  }
   Require(result.value().valid(), "execution host returned an invalid Apply result");
   if (result.value().outcome == HostApplyOutcome::kFailed)
     throw core::TypedError(*result.value().error, std::string(kExecutionHostProducer));

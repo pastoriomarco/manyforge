@@ -46,6 +46,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/eventfd.h>
 #include <sys/file.h>
 #include <sys/random.h>
 #include <sys/socket.h>
@@ -135,7 +136,11 @@ constexpr std::size_t kMaximumPoseObserverSessions =
     kDefaultMaximumPoseObservationKeys;
 constexpr std::size_t kRandomTokenBytes = 16U;
 constexpr std::size_t kSocketBacklog = 16U;
-constexpr int kClientReadTimeoutMilliseconds = 250;
+/// The Kernel Stop control exchanges' connect and reply limit (Stop, planned
+/// Halt and its reads, the carried-object-lost signal). Not used by the
+/// Program Runner exchange (OD-296 (a)) or the command socket (OD-298 (a)),
+/// whose waits end on their events.
+constexpr int kKernelControlTimeoutMilliseconds = 250;
 /// The main loop's status tick (OD-216): each one shows the status stream's
 /// readers that the loop runs. Fixed, independent of the reconcile period, so
 /// a long reconcile period never reads as a Manager that does not answer.
@@ -155,9 +160,25 @@ static_assert(std::atomic<unsigned>::is_always_lock_free);
 std::atomic<bool> g_stop_sequence_running{false};
 std::atomic<bool> g_stop_started_by_command{false};
 
+/// The execution host adapter's abandon eventfd while the daemon lives, -1
+/// otherwise. A stop signal writes it, so the stop ends every host wait at
+/// once, on any thread: also the main thread's own (launch, scene commit,
+/// Apply acceptance), which cannot reach the stop sequence while it waits.
+std::atomic<int> g_abandon_signal_fd{-1};
+static_assert(std::atomic<int>::is_always_lock_free);
+
 void HandleStopSignal(int) {
+  const int saved_errno = errno;
   g_stop_requested = 1;
   g_stop_signal_count.fetch_add(1U, std::memory_order_relaxed);
+  // One eventfd write: async-signal-safe. A later signal only adds to the
+  // counter; the waits see it as already written.
+  if (const int fd = g_abandon_signal_fd.load(std::memory_order_acquire);
+      fd >= 0) {
+    const std::uint64_t one = 1U;
+    [[maybe_unused]] const auto io_result = ::write(fd, &one, sizeof(one));
+  }
+  errno = saved_errno;
 }
 
 /// True once a second stop request came while the stop sequence runs: the
@@ -1011,13 +1032,134 @@ RequiredProgramCycleStatus(const CanonicalValue &value) {
   return result;
 }
 
-// One request and one reply over an exact same-user SEQPACKET socket.
+/// A Program Runner exchange ended by the application's stop (OD-296 (a)):
+/// not a lost contact, so it is never reported as one.
+class ProgramRunnerExchangeStopped final : public std::runtime_error {
+public:
+  ProgramRunnerExchangeStopped()
+      : std::runtime_error(
+            "Program Runner exchange ended by the application stop") {}
+};
+
+/// The Program Runner exchanges outstanding now (OD-296 (a)), read by the
+/// Manager's status tick as information only: nothing ends, halts or faults
+/// on it. A leaf lock held for memory work only; a full table only skips the
+/// record.
+class ProgramRunnerExchangeBoard final {
+public:
+  struct Row final {
+    /// The exchange's number; 0 = free slot. A new value is a new exchange.
+    std::uint64_t episode{};
+    /// "probe" or "heartbeat" (static strings).
+    const char *exchange{};
+    std::chrono::steady_clock::time_point since{};
+  };
+
+  [[nodiscard]] std::uint64_t Begin(const char *exchange) noexcept {
+    std::lock_guard lock(mutex_);
+    for (auto &slot : slots_) {
+      if (slot.episode == 0U) {
+        slot = Row{++next_episode_, exchange, std::chrono::steady_clock::now()};
+        return slot.episode;
+      }
+    }
+    return 0U;
+  }
+
+  void End(const std::uint64_t episode) noexcept {
+    if (episode == 0U) return;
+    std::lock_guard lock(mutex_);
+    for (auto &slot : slots_)
+      if (slot.episode == episode) slot = Row{};
+  }
+
+  /// The oldest outstanding exchange, if any.
+  [[nodiscard]] std::optional<Row> Oldest() const noexcept {
+    std::lock_guard lock(mutex_);
+    const Row *oldest = nullptr;
+    for (const auto &slot : slots_)
+      if (slot.episode != 0U &&
+          (oldest == nullptr || slot.episode < oldest->episode))
+        oldest = &slot;
+    return oldest != nullptr ? std::optional<Row>(*oldest) : std::nullopt;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::uint64_t next_episode_{};
+  // The Runner lane, the Apply lane and the command lane at most.
+  std::array<Row, 4U> slots_{};
+};
+
+/// How a Program Runner exchange ends besides its reply (OD-296 (a)): the
+/// Runner refusing or closing the connection (a lost contact), or its
+/// caller's stop event becoming readable (`ProgramRunnerExchangeStopped`).
+/// There is no time limit: a slow Runner is waited for.
+struct ProgramRunnerExchangeEnd final {
+  /// An eventfd that stays readable once the caller's stop came: the Runner
+  /// lane's own stop, or the execution host adapter's abandon signal (the
+  /// application stop) for the other lanes.
+  int stop_fd{-1};
+  ProgramRunnerExchangeBoard *board{};
+  const char *exchange{};
+};
+
+/// Waits for `events` on `fd` (OD-296 (a)): true when they are ready, false
+/// when the peer closed or failed the connection; the stop throws
+/// ProgramRunnerExchangeStopped. No time limit.
+bool WaitForProgramRunner(const int fd, const short events, const int stop_fd) {
+  std::array<pollfd, 2U> descriptors{
+      {{fd, events, 0}, {stop_fd, POLLIN, 0}}};
+  const nfds_t count = stop_fd >= 0 ? 2U : 1U;
+  for (;;) {
+    descriptors[0].revents = 0;
+    descriptors[1].revents = 0;
+    if (::poll(descriptors.data(), count, -1) < 0) {
+      if (errno == EINTR) continue;
+      FailErrno("wait for the Program Runner");
+    }
+    if (count == 2U && (descriptors[1].revents & POLLIN) != 0)
+      throw ProgramRunnerExchangeStopped();
+    if ((descriptors[0].revents & events) != 0) return true;
+    if ((descriptors[0].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0)
+      return false;
+  }
+}
+
+// One request and one reply over an exact same-user SEQPACKET socket. With
+// `runner` the exchange is a Program Runner exchange without a time limit
+// (OD-296 (a)); without it each wait has the Kernel Stop control limit.
 CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
                                    const CanonicalValue &request,
                                    const std::string_view peer_name,
                                    const content_identity::CanonicalJsonParseLimits
-                                       &limits) {
+                                       &limits,
+                                   const ProgramRunnerExchangeEnd *runner = nullptr) {
   const std::string label(peer_name);
+  // Information only: the exchange is outstanding until this returns.
+  struct Outstanding final {
+    ProgramRunnerExchangeBoard *board;
+    std::uint64_t episode;
+    ~Outstanding() {
+      if (board != nullptr) board->End(episode);
+    }
+  } const outstanding{
+      runner != nullptr ? runner->board : nullptr,
+      runner != nullptr && runner->board != nullptr
+          ? runner->board->Begin(runner->exchange)
+          : 0U};
+  // True when `events` are ready; false when the peer closed the connection
+  // (Runner) or the limit passed (Kernel Stop control).
+  const auto wait = [&](const int fd, const short events) {
+    if (runner != nullptr)
+      return WaitForProgramRunner(fd, events, runner->stop_fd);
+    pollfd ready{fd, events, 0};
+    int polled = -1;
+    do {
+      polled = ::poll(&ready, 1, kKernelControlTimeoutMilliseconds);
+    } while (polled < 0 && errno == EINTR);
+    return polled == 1 && (ready.revents & events) != 0;
+  };
   const auto maximum_bytes = limits.maximum_bytes;
   const auto spelling = path.string();
   Require(!spelling.empty() && spelling.size() < sizeof(sockaddr_un::sun_path),
@@ -1042,13 +1184,9 @@ CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
       errno != EINPROGRESS) {
     FailErrno("connect " + label + " socket");
   }
-  pollfd ready{connection.get(), POLLOUT, 0};
-  int polled = -1;
-  do {
-    polled = ::poll(&ready, 1, kClientReadTimeoutMilliseconds);
-  } while (polled < 0 && errno == EINTR);
-  Require(polled == 1 && (ready.revents & POLLOUT) != 0,
-          label + " connection timed out");
+  Require(wait(connection.get(), POLLOUT),
+          runner != nullptr ? label + " connection was closed"
+                            : label + " connection timed out");
   int socket_error = 0;
   socklen_t socket_error_size = sizeof(socket_error);
   Require(::getsockopt(connection.get(), SOL_SOCKET, SO_ERROR, &socket_error,
@@ -1069,12 +1207,10 @@ CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
       ::send(connection.get(), encoded.data(), encoded.size(), MSG_NOSIGNAL);
   Require(sent == static_cast<ssize_t>(encoded.size()),
           label + " request was not sent exactly");
-  ready = pollfd{connection.get(), POLLIN, 0};
-  do {
-    polled = ::poll(&ready, 1, kClientReadTimeoutMilliseconds);
-  } while (polled < 0 && errno == EINTR);
-  Require(polled == 1 && (ready.revents & POLLIN) != 0,
-          label + " acknowledgement timed out");
+  Require(wait(connection.get(), POLLIN),
+          runner != nullptr
+              ? label + " connection was closed before the acknowledgement"
+              : label + " acknowledgement timed out");
   std::vector<char> response(maximum_bytes + 1U);
   iovec vector{response.data(), response.size()};
   msghdr message{};
@@ -1099,24 +1235,32 @@ CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
   return decoded;
 }
 
+/// One Program Runner liveness exchange (OD-296 (a)): it ends on the reply,
+/// on the Runner refusing or closing the connection (a lost contact) or on
+/// `end`'s stop; no time limit on either side.
 CanonicalValue
 ExchangeProgramRunnerLivenessPacket(const std::filesystem::path &path,
-                                    const CanonicalValue &request) {
+                                    const CanonicalValue &request,
+                                    ProgramRunnerExchangeEnd end,
+                                    const char *exchange) {
+  end.exchange = exchange;
   return ExchangeLocalPacket(
       path, request, "Program Runner liveness",
-      {kMaximumProgramRunnerLivenessPacketBytes, 4U, 64U});
+      {kMaximumProgramRunnerLivenessPacketBytes, 4U, 64U}, &end);
 }
 
 ProgramRunnerLivenessIdentity
 ProbeProgramRunnerLiveness(const std::filesystem::path &path,
-                           const core::CellId &cell_id) {
+                           const core::CellId &cell_id,
+                           const ProgramRunnerExchangeEnd &end) {
   const auto response = ExchangeProgramRunnerLivenessPacket(
       path, CanonicalValue(CanonicalValue::Object{
                 {"api_version",
                  CanonicalValue(std::string(kProgramRunnerLivenessApiVersion))},
                 {"cell_id", CanonicalValue(cell_id.value())},
                 {"kind", CanonicalValue("probe")},
-            }));
+            }),
+      end, "probe");
   RequireExactObjectSize(response, 8U, "Program Runner liveness probe");
   Require(RequiredString(response, "api_version") ==
                   kProgramRunnerLivenessApiVersion &&
@@ -1134,7 +1278,8 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
     const ProgramRunnerLivenessIdentity &receiver,
     const core::ManagerLivenessRequiredSetDTO &required_set,
     const std::uint64_t sequence,
-    const std::optional<core::ContentDigest> &reconciliation_digest) {
+    const std::optional<core::ContentDigest> &reconciliation_digest,
+    const ProgramRunnerExchangeEnd &end) {
   const auto response = ExchangeProgramRunnerLivenessPacket(
       path,
       CanonicalValue(CanonicalValue::Object{
@@ -1161,8 +1306,9 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
            CanonicalValue(std::string(kProgramRunnerLivenessPolicyId))},
           {"runtime_policy_revision",
            CanonicalValue(std::string(kProgramRunnerLivenessPolicyRevision))},
-      }));
-  RequireExactObjectSize(response, 18U, "Program Runner heartbeat ack");
+      }),
+      end, "heartbeat");
+  RequireExactObjectSize(response, 9U, "Program Runner heartbeat ack");
   const auto receiver_status_sequence =
       RequiredUnsigned(RequiredMember(response, "receiver_status_sequence"),
                        "Program Runner receiver status sequence");
@@ -1197,8 +1343,8 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
           "Program Runner liveness observation is malformed");
   const auto cycle = RequiredProgramCycleStatus(
       RequiredMember(response, "program_cycle_status"));
-  detail::CheckProgramRunnerPublicationHealth(
-      RequiredMember(response, "publisher_fault"), cycle, fenced);
+  detail::CheckProgramRunnerHealth(RequiredMember(response, "runner_fault"),
+                                  cycle, fenced);
   Require(current || (!reconciliation_digest.has_value() &&
                       state == "unreconciled" && fenced),
           "Program Runner liveness acknowledgement is not exact");
@@ -2489,13 +2635,34 @@ SuccessResponse(const std::string_view operation,
   });
 }
 
+/// Waits on the command lane for `events` on a command client (OD-298 (a)):
+/// true when they are ready; false when the client closed or failed the
+/// connection, or the application is stopping (the execution host adapter's
+/// abandon signal, written by the stop signal and the stop sequence). No
+/// time limit: a slow client holds only the command lane, never the main
+/// thread. Readiness is checked first, so a reply the client waits for is
+/// still sent during the stop.
+bool WaitForCommandClient(const int client, const short events) {
+  const int stop_fd = g_abandon_signal_fd.load(std::memory_order_acquire);
+  std::array<pollfd, 2U> descriptors{
+      {{client, events, 0}, {stop_fd, POLLIN, 0}}};
+  const nfds_t count = stop_fd >= 0 ? 2U : 1U;
+  for (;;) {
+    descriptors[0].revents = 0;
+    descriptors[1].revents = 0;
+    if (::poll(descriptors.data(), count, -1) < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if ((descriptors[0].revents & events) != 0) return true;
+    if ((descriptors[0].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0)
+      return false;
+    if (count == 2U && (descriptors[1].revents & POLLIN) != 0) return false;
+  }
+}
+
 std::optional<std::string> ReceiveCommand(const int client) {
-  pollfd descriptor{client, POLLIN, 0};
-  int ready = -1;
-  do {
-    ready = ::poll(&descriptor, 1, kClientReadTimeoutMilliseconds);
-  } while (ready < 0 && errno == EINTR);
-  if (ready <= 0 || (descriptor.revents & POLLIN) == 0) {
+  if (!WaitForCommandClient(client, POLLIN)) {
     return std::nullopt;
   }
   std::array<char, kMaximumCommandBytes + 1U> bytes{};
@@ -2522,12 +2689,7 @@ void TrySendResponse(const int client,
           "manager_command_response_oversized",
           "Manager response exceeds the bounded private transport"));
     }
-    pollfd descriptor{client, POLLOUT, 0};
-    int ready = -1;
-    do {
-      ready = ::poll(&descriptor, 1, kClientReadTimeoutMilliseconds);
-    } while (ready < 0 && errno == EINTR);
-    if (ready <= 0 || (descriptor.revents & POLLOUT) == 0) {
+    if (!WaitForCommandClient(client, POLLOUT)) {
       return;
     }
     ssize_t count = -1;
@@ -2876,7 +3038,8 @@ class DaemonPlannedMaintenanceGate final
 public:
   using StateReader =
       std::function<component_manager::ManagementIdleState()>;
-  using AdmissionCloser = std::function<bool()>;
+  using AdmissionCloser =
+      std::function<component_manager::AdmissionCloseState(bool)>;
 
   DaemonPlannedMaintenanceGate(StateReader state_reader,
                                AdmissionCloser admission_closer)
@@ -2888,8 +3051,9 @@ public:
     return state_reader_();
   }
 
-  [[nodiscard]] bool CloseAdmissionAndProveClosed() override {
-    return admission_closer_();
+  [[nodiscard]] component_manager::AdmissionCloseState
+  CloseAdmissionAndProveClosed(const bool continue_posted) override {
+    return admission_closer_(continue_posted);
   }
 
 private:
@@ -3037,7 +3201,9 @@ public:
             [this] { RequireCurrentPackageGeneration(); }),
         planned_maintenance_gate_(
             [this] { return ReadPlannedMaintenanceState(); },
-            [this] { return ClosePlannedMaintenanceAdmission(); }),
+            [this](const bool continue_posted) {
+              return ClosePlannedMaintenanceAdmission(continue_posted);
+            }),
         planned_maintenance_(plan_source_, planned_maintenance_gate_),
         named_apply_(
             stores_.apply_journal(), plan_source_, verified_package_,
@@ -3078,6 +3244,10 @@ public:
     // OD-187 (1): a second stop request during the stop sequence also ends
     // the execution host the adapter is waiting on.
     execution_host_adapter_.SetShutdownForce(&StopForceRequested);
+    g_abandon_signal_fd.store(execution_host_adapter_.AbandonSignalFd(),
+                              std::memory_order_release);
+    // A stop signal that came before the fd was published.
+    if (g_stop_requested != 0) execution_host_adapter_.AbandonExchanges();
     try {
       // Checked as soon as the stores and the Scene owner it reads are open,
       // before any process is started (OD-242).
@@ -3096,6 +3266,7 @@ public:
       // Nothing from a previous run is recreated or resumed.
       static_cast<void>(LaunchEmptyRuntimeAndPublish());
     } catch (...) {
+      g_abandon_signal_fd.store(-1, std::memory_order_release);
       DrainAndCloseStores();
       throw;
     }
@@ -3103,8 +3274,19 @@ public:
 
   /// Runs after Run has returned or thrown: every lane is joined, so nothing
   /// posts any more.
-  ~ManagerDaemon() { DrainAndCloseStores(); }
+  ~ManagerDaemon() {
+    g_abandon_signal_fd.store(-1, std::memory_order_release);
+    DrainAndCloseStores();
+  }
 
+  /// OD-298 (a): the main thread only ticks and supervises. It keeps the
+  /// status tick, the signals, the outstanding-exchange information and the
+  /// supervision of the application's processes, and runs the stop
+  /// sequence. Commands and the periodic reconcile run on the command lane,
+  /// in today's order. The main thread waits for its next tick, a stop
+  /// request (the abandon signal the stop signal writes) or a hand-over from
+  /// the command lane; it never waits on the execution host, the Program
+  /// Runner or a client.
   int Run() {
     CommandSocket command_socket(config_.manager_run_root);
     // OD-216: the status stream's own socket and accepting thread. Declared
@@ -3116,79 +3298,158 @@ public:
         [this, socket = status_socket.get()](const std::stop_token stop) {
           status_stream_.Run(socket, stop);
         });
-    StartNativeManagerLivenessLane();
-    StartApplyProgressLane();
-    auto next_reconciliation =
-        std::chrono::steady_clock::now() + config_.reconciliation_period;
+    main_wake_fd_ = FileDescriptor(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK));
+    if (!main_wake_fd_) FailErrno("create the Manager main-thread wake");
+    const int stop_fd = execution_host_adapter_.AbandonSignalFd();
     auto next_status_tick = std::chrono::steady_clock::now();
     try {
+      StartNativeManagerLivenessLane();
+      StartApplyProgressLane();
+      StartCommandLane(command_socket);
       while (g_stop_requested == 0) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= next_status_tick) {
           status_board_.AdvanceTick();
+          PublishOutstandingExchanges();
           status_board_.NotifyIfChanged();
-          next_status_tick = now + kStatusTickPeriod;
-        }
-        if (now >= next_reconciliation) {
-          TryPeriodicReconcile();
           if (SuperviseApplication()) {
             EndApplication();
             return kApplicationComponentExitStatus;
           }
-          next_reconciliation =
-              std::chrono::steady_clock::now() + config_.reconciliation_period;
-          continue;
+          next_status_tick = now + kStatusTickPeriod;
+        }
+        {
+          std::lock_guard lock(command_lane_mutex_);
+          if (command_lane_failure_.has_value())
+            Fail("Manager command lane failed: " + *command_lane_failure_);
+          if (shutdown_client_.has_value()) {
+            // shutdown_runtime (the first stop request): the stop sequence
+            // runs here; its client is answered once it ended.
+            break;
+          }
         }
         const auto remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::min(next_reconciliation, next_status_tick) - now);
-        pollfd descriptor{command_socket.get(), POLLIN, 0};
-        int ready = -1;
-        do {
-          ready = ::poll(
-              &descriptor, 1,
-              static_cast<int>(std::max<std::int64_t>(1, remaining.count())));
-        } while (ready < 0 && errno == EINTR && g_stop_requested == 0);
-        if (g_stop_requested != 0) {
-          break;
-        }
-        if (ready < 0) {
-          FailErrno("poll Manager command socket");
-        }
-        if (ready == 0) {
-          if (std::chrono::steady_clock::now() < next_reconciliation) {
-            continue;  // The status tick's wake.
-          }
-          TryPeriodicReconcile();
-          if (SuperviseApplication()) {
-            EndApplication();
-            return kApplicationComponentExitStatus;
-          }
-          next_reconciliation =
-              std::chrono::steady_clock::now() + config_.reconciliation_period;
-          continue;
-        }
-        if ((descriptor.revents & POLLIN) != 0 &&
-            HandleOneClient(command_socket)) {
-          // shutdown_runtime already ran the stop sequence (EndApplication).
-          return StoppedExitStatus();
-        }
-        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-          Fail("Manager command socket became unavailable");
+                next_status_tick - std::chrono::steady_clock::now());
+        std::array<pollfd, 2U> descriptors{
+            {{main_wake_fd_.get(), POLLIN, 0}, {stop_fd, POLLIN, 0}}};
+        const int ready = ::poll(
+            descriptors.data(), descriptors.size(),
+            static_cast<int>(std::max<std::int64_t>(1, remaining.count())));
+        if (ready < 0 && errno != EINTR) FailErrno("wait on the Manager main thread");
+        if (ready > 0 && (descriptors[0].revents & POLLIN) != 0) {
+          std::uint64_t count = 0U;
+          [[maybe_unused]] const auto io_result = ::read(main_wake_fd_.get(), &count, sizeof(count));
         }
       }
     } catch (...) {
       EndApplication();
       throw;
     }
-    // SIGTERM or SIGINT: the orderly stop (build spec 3.3 item 5).
+    // SIGTERM or SIGINT, or shutdown_runtime: the orderly stop (build spec
+    // 3.3 item 5).
     EndApplication();
+    std::optional<FileDescriptor> shutdown_client;
+    {
+      std::lock_guard lock(command_lane_mutex_);
+      shutdown_client = std::move(shutdown_client_);
+      shutdown_client_.reset();
+    }
+    if (shutdown_client.has_value())
+      TrySendResponse(shutdown_client->get(),
+                      SuccessResponse("shutdown_runtime", std::nullopt,
+                                      std::nullopt, std::nullopt));
     return StoppedExitStatus();
   }
 
+  /// The command lane (OD-298 (a)): today's main-loop body without the tick.
+  /// One command at a time, accepted from the command socket, and the
+  /// periodic reconcile when it is due, in the same order as before. Its
+  /// waits: the next command or the reconcile period (a period, not a limit),
+  /// a client's request or its reply room (ended by the client closing or
+  /// the application stop, never by a limit), and the host or Runner waits
+  /// inside a command (reply, peer gone or application stop). It ends on the
+  /// application stop (the adapter's abandon signal) or after handing a
+  /// shutdown_runtime request to the main thread. A failure of the socket is
+  /// handed to the main thread, which ends the application.
+  void StartCommandLane(const CommandSocket &socket) {
+    Require(!command_lane_.joinable(), "Manager command lane is already running");
+    command_lane_ = std::thread([this, &socket] { RunCommandLane(socket); });
+  }
+
+  void StopCommandLane() noexcept {
+    // The abandon signal is written: the lane's waits end and it returns.
+    if (command_lane_.joinable()) command_lane_.join();
+  }
+
+  void RunCommandLane(const CommandSocket &socket) noexcept {
+    const int stop_fd = execution_host_adapter_.AbandonSignalFd();
+    auto next_reconciliation =
+        std::chrono::steady_clock::now() + config_.reconciliation_period;
+    try {
+      for (;;) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_reconciliation) {
+          TryPeriodicReconcile();
+          next_reconciliation =
+              std::chrono::steady_clock::now() + config_.reconciliation_period;
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                next_reconciliation - std::chrono::steady_clock::now());
+        std::array<pollfd, 2U> descriptors{
+            {{socket.get(), POLLIN, 0}, {stop_fd, POLLIN, 0}}};
+        const int ready = ::poll(
+            descriptors.data(), descriptors.size(),
+            static_cast<int>(std::max<std::int64_t>(1, remaining.count())));
+        if (ready < 0) {
+          if (errno == EINTR) continue;
+          FailErrno("poll Manager command socket");
+        }
+        if ((descriptors[1].revents & POLLIN) != 0) return;  // Stopping.
+        if (ready == 0) continue;  // The reconcile is due.
+        if ((descriptors[0].revents & POLLIN) != 0 && HandleOneClient(socket))
+          return;  // shutdown_runtime went to the main thread.
+        if ((descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+          Fail("Manager command socket became unavailable");
+      }
+    } catch (const std::exception &error) {
+      HandOverCommandLaneFailure(error.what());
+    } catch (...) {
+      HandOverCommandLaneFailure("unknown error");
+    }
+  }
+
+  void WakeMainThread() noexcept {
+    const std::uint64_t one = 1U;
+    [[maybe_unused]] const auto io_result = ::write(main_wake_fd_.get(), &one, sizeof(one));
+  }
+
+  void HandOverCommandLaneFailure(const char *what) noexcept {
+    try {
+      std::lock_guard lock(command_lane_mutex_);
+      command_lane_failure_ = what;
+    } catch (...) {
+      // Allocation only; the main thread then ends on the next stop request.
+    }
+    WakeMainThread();
+  }
+
+  /// shutdown_runtime: the request is the first stop request; the main
+  /// thread runs the stop sequence and answers the client (OD-298 (a)).
+  void HandOverShutdown(FileDescriptor client) noexcept {
+    g_stop_started_by_command.store(true, std::memory_order_relaxed);
+    {
+      std::lock_guard lock(command_lane_mutex_);
+      shutdown_client_ = std::move(client);
+    }
+    WakeMainThread();
+  }
+
   /// Any application process exit ends the application (OD-122 (1)). Runs
-  /// on the main thread's observation tick; `waitpid(WNOHANG)` and atomic
-  /// reads only, no lock, no wait. Also starts the `after_baseline` entries
+  /// on the main thread's observation tick; `waitpid(WNOHANG)`, atomic
+  /// reads and the adapter's non-blocking reply reads under its leaf locks;
+  /// no wait. Also starts the `after_baseline` entries
   /// once the first converged baseline is published (build spec 4.7 a).
   /// Returns true when the application must end.
   [[nodiscard]] bool SuperviseApplication() {
@@ -3204,15 +3465,7 @@ public:
                 << '\n';
       return true;
     }
-    // A late execution host (OD-121 (4), (16)): the host unit is faulted
-    // while its reply is outstanding (BuildCellAdmissionReadiness), and each
-    // new late episode gets its one event and one Halt. The Halt stays until
-    // the operator releases it (Execute or Reset), as any Halt.
-    if (const auto late = execution_host_adapter_.HostLate();
-        late.has_value() && late->episode != execution_host_late_episode_) {
-      execution_host_late_episode_ = late->episode;
-      RequestExecutionHostLateStop(*late);
-    }
+    LogExecutionHostLateReply();
     if (!application_processes_.after_baseline_started()) {
       bool converged = false;
       {
@@ -3247,6 +3500,13 @@ public:
   /// complete makes the stop incomplete (OD-187 (2)).
   void EndApplication() noexcept {
     g_stop_sequence_running.store(true, std::memory_order_release);
+    // OD-270: first end every host exchange without a time limit (projection
+    // preparation, process inspection, rebuild), so the Apply lane returns
+    // and the host's stop below is not held behind it.
+    execution_host_adapter_.AbandonExchanges();
+    // OD-298 (a): the same signal ends the command lane's waits; it takes no
+    // command during the stop.
+    StopCommandLane();
     // With no execution host there is nothing to halt: an unreachable Stop
     // control is then not an incomplete Halt.
     if (!RequestPlannedStopAndWait() && execution_host_adapter_.HasHostChild())
@@ -3335,6 +3595,58 @@ private:
 
   struct SuccessfulManagerRenewal final {
     NativeManagerLivenessSnapshot snapshot;
+  };
+
+  /// A Runner-lane step that failed (OD-295 (3)(a)); the host-liveness lane
+  /// contains it.
+  struct RunnerLivenessFailure final {
+    std::string_view predicate;
+    std::string_view scope;
+    std::string runtime_unit;
+    std::string cause;
+    // A Program Runner fault: its typed error and the cycle it reported.
+    std::optional<core::ErrorDTO> fault;
+    std::optional<core::ProgramCycleStatusDTO> fault_cycle;
+    // A non-standard exception.
+    bool unknown{};
+  };
+
+  /// One Runner-lane attempt, handed to the host-liveness lane through a
+  /// latest-value slot. It carries the snapshot it was made for, so both
+  /// lanes use the same required set.
+  struct RunnerLivenessAttempt final {
+    std::optional<NativeManagerLivenessSnapshot> snapshot;
+    bool forced_closed{};
+    std::uint64_t readiness_barrier{};
+    bool allow_native{};
+    // The last Apply renewal request posted before this attempt started.
+    std::uint64_t renewal_request{};
+    bool ordinary_heartbeat{};
+    // The Runner answered the probe.
+    bool runner_probed{};
+    std::optional<core::ProgramCycleStatusDTO> cycle_status;
+    // Set when the Runner was renewed.
+    std::optional<core::ManagerLivenessRequiredSetDTO> required_set;
+    std::vector<core::RequiredManagerLivenessReceiverDTO> native_receivers;
+    std::uint64_t heartbeat_sequence{};
+    std::optional<core::ManagerLivenessObservationDTO> runner_observation;
+    std::optional<RunnerLivenessFailure> failure;
+    // The lane's stop ended a Runner exchange (OD-296 (a)).
+    bool stopped{};
+  };
+
+  /// The reconciliation the host-liveness lane delivered to every native
+  /// receiver of one required set; the Runner lane hands the same digest to
+  /// an unreconciled Program Runner.
+  struct ReconciledRequiredSet final {
+    core::ContentDigest required_runtime_set_digest;
+    core::ContentDigest reconciliation_evidence_digest;
+  };
+
+  /// What one host-liveness attempt achieved.
+  struct HostLivenessOutcome final {
+    // The whole renewal, readiness included, succeeded.
+    bool renewed{};
   };
 
   struct PoseObserverSession final {
@@ -3539,8 +3851,8 @@ private:
         *active_publication.request.expected_previous_publication_generation};
   }
   /// Observation-only convergence and publication. Used by periodic runtime
-  /// observation. The independent liveness
-  /// lane consumes the resulting snapshot; it does not call this method. A
+  /// observation. The liveness lanes
+  /// consume the resulting snapshot; they do not call this method. A
   /// missing required Manager-managed unit is reported as non-converged fault
   /// evidence that closes readiness; this surface never starts or replaces a
   /// process.
@@ -3724,8 +4036,8 @@ private:
       // every Manager source value pairs one active publication with the
       // Apply history read after it, and values are stored in journal order.
       std::lock_guard source_lock(manager_source_mutex_);
-      return status_board_.Publish(
-          ManagerStatusSection::kManager, observed_at,
+      return PublishManagerSectionLocked(
+          observed_at,
           BuildManagerSourcePayload(
               *active_bundle, admission_, runtime, stores_.apply_journal(),
               stores_.apply_journal().ReadStatusInventory(),
@@ -3759,10 +4071,6 @@ private:
             "required runtime-unit count exceeds readiness capacity");
     std::uint32_t converged_runtime_units = 0U;
     std::uint32_t faulted_runtime_units = 0U;
-    // The execution host unit counts as faulted exactly while its late reply
-    // is outstanding (OD-121 (4); no separate latch, maintainer 2026-11-13).
-    const bool execution_host_late =
-        execution_host_adapter_.HostLate().has_value();
     for (const auto &row : runtime.plan.runtime_units) {
       const auto *observation =
           runtime.observations.observation(row.runtime_unit_id.value());
@@ -3774,11 +4082,7 @@ private:
       if (observation->source_phase() ==
               component_manager::RuntimeSourcePhase::kFaulted ||
           observation->source_health() ==
-              component_manager::RuntimeSourceHealth::kFaulted ||
-          (execution_host_late &&
-           row.process_adapter_contract_id ==
-               deployment::execution_runtime_contract::
-                   kProcessAdapterContractId)) {
+              component_manager::RuntimeSourceHealth::kFaulted) {
         ++faulted_runtime_units;
       }
     }
@@ -3803,9 +4107,13 @@ private:
       return component_manager::ManagementIdleState::kUnavailable;
     }
     try {
+      // OD-296 (a): no time limit; ends on the reply, the Runner gone or the
+      // application stop (the adapter's abandon signal).
       const auto status = ProbeProgramRunnerLiveness(
                               config_.program_runner_liveness_socket,
-                              admission_.cell_id())
+                              admission_.cell_id(),
+                              {execution_host_adapter_.AbandonSignalFd(),
+                               &runner_exchanges_, nullptr})
                               .program_cycle_status;
       switch (status.state) {
       case core::ProgramCycleStateDTO::kIdleAfterReset:
@@ -3830,8 +4138,39 @@ private:
     return component_manager::ManagementIdleState::kUnavailable;
   }
 
-  [[nodiscard]] bool ClosePlannedMaintenanceAdmission() noexcept {
-    std::lock_guard attempt_lock(manager_liveness_attempt_mutex_);
+  /// Apply lane (planned maintenance). OD-295 (3)(a): the close is posted to
+  /// the host-liveness lane, which owns the readiness it publishes, and its
+  /// result observed as an event: no wait on another lane. The first call
+  /// posts a new close and answers pending; when the host-liveness lane has
+  /// done it, that lane requests the next Apply pass, whose call
+  /// (`continue_posted`) picks up the result. Memory only, under the leaf
+  /// lock.
+  [[nodiscard]] component_manager::AdmissionCloseState
+  ClosePlannedMaintenanceAdmission(const bool continue_posted) noexcept {
+    using component_manager::AdmissionCloseState;
+    if (config_.program_runner_liveness_socket.empty()) {
+      return AdmissionCloseState::kNotClosed;
+    }
+    {
+      std::lock_guard lock(manager_liveness_lane_mutex_);
+      if (manager_liveness_lane_stop_) return AdmissionCloseState::kNotClosed;
+      if (continue_posted && manager_liveness_apply_close_request_ != 0U) {
+        if (manager_liveness_close_completed_ <
+            manager_liveness_apply_close_request_)
+          return AdmissionCloseState::kPending;
+        manager_liveness_apply_close_request_ = 0U;
+        return manager_liveness_close_result_ ? AdmissionCloseState::kClosed
+                                              : AdmissionCloseState::kNotClosed;
+      }
+      manager_liveness_apply_close_request_ =
+          ++manager_liveness_close_requested_;
+    }
+    manager_host_liveness_condition_.notify_one();
+    return AdmissionCloseState::kPending;
+  }
+
+  /// Host-liveness lane: close readiness for planned maintenance.
+  [[nodiscard]] bool CloseReadinessForMaintenance() noexcept {
     if (!last_submitted_readiness_.has_value()) {
       return false;
     }
@@ -3857,15 +4196,16 @@ private:
     ClearCarriedObjectLostOnReset(snapshot);
   }
 
-  void RetainRunnerContactFailure(const std::string_view predicate,
-                                  const std::string_view message) noexcept {
+  void RetainRunnerContactFailure(
+      const std::string_view predicate, const std::string_view message,
+      const std::optional<std::string_view> fault_code = std::nullopt) noexcept {
     try {
       if (program_runner_contact_loss_ || !established_program_cycle_status_)
         return;
       program_runner_contact_loss_ = MakeProgramRunnerContactLoss(
-          established_program_cycle_status_, predicate, message);
+          established_program_cycle_status_, predicate, message, fault_code);
     } catch (...) {
-      // Failure reporting cannot terminate the existing renewal lane.
+      // Failure reporting cannot terminate the host-liveness lane.
     }
   }
 
@@ -3972,17 +4312,164 @@ private:
     manager_liveness_lane_condition_.notify_one();
   }
 
-  /// Report the Manager's identity to the Program Runner and every required native
-  /// receiver, publish their observations to the Kernel and reduce one
-  /// cell-admission readiness snapshot.
+  [[nodiscard]] static bool IsApplyPublication(
+      const NativeManagerLivenessSnapshot &snapshot,
+      const component_manager::ManagerApplyIntentDTO &expected) {
+    const auto &publication = snapshot.runtime.plan.active_publication;
+    return publication.request.transaction_ref ==
+               core::ActiveBundlePublicationTransactionRefDTO{
+                   core::NamedApplyPublicationTransactionDTO{
+                       expected.apply_id, expected.apply_generation}} &&
+           publication.request.candidate_retained_bundle_id ==
+               expected.candidate_retained_bundle_id &&
+           publication.request.candidate_graph_revision ==
+               expected.candidate_graph_revision;
+  }
+
+  /// Runner lane (OD-295 (3)(a)): probe the Program Runner, mint the exact
+  /// required set from the snapshot's observed epochs and renew the Runner.
+  /// An unreconciled Runner is renewed again with the reconciliation the
+  /// host-liveness lane delivered to every native receiver of this same
+  /// required set. No execution host call. Each Runner exchange ends on its
+  /// reply, on the Runner refusing or closing the connection (a lost contact)
+  /// or on this lane's stop (OD-296 (a)); a slow Runner holds only this lane.
+  void RenewProgramRunner(
+      RunnerLivenessAttempt &attempt,
+      const std::optional<ReconciledRequiredSet> &reconciled) noexcept {
+    const auto &snapshot = *attempt.snapshot;
+    const auto &runtime = snapshot.runtime;
+    const auto &active_bundle = *snapshot.active_bundle;
+    std::string_view predicate = "program_runner_liveness_probe";
+    std::string_view scope = "cell-role:program_runner";
+    std::string runtime_unit;
+    const auto track = [&](const std::string_view next_predicate,
+                           const std::string_view next_scope,
+                           const std::string_view next_runtime_unit = {}) {
+      predicate = next_predicate;
+      scope = next_scope;
+      runtime_unit = next_runtime_unit;
+    };
+    const auto fail = [&](std::string cause) {
+      attempt.failure = RunnerLivenessFailure{
+          predicate, scope, std::move(runtime_unit), std::move(cause),
+          std::nullopt, std::nullopt, false};
+    };
+    try {
+      const ProgramRunnerExchangeEnd end{runner_lane_stop_fd_.get(),
+                                         &runner_exchanges_, nullptr};
+      const auto runner = ProbeProgramRunnerLiveness(
+          config_.program_runner_liveness_socket, admission_.cell_id(), end);
+      attempt.runner_probed = true;
+      attempt.cycle_status = runner.program_cycle_status;
+      std::vector<core::RequiredManagerLivenessReceiverDTO> native_receivers;
+      native_receivers.reserve(runtime.plan.runtime_units.size());
+      const auto &retained_policy = deployment::
+          execution_runtime_contract::manager_liveness_policy();
+      for (const auto &row : runtime.plan.runtime_units) {
+        if (row.process_adapter_contract_id !=
+            deployment::execution_runtime_contract::
+                kProcessAdapterContractId) {
+          continue;
+        }
+        track("required_native_receiver_observable", "execution_host_unit",
+              row.runtime_unit_id.value());
+        const auto *observation =
+            runtime.observations.observation(row.runtime_unit_id.value());
+        if (observation == nullptr || observation->runtime_epoch().empty()) {
+          throw std::runtime_error(
+              "required native liveness receiver is not observable");
+        }
+        native_receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
+            row.runtime_unit_id,
+            core::RuntimeEpoch(observation->runtime_epoch()),
+            retained_policy.runtime_policy_id,
+            retained_policy.runtime_policy_revision});
+      }
+      auto receivers = native_receivers;
+      receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
+          runner.runtime_unit_id, runner.runtime_epoch,
+          core::RuntimePolicyId(std::string(kProgramRunnerLivenessPolicyId)),
+          core::RuntimePolicyRevision(
+              std::string(kProgramRunnerLivenessPolicyRevision))});
+      std::sort(receivers.begin(), receivers.end(),
+                [](const auto &left, const auto &right) {
+                  return std::tie(left.runtime_unit_id, left.runtime_epoch,
+                                  left.runtime_policy_id,
+                                  left.runtime_policy_revision) <
+                         std::tie(right.runtime_unit_id, right.runtime_epoch,
+                                  right.runtime_policy_id,
+                                  right.runtime_policy_revision);
+                });
+      track("required_runtime_set_valid", "cell");
+      const auto digest = core::ComputeRequiredRuntimeSetDigest(receivers);
+      core::ManagerLivenessRequiredSetDTO required_set{
+          admission_.cell_id(),
+          active_bundle.retained_bundle_id(),
+          digest,
+          core::RuntimeUnitId(std::string(
+              core::ApplicationRoleText(core::ApplicationRole::kManager))),
+          receivers};
+      if (!core::ValidateManagerLivenessRequiredSet(required_set).ok() ||
+          manager_heartbeat_sequence_ >= core::kMaximumManagerLivenessCounter) {
+        throw std::runtime_error(
+            "Manager cannot mint the exact native liveness required set");
+      }
+      const auto heartbeat_sequence = ++manager_heartbeat_sequence_;
+      // Renew the independent Runner before any native or readiness work.
+      // Apply may deliberately retire a native receiver; that is not
+      // evidence that this Manager process has disappeared.
+      track("program_runner_liveness_renewal", "cell-role:program_runner",
+            runner.runtime_unit_id.value());
+      auto renewal = RenewProgramRunnerLiveness(
+          config_.program_runner_liveness_socket, runner, required_set,
+          heartbeat_sequence, std::nullopt, end);
+      attempt.cycle_status = renewal.program_cycle_status;
+      if (renewal.observation.status.state !=
+              core::ManagerLivenessStateDTO::kCurrent &&
+          reconciled.has_value() &&
+          reconciled->required_runtime_set_digest == digest) {
+        track("program_runner_reconciliation_sequence_available",
+              "cell-role:program_runner", runner.runtime_unit_id.value());
+        Require(manager_heartbeat_sequence_ <
+                    core::kMaximumManagerLivenessCounter,
+                "Manager heartbeat sequence is exhausted");
+        track("program_runner_reconciliation_renewal",
+              "cell-role:program_runner", runner.runtime_unit_id.value());
+        renewal = RenewProgramRunnerLiveness(
+            config_.program_runner_liveness_socket, runner, required_set,
+            ++manager_heartbeat_sequence_,
+            reconciled->reconciliation_evidence_digest, end);
+        attempt.cycle_status = renewal.program_cycle_status;
+      }
+      attempt.required_set = std::move(required_set);
+      attempt.native_receivers = std::move(native_receivers);
+      attempt.heartbeat_sequence = heartbeat_sequence;
+      attempt.runner_observation = std::move(renewal.observation);
+    } catch (const detail::ProgramRunnerFault &error) {
+      fail(error.what());
+      attempt.failure->fault = error.error();
+      attempt.failure->fault_cycle = error.cycle();
+    } catch (const ProgramRunnerExchangeStopped &) {
+      // The lane is stopping: not a lost contact; nothing is handed over.
+      attempt.stopped = true;
+    } catch (const std::exception &error) {
+      fail(error.what());
+    } catch (...) {
+      fail("unknown exception");
+      attempt.failure->unknown = true;
+    }
+  }
+
+  /// Host-liveness lane (OD-295 (3)(a)): from the latest Runner-lane attempt,
+  /// renew every required native receiver, publish the Runner's observation
+  /// to the Kernel and reduce one cell-admission readiness snapshot.
   ///
-  /// Traced path: ProbeProgramRunnerLiveness (read-only socket probe) ->
-  /// required-set construction from the currently observed epochs ->
-  /// RenewProgramRunnerLiveness -> RetainedExecutionHostAdapter
-  /// RenewManagerLivenessBatch -> Kernel liveness publication ->
-  /// BuildCellAdmissionReadiness. This lane performs no process lifecycle call:
-  /// it never reaches the active-runtime coordinator's Observe/Initialize and
-  /// therefore never starts a managed unit.
+  /// Traced path: RetainedExecutionHostAdapter RenewManagerLivenessBatch ->
+  /// Kernel liveness publication -> BuildCellAdmissionReadiness. This lane
+  /// performs no process lifecycle call: it never reaches the active-runtime
+  /// coordinator's Observe/Initialize and therefore never starts a managed
+  /// unit. Its host waits end on reply, host exit or application stop
+  /// (OD-290 (a)); meanwhile the Runner lane renews the Runner on.
   ///
   /// A required owner that is missing, foreign or stale makes the observation
   /// lane report non-converged evidence and makes this renewal throw; every
@@ -3990,13 +4477,16 @@ private:
   /// `required_component_status_current=false` and
   /// `deployment_status_current=false` before returning. Reports never expire:
   /// a late or missing report closes nothing by itself and stops nothing.
-  bool TryRenewNativeManagerLiveness(
-      const NativeManagerLivenessSnapshot &snapshot, const bool forced_closed,
-      const std::uint64_t readiness_barrier, const bool allow_native) noexcept {
-    bool required_owners_published = false;
+  /// The Runner observations reach the Kernel in the Runner lane's order, so
+  /// their status sequence stays strictly increasing; readiness is published
+  /// only after the Runner observation was.
+  HostLivenessOutcome
+  RenewNativeManagerLiveness(const RunnerLivenessAttempt &attempt) noexcept {
+    HostLivenessOutcome outcome;
+    const auto &snapshot = *attempt.snapshot;
     const auto &runtime = snapshot.runtime;
     const auto &active_bundle = *snapshot.active_bundle;
-    std::optional<core::ProgramCycleStatusDTO> probed_cycle_status;
+    const auto probed_cycle_status = attempt.cycle_status;
     std::string_view failure_predicate = "program_runner_liveness_probe";
     std::string_view failure_scope = "cell-role:program_runner";
     std::array<char, 256U> failure_runtime_unit{};
@@ -4013,7 +4503,7 @@ private:
                     failure_runtime_unit.data());
     };
     const auto warn_failure = [&](const std::string_view cause) noexcept {
-      // Diagnostic identity only, owned by this single renewal lane. Lease
+      // Diagnostic identity only, owned by the host-liveness lane. Lease
       // counters and retry decisions never consult it. Diagnostic allocation
       // or stream failure must not escape into renewal or terminate its lane.
       const std::string_view runtime_unit(failure_runtime_unit.data(),
@@ -4046,87 +4536,62 @@ private:
         }
       }
     };
+    const auto snapshot_replaced = [&] {
+      std::lock_guard lock(manager_liveness_lane_mutex_);
+      return manager_liveness_snapshot_.has_value() &&
+             !SameNativeManagerLivenessIdentity(snapshot,
+                                                *manager_liveness_snapshot_);
+    };
+    // Runner contact loss counts only while it lasts (OD-188 P3): a good
+    // probe ends it. The Stop it caused stays until the operator releases
+    // it; that Stop is the Kernel's, not this mark.
+    if (attempt.runner_probed) program_runner_contact_loss_.reset();
+    if (attempt.failure.has_value()) {
+      const auto &failure = *attempt.failure;
+      track_failure(failure.predicate, failure.scope, failure.runtime_unit);
+      if (failure.fault.has_value()) {
+        // A responding Runner is present. Its BB key publisher or its tick
+        // worker has failed; reuse required-owner containment without
+        // manufacturing process death.
+        track_failure("program_runner_fault", "cell-role:program_runner");
+        const auto &cycle = *failure.fault_cycle;
+        if (established_program_cycle_status_ &&
+            cycle.program_run_id ==
+                established_program_cycle_status_->program_run_id &&
+            cycle.cycle_claim_generation ==
+                established_program_cycle_status_->cycle_claim_generation) {
+          RetainRunnerContactFailure(failure_predicate, failure.fault->message,
+                                     failure.fault->code);
+        }
+        SubmitFailClosedReadiness(probed_cycle_status);
+        warn_failure(failure.cause);
+        return outcome;
+      }
+      if (failure_predicate == "program_runner_liveness_probe" ||
+          failure_predicate == "program_runner_liveness_renewal" ||
+          failure_predicate == "program_runner_reconciliation_renewal")
+        RetainRunnerContactFailure(failure_predicate,
+                                   failure.unknown
+                                       ? "Program Runner contact failed"
+                                       : std::string_view(failure.cause));
+      SubmitFailClosedReadiness(probed_cycle_status);
+      if (!snapshot_replaced()) warn_failure(failure.cause);
+      return outcome;
+    }
     try {
-      const auto runner = ProbeProgramRunnerLiveness(
-          config_.program_runner_liveness_socket, admission_.cell_id());
-      probed_cycle_status = runner.program_cycle_status;
-      // Runner contact loss counts only while it lasts (OD-188 P3): a good
-      // probe ends it. The Stop it caused stays until the operator releases
-      // it; that Stop is the Kernel's, not this mark.
-      program_runner_contact_loss_.reset();
-      std::vector<core::RequiredManagerLivenessReceiverDTO> native_receivers;
-      native_receivers.reserve(runtime.plan.runtime_units.size());
+      const auto &required_set = *attempt.required_set;
+      const auto &runner_observation = *attempt.runner_observation;
       const auto &retained_policy = deployment::
           execution_runtime_contract::manager_liveness_policy();
-      for (const auto &row : runtime.plan.runtime_units) {
-        if (row.process_adapter_contract_id !=
-            deployment::execution_runtime_contract::
-                kProcessAdapterContractId) {
-          continue;
-        }
-        track_failure("required_native_receiver_observable",
-                      "execution_host_unit",
-                      row.runtime_unit_id.value());
-        const auto *observation =
-            runtime.observations.observation(row.runtime_unit_id.value());
-        if (observation == nullptr || observation->runtime_epoch().empty()) {
-          throw std::runtime_error(
-              "required native liveness receiver is not observable");
-        }
-        native_receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
-            row.runtime_unit_id,
-            core::RuntimeEpoch(observation->runtime_epoch()),
-            retained_policy.runtime_policy_id,
-            retained_policy.runtime_policy_revision});
-      }
-      auto receivers = native_receivers;
-      receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
-          runner.runtime_unit_id, runner.runtime_epoch,
-          core::RuntimePolicyId(std::string(kProgramRunnerLivenessPolicyId)),
-          core::RuntimePolicyRevision(
-              std::string(kProgramRunnerLivenessPolicyRevision))});
-      std::sort(receivers.begin(), receivers.end(),
-                [](const auto &left, const auto &right) {
-                  return std::tie(left.runtime_unit_id, left.runtime_epoch,
-                                  left.runtime_policy_id,
-                                  left.runtime_policy_revision) <
-                         std::tie(right.runtime_unit_id, right.runtime_epoch,
-                                  right.runtime_policy_id,
-                                  right.runtime_policy_revision);
-                });
-      track_failure("required_runtime_set_valid", "cell");
-      const auto digest = core::ComputeRequiredRuntimeSetDigest(receivers);
-      const core::ManagerLivenessRequiredSetDTO required_set{
-          admission_.cell_id(),
-          active_bundle.retained_bundle_id(),
-          digest,
-          core::RuntimeUnitId(std::string(
-              core::ApplicationRoleText(core::ApplicationRole::kManager))),
-          receivers};
-      if (!core::ValidateManagerLivenessRequiredSet(required_set).ok() ||
-          manager_heartbeat_sequence_ >= core::kMaximumManagerLivenessCounter) {
-        throw std::runtime_error(
-            "Manager cannot mint the exact native liveness required set");
-      }
-      ++manager_heartbeat_sequence_;
-      // Renew the independent Runner before any native or readiness work. Apply may deliberately retire a native receiver;
-      // that is not evidence that this Manager process has disappeared.
-      track_failure("program_runner_liveness_renewal", "cell-role:program_runner",
-                    runner.runtime_unit_id.value());
-      auto runner_renewal = RenewProgramRunnerLiveness(
-          config_.program_runner_liveness_socket, runner, required_set,
-          manager_heartbeat_sequence_, std::nullopt);
-      probed_cycle_status = runner_renewal.program_cycle_status;
       track_failure("cell_admission_readiness_reduction", "cell");
-      if (!allow_native) {
-        successful_manager_renewal_.reset();
+      if (!attempt.allow_native) {
         SubmitFailClosedReadiness(probed_cycle_status);
-        return required_owners_published;
+        return outcome;
       }
       {
         const auto probed_readiness = BuildCellAdmissionReadiness(
             runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
-            forced_closed);
+            attempt.forced_closed);
         if (last_submitted_readiness_.has_value() &&
             *last_submitted_readiness_ != probed_readiness &&
             !IsSameProgramAdmissionProgress(*last_submitted_readiness_,
@@ -4140,7 +4605,7 @@ private:
       const core::ManagerHeartbeatDTO heartbeat{
           required_set.cell_id,
           required_set.manager_runtime_unit_id,
-          manager_heartbeat_sequence_,
+          attempt.heartbeat_sequence,
           retained_policy.runtime_policy_id,
           retained_policy.runtime_policy_revision};
       std::optional<core::ManagerLivenessReconciliationAck> reconciliation;
@@ -4150,7 +4615,7 @@ private:
         material.push_back('\0');
         material.append(active_bundle.retained_bundle_id().value());
         material.push_back('\0');
-        material.append(digest.value());
+        material.append(required_set.required_runtime_set_digest.value());
         material.push_back('\0');
         material.append(application_start_text_);
         for (const auto &observation : runtime.observations.observations()) {
@@ -4171,8 +4636,8 @@ private:
       }
       std::vector<component_manager::ManagerLivenessTransportRequestDTO>
           requests;
-      requests.reserve(native_receivers.size());
-      for (const auto &receiver : native_receivers) {
+      requests.reserve(attempt.native_receivers.size());
+      for (const auto &receiver : attempt.native_receivers) {
         requests.push_back(
             {receiver.runtime_unit_id, runtime.plan.active_publication,
              required_set, retained_policy, heartbeat, reconciliation});
@@ -4182,12 +4647,13 @@ private:
           requests.empty()
               ? std::vector<core::ManagerLivenessObservationDTO>{}
               : execution_host_adapter_.RenewManagerLivenessBatch(requests);
-      if (responses.size() != native_receivers.size()) {
+      if (responses.size() != attempt.native_receivers.size()) {
         throw std::runtime_error(
             "native liveness batch returned the wrong receiver count");
       }
-      for (std::size_t index = 0U; index < native_receivers.size(); ++index) {
-        const auto &receiver = native_receivers[index];
+      for (std::size_t index = 0U; index < attempt.native_receivers.size();
+           ++index) {
+        const auto &receiver = attempt.native_receivers[index];
         const auto &response = responses[index];
         track_failure("native_receiver_reconciliation_identity",
                       "execution_host_unit",
@@ -4206,33 +4672,31 @@ private:
         throw std::runtime_error(
             "Execution readiness requires converged reconciliation");
       }
-      if (runner_renewal.observation.status.state !=
+      if (runner_observation.status.state !=
           core::ManagerLivenessStateDTO::kCurrent) {
-        track_failure("program_runner_reconciliation_sequence_available",
-                      "cell-role:program_runner",
-                      runner.runtime_unit_id.value());
-        Require(manager_heartbeat_sequence_ <
-                    core::kMaximumManagerLivenessCounter,
-                "Manager heartbeat sequence is exhausted");
-        track_failure("program_runner_reconciliation_renewal",
-                      "cell-role:program_runner",
-                      runner.runtime_unit_id.value());
-        runner_renewal = RenewProgramRunnerLiveness(
-            config_.program_runner_liveness_socket, runner, required_set,
-            ++manager_heartbeat_sequence_,
-            reconciliation->reconciliation_evidence_digest);
+        // Every native receiver of this required set is reconciled: the
+        // Runner lane now hands the same reconciliation to the Runner, and
+        // its next attempt is published.
+        {
+          std::lock_guard lock(manager_liveness_lane_mutex_);
+          manager_liveness_reconciled_set_ = ReconciledRequiredSet{
+              required_set.required_runtime_set_digest,
+              reconciliation->reconciliation_evidence_digest};
+          ++manager_liveness_wake_generation_;
+        }
+        manager_liveness_lane_condition_.notify_one();
+        return outcome;
       }
       // The Program Runner owns cycle progression. A Start or terminal event
       // may legitimately occur between the preflight probe and this renewal;
       // require the private receiver's exact process identity and publish the
       // newer owner-issued status instead of treating ordinary progress as a
       // liveness failure.
-      probed_cycle_status = runner_renewal.program_cycle_status;
       track_failure("kernel_program_runner_liveness_publication",
                     "cell-role:program_runner",
-                    runner.runtime_unit_id.value());
+                    runner_observation.status.receiver_runtime_unit_id.value());
       const auto published_runner =
-          execution_host_adapter_.Publish(runner_renewal.observation);
+          execution_host_adapter_.Publish(runner_observation);
       if (!published_runner.ok()) {
         throw std::runtime_error(
             "Kernel rejected Program Runner liveness observation: " +
@@ -4241,12 +4705,11 @@ private:
       // The native rows and this actual Runner row now make the exact
       // successor renewal available to the existing Kernel owner guard.
       // Subsequent readiness reduction/publication is not a settlement gate.
-      required_owners_published = true;
-      successful_manager_renewal_ = SuccessfulManagerRenewal{snapshot};
+      outcome.renewed = true;
       track_failure("cell_admission_readiness_reduction", "cell");
       const auto readiness = BuildCellAdmissionReadiness(
           runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
-          forced_closed);
+          attempt.forced_closed);
       // Renewal and owner identity are now validated. Publish the complete
       // reduction atomically; an artificial close/reopen here would expose a
       // false outage to already-running Program children.
@@ -4255,30 +4718,25 @@ private:
         track_failure("readiness_snapshot_current", "cell");
         {
           std::lock_guard lock(manager_liveness_lane_mutex_);
-          Require(forced_closed || (readiness_barrier ==
-                                        manager_liveness_readiness_barrier_ &&
-                                    !manager_liveness_force_closed_),
+          Require(attempt.forced_closed ||
+                      (attempt.readiness_barrier ==
+                           manager_liveness_readiness_barrier_ &&
+                       !manager_liveness_force_closed_),
                   "Manager liveness snapshot changed during renewal");
         }
         track_failure("kernel_cell_readiness_publication", "cell");
         SubmitCellAdmissionReadiness(readiness);
       }
       manager_liveness_last_warning_.reset();
-    } catch (const component_manager::ManagerLivenessRuntimeTransition &) {
-      successful_manager_renewal_.reset();
-      // Runtime replacement is already fenced by Apply. No native heartbeat
-      // was sent, so this is ordinary convergence rather than an uncertain
-      // renewal. Keep readiness closed until the next exact snapshot arrives.
-      SubmitFailClosedReadiness(probed_cycle_status);
     } catch (const component_manager::ManagerLivenessPublicationSuperseded &) {
-      successful_manager_renewal_.reset();
+      outcome.renewed = false;
       SubmitFailClosedReadiness(probed_cycle_status);
       {
         std::lock_guard lock(manager_liveness_lane_mutex_);
         if (!manager_liveness_snapshot_.has_value() ||
             !SameNativeManagerLivenessIdentity(snapshot,
                                                *manager_liveness_snapshot_)) {
-          return required_owners_published;
+          return outcome;
         }
         manager_liveness_superseded_publication_ =
             snapshot.runtime.plan.active_publication;
@@ -4286,106 +4744,65 @@ private:
       // Every native receiver rejected before renewal and the adapter drained
       // the complete batch: an expected publication race. Readiness stays
       // fail-closed until the next exact snapshot.
-    } catch (const detail::ProgramRunnerPublisherFault &error) {
-      successful_manager_renewal_.reset();
-      // A responding Runner is present. Its independent publisher has failed;
-      // reuse required-owner containment without manufacturing process death.
-      track_failure("program_runner_publication_fault",
-                    "cell-role:program_runner");
-      const auto &cycle = error.cycle();
-      if (established_program_cycle_status_ &&
-          cycle.program_run_id ==
-              established_program_cycle_status_->program_run_id &&
-          cycle.cycle_claim_generation ==
-              established_program_cycle_status_->cycle_claim_generation) {
-        RetainRunnerContactFailure(failure_predicate, error.what());
-      }
-      SubmitFailClosedReadiness(probed_cycle_status);
-      warn_failure(error.what());
     } catch (const std::exception &error) {
-      successful_manager_renewal_.reset();
-      if (failure_predicate == "program_runner_liveness_probe" ||
-          failure_predicate == "program_runner_liveness_renewal" ||
-          failure_predicate == "program_runner_reconciliation_renewal")
-        RetainRunnerContactFailure(failure_predicate, error.what());
+      outcome.renewed = false;
       SubmitFailClosedReadiness(probed_cycle_status);
-      {
-        std::lock_guard lock(manager_liveness_lane_mutex_);
-        if (manager_liveness_snapshot_.has_value() &&
-            !SameNativeManagerLivenessIdentity(snapshot,
-                                               *manager_liveness_snapshot_)) {
-          return required_owners_published;
-        }
-      }
-      warn_failure(error.what());
+      if (!snapshot_replaced()) warn_failure(error.what());
     } catch (...) {
-      successful_manager_renewal_.reset();
-      if (failure_predicate == "program_runner_liveness_probe" ||
-          failure_predicate == "program_runner_liveness_renewal" ||
-          failure_predicate == "program_runner_reconciliation_renewal")
-        RetainRunnerContactFailure(failure_predicate, "Program Runner contact failed");
+      outcome.renewed = false;
       SubmitFailClosedReadiness(probed_cycle_status);
-      {
-        std::lock_guard lock(manager_liveness_lane_mutex_);
-        if (manager_liveness_snapshot_.has_value() &&
-            !SameNativeManagerLivenessIdentity(snapshot,
-                                               *manager_liveness_snapshot_)) {
-          return required_owners_published;
-        }
-      }
-      warn_failure("unknown exception");
+      if (!snapshot_replaced()) warn_failure("unknown exception");
     }
-    return required_owners_published;
+    return outcome;
   }
 
-  bool SuccessfulRenewalIsCurrent(
+  /// Under manager_liveness_lane_mutex_. The latest host-liveness attempt
+  /// succeeded for this exact snapshot (every failed attempt clears it). The
+  /// final Kernel guard remains the authority for actual health.
+  bool SuccessfulRenewalIsCurrentLocked(
       const NativeManagerLivenessSnapshot &snapshot) const {
-    // The latest renewal attempt succeeded for this exact snapshot (every
-    // failed attempt resets it). The final Kernel guard remains the
-    // authority for actual health.
-    return successful_manager_renewal_ && !program_runner_contact_loss_ &&
+    return successful_manager_renewal_ && !manager_liveness_runner_contact_lost_ &&
            SameNativeManagerLivenessIdentity(successful_manager_renewal_->snapshot, snapshot);
   }
 
-  bool RenewCurrentNativeManagerLiveness(
-      const component_manager::ManagerApplyIntentDTO *expected = nullptr,
-      const bool reuse_only = false) {
-    std::lock_guard attempt_lock(manager_liveness_attempt_mutex_);
-    const auto [snapshot, superseded, forced_closed, barrier] = [&] {
+  /// Apply lane. True when a renewal of this Apply's snapshot is already
+  /// current. Otherwise, with `renew`, a new attempt is posted to the
+  /// liveness lanes and false returned (OD-295 (3)(a)): no wait on another
+  /// lane. The release then stays a pending settlement; when the attempt that
+  /// answers the request is done, the host-liveness lane requests the
+  /// settlement retry, which picks up its result here.
+  bool ManagerLivenessRenewedFor(
+      const component_manager::ManagerApplyIntentDTO &expected,
+      const bool renew) {
+    {
       std::lock_guard lock(manager_liveness_lane_mutex_);
-      return std::tuple{manager_liveness_snapshot_, manager_liveness_superseded_publication_,
-                        manager_liveness_force_closed_, manager_liveness_readiness_barrier_};
-    }();
-    if (!snapshot) {
-      if (!reuse_only) SubmitFailClosedReadiness();
-      return false;
+      if (manager_liveness_snapshot_) {
+        if (!IsApplyPublication(*manager_liveness_snapshot_, expected))
+          return false;
+        if (SuccessfulRenewalIsCurrentLocked(*manager_liveness_snapshot_))
+          return true;
+      }
+      if (!renew || manager_liveness_lane_stop_) return false;
+      ++manager_liveness_renewal_requested_;
+      ++manager_liveness_wake_generation_;
     }
-    const auto &publication = snapshot->runtime.plan.active_publication;
-    if (expected &&
-        (publication.request.transaction_ref != core::ActiveBundlePublicationTransactionRefDTO{
-             core::NamedApplyPublicationTransactionDTO{expected->apply_id, expected->apply_generation}} ||
-         publication.request.candidate_retained_bundle_id != expected->candidate_retained_bundle_id ||
-         publication.request.candidate_graph_revision != expected->candidate_graph_revision))
-      return false;
-    if (expected && SuccessfulRenewalIsCurrent(*snapshot)) return true;
-    if (reuse_only) return false;
-    const bool allow_native = !superseded || publication != *superseded;
-    const bool published = TryRenewNativeManagerLiveness(*snapshot, forced_closed,
-                                                        barrier, allow_native);
-    return published && !program_runner_contact_loss_;
+    manager_liveness_lane_condition_.notify_one();
+    return false;
   }
 
   bool PrepareSuccessfulApplySettlement(
       const component_manager::ManagerApplyIntentDTO &intent,
       const component_manager::ManagerApplySettlementAttempt attempt) {
     if (config_.program_runner_liveness_socket.empty()) return true;
-    if (RenewCurrentNativeManagerLiveness(&intent, true)) return true;
+    if (ManagerLivenessRenewedFor(intent, false)) return true;
     if (attempt == component_manager::ManagerApplySettlementAttempt::kOrdinaryHeartbeat)
       return false;  // No second attempt: use only this ordinary heartbeat.
     try {
-      // I/O stays outside renewal serialization and all host/Core locks.
+      // I/O stays outside the liveness lanes' lock and all host/Core locks.
+      // The renewal is posted; its result settles on the retry the
+      // host-liveness lane requests (OD-295 (3)(a)).
       static_cast<void>(ObserveRuntimeAndPublish());
-      return RenewCurrentNativeManagerLiveness(&intent);
+      return ManagerLivenessRenewedFor(intent, true);
     } catch (const std::exception &error) {
       std::cerr << "Manager Apply successor observation remains pending: " << error.what() << '\n';
     } catch (...) {
@@ -4398,12 +4815,18 @@ private:
     if (config_.program_runner_liveness_socket.empty()) {
       return;
     }
-    Require(!manager_liveness_lane_.joinable(),
+    Require(!manager_liveness_lane_.joinable() &&
+                !manager_host_liveness_lane_.joinable(),
             "Manager liveness renewal lane is already running");
     {
       std::lock_guard lock(manager_liveness_lane_mutex_);
       manager_liveness_lane_stop_ = false;
     }
+    runner_lane_stop_fd_ =
+        FileDescriptor(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK));
+    if (!runner_lane_stop_fd_) FailErrno("create the Runner lane stop signal");
+    manager_host_liveness_lane_ =
+        std::thread([this] { RunHostLivenessLane(); });
     manager_liveness_lane_ =
         std::thread([this] { RunNativeManagerLivenessLane(); });
   }
@@ -4416,10 +4839,18 @@ private:
       std::lock_guard lock(manager_liveness_lane_mutex_);
       manager_liveness_lane_stop_ = true;
     }
+    // Ends a Runner exchange the Runner lane waits on (OD-296 (a)).
+    const std::uint64_t one = 1U;
+    [[maybe_unused]] const auto io_result = ::write(runner_lane_stop_fd_.get(), &one, sizeof(one));
     manager_liveness_lane_condition_.notify_one();
+    manager_host_liveness_condition_.notify_one();
     manager_liveness_lane_.join();
+    manager_host_liveness_lane_.join();
   }
 
+  /// The Runner lane (OD-295 (3)(a)): renews the Program Runner on the
+  /// heartbeat period and on every wake, whatever the execution host does,
+  /// and hands each attempt to the host-liveness lane.
   void RunNativeManagerLivenessLane() noexcept {
     const auto heartbeat_period = std::chrono::nanoseconds(
         deployment::execution_runtime_contract::manager_liveness_policy().heartbeat_period_ns);
@@ -4430,23 +4861,29 @@ private:
       if (ordinary_heartbeat)
         next_heartbeat = std::chrono::steady_clock::now() + heartbeat_period;
       const auto wake_generation = manager_liveness_wake_generation_;
+      RunnerLivenessAttempt attempt;
+      attempt.snapshot = manager_liveness_snapshot_;
+      attempt.forced_closed = manager_liveness_force_closed_;
+      attempt.readiness_barrier = manager_liveness_readiness_barrier_;
+      attempt.allow_native =
+          attempt.snapshot &&
+          (!manager_liveness_superseded_publication_ ||
+           attempt.snapshot->runtime.plan.active_publication !=
+               *manager_liveness_superseded_publication_);
+      attempt.renewal_request = manager_liveness_renewal_requested_;
+      attempt.ordinary_heartbeat = ordinary_heartbeat;
+      const auto reconciled = manager_liveness_reconciled_set_;
       lock.unlock();
-      static_cast<void>(RenewCurrentNativeManagerLiveness());
-      // Only tag the actual pending Apply with this ordinary heartbeat.
-      // The existing progress owner performs release RPCs; this independent
-      // reporting lane never waits behind that owner's operation or transport.
-      try {
-        if (ordinary_heartbeat) {
-          if (const auto pending = named_apply_.PendingSettlementForHeartbeat())
-            RequestApplySettlementProgress(*pending);
-        }
-      } catch (const std::exception &error) {
-        std::cerr << "Manager Apply heartbeat settlement stopped fail-closed: "
-                  << error.what() << '\n';
-      } catch (...) {
-        std::cerr << "Manager Apply heartbeat settlement stopped fail-closed after an unknown error\n";
-      }
+      if (attempt.snapshot) RenewProgramRunner(attempt, reconciled);
       lock.lock();
+      if (attempt.stopped) break;
+      // Latest value: an attempt the host-liveness lane has not taken yet is
+      // replaced; its ordinary heartbeat is kept.
+      if (manager_liveness_runner_attempt_ &&
+          manager_liveness_runner_attempt_->ordinary_heartbeat)
+        attempt.ordinary_heartbeat = true;
+      manager_liveness_runner_attempt_ = std::move(attempt);
+      manager_host_liveness_condition_.notify_one();
       const bool woken = manager_liveness_lane_condition_.wait_until(
           lock, next_heartbeat, [&] {
             return manager_liveness_lane_stop_ ||
@@ -4455,6 +4892,170 @@ private:
       // Keep this SAME ordinary deadline through extra publication/control
       // wakes: they may report early, but cannot starve the timed report.
       ordinary_heartbeat = !woken;
+    }
+  }
+
+  /// The host-liveness lane (OD-295 (3)(a)): the only lane that publishes
+  /// liveness and readiness to the Kernel. It takes the latest Runner-lane
+  /// attempt and the Apply lane's close requests; no lock is held across
+  /// its host I/O.
+  void RunHostLivenessLane() noexcept {
+    std::unique_lock lock(manager_liveness_lane_mutex_);
+    while (true) {
+      manager_host_liveness_condition_.wait(lock, [&] {
+        return manager_liveness_lane_stop_ ||
+               manager_liveness_runner_attempt_.has_value() ||
+               manager_liveness_close_requested_ !=
+                   manager_liveness_close_completed_;
+      });
+      if (manager_liveness_lane_stop_) break;
+      const auto close_request = manager_liveness_close_requested_;
+      const bool close = close_request != manager_liveness_close_completed_;
+      auto attempt = std::move(manager_liveness_runner_attempt_);
+      manager_liveness_runner_attempt_.reset();
+      lock.unlock();
+      if (close) {
+        const bool closed = CloseReadinessForMaintenance();
+        lock.lock();
+        manager_liveness_close_completed_ = close_request;
+        manager_liveness_close_result_ = closed;
+        lock.unlock();
+        // The Apply lane picks the result up on its next pass (OD-295 (3)(a)).
+        RequestApplyProgress();
+      }
+      if (attempt) {
+        HostLivenessOutcome outcome;
+        if (attempt->snapshot)
+          outcome = RenewNativeManagerLiveness(*attempt);
+        else
+          SubmitFailClosedReadiness();
+        lock.lock();
+        // Without a snapshot the last successful renewal stays as it is.
+        if (outcome.renewed)
+          successful_manager_renewal_ = SuccessfulManagerRenewal{*attempt->snapshot};
+        else if (attempt->snapshot)
+          successful_manager_renewal_.reset();
+        manager_liveness_runner_contact_lost_ =
+            program_runner_contact_loss_.has_value();
+        // This attempt answers an Apply's renewal request (OD-295 (3)(a)).
+        const bool answered_request =
+            attempt->renewal_request != manager_liveness_renewal_completed_;
+        manager_liveness_renewal_completed_ = attempt->renewal_request;
+        lock.unlock();
+        // Only tag the actual pending Apply with an ordinary heartbeat or the
+        // attempt its renewal request asked for. The existing progress owner
+        // performs release RPCs; this lane never waits behind that owner's
+        // operation or transport.
+        try {
+          if (attempt->ordinary_heartbeat || answered_request) {
+            if (const auto pending = named_apply_.PendingSettlementForHeartbeat())
+              RequestApplySettlementProgress(*pending);
+          }
+        } catch (const std::exception &error) {
+          std::cerr << "Manager Apply heartbeat settlement stopped fail-closed: "
+                    << error.what() << '\n';
+        } catch (...) {
+          std::cerr << "Manager Apply heartbeat settlement stopped fail-closed after an unknown error\n";
+        }
+      }
+      lock.lock();
+    }
+  }
+
+  /// Under manager_source_mutex_. Every Manager section value goes through
+  /// here: `payload` is kept as the last base value and published with the
+  /// outstanding exchanges the main thread last read (information only).
+  std::uint64_t PublishManagerSectionLocked(const std::int64_t observed_at,
+                                            CanonicalValue payload) {
+    last_manager_payload_ = std::move(payload);
+    return PublishManagerValueLocked(observed_at);
+  }
+
+  /// Under manager_source_mutex_, with a last base value.
+  std::uint64_t PublishManagerValueLocked(const std::int64_t observed_at) {
+    if (outstanding_exchanges_.empty())
+      return status_board_.Publish(ManagerStatusSection::kManager, observed_at,
+                                   *last_manager_payload_);
+    return status_board_.Publish(ManagerStatusSection::kManager, observed_at,
+                                 WithOutstandingExchangesLocked());
+  }
+
+  /// Under manager_source_mutex_: the last base value with
+  /// `runtime.outstanding_exchanges` when an exchange is outstanding
+  /// (optional field, absent otherwise; OD-295 (1)(a), OD-296 (a),
+  /// OD-298 (a)).
+  [[nodiscard]] CanonicalValue WithOutstandingExchangesLocked() const {
+    auto object = last_manager_payload_->as_object();
+    for (auto &[key, value] : object) {
+      if (key != "runtime" || !value.is_object()) continue;
+      auto runtime = value.as_object();
+      runtime.emplace_back("outstanding_exchanges",
+                           CanonicalValue(outstanding_exchanges_));
+      value = CanonicalValue(std::move(runtime));
+    }
+    return CanonicalValue(std::move(object));
+  }
+
+  /// Main thread, at each status tick: what the Manager waits for now, as
+  /// information only; it never ends, halts or faults anything. An exchange
+  /// with the execution host (the management channel; a command held by the
+  /// host shows here as "waiting for execution host", OD-298 (a)) or with the
+  /// Program Runner (OD-296 (a)) that is still outstanding at the next tick
+  /// is published with its peer, channel, kind and start (`since_ns`, the
+  /// clock of `observed_at_ns`); it goes when its reply is in. The rule is
+  /// the late-reply log's (OD-290 (a)). Republishes the Manager section only
+  /// when the set changes.
+  void PublishOutstandingExchanges() noexcept {
+    try {
+      const auto now_ns = static_cast<std::int64_t>(ElapsedNs());
+      CanonicalValue::Array rows;
+      const auto row = [&](const char *peer, const char *channel,
+                           const std::string &exchange,
+                           const std::int64_t since_ns) {
+        rows.emplace_back(CanonicalValue(CanonicalValue::Object{
+            {"channel", CanonicalValue(channel)},
+            {"exchange", CanonicalValue(exchange)},
+            {"peer", CanonicalValue(peer)},
+            {"since_ns", CanonicalValue(static_cast<double>(since_ns))},
+        }));
+      };
+      // Seen at two ticks in a row: published, with the start it had at the
+      // first one.
+      const auto observe = [](OutstandingSeen &seen, const std::uint64_t episode,
+                              const std::int64_t since_ns) {
+        const bool again = episode != 0U && seen.episode == episode;
+        if (!again) seen = OutstandingSeen{episode, since_ns};
+        return again;
+      };
+      const auto host = execution_host_adapter_.HostReplyOutstanding();
+      if (observe(host_outstanding_seen_, host ? host->episode : 0U,
+                  host ? now_ns - static_cast<std::int64_t>(
+                                      std::chrono::nanoseconds(host->waited)
+                                          .count())
+                       : 0))
+        row("execution_host", "management", host->exchange,
+            host_outstanding_seen_.since_ns);
+      const auto runner = runner_exchanges_.Oldest();
+      if (observe(runner_outstanding_seen_, runner ? runner->episode : 0U,
+                  runner ? now_ns - static_cast<std::int64_t>(
+                                        std::chrono::duration_cast<
+                                            std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() -
+                                            runner->since)
+                                            .count())
+                         : 0))
+        row("program_runner", "liveness", runner->exchange,
+            runner_outstanding_seen_.since_ns);
+      std::lock_guard source_lock(manager_source_mutex_);
+      if (rows == outstanding_exchanges_) return;
+      outstanding_exchanges_ = std::move(rows);
+      if (last_manager_payload_.has_value())
+        static_cast<void>(PublishManagerValueLocked(now_ns));
+    } catch (const std::exception &error) {
+      std::cerr << "Manager outstanding-exchange publication failed: "
+                << error.what() << '\n';
+    } catch (...) {
+      std::cerr << "Manager outstanding-exchange publication failed\n";
     }
   }
 
@@ -4641,8 +5242,8 @@ private:
         // runtime, which holds the new publication.
         if (ManagerRuntimeAccountsForCommittedApplies(*last_runtime_,
                                                       apply_inventory)) {
-          static_cast<void>(status_board_.Publish(
-              ManagerStatusSection::kManager, observed_at,
+          static_cast<void>(PublishManagerSectionLocked(
+              observed_at,
               BuildManagerSourcePayload(
                   *last_active_bundle_, admission_, *last_runtime_,
                   stores_.apply_journal(), apply_inventory,
@@ -4861,7 +5462,7 @@ private:
           active.program_revision = core::ProgramRevision(revision->as_string());
       }
       const auto collected = deployment::collect_unreferenced_activation_content(
-          config_.activation_root, active);
+          config_.activation_root, active, activation_content_references_);
       // One line per run, also when nothing is removed or a preparation
       // deferred it: its duration is time this lane holds the writer lock.
       std::cerr << "Manager activation content collection: "
@@ -4870,6 +5471,7 @@ private:
                 << " removed=" << collected.removed_entries
                 << " removed_bytes=" << collected.removed_bytes
                 << " read_bytes=" << collected.read_bytes
+                << " reused_documents=" << collected.reused_documents
                 << " elapsed_ms=" << elapsed_ms() << '\n';
     } catch (const std::exception &error) {
       std::cerr << "Manager activation content collection skipped after "
@@ -4903,8 +5505,7 @@ private:
         // would be inconsistent. Readers keep the previous value.
         return;
       }
-      static_cast<void>(status_board_.Publish(
-          ManagerStatusSection::kManager,
+      static_cast<void>(PublishManagerSectionLocked(
           static_cast<std::int64_t>(ElapsedNs()),
           BuildManagerSourcePayload(
               *last_active_bundle_, admission_, *last_runtime_, stores_.apply_journal(),
@@ -5021,45 +5622,33 @@ private:
     }
   }
 
-  /// One cell-wide Stop for a late execution host (OD-121 (16)) on the
-  /// Kernel's Stop control socket, which never uses the host's management
-  /// channel, with the one typed event of the episode. Best effort: a
-  /// refusal or an unavailable socket is recorded in the event; nothing is
-  /// retried. The wait is the socket's own connect and acknowledgement bound.
-  /// The Stop is a Halt (P-15).
-  void RequestExecutionHostLateStop(
-      const component_manager::ExecutionHostLateDTO &late) noexcept {
-    std::string_view stop = "accepted";
-    try {
-      const auto response = ExchangeLocalPacket(
-          config_.execution_run_root / "execution-control.sock",
-          CanonicalValue(CanonicalValue::Object{
-              {"api_version", CanonicalValue("manyforge.execution_command.v4")},
-              {"attribution",
-               CanonicalValue(CanonicalValue::Object{
-                   {"assurance", CanonicalValue("unverified")},
-                   {"principal_id", CanonicalValue(nullptr)},
-                   {"transport", CanonicalValue("internal")}})},
-              {"command", CanonicalValue("halt")},
-              {"request",
-               CanonicalValue(CanonicalValue::Object{
-                   {"request_context",
-                    CanonicalValue(CanonicalValue::Object{
-                        {"request_key", RequestKeyValue(MintRequestKey())},
-                        {"source_label",
-                         CanonicalValue("manager.execution_host_late")}})}})}}),
-          "Kernel Stop control", {kMaximumKernelStopResponseBytes, 32U});
-      const auto *accepted = response.find_object_member("accepted");
-      if (accepted == nullptr ||
-          accepted->find_object_member("event_id") == nullptr)
-        stop = "refused";
-    } catch (const std::exception &) {
-      stop = "unavailable";
+  /// A late execution host reply is information, never a trigger
+  /// (OD-290 (a)): an exchange whose reply is still outstanding at the next
+  /// observation tick gets one typed line, and one more when its reply
+  /// arrives. Nothing is halted and the host unit does not count as faulted;
+  /// new requests to the host meet the outstanding exchange and are answered
+  /// `execution_host_late` at once. Main thread; non-blocking reads under the
+  /// adapter's leaf locks only.
+  void LogExecutionHostLateReply() noexcept {
+    const auto outstanding = execution_host_adapter_.HostReplyOutstanding();
+    if (late_reply_logged_.has_value() &&
+        (!outstanding || outstanding->episode != late_reply_logged_->first)) {
+      std::cerr << "{\"code\":\"execution_host_late_reply_settled\","
+                   "\"exchange\":\""
+                << late_reply_logged_->second << "\"}\n";
+      late_reply_logged_.reset();
     }
-    std::cerr << "{\"code\":\"execution_host_late_reply\",\"exchange\":\""
-              << late.exchange << "\",\"bound_ms\":" << late.bound.count()
-              << ",\"waited_ms\":" << late.waited.count()
-              << ",\"halt\":\"" << stop << "\"}\n";
+    if (outstanding && outstanding->episode == late_reply_seen_episode_ &&
+        !late_reply_logged_.has_value()) {
+      std::cerr << "{\"code\":\"execution_host_late_reply\",\"exchange\":\""
+                << outstanding->exchange
+                << "\",\"waited_ms\":" << outstanding->waited.count() << "}\n";
+      try {
+        late_reply_logged_.emplace(outstanding->episode, outstanding->exchange);
+      } catch (...) {
+      }
+    }
+    late_reply_seen_episode_ = outstanding ? outstanding->episode : 0U;
   }
 
   /// Planned application stop (OD-121 (7), (19); stop state model S17): one
@@ -5729,7 +6318,7 @@ private:
   bool HandleOneClient(const CommandSocket &socket) {
     sockaddr_un peer_address{};
     socklen_t peer_address_size = sizeof(peer_address);
-    const FileDescriptor client(
+    FileDescriptor client(
         ::accept4(socket.get(), reinterpret_cast<sockaddr *>(&peer_address),
                   &peer_address_size, SOCK_CLOEXEC | SOCK_NONBLOCK));
     if (!client) {
@@ -6565,12 +7154,10 @@ private:
         return false;
       }
       case CommandKind::kShutdownRuntime:
-        // The request is the first stop request; a later signal forces.
-        g_stop_started_by_command.store(true, std::memory_order_relaxed);
-        EndApplication();
-        TrySendResponse(client.get(),
-                        SuccessResponse("shutdown_runtime", std::nullopt,
-                                        std::nullopt, std::nullopt));
+        // The request is the first stop request; a later signal forces. The
+        // stop sequence runs on the main thread, which answers the client
+        // once it ended (OD-298 (a)).
+        HandOverShutdown(std::move(client));
         return true;
       }
     } catch (const ManagerPackageGenerationRestartRequired &error) {
@@ -6627,6 +7214,10 @@ private:
   std::optional<std::string> scene_admission_last_warning_;
   std::optional<component_manager::ManagerActiveRuntimeConvergenceResult>
       last_runtime_;
+  // The last Manager section value as built (without the outstanding
+  // exchanges), and the outstanding exchanges the main thread last read.
+  std::optional<CanonicalValue> last_manager_payload_;
+  CanonicalValue::Array outstanding_exchanges_;
   std::shared_ptr<const deployment::RetainedBundle> last_active_bundle_;
   component_manager::ManagerNamedApplyCoordinator named_apply_;
   // Guarded by manager_source_mutex_. The active bundle's pose-source rows
@@ -6641,27 +7232,52 @@ private:
   core::ExecutionEventChangeSignal status_signal_;
   ManagerStatusBoard status_board_;
   ManagerStatusStream status_stream_;
-  // All heartbeat sequence/retry/readiness fields are serialized by this
-  // same attempt mutex. Never take it while holding lane_mutex_.
-  std::mutex manager_liveness_attempt_mutex_;
-  std::optional<SuccessfulManagerRenewal> successful_manager_renewal_;
+  // OD-295 (3)(a): two liveness lanes. The Runner lane renews the Program
+  // Runner; the host-liveness lane renews the native receivers and is the
+  // only one to publish liveness and readiness to the Kernel. They meet only
+  // in the fields below, under manager_liveness_lane_mutex_: a leaf lock,
+  // held for memory-only work and never across I/O or another lock.
   std::mutex manager_liveness_lane_mutex_;
+  // Wakes the Runner lane.
   std::condition_variable manager_liveness_lane_condition_;
+  // Wakes the host-liveness lane.
+  std::condition_variable manager_host_liveness_condition_;
   std::optional<NativeManagerLivenessSnapshot> manager_liveness_snapshot_;
   std::uint64_t manager_liveness_readiness_barrier_{};
   std::uint64_t manager_liveness_wake_generation_{};
   bool manager_liveness_force_closed_{true};
   bool manager_liveness_lane_stop_{};
-  std::thread manager_liveness_lane_;
-  std::uint64_t manager_heartbeat_sequence_{};
-  // Log-only, accessed under manager_liveness_attempt_mutex_.
-  std::optional<std::string> manager_liveness_last_warning_;
   std::optional<core::ActiveBundlePublicationReceiptDTO>
       manager_liveness_superseded_publication_;
+  // Runner lane -> host-liveness lane: the latest attempt not yet taken.
+  std::optional<RunnerLivenessAttempt> manager_liveness_runner_attempt_;
+  // Host-liveness lane -> Runner lane.
+  std::optional<ReconciledRequiredSet> manager_liveness_reconciled_set_;
+  // Apply-lane requests and the host-liveness lane's results, observed by
+  // the Apply lane as events (OD-295 (3)(a)).
+  std::uint64_t manager_liveness_renewal_requested_{};
+  std::uint64_t manager_liveness_renewal_completed_{};
+  std::uint64_t manager_liveness_close_requested_{};
+  std::uint64_t manager_liveness_close_completed_{};
+  bool manager_liveness_close_result_{};
+  // The close the Apply lane posted and has not picked up yet; 0 = none.
+  std::uint64_t manager_liveness_apply_close_request_{};
+  std::optional<SuccessfulManagerRenewal> successful_manager_renewal_;
+  bool manager_liveness_runner_contact_lost_{};
+  std::thread manager_liveness_lane_;
+  std::thread manager_host_liveness_lane_;
+  // Runner lane only.
+  std::uint64_t manager_heartbeat_sequence_{};
+  // Readable once the Runner lane stops: ends its Runner exchange (OD-296 (a)).
+  FileDescriptor runner_lane_stop_fd_;
+  // The Program Runner exchanges outstanding now; information only (OD-296).
+  mutable ProgramRunnerExchangeBoard runner_exchanges_;
+  // Host-liveness lane only, from here to program_runner_contact_loss_.
+  // Log-only.
+  std::optional<std::string> manager_liveness_last_warning_;
   std::optional<core::CellAdmissionReadinessSnapshotDTO>
       last_submitted_readiness_;
-  // Alarm evidence only, serialized with the existing renewal attempt. It does not
-  // alter readiness selection.
+  // Alarm evidence only. It does not alter readiness selection.
   std::optional<core::ProgramCycleStatusDTO> established_program_cycle_status_;
   /// The accepted Reset whose carried-object-lost signals were cleared.
   std::optional<core::RequestKey> cleared_reset_request_key_;
@@ -6671,14 +7287,36 @@ private:
   bool apply_progress_lane_stop_{};
   bool apply_progress_requested_{};
   std::optional<core::NamedApplyPublicationTransactionDTO> apply_settlement_retry_requested_;
+  // Apply progression lane only: the references the activation content
+  // collection already read (empty at start, so the first one reads all).
+  deployment::ActivationContentReferences activation_content_references_;
   // Main thread only: the last late-host episode that got its Stop.
-  std::uint64_t execution_host_late_episode_{};
+  // LogExecutionHostLateReply: the outstanding exchange seen at the last
+  // tick, and the one logged (main thread only).
+  std::uint64_t late_reply_seen_episode_{};
+  // PublishOutstandingExchanges (main thread only): the exchange seen at the
+  // last tick per peer and the start published for it.
+  struct OutstandingSeen final {
+    std::uint64_t episode{};
+    std::int64_t since_ns{};
+  };
+  OutstandingSeen host_outstanding_seen_;
+  OutstandingSeen runner_outstanding_seen_;
+  std::optional<std::pair<std::uint64_t, std::string>> late_reply_logged_;
   // Main thread only (OD-187): a stop step did not complete (a process
   // killed, the host's exit not clean, the Halt not complete), and whether
   // the forced step was logged.
   bool stop_incomplete_{};
   bool stop_forced_logged_{};
   std::thread apply_progress_lane_;
+  // OD-298 (a): the command lane, and what it hands to the main thread under
+  // command_lane_mutex_ (a leaf lock, memory only). main_wake_fd_ wakes the
+  // main thread for a hand-over.
+  std::thread command_lane_;
+  FileDescriptor main_wake_fd_;
+  std::mutex command_lane_mutex_;
+  std::optional<std::string> command_lane_failure_;
+  std::optional<FileDescriptor> shutdown_client_;
   std::map<std::string, PoseObserverSession> pose_observer_sessions_;
   std::vector<DeploymentCandidateReceipt> deployment_candidate_receipts_;
   std::map<PoseObservationKey, PoseObservationReplay> pose_observation_replays_;

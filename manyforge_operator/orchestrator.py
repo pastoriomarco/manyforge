@@ -72,7 +72,6 @@ from .application_processes import (
     START_AFTER_BASELINE,
     ApplicationProcess,
     parent_death_preexec,
-    request_manager_shutdown,
     write_document as write_application_processes,
 )
 from .cell_layout import (
@@ -94,8 +93,6 @@ DEFAULT_TIMEOUT_SECONDS = 60.0
 # Bound on each wait for the Manager to end the application on stop: it stops
 # every application process in turn, each with its own bounded wait.
 MANAGER_STOP_TIMEOUT_SECONDS = 60.0
-# Bound on the recovery cleanup of a Manager left by a dead launcher.
-_CLEANUP_TIMEOUT_SECONDS = 10.0
 DEFAULT_POLL_SECONDS = 0.25
 
 
@@ -1932,17 +1929,7 @@ class NativeLauncher:
                         old_status.last_failure,
                     )
                     self.store.write(stopping, mechanical)
-                    paths = mechanical.get("paths")
-                    manager_root = (
-                        Path(paths["manager_run_root"])
-                        if isinstance(paths, dict)
-                        and isinstance(paths.get("manager_run_root"), str)
-                        else self.config.manager_run_root
-                    )
-                    clean = self._cleanup_authenticated(
-                        processes,
-                        manager_run_root=manager_root,
-                    )
+                    clean = self._cleanup_authenticated(processes)
                     observations = self._resource_observations(resources)
                     if not clean or any(
                         observation.presence is not ResourcePresence.ABSENT
@@ -2228,42 +2215,21 @@ class NativeLauncher:
     def _cleanup_authenticated(
         self,
         process_records: Mapping[str, Mapping[str, Any]] | None = None,
-        *,
-        manager_run_root: Path | None = None,
     ) -> bool:
+        """One stop request to a live recorded Manager, then follow it, without
+        a time limit, until it has ended (a further `stop` is one more request
+        and forces it). The launcher starts only the Manager; its children end
+        with it. Returns whether every recorded process has ended."""
+
         processes = (
             dict(process_records)
             if process_records is not None
             else self._mechanical().get("processes", {})
         )
         manager = processes.get("manager")
-        if manager is not None and _safe_process_is_authenticated(manager):
-            request_manager_shutdown(
-                (manager_run_root or self.config.manager_run_root) / "manager-command.sock",
-                timeout_seconds=2.0,
-            )
-        deadline = time.monotonic() + _CLEANUP_TIMEOUT_SECONDS
-        # The launcher starts only the Manager; its children end with it.
-        if manager is not None and _safe_process_is_authenticated(manager):
-            pgid = int(manager["process_group_id"])
-            if pgid > 1 and pgid != os.getpgrp():
-                try:
-                    os.killpg(pgid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-        while time.monotonic() < deadline:
-            if not any(_safe_process_is_authenticated(item) for item in processes.values()):
-                return True
-            time.sleep(0.05)
-        for item in processes.values():
-            if _safe_process_is_authenticated(item):
-                pgid = int(item["process_group_id"])
-                if pgid > 1 and pgid != os.getpgrp():
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-        time.sleep(0.05)
+        if self._request_manager_stop(manager):
+            while _safe_process_is_authenticated(manager):
+                time.sleep(self.config.poll_interval_seconds)
         return not any(_safe_process_is_authenticated(item) for item in processes.values())
 
     def _request_manager_stop(self, manager: Mapping[str, Any] | None) -> bool:
@@ -2351,20 +2317,8 @@ class NativeLauncher:
                 old_status.record_generation + 1,
             )
             self.store.write(stopping, mechanical)
-            # A live Manager whose launcher has ended: one stop request, then
-            # follow it, without a time limit, until its recorded process has
-            # ended (a further `stop` is one more request and forces it). The
-            # cleanup below then finds only leftovers of a dead application.
-            manager = processes.get("manager")
-            if self._request_manager_stop(manager):
-                while _safe_process_is_authenticated(manager):
-                    time.sleep(self.config.poll_interval_seconds)
-            clean = self._cleanup_authenticated(
-                processes,
-                manager_run_root=Path(
-                    mechanical["paths"]["manager_run_root"]
-                ),
-            )
+            # A live Manager whose launcher has ended: stop it and wait for it.
+            clean = self._cleanup_authenticated(processes)
             observations = [
                 ResourceObservation(
                     resource_id=str(item.get("resource_id", component)),

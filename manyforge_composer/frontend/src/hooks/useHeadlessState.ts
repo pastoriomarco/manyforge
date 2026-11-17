@@ -459,6 +459,25 @@ function websocketUrl(path: '/ws/control' | '/ws/scene/viewer'): string {
   return resolved.toString();
 }
 
+/** A random identity kept per browser (local storage), new when unavailable. */
+function browserStableIdentity(storageKey: string, prefix: string): string {
+  const valid = (value: string | null): value is string =>
+    value !== null && new RegExp(`^${prefix}\\.[A-Za-z0-9_-]{8,256}$`).test(value);
+  try {
+    const stored = globalThis.localStorage?.getItem(storageKey);
+    if (valid(stored)) return stored;
+    const random = globalThis.crypto?.randomUUID?.()
+      ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const value = `${prefix}.${random}`;
+    globalThis.localStorage?.setItem(storageKey, value);
+    return value;
+  } catch {
+    const random = globalThis.crypto?.randomUUID?.()
+      ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return `${prefix}.${random}`;
+  }
+}
+
 function sameStrings(current: string[], candidate: string[]): boolean {
   return current.length === candidate.length
     && current.every((value, index) => value === candidate[index]);
@@ -1516,10 +1535,17 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         || !this.enabled
         || this.disposed
       ) return;
+      // The browser's own identity: Headless keys this browser's incident
+      // reports by it, across sessions and application starts.
+      const clientIncarnation = browserStableIdentity(
+        'manyforge.composer.control_client_incarnation',
+        'control-client',
+      );
       socket.send(JSON.stringify({
         schema_version: CONTROL_PROTOCOL_VERSION,
         message_kind: 'client_hello',
         supported_versions: [CONTROL_PROTOCOL_VERSION],
+        client_incarnation: clientIncarnation,
         source_label: 'operator_ui',
       }));
     };

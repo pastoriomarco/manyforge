@@ -93,8 +93,7 @@ void ResourceAddressedExecutionKernel::note_operation_change_locked(const bool s
 }
 
 Result<bool> ResourceAddressedExecutionKernel::record_operation_state_locked(
-    std::unique_lock<KernelStateMutex>& state_lock, OperationStateDTO& state,
-    const RuntimeScaleStatusDTO* scale, const char* reason,
+    OperationStateDTO& state, const RuntimeScaleStatusDTO* scale, const char* reason,
     std::span<const PreparedMotionDiagnosticsDTO> diagnostics,
     std::optional<RequestKey> request_key) {
   auto* operation = find_active_operation_locked(state.operation_id);
@@ -105,7 +104,6 @@ Result<bool> ResourceAddressedExecutionKernel::record_operation_state_locked(
     return Result<bool>::Ok(false);
   // The lock stays held: the capture is stamped, posted and then applied by
   // the caller in this one section.
-  static_cast<void>(state_lock);
   stamp_operation_capture_locked(*operation, state);
   // Ordinary rows carry the participants' `stop` objects too (C4).
   fill_participant_stop_observations(operation->participants, state);

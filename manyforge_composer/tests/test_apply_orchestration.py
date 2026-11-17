@@ -653,7 +653,7 @@ def test_the_apply_leaves_the_admission_wait_to_the_preparation() -> None:
 
 
 def test_the_default_lifecycle_timeout_mirrors_the_generated_default() -> None:
-    # The Manager's `ManagerApplyBound` uses `kDefaultLifecycleBudgetNs`,
+    # The Manager's component budgets use `kDefaultLifecycleBudgetNs`,
     # generated from robot_defaults.tsv like this Composer table.
     from manyforge_composer.backend.robot_defaults import COMPONENT_DEFAULTS
     from manyforge_headless_api.component_model import DEFAULT_LIFECYCLE_TIMEOUT_S
@@ -799,29 +799,6 @@ def test_the_manager_apply_wait_has_no_bound() -> None:
     assert manager.reads == 50
 
 
-def test_the_manager_apply_wait_shows_the_managers_own_timeout() -> None:
-    # OD-188 P2: the Manager ends an Apply past its bound `apply_timed_out`;
-    # the Composer, with no limit of its own, shows that typed end.
-    class _ManagerTimesOut:
-        reads = 0
-
-        def manager_apply_status(
-            self, _apply_id: int, _generation: int, *, application_start_id: str
-        ) -> dict[str, Any]:
-            self.reads += 1
-            if self.reads < 20:
-                return {"ok": True, "state": "pending"}
-            return {"ok": True, "state": "unknown_effect", "error": None,
-                    "failure": {"code": "apply_timed_out", "cause_code": "apply_timed_out",
-                                "cause_details": {}, "message": "timed out"}}
-
-    with pytest.raises(ApplyStepFailed) as ended:
-        _ports(_ManagerTimesOut()).wait_for_manager_apply(
-            {"status": "accepted", "apply_id": 1, "apply_generation": 1}
-        )
-    assert ended.value.code == "apply_timed_out"
-
-
 def test_a_failed_manager_apply_status_read_ends_the_wait() -> None:
     # Peer loss: the status read's own error ends the wait, typed.
     from manyforge_headless_api.client import HeadlessClientError
@@ -864,9 +841,9 @@ def test_a_terminal_manager_apply_reports_its_retained_failure() -> None:
     assert failed.value.code == "manager_apply_fence_failed"
 
 
-@pytest.mark.parametrize("code", ["apply_progression_failed", "apply_timed_out"])
+@pytest.mark.parametrize("code", ["apply_progression_failed"])
 def test_a_manager_apply_ended_by_the_manager_is_an_unknown_effect_failure(code: str) -> None:
-    # OD-188 P1/P2: the existing terminal state, the Manager's own typed code
+    # OD-188 P1: the existing terminal state, the Manager's own typed code
     # (the phase code and, without a deeper cause, the cause code too).
     class _Ended:
         def components(self) -> list[dict[str, Any]]:

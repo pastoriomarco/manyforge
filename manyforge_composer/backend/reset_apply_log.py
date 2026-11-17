@@ -26,7 +26,8 @@ _RunNumber = Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
 
 class ResetApplyContextRequest(BaseModel):
-    """The confirmed identities of one Apply that Resets a held run first."""
+    """The confirmed identities of one Apply (or Revert) that Resets a held
+    run first."""
 
     model_config = ConfigDict(
         populate_by_name=True, extra="forbid", allow_inf_nan=False, strict=True
@@ -37,6 +38,8 @@ class ResetApplyContextRequest(BaseModel):
     )
     correlation_id: _Identity = Field(alias="correlationId")
     document: Literal["program", "deployment"]
+    # What follows the Reset: an Apply of the Draft or a Revert to Saved.
+    action: Literal["apply", "revert"] = "apply"
     program_run_id: _RunNumber = Field(alias="programRunId")
     cycle_generation: _Count = Field(alias="cycleGeneration")
     draft_id: _Identity = Field(alias="draftId")
@@ -53,6 +56,7 @@ def record_reset_apply_context(body: ResetApplyContextRequest) -> dict[str, Any]
         extra={
             "reset_apply_correlation_id": body.correlation_id,
             "document": body.document,
+            "action": body.action,
             "program_run_id": body.program_run_id,
             "cycle_generation": body.cycle_generation,
             "draft_id": body.draft_id,

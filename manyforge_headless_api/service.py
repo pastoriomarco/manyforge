@@ -8,7 +8,7 @@ from functools import lru_cache
 import hashlib
 import logging
 import math
-from threading import Event, Lock, Thread
+from threading import Condition, Event, Lock, Thread
 import time
 from typing import Any, Callable, Final, Sequence
 
@@ -41,7 +41,6 @@ from .models import (
     MockIoInputRequest,
     ManagerDeploymentCandidatePreviewRequest,
     AuthoringMutationContext,
-    AuthoringMutationRecoveryRequest,
     AuthoringMutationSettlementRequest,
     ProgramModelAttemptRequest,
     ProgramNodeCorrectionPreviewRequest,
@@ -66,6 +65,7 @@ from .models import (
     RuntimeScaleControlRequest,
     RuntimeScaleControlSelectorRequest,
     SceneResourcePoseQuery,
+    SceneRuntimeLatchRequest,
     SceneTransactionRequest,
     SkillExpansionRequest,
     StopIntentRequest,
@@ -481,6 +481,13 @@ class HeadlessService:
         # Admission bound only: exact node attempts whose advisory native
         # preview is in flight (see program_node_correction_preview).
         self._apply_scene_stop = Event()
+        # OD-293: a leaf lock; the Manager status follower bumps the counter
+        # on each change it applies to the mirror (and on liveness changes),
+        # waking scene commits that wait for their publication, and counts
+        # the ends of its subscription (the Manager gone).
+        self._manager_status = Condition(Lock())
+        self._manager_status_changes = 0
+        self._manager_status_disconnects = 0
         self._apply_scene_completion_lock = Lock()
         self._empty_scene_execution_lock = Lock()
         self._apply_scene_attempted: tuple[int, int, str] | None = None
@@ -522,8 +529,27 @@ class HeadlessService:
         """Stop following forwarded Applies; owners are untouched."""
 
         self._apply_scene_stop.set()
+        # Ends scene commits waiting for their publication (OD-293).
+        self.manager_status_changed()
         if self.apply_follower is not None:
             self.apply_follower.close()
+
+    def manager_status_changed(self) -> None:
+        """The mirror of the Manager's status changed, or whether the Manager
+        answers did (follower thread; never blocks beyond the leaf lock)."""
+
+        with self._manager_status:
+            self._manager_status_changes += 1
+            self._manager_status.notify_all()
+
+    def manager_status_disconnected(self) -> None:
+        """The Manager status subscription ended (follower thread; never
+        blocks beyond the leaf lock)."""
+
+        with self._manager_status:
+            self._manager_status_disconnects += 1
+            self._manager_status_changes += 1
+            self._manager_status.notify_all()
 
     def _cell_admission(self) -> Any:
         if self.cell_admission is None:
@@ -598,25 +624,6 @@ class HeadlessService:
         }
         try:
             return self._cell_admission().release(release)
-        except CellAdmissionError as error:
-            raise self._admission_error(error) from error
-
-    def recover_authoring_mutation(
-        self, request: AuthoringMutationRecoveryRequest
-    ) -> dict[str, Any]:
-        intent = request.intent
-        if (
-            intent.get("claim_kind") != "authoring_mutation"
-            or intent.get("owner_role") != "authoring_owner"
-        ):
-            raise HeadlessApiError(
-                "authoring_claim_invalid",
-                "recovery query does not identify a Composer authoring claim",
-            )
-        try:
-            return self._cell_admission().recovery_receipt(
-                request.model_dump(mode="json")
-            )
         except CellAdmissionError as error:
             raise self._admission_error(error) from error
 
@@ -3521,11 +3528,76 @@ class HeadlessService:
                 "invalid_request",
                 "runtime scene mutation cannot carry Program Reset authorization",
             )
+        disconnects = self._manager_status_disconnects_now()
         response = self.manager.commit_scene_transaction(
             request,
             trusted_principal_id=attribution.principal_id,
         )
+        if response.get("ok") is True:
+            self._await_scene_publication(
+                response["committed_projection_revision"], disconnects
+            )
         return response
+
+    def scene_runtime_owner(self) -> dict[str, Any]:
+        return self.manager.scene_runtime_owner()
+
+    def scene_runtime_latch_between_nodes(
+        self, request: SceneRuntimeLatchRequest
+    ) -> dict[str, Any]:
+        """The Program Runner's between-nodes latch (OD-294): when it
+        committed observations, answered once the mirror shows its revision,
+        like a Scene commit (OD-293)."""
+
+        disconnects = self._manager_status_disconnects_now()
+        response = self.manager.latch_scene_runtime_between_nodes(request)
+        if response["committed_observation_count"] > 0:
+            self._await_scene_publication(response["projection_revision"], disconnects)
+        return response
+
+    def _manager_status_disconnects_now(self) -> int:
+        with self._manager_status:
+            return self._manager_status_disconnects
+
+    def _await_scene_publication(self, committed: dict[str, Any], disconnects: int) -> None:
+        """Read-your-writes for a committed scene (OD-293): return once the
+        Manager status mirror shows the committed revision, a newer one or a
+        different lineage; or once the status subscription ended after the
+        commit was sent (``disconnects`` read before it: the Manager is gone);
+        or on shutdown. Tick silence does not end it: a commit that held the
+        Manager's loop leaves the mirror "not answering" when its reply
+        arrives, while the section frames, sent before the reply, still come.
+        No time limit: each mirror change wakes the check."""
+
+        lineage = (
+            committed["retained_bundle_id"],
+            committed["graph_revision"],
+            committed["scene_revision"]["scene_id"],
+        )
+        revision = committed["scene_revision"]["revision_id"]
+        while True:
+            with self._manager_status:
+                seen = self._manager_status_changes
+                gone = self._manager_status_disconnects != disconnects
+            section = self.core.runtime_snapshot()["sections"]["logical_scene"]
+            # Null before the Manager's bootstrap publication, or with no
+            # value yet: not yet shown.
+            shown = ((section.get("payload") or {}).get("access") or {}).get(
+                "active_projection"
+            )
+            if shown is not None:
+                if (
+                    shown["retained_bundle_id"],
+                    shown["graph_revision"],
+                    shown["scene_revision"]["scene_id"],
+                ) != lineage or shown["scene_revision"]["revision_id"] >= revision:
+                    return
+            if gone or self._apply_scene_stop.is_set():
+                return
+            with self._manager_status:
+                self._manager_status.wait_for(
+                    lambda: self._manager_status_changes != seen
+                )
 
     def scene_transaction_status(
         self, request: SceneTransactionRequest

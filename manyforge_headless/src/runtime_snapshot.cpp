@@ -232,6 +232,8 @@ CanonicalValue ControlPayload(const CanonicalValue &value, const std::size_t ind
     ValidatePoseSourcesShape(value);
   CanonicalValue::Object result;
   for (const auto &[key, child] : value.as_object()) {
+    if (manager && location == "observed_unit" && key == "report_age_ns")
+      continue;  // Observation-only information (OD-295 (1)(a)).
     if (manager && location == "observed_unit" &&
         (key == "process_observation_sequence" || key == "source_report_sequence")) {
       // Malformed ignored counters must not masquerade as valid pulses.
@@ -505,10 +507,17 @@ ManagerStatusMirror::Apply(const std::string_view frame) {
       section.current = false;
       section.problem = Problem::kNone;
     }
+    // A snapshot is sent by the stream's own threads, so it proves the loop
+    // ran only when its tick is above the last one seen from the same start
+    // (§5.3); a new start's first snapshot counts (OD-284).
+    const bool advanced = current->application_start_id != start->as_string() ||
+                          tick > current->tick;
+    next->application_start_id = start->as_string();
     next->tick = tick;
-    next->last_tick_advance_ns = now;
+    if (advanced)
+      next->last_tick_advance_ns = now;
     view_.store(std::move(next));
-    return {true, true, true};
+    return {true, true, advanced};
   }
   if (current->connection != Connection::kConnected)
     StreamInvalid("frame before the snapshot");

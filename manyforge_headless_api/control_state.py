@@ -136,7 +136,10 @@ def _runtime_payload_key(name: str, payload: Any) -> str:
                     {
                         key: value for key, value in row.items()
                         if key not in {
-                            "process_observation_sequence", "source_report_sequence"
+                            "process_observation_sequence",
+                            "source_report_sequence",
+                            # Information only (OD-295 (1)(a)).
+                            "report_age_ns",
                         }
                     } if isinstance(row, dict) else row
                     for row in rows

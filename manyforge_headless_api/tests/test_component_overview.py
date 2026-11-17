@@ -235,6 +235,36 @@ def test_expected_manager_convergence_is_waiting_without_operator_retry() -> Non
     )
 
 
+def test_oversized_manager_section_keeps_its_typed_reason() -> None:
+    # OD-281: the earlier value is still held, freshness is unavailable.
+    facts = _facts()
+    facts["runtime"]["sections"]["manager"].update(
+        {"freshness": "unavailable", "known_gaps": ["manager_status_section_oversized"]}
+    )
+
+    manager = _by_id(build_component_overview(**facts))["manager"]
+
+    assert manager["status"] == "offline"
+    assert manager["reason_code"] == "manager_status_section_oversized"
+
+
+def test_manager_not_answering_is_offline_with_the_catalog_code() -> None:
+    # OD-284: every section is stale with the one code; only the Manager tile
+    # changes, the scene tiles keep their stale presentation.
+    facts = _facts()
+    for section in ("manager", "logical_scene", "scene_runtime"):
+        facts["runtime"]["sections"].setdefault(section, _source(section)).update(
+            {"freshness": "stale", "known_gaps": ["manager_status_unavailable"]}
+        )
+
+    tiles = _by_id(build_component_overview(**facts))
+
+    assert tiles["manager"]["status"] == "offline"
+    assert tiles["manager"]["reason_code"] == "manager_status_unavailable"
+    assert tiles["logical_scene"]["status"] == "waiting"
+    assert tiles["logical_scene"]["reason_code"] == "source_stale"
+
+
 def test_admitted_maintenance_exposes_one_stable_reason_without_hiding_faults() -> None:
     facts = _facts()
     manager = facts["runtime"]["sections"]["manager"]["payload"]

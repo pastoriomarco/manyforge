@@ -18,6 +18,10 @@ from manyforge_behavior.orchestration_values import (
     ProgramValueStore,
 )
 from manyforge_behavior.program import Program
+from manyforge_behavior.program_scheduling import (
+    PROGRAM_TICK_WORKER_FAILED_CODE,
+    ProgramSchedulingError,
+)
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_program_runner.bbkey_publication import (
     FAULT_CODE,
@@ -28,8 +32,11 @@ from manyforge_program_runner.active_tcp_mirror import ActiveTcpMirror
 from manyforge_program_runner.execution_transport import (
     ProgramRunnerExecutionTransport,
 )
-from manyforge_program_runner.liveness import ProgramRunnerLivenessError
-from manyforge_program_runner.runtime import ProgramRuntime
+from manyforge_program_runner.liveness import (
+    TICK_WORKER_FAULT_CODE,
+    ProgramRunnerLivenessError,
+)
+from manyforge_program_runner.runtime import ProgramRunnerError, ProgramRuntime
 
 from manyforge_program_runner.tests.test_liveness import _heartbeat, _receiver
 
@@ -295,7 +302,7 @@ def test_a_failed_forward_is_source_loss_before_the_write_returns(
         stop_run=lambda run_id: events.append(("stop", run_id)),
         on_fault=lambda fault, reference: (
             events.append(("fault", fault["code"])),
-            receiver.latch_publisher_fault(fault, reference),
+            receiver.latch_runner_fault(fault, reference),
         ),
         fault_reference=ProgramRuntime._digest,  # noqa: SLF001
     )
@@ -312,16 +319,20 @@ def test_a_failed_forward_is_source_loss_before_the_write_returns(
     queue.run()  # Containment, off the store lock.
     assert events == [("stop", 1), ("fault", FAULT_CODE)]
     acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert len(acknowledgement) == 18
-    assert acknowledgement["publisher_fault"]["code"] == FAULT_CODE
-    assert acknowledgement["publisher_fault"]["details"] == {}
+    # Only the fields the Manager reads.
+    assert set(acknowledgement) == {
+        "api_version", "kind", "schema_version", "receiver_status_sequence",
+        "state", "command_fenced", "fault_reference", "runner_fault",
+        "program_cycle_status",
+    }
+    assert acknowledgement["runner_fault"]["code"] == FAULT_CODE
+    assert acknowledgement["runner_fault"]["details"] == {}
     assert acknowledgement["state"] == "current"
     assert acknowledgement["command_fenced"] is True
     assert acknowledgement["fault_reference"] == ProgramRuntime._digest(  # noqa: SLF001
-        acknowledgement["publisher_fault"]
+        acknowledgement["runner_fault"]
     )
-    assert acknowledgement["last_accepted_heartbeat_sequence"] == 2
-    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
+    with pytest.raises(ProgramRunnerLivenessError, match="Runner fault: program_bbkey_publication_failed"):
         receiver.require_current()
 
 
@@ -373,26 +384,91 @@ def test_reconciliation_and_later_heartbeats_never_clear_the_latch(
     )
     assert len(probe) == 8
     healthy = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert healthy["publisher_fault"] is None and len(healthy) == 18
-    receiver.latch_publisher_fault(
+    # The nine fields the Manager reads (it requires exactly these).
+    assert healthy["runner_fault"] is None and len(healthy) == 9
+    receiver.latch_runner_fault(
         {"code": FAULT_CODE, "message": "lost", "details": {}}, "sha256:" + "e" * 64
     )
     for sequence in range(3, 6):
         result = receiver._handle(_heartbeat(sequence=sequence))  # noqa: SLF001
-        assert result["publisher_fault"] == {
+        assert result["runner_fault"] == {
             "code": FAULT_CODE,
             "message": "lost",
             "details": {},
         }
         assert result["command_fenced"] is True
         assert result["fault_reference"] == "sha256:" + "e" * 64
-        assert result["last_accepted_heartbeat_sequence"] == sequence
     with pytest.raises(ProgramRunnerLivenessError):
         receiver.require_current()
     with pytest.raises(ProgramRunnerLivenessError):
-        receiver.latch_publisher_fault(
+        receiver.latch_runner_fault(
             {"code": "other", "message": "x", "details": {}}, "sha256:" + "e" * 64
         )
+
+
+def test_a_tick_worker_fault_fences_with_its_code_and_never_clears(
+    tmp_path: Path,
+) -> None:
+    # OD-267: the Runner fault's second code. It replaces a latched BB
+    # publication fault, no clear releases it, and no BB fault replaces it.
+    receiver = _receiver(tmp_path)
+    receiver._handle(_heartbeat())  # noqa: SLF001
+    bb_fault = {"code": FAULT_CODE, "message": "lost", "details": {}}
+    bb_reference = ProgramRuntime._digest(bb_fault)  # noqa: SLF001
+    tick_fault = {
+        "code": TICK_WORKER_FAULT_CODE,
+        "message": "RuntimeError: boom",
+        "details": {},
+    }
+    tick_reference = ProgramRuntime._digest(tick_fault)  # noqa: SLF001
+    assert receiver.latch_runner_fault(bb_fault, bb_reference) is True
+    with pytest.raises(ProgramRunnerLivenessError) as fenced:
+        receiver.require_current()
+    assert fenced.value.code is None
+    assert receiver.latch_runner_fault(tick_fault, tick_reference) is True
+    assert receiver.clear_runner_fault(bb_reference) is False
+    assert receiver.clear_runner_fault(tick_reference) is False
+    assert receiver.latch_runner_fault(bb_fault, bb_reference) is False
+    assert receiver.latch_runner_fault(tick_fault, tick_reference) is False
+    acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
+    assert acknowledgement["runner_fault"] == tick_fault
+    assert acknowledgement["fault_reference"] == tick_reference
+    assert acknowledgement["command_fenced"] is True
+    with pytest.raises(ProgramRunnerLivenessError) as fenced:
+        receiver.require_current()
+    assert fenced.value.code == TICK_WORKER_FAULT_CODE
+
+
+def test_runtime_fences_a_failed_tick_worker_and_refuses_with_its_code(
+    tmp_path: Path,
+) -> None:
+    # OD-267: the tick host's failure observer latches the Runner fault;
+    # every later command refuses with the typed code, not a generic one.
+    receiver = _receiver(tmp_path)
+    receiver._handle(_heartbeat())  # noqa: SLF001
+    runtime, _hosts = _runtime(_Applied(), _Journal())
+    runtime._liveness = receiver  # noqa: SLF001
+    runtime._fence_tick_worker_failure(RuntimeError("boom"))  # noqa: SLF001
+    acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
+    fault = {
+        "code": TICK_WORKER_FAULT_CODE,
+        "message": "RuntimeError: boom",
+        "details": {},
+    }
+    assert acknowledgement["runner_fault"] == fault
+    assert acknowledgement["fault_reference"] == ProgramRuntime._digest(fault)  # noqa: SLF001
+    assert acknowledgement["command_fenced"] is True
+    with pytest.raises(ProgramRunnerError) as refused:
+        runtime._require_manager_current()  # noqa: SLF001
+    assert refused.value.code == TICK_WORKER_FAULT_CODE
+    scheduling = ProgramSchedulingError(
+        "Program tick worker failed", code=PROGRAM_TICK_WORKER_FAILED_CODE
+    )
+    assert ProgramRuntime._runner_error(scheduling).code == TICK_WORKER_FAULT_CODE  # noqa: SLF001
+    assert (
+        ProgramRuntime._runner_error(ProgramSchedulingError("full")).code  # noqa: SLF001
+        == "program_run_scheduling_failed"
+    )
 
 
 def test_wrong_reply_kind_is_a_fault() -> None:
@@ -707,12 +783,12 @@ def test_between_run_baseline_start_failure_keeps_the_source_without_fence(
     runtime._start_idle_bbkey_publication = fail_start  # type: ignore[method-assign]  # noqa: SLF001
     runtime._cell_bbkey_union = lambda: ()  # type: ignore[method-assign]  # noqa: SLF001
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
-    assert receiver._handle(_heartbeat(sequence=2))["publisher_fault"] is None  # noqa: SLF001
+    assert receiver._handle(_heartbeat(sequence=2))["runner_fault"] is None  # noqa: SLF001
     assert runtime._bbkey_publishers[None] is previous  # noqa: SLF001
     runtime._cell_bbkey_union = lambda: ("count",)  # type: ignore[method-assign]  # noqa: SLF001
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
     acknowledgement = receiver._handle(_heartbeat(sequence=3))  # noqa: SLF001
-    assert acknowledgement["publisher_fault"] is None
+    assert acknowledgement["runner_fault"] is None
     assert acknowledgement["command_fenced"] is False
     assert runtime._bbkey_publishers[None] is previous  # noqa: SLF001
     receiver.require_current()
@@ -1010,7 +1086,7 @@ def test_refused_between_run_baseline_is_declared_lost_without_fence(
     assert runtime._bbkey_idle_store is None  # No edit lands in a dead store.  # noqa: SLF001
     assert stops == []
     acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert acknowledgement["publisher_fault"] is None
+    assert acknowledgement["runner_fault"] is None
     assert acknowledgement["command_fenced"] is False
     receiver.require_current()
     senders = [r.getMessage() for r in caplog.records if "BB baseline sender" in r.getMessage()]
@@ -1024,7 +1100,7 @@ def test_refused_between_run_baseline_is_declared_lost_without_fence(
     host.errors = [_SEQUENCE_STALE, _SEQUENCE_GAP]
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
     assert None not in runtime._bbkey_publishers  # noqa: SLF001
-    assert receiver._handle(_heartbeat(sequence=3))["publisher_fault"] is None  # noqa: SLF001
+    assert receiver._handle(_heartbeat(sequence=3))["runner_fault"] is None  # noqa: SLF001
 
     # The next Reset (a new Idle cycle) establishes a fresh, accepted source.
     journal.cycle_generation = 8
@@ -1034,7 +1110,7 @@ def test_refused_between_run_baseline_is_declared_lost_without_fence(
     assert fresh.baseline_accepted
     assert host.frames[-1]["cycle_generation"] == 8
     assert host.frames[-1]["message_sequence"] == "1"
-    assert receiver._handle(_heartbeat(sequence=4))["publisher_fault"] is None  # noqa: SLF001
+    assert receiver._handle(_heartbeat(sequence=4))["runner_fault"] is None  # noqa: SLF001
 
 
 def test_between_run_loss_not_confirmed_by_the_kernel_fences_as_before(
@@ -1048,10 +1124,10 @@ def test_between_run_loss_not_confirmed_by_the_kernel_fences_as_before(
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
     assert len(host.frames) == 2 and stops == []
     acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert acknowledgement["publisher_fault"]["code"] == FAULT_CODE
-    assert "program_bb_sequence_stale" in acknowledgement["publisher_fault"]["message"]
+    assert acknowledgement["runner_fault"]["code"] == FAULT_CODE
+    assert "program_bb_sequence_stale" in acknowledgement["runner_fault"]["message"]
     assert acknowledgement["command_fenced"] is True
-    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
+    with pytest.raises(ProgramRunnerLivenessError, match="Runner fault: program_bbkey_publication_failed"):
         receiver.require_current()
 
 
@@ -1089,7 +1165,7 @@ def test_between_run_fault_is_lost_in_the_kernel_before_any_containment(
     assert len(queue.work) == 1  # Containment, off the store lock.
     queue.run()
     released = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert released["publisher_fault"] is None and released["command_fenced"] is False
+    assert released["runner_fault"] is None and released["command_fenced"] is False
     receiver.require_current()
 
 
@@ -1107,14 +1183,14 @@ def test_late_reply_for_a_superseded_between_run_source_releases_the_fence(
     assert newer.scope.cycle_generation == 8 and newer.baseline_accepted
     queue.work.pop(0)()  # The old containment: the fence latches.
     held = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert held["publisher_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
+    assert held["runner_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
     queue.run()  # The newer baseline's ACK settles the old loss.
     assert [(f["cycle_generation"], f["message_sequence"]) for f in host.frames] == [
         (7, "1"), (7, _LOSS_SEQUENCE), (8, "1"),
     ]
     assert newer.fault is None
     released = receiver._handle(_heartbeat(sequence=3))  # noqa: SLF001
-    assert released["publisher_fault"] is None and released["command_fenced"] is False
+    assert released["runner_fault"] is None and released["command_fenced"] is False
     receiver.require_current()
 
 
@@ -1129,12 +1205,12 @@ def test_unacked_successor_does_not_release_the_fence(tmp_path: Path) -> None:
     successor = runtime._bbkey_publishers[None]  # noqa: SLF001
     assert not successor.baseline_accepted
     queue.work.pop(0)()  # The old containment: fenced.
-    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
+    with pytest.raises(ProgramRunnerLivenessError, match="Runner fault: program_bbkey_publication_failed"):
         receiver.require_current()
     queue.run()
     assert not successor.baseline_accepted
     held = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert held["publisher_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
+    assert held["runner_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
     assert len(runtime._bbkey_open_losses) == 2  # noqa: SLF001
 
 
@@ -1150,9 +1226,9 @@ def test_fence_waits_for_every_unconfirmed_loss(tmp_path: Path) -> None:
     queue.run()
     assert [frame["cycle_generation"] for frame in host.frames] == [7, 7, 8, 8]
     held = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert held["publisher_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
+    assert held["runner_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
     assert len(runtime._bbkey_open_losses) == 1  # noqa: SLF001
-    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
+    with pytest.raises(ProgramRunnerLivenessError, match="Runner fault: program_bbkey_publication_failed"):
         receiver.require_current()
 
 
@@ -1182,9 +1258,9 @@ def test_late_ack_of_a_replaced_sender_leaves_the_newer_loss_open(tmp_path: Path
     ]
     assert len(runtime._bbkey_open_losses) == 1  # B's loss stays open.  # noqa: SLF001
     held = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert held["publisher_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
+    assert held["runner_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
     queue.run()  # B's own gap reply is unavailable: the fence stays.
-    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
+    with pytest.raises(ProgramRunnerLivenessError, match="Runner fault: program_bbkey_publication_failed"):
         receiver.require_current()
 
 
@@ -1237,10 +1313,10 @@ def test_refused_run_publication_still_stops_the_run_and_fences(tmp_path: Path) 
     assert stops == [1]
     assert publisher.fault is not None
     acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert acknowledgement["publisher_fault"]["code"] == FAULT_CODE
-    assert "program_bb_sequence_stale" in acknowledgement["publisher_fault"]["message"]
+    assert acknowledgement["runner_fault"]["code"] == FAULT_CODE
+    assert "program_bb_sequence_stale" in acknowledgement["runner_fault"]["message"]
     assert acknowledgement["command_fenced"] is True
-    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
+    with pytest.raises(ProgramRunnerLivenessError, match="Runner fault: program_bbkey_publication_failed"):
         receiver.require_current()
 
 
@@ -1273,7 +1349,7 @@ def test_a_run_source_fault_ends_once_the_kernel_confirms_its_loss(tmp_path: Pat
     assert publisher.fault is not None and publisher.loss_confirmed
     assert runtime._bbkey_open_losses == {}  # noqa: SLF001
     acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert acknowledgement["publisher_fault"] is None
+    assert acknowledgement["runner_fault"] is None
     assert acknowledgement["command_fenced"] is False
     receiver.require_current()
 
@@ -1286,7 +1362,7 @@ def test_a_run_source_fault_ends_once_the_kernel_confirms_its_loss(tmp_path: Pat
     fresh = runtime._bbkey_publishers[None]  # noqa: SLF001
     assert fresh.baseline_accepted and fresh.fault is None
     assert host.frames[-1]["cycle_generation"] == 8
-    assert receiver._handle(_heartbeat(sequence=3))["publisher_fault"] is None  # noqa: SLF001
+    assert receiver._handle(_heartbeat(sequence=3))["runner_fault"] is None  # noqa: SLF001
     receiver.require_current()
 
 
@@ -1300,7 +1376,7 @@ def test_a_contact_loss_without_a_refused_value_leaves_the_run_publishing(
     store = _store()
     publisher = _run_publisher(runtime, store)
     acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert acknowledgement["publisher_fault"] is None
+    assert acknowledgement["runner_fault"] is None
     assert acknowledgement["command_fenced"] is False
     receiver.require_current()
     store.write("count", 4)
@@ -1330,4 +1406,4 @@ def test_a_source_not_ready_starts_later_from_the_values_committed_meanwhile(
     assert _rows(host.frames[1]) == {"door": True}
     assert runtime._bbkey_pending == {} and stops == []  # noqa: SLF001
     assert runtime._bbkey_publishers[None].baseline_accepted  # noqa: SLF001
-    assert receiver._handle(_heartbeat(sequence=2))["publisher_fault"] is None  # noqa: SLF001
+    assert receiver._handle(_heartbeat(sequence=2))["runner_fault"] is None  # noqa: SLF001

@@ -1239,12 +1239,15 @@ TEST(HeadlessApiCore, ActiveApplyFromTheRemovedOverrideVersionIsRefused) {
 
 namespace {
 
+/// As the Manager publishes it: only the record of the Apply that installed
+/// the active configuration carries its preparation receipt (OD-281).
 CanonicalValue CommittedApplyRecord(const double apply_id,
                                     const std::string &digest,
                                     const std::string &scenario_id,
                                     const bool committed,
-                                    const CanonicalValue &active) {
-  return CanonicalValue(CanonicalValue::Object{
+                                    const CanonicalValue &active,
+                                    const bool installed_active) {
+  auto record = CanonicalValue(CanonicalValue::Object{
       {"apply_id", CanonicalValue(apply_id)},
       {"apply_generation", CanonicalValue(1.0)},
       {"committed", CanonicalValue(committed)},
@@ -1252,27 +1255,32 @@ CanonicalValue CommittedApplyRecord(const double apply_id,
       {"incomplete", CanonicalValue(false)},
       {"intent_digest", CanonicalValue(digest)},
       {"scene_initialization", CanonicalValue("initialize")},
-      {"prepared_activation",
-       CanonicalValue(CanonicalValue::Object{
-           {"schema_version",
-            CanonicalValue("manyforge.prepared_activation_input.v7")},
-           {"retained_bundle_id", Member(active, "retained_bundle_id")},
-           {"graph_revision", Member(active, "graph_revision")},
-           {"origin",
-            CanonicalValue(CanonicalValue::Object{
-                {"kind", CanonicalValue("scenario")},
-                {"scenario_id", CanonicalValue(scenario_id)},
-                {"project_path",
-                 CanonicalValue("/fixtures/" + scenario_id + ".scenario")},
-                {"source_document_digest", CanonicalValue(Digest('b'))},
-            })},
-           {"program_id", CanonicalValue(nullptr)},
-           {"program_revision", CanonicalValue(nullptr)},
-           {"program_outcome", CanonicalValue(CanonicalValue::Object{
-                                   {"kind", CanonicalValue("no_program")},
-                               })},
-       })},
+      {"prepared_activation", CanonicalValue(nullptr)},
   });
+  if (!installed_active) {
+    return record;
+  }
+  return JournalField(
+      record, "prepared_activation",
+      CanonicalValue(CanonicalValue::Object{
+          {"schema_version",
+           CanonicalValue("manyforge.prepared_activation_input.v7")},
+          {"retained_bundle_id", Member(active, "retained_bundle_id")},
+          {"graph_revision", Member(active, "graph_revision")},
+          {"origin",
+           CanonicalValue(CanonicalValue::Object{
+               {"kind", CanonicalValue("scenario")},
+               {"scenario_id", CanonicalValue(scenario_id)},
+               {"project_path",
+                CanonicalValue("/fixtures/" + scenario_id + ".scenario")},
+               {"source_document_digest", CanonicalValue(Digest('b'))},
+           })},
+          {"program_id", CanonicalValue(nullptr)},
+          {"program_revision", CanonicalValue(nullptr)},
+          {"program_outcome", CanonicalValue(CanonicalValue::Object{
+                                  {"kind", CanonicalValue("no_program")},
+                              })},
+      }));
 }
 
 /// The active Apply, a refused one, and `older_applies` older committed
@@ -1291,9 +1299,9 @@ CanonicalValue CommittedActivationCore(TemporaryDirectory &directory,
       })},
   }));
   CanonicalValue::Array records{
-      CommittedApplyRecord(3, Digest('d'), "cell_pick", true, active),
+      CommittedApplyRecord(3, Digest('d'), "cell_pick", true, active, true),
       CommittedApplyRecord(5, Digest('e'), "cell_pick", false,
-                           active),
+                           active, false),
   };
   for (std::size_t index = 0U; index < older_applies; ++index) {
     std::ostringstream digest;
@@ -1301,7 +1309,7 @@ CanonicalValue CommittedActivationCore(TemporaryDirectory &directory,
     records.push_back(CommittedApplyRecord(
         index == 0U ? 4.0 : 10.0 + static_cast<double>(index),
         index == 0U ? Digest('c') : digest.str(),
-        index == 0U ? "other_cell" : "cell_pick", true, active));
+        index == 0U ? "other_cell" : "cell_pick", true, active, false));
   }
   payload = JournalField(payload, "active", active);
   payload = JournalField(payload, "apply", CanonicalValue(CanonicalValue::Object{
@@ -2369,6 +2377,16 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Text(restart_receipt, "status"), "duplicate");
   EXPECT_EQ(Text(restart_receipt, "event_id"), Text(receipt, "event_id"));
   EXPECT_EQ(Array(replacement.HistoryPage(query), "events").size(), 2U);
+  // A later start repeats run numbers and attempt counters: its attempt with
+  // the same model_attempt_id is another event, never a conflict.
+  auto later_start = record.as_object();
+  for (auto &[name, value] : later_start) {
+    if (name == "application_start_id") value = CanonicalValue("3f9a0000000000b2");
+  }
+  const auto later_receipt =
+      replacement.CommitProgramModelAttempt(CanonicalValue(std::move(later_start)));
+  EXPECT_EQ(Text(later_receipt, "status"), "stored");
+  EXPECT_NE(Text(later_receipt, "event_id"), Text(receipt, "event_id"));
 }
 
 TEST(HeadlessApiCore,
@@ -4474,6 +4492,7 @@ CanonicalValue RuntimeFaultSnapshot(bool runner, bool journal,
       {"application_start_id", CanonicalValue("3f9a0000000000a1")},
       {"failure_predicate", CanonicalValue("program_runner_liveness_probe")},
       {"message", CanonicalValue("connection refused")},
+      {"fault_code", CanonicalValue("program_runner_contact_lost")},
       {"established_cycle",
        CanonicalValue(CanonicalValue::Object{
            {"cycle_generation", CanonicalValue(2.0)},
@@ -4495,17 +4514,20 @@ CanonicalValue RuntimeFaultSnapshot(bool runner, bool journal,
 }
 } // namespace
 
-TEST(HeadlessApiCore, PublicationFaultKeepsItsActualPredicateAndDiagnostic) {
+TEST(HeadlessApiCore, RunnerFaultKeepsItsActualPredicateAndDiagnostic) {
   TemporaryDirectory directory;
   HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
   auto facts = RuntimeFaultSnapshot(true, false);
   auto fault =
       WithField(Member(facts, "program_runner_loss"), "failure_predicate",
-                CanonicalValue("program_runner_publication_fault"));
-  fault =
-      WithField(fault, "message",
-                CanonicalValue(
-                    "program_bbkey_publication_failed: exact key ACK missing"));
+                CanonicalValue("program_runner_fault"));
+  fault = WithField(fault, "message", CanonicalValue("exact key ACK missing"));
+  // A fault without its own typed code is refused.
+  EXPECT_THROW(static_cast<void>(core.ObserveRuntimeFaultConditions(
+                   WithField(facts, "program_runner_loss", fault))),
+               std::exception);
+  fault = WithField(fault, "fault_code",
+                    CanonicalValue("program_bbkey_publication_failed"));
   facts = WithField(facts, "program_runner_loss", fault);
   EXPECT_TRUE(
       Member(core.ObserveRuntimeFaultConditions(facts), "changed")
@@ -4515,9 +4537,11 @@ TEST(HeadlessApiCore, PublicationFaultKeepsItsActualPredicateAndDiagnostic) {
       AlarmFor(snapshot, "manyforge.runtime.program_runner_loss");
   ASSERT_NE(alarm, nullptr);
   EXPECT_EQ(Text(Member(*alarm, "details"), "failure_predicate"),
-            "program_runner_publication_fault");
+            "program_runner_fault");
   EXPECT_EQ(Text(Member(*alarm, "details"), "message"),
-            "program_bbkey_publication_failed: exact key ACK missing");
+            "exact key ACK missing");
+  EXPECT_EQ(Text(Member(*alarm, "details"), "fault_code"),
+            "program_bbkey_publication_failed");
   EXPECT_EQ(Member(Member(*alarm, "details"), "established_cycle"),
             Member(fault, "established_cycle"));
   // The fault ends with its fact; the returned alarm keeps its diagnostic.
@@ -4533,7 +4557,7 @@ TEST(HeadlessApiCore, PublicationFaultKeepsItsActualPredicateAndDiagnostic) {
   EXPECT_EQ(Text(*same, "lifecycle_state"), "returned_unacknowledged");
   EXPECT_EQ(Text(*same, "activation_id"), Text(*alarm, "activation_id"));
   EXPECT_EQ(Text(Member(*same, "details"), "failure_predicate"),
-            "program_runner_publication_fault");
+            "program_runner_fault");
 }
 
 TEST(HeadlessApiCore, RunnerLossAlarmClearsWhenTheRunnerIsHeardAgain) {
@@ -5074,9 +5098,11 @@ TEST(HeadlessApiCore,
   constexpr std::size_t kReasonCodeBytes = 128U;        // :1185
   constexpr std::size_t kApplicationStartBytes = 16U;   // :1190
   constexpr std::size_t kRequestKeyBytes = 32U;         // :1172 (IsRequestKeyText, exact)
-  // :1191-1196: the predicate is one of four names; the longest is the
-  // maximum (the 128-byte text bound is not reachable).
-  const std::string longest_predicate = "program_runner_reconciliation_renewal";
+  // The predicate is one of four names (the 128-byte text bound is not
+  // reachable). Only program_runner_fault carries a fault code (128 bytes),
+  // so it is the largest Runner fact.
+  const std::string fault_predicate = "program_runner_fault";
+  constexpr std::size_t kFaultCodeBytes = 128U;
   // :1209: the longest accepted established state ("starting"/"stopping").
   const std::string longest_state = "starting";
   // Counters (:1170, :1175, :1180, :1186, :1204-1206) up to the I-JSON safe
@@ -5116,7 +5142,9 @@ TEST(HeadlessApiCore,
         if (key == "application_start_id")
           value = CanonicalValue(escaped(kApplicationStartBytes));
         if (key == "failure_predicate")
-          value = CanonicalValue(longest_predicate);
+          value = CanonicalValue(fault_predicate);
+        if (key == "fault_code")
+          value = CanonicalValue(escaped(kFaultCodeBytes));
         if (key == "established_cycle") {
           auto cycle = value.as_object();
           for (auto &[name, item] : cycle) {
@@ -5141,7 +5169,8 @@ TEST(HeadlessApiCore,
       text_bytes(kWriteKindBytes) + text_bytes(kErrorCodeBytes) +
       2U * text_bytes(kMessageBytes) + text_bytes(kNodeInstanceBytes) +
       text_bytes(kReasonCodeBytes) + text_bytes(kApplicationStartBytes) +
-      (kRequestKeyBytes + 2U) + (longest_predicate.size() + 2U) +
+      (kRequestKeyBytes + 2U) + (fault_predicate.size() + 2U) +
+      text_bytes(kFaultCodeBytes) +
       (longest_state.size() + 2U) +
       // journal: operation_id, operation_revision, program_run_id,
       // node_attempt_id; internal: later_count; cycle: three counters.
@@ -5176,7 +5205,9 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Text(Member(*runner, "details"), "application_start_id"),
             escaped(kApplicationStartBytes));
   EXPECT_EQ(Text(Member(*runner, "details"), "failure_predicate"),
-            longest_predicate);
+            fault_predicate);
+  EXPECT_EQ(Text(Member(*runner, "details"), "fault_code"),
+            escaped(kFaultCodeBytes));
   const auto *internal =
       AlarmFor(snapshot, "manyforge.runtime.kernel_internal_fault");
   ASSERT_NE(internal, nullptr);

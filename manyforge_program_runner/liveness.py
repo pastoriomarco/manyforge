@@ -28,15 +28,26 @@ POLICY_REVISION: Final = "1"
 PUBLICATION_CHECK_INTERVAL_S: Final = 0.0625
 MAXIMUM_PACKET_BYTES: Final = 16_384
 MAXIMUM_SEQUENCE: Final = 9_007_199_254_740_991
+# A Runner fault (OD-267): the closed set of codes that fence the cell.
 PUBLISHER_FAULT_CODE: Final = "program_bbkey_publication_failed"
-_MAXIMUM_PUBLISHER_FAULT_MESSAGE_BYTES: Final = 1_024
+TICK_WORKER_FAULT_CODE: Final = "program_tick_worker_failed"
+RUNNER_FAULT_CODES: Final = frozenset({PUBLISHER_FAULT_CODE, TICK_WORKER_FAULT_CODE})
+_MAXIMUM_RUNNER_FAULT_MESSAGE_BYTES: Final = 1_024
 
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class ProgramRunnerLivenessError(RuntimeError):
-    """A malformed, foreign, or stale private liveness packet."""
+    """A malformed, foreign, or stale private liveness packet.
+
+    ``code`` is the typed cause of a fence that has one (a failed tick
+    worker), else None.
+    """
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class ProgramRunnerLivenessReceiver:
@@ -69,16 +80,18 @@ class ProgramRunnerLivenessReceiver:
         self._run_root_identity: tuple[int, int] | None = None
         self._server_thread: Thread | None = None
         self._publication_thread: Thread | None = None
-        self._manager_runtime_unit_id: str | None = None
-        self._last_sequence: int | None = None
+        # The serving thread's stop event (OD-296 (a)): close() writes it, so
+        # the thread waits for a connection or a request without a time limit.
+        self._stop_read_fd: int | None = None
+        self._stop_write_fd: int | None = None
         self._receiver_status_sequence = 1
         self._state = "unreconciled"
         self._fenced = True
         self._last_rejection: str | None = None
         # Independent of Manager presence: no heartbeat or reconciliation
         # clears it, and it keeps commands fenced while Manager stays current.
-        self._publisher_fault: dict[str, Any] | None = None
-        self._publisher_fault_reference: str | None = None
+        self._runner_fault: dict[str, Any] | None = None
+        self._runner_fault_reference: str | None = None
 
     @staticmethod
     def _safe_run_root(metadata: os.stat_result) -> bool:
@@ -213,6 +226,9 @@ class ProgramRunnerLivenessReceiver:
             self._listener_identity = bound_identity
             listener.listen(8)
             listener.setblocking(False)
+            self._stop_read_fd, self._stop_write_fd = os.pipe2(
+                os.O_CLOEXEC | os.O_NONBLOCK
+            )
             self._listener = listener
             self._server_thread = Thread(
                 target=self._serve,
@@ -228,11 +244,13 @@ class ProgramRunnerLivenessReceiver:
             self._publication_thread.start()
         except BaseException:
             self._stop.set()
+            self._signal_stop()
             if listener is not None:
                 listener.close()
             for thread in (self._server_thread, self._publication_thread):
                 if thread is not None and thread.is_alive():
-                    thread.join(timeout=2.0)
+                    thread.join()
+            self._close_stop_pipe()
             self._remove_endpoint(descriptor, bound_identity)
             os.close(descriptor)
             self._run_root_fd = None
@@ -240,14 +258,30 @@ class ProgramRunnerLivenessReceiver:
             self._listener = None
             raise
 
+    def _signal_stop(self) -> None:
+        if self._stop_write_fd is not None:
+            try:
+                os.write(self._stop_write_fd, b"\0")
+            except BlockingIOError:
+                pass  # Already signalled.
+
+    def _close_stop_pipe(self) -> None:
+        for descriptor in (self._stop_read_fd, self._stop_write_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+        self._stop_read_fd = None
+        self._stop_write_fd = None
+
     def close(self) -> None:
         self._stop.set()
+        self._signal_stop()
         listener = self._listener
-        if listener is not None:
-            listener.close()
         for thread in (self._server_thread, self._publication_thread):
             if thread is not None:
-                thread.join(timeout=2.0)
+                thread.join()
+        if listener is not None:
+            listener.close()
+        self._close_stop_pipe()
         descriptor = self._run_root_fd
         if descriptor is not None:
             try:
@@ -260,61 +294,70 @@ class ProgramRunnerLivenessReceiver:
 
     def require_current(self) -> None:
         with self._lock:
-            if self._publisher_fault is not None:
+            if self._runner_fault is not None:
+                code = self._runner_fault["code"]
                 raise ProgramRunnerLivenessError(
-                    "Program Runner is fenced by a BB key publication fault"
+                    f"Program Runner is fenced by a Runner fault: {code}",
+                    code=code if code == TICK_WORKER_FAULT_CODE else None,
                 )
             if self._state != "current" or self._fenced:
                 raise ProgramRunnerLivenessError(
                     "Program Runner awaits the Manager's reconciliation"
                 )
 
-    def latch_publisher_fault(
+    def latch_runner_fault(
         self, fault: Mapping[str, Any], reference: str
     ) -> bool:
-        """Latch the first BB publication fault until its owner clears it
-        (`clear_publisher_fault`). True when this call latched it."""
+        """Latch a Runner fault. A BB publication fault is latched while no
+        fault is, until its owner clears it (`clear_runner_fault`). A tick
+        worker fault replaces a BB publication fault and never clears.
+        True when this call latched it."""
 
+        code = fault.get("code")
         message = fault.get("message")
         if (
             set(fault) != {"code", "message", "details"}
-            or fault.get("code") != PUBLISHER_FAULT_CODE
+            or code not in RUNNER_FAULT_CODES
             or fault.get("details") != {}
             or not isinstance(message, str)
             or not message
-            or len(message.encode("utf-8")) > _MAXIMUM_PUBLISHER_FAULT_MESSAGE_BYTES
+            or len(message.encode("utf-8")) > _MAXIMUM_RUNNER_FAULT_MESSAGE_BYTES
             or unicodedata.normalize("NFC", message) != message
             or not isinstance(reference, str)
             or len(reference) != 71
             or not reference.startswith("sha256:")
         ):
-            raise ProgramRunnerLivenessError("malformed BB publication fault")
+            raise ProgramRunnerLivenessError("malformed Runner fault")
         with self._lock:
-            if self._publisher_fault is not None:
+            if self._runner_fault is not None and (
+                code == PUBLISHER_FAULT_CODE
+                or self._runner_fault["code"] == TICK_WORKER_FAULT_CODE
+            ):
                 return False
-            self._publisher_fault = {
-                "code": PUBLISHER_FAULT_CODE,
+            self._runner_fault = {
+                "code": code,
                 "message": message,
                 "details": {},
             }
-            self._publisher_fault_reference = reference
+            self._runner_fault_reference = reference
             if self._receiver_status_sequence < MAXIMUM_SEQUENCE:
                 self._receiver_status_sequence += 1
         return True
 
-    def clear_publisher_fault(self, reference: str) -> bool:
-        """Clear exactly the latched fault with this reference (a source
-        whose loss the Kernel confirmed, or that a newer source superseded).
-        True when it was cleared."""
+    def clear_runner_fault(self, reference: str) -> bool:
+        """Clear exactly the latched BB publication fault with this reference
+        (a source whose loss the Kernel confirmed, or that a newer source
+        superseded). True when it was cleared."""
 
         with self._lock:
             if (
-                self._publisher_fault is None
-                or self._publisher_fault_reference != reference
+                self._runner_fault is None
+                or self._runner_fault["code"] != PUBLISHER_FAULT_CODE
+                or self._runner_fault_reference != reference
             ):
                 return False
-            self._publisher_fault = None
-            self._publisher_fault_reference = None
+            self._runner_fault = None
+            self._runner_fault_reference = None
             if self._receiver_status_sequence < MAXIMUM_SEQUENCE:
                 self._receiver_status_sequence += 1
         return True
@@ -333,45 +376,46 @@ class ProgramRunnerLivenessReceiver:
 
     def status(self) -> dict[str, Any]:
         with self._lock:
-            publisher_fault = (
-                None if self._publisher_fault is None else dict(self._publisher_fault)
+            runner_fault = (
+                None if self._runner_fault is None else dict(self._runner_fault)
             )
             return {
                 "schema_version": "manyforge.program_runner_liveness_status.v2",
-                "cell_id": self._cell_id,
-                "receiver_runtime_unit_id": self._runtime_unit_id,
-                "receiver_runtime_epoch": self._runtime_epoch,
-                "manager_runtime_unit_id": self._manager_runtime_unit_id,
-                "last_accepted_heartbeat_sequence": self._last_sequence,
                 "receiver_status_sequence": self._receiver_status_sequence,
                 "state": self._state,
-                # A publisher fault reuses the digested fence; its reference
-                # is the digest of the emitted publisher ErrorDTO.
-                "command_fenced": self._fenced or publisher_fault is not None,
+                # A Runner fault reuses the digested fence; its reference
+                # is the digest of the emitted Runner-fault ErrorDTO.
+                "command_fenced": self._fenced or runner_fault is not None,
                 "fault_reference": (
-                    None if publisher_fault is None else self._publisher_fault_reference
+                    None if runner_fault is None else self._runner_fault_reference
                 ),
-                "publisher_fault": publisher_fault,
-                "runtime_policy_id": POLICY_ID,
-                "runtime_policy_revision": POLICY_REVISION,
+                "runner_fault": runner_fault,
             }
 
     def _serve(self) -> None:
+        """Serve the Manager's liveness exchanges (OD-296 (a)): each wait ends
+        on its event, never on a time limit. Waiting for a connection or a
+        request ends on its arrival, on the Manager closing the connection
+        or on close(); a Runner that is slow to answer is never lost."""
+
+        stop_fd = self._stop_read_fd
         while not self._stop.is_set():
             listener = self._listener
-            if listener is None:
+            if listener is None or stop_fd is None:
                 return
             try:
-                readable, _, _ = select.select([listener], [], [], 0.05)
-                if not readable:
-                    continue
+                readable, _, _ = select.select([listener, stop_fd], [], [])
+                if stop_fd in readable:
+                    return
                 connection, _ = listener.accept()
+            except BlockingIOError:
+                continue  # The connection went before it was accepted.
             except (OSError, ValueError):
                 if self._stop.is_set():
                     return
                 continue
             with connection:
-                connection.settimeout(0.2)
+                connection.setblocking(True)
                 try:
                     credentials = connection.getsockopt(
                         socket.SOL_SOCKET, socket.SO_PEERCRED, 12
@@ -379,6 +423,11 @@ class ProgramRunnerLivenessReceiver:
                     _peer_pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
                     if peer_uid != os.geteuid():
                         raise ProgramRunnerLivenessError("foreign peer uid")
+                    # The request, the Manager closing the connection (an
+                    # empty read below) or close().
+                    readable, _, _ = select.select([connection, stop_fd], [], [])
+                    if stop_fd in readable:
+                        return
                     packet, _ancillary, flags, _address = connection.recvmsg(
                         MAXIMUM_PACKET_BYTES + 1
                     )
@@ -605,8 +654,6 @@ class ProgramRunnerLivenessReceiver:
                 raise ProgramRunnerLivenessError(
                     "receiver status sequence is exhausted"
                 )
-            self._manager_runtime_unit_id = request["manager_runtime_unit_id"]
-            self._last_sequence = sequence
             self._receiver_status_sequence += 1
             # Receipt proves peer liveness, not runtime readiness. During Apply
             # a healthy Manager may have no reconciled native projection yet.
@@ -619,11 +666,9 @@ class ProgramRunnerLivenessReceiver:
         status = self.status()
         return {
             **status,
-            "active_bundle_id": request["active_bundle_id"],
             "api_version": API_VERSION,
             "kind": "heartbeat_ack",
             "program_cycle_status": self._project_cycle_status(),
-            "required_runtime_set_digest": request["required_runtime_set_digest"],
         }
 
     def _publication_loop(self) -> None:
@@ -637,6 +682,8 @@ __all__ = [
     "POLICY_REVISION",
     "PUBLICATION_CHECK_INTERVAL_S",
     "PUBLISHER_FAULT_CODE",
+    "RUNNER_FAULT_CODES",
+    "TICK_WORKER_FAULT_CODE",
     "ProgramRunnerLivenessError",
     "ProgramRunnerLivenessReceiver",
 ]

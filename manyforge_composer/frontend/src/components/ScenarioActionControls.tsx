@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
+import type { InitialSceneReloadController } from '../hooks/useInitialSceneReload';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { ResetApplyController } from '../hooks/useResetApply';
-import { programActionUnavailableReason, programApplyScenarioReason } from '../state/authoringWorkspace';
+import {
+  programActionUnavailableReason,
+  programApplyScenarioReason,
+  type AuthoringUnavailableCause,
+} from '../state/authoringWorkspace';
 import { busyLabel, busyReason } from '../state/busyOperation';
 import {
   deploymentActionUnavailableReason,
@@ -13,9 +18,17 @@ import {
   scenarioActionRoute,
   type ScenarioAction,
 } from '../state/documentStates';
+import {
+  PERSISTENT_KEYS_RESET_NOTE,
+  RELOAD_INITIAL_SCENE_NOTE,
+  declaresPersistentKeys,
+  initialSceneReloadOffered,
+  type InitialSceneExpectation,
+} from '../state/initialSceneApplied';
 import { ApplyImpact } from './ApplyImpact';
-import { useAuthoringAdmissionTooltip } from './authoringAdmission';
+import { applyAdmissionBlock, useAuthoringAdmissionTooltip } from './authoringAdmission';
 import { OverlayPanel } from './OverlayPanel';
+import { PersistentKeyResetNotice } from './PersistentKeyValues';
 
 function actionTitle(action: ScenarioAction): string {
   switch (action) {
@@ -42,6 +55,8 @@ export function ScenarioActionControls({
   resetApply = null,
   localInvalidEdit = false,
   authoringAdmissionAllowed = null,
+  authoringCause = null,
+  initialScene = null,
 }: {
   program: ProgramWorkspaceController;
   deployment: DeploymentWorkspaceController;
@@ -51,16 +66,22 @@ export function ScenarioActionControls({
   localInvalidEdit?: boolean;
   /** Current Headless authoring admission; unknown leaves existing behavior unchanged. */
   authoringAdmissionAllowed?: boolean | null;
+  /** Why Headless authoring admission is closed, when it is. */
+  authoringCause?: AuthoringUnavailableCause | null;
+  /** Offers Reload initial scene with an Apply or Revert. */
+  initialScene?: InitialSceneReloadController | null;
 }) {
   const authoringAdmissionTooltip = useAuthoringAdmissionTooltip();
   const [action, setAction] = useState<ScenarioAction | null>(null);
   const [applyRefusal, setApplyRefusal] = useState<string | null>(null);
+  const [reloadScene, setReloadScene] = useState(false);
   const returnFocus = useRef<HTMLElement | null>(null);
   const programWorkspace = program.state.workspace;
   const deploymentWorkspace = deployment.workspace;
   const authoringAdmissionBlock = authoringAdmissionAllowed === false
     ? authoringAdmissionTooltip : null;
   const resetsRun = resetApply?.runExists === true;
+  const applyAuthoringBlock = applyAdmissionBlock(authoringAdmissionBlock, resetsRun, authoringCause);
 
   // Program reasons: the same order the Program controls always used.
   const programBusy = program.state.status === 'loading'
@@ -75,11 +96,12 @@ export function ScenarioActionControls({
   const currentScenarioUnavailable = programApplyScenarioReason(runtime.state.currentScenario);
   const invalidEditReason = localInvalidEdit ? 'Review or discard the invalid local field edit first.' : null;
   const programReasons = {
-    apply: authoringAdmissionBlock
+    apply: applyAuthoringBlock
       ?? programActionUnavailableReason(programWorkspace, 'apply', programApplyCommon)
       ?? invalidEditReason ?? currentScenarioUnavailable,
-    revert: authoringAdmissionBlock
-      ?? programActionUnavailableReason(programWorkspace, 'revert', programBusyReason ?? program.documentUnavailableReason),
+    revert: applyAuthoringBlock
+      ?? programActionUnavailableReason(programWorkspace, 'revert', programBusyReason ?? (resetsRun && resetApply !== null
+        ? resetApply.unavailableReason('program', 'revert') : program.documentUnavailableReason)),
     discard: programActionUnavailableReason(programWorkspace, 'discard', programBusyReason ?? program.mutationUnavailableReason),
   };
   const programSavedDiffers = programWorkspace?.saved.available === true
@@ -104,11 +126,13 @@ export function ScenarioActionControls({
     ? programWorkspace.draft.diagnostics[0]?.message ?? 'Complete the Program Draft before Apply.'
     : null;
   const deploymentReasons = {
-    apply: authoringAdmissionBlock
+    apply: applyAuthoringBlock
       ?? deploymentActionUnavailableReason(deploymentWorkspace, 'apply', deploymentApplyCommon)
       ?? invalidEditReason ?? programIncomplete,
-    revert: authoringAdmissionBlock ?? deploymentActionUnavailableReason(
-      deploymentWorkspace, 'revert', deploymentBusyReason ?? deployment.documentUnavailableReason,
+    revert: applyAuthoringBlock ?? deploymentActionUnavailableReason(
+      deploymentWorkspace, 'revert', deploymentBusyReason ?? (resetApply === null || !resetApply.runExists
+        ? deployment.documentUnavailableReason
+        : deploymentResetsRun ? resetApply.unavailableReason('deployment', 'revert') : deployment.mutationUnavailableReason),
     ),
     discard: deploymentActionUnavailableReason(
       deploymentWorkspace, 'discard', deploymentBusyReason ?? deployment.mutationUnavailableReason,
@@ -145,6 +169,8 @@ export function ScenarioActionControls({
   const beginAction = (next: ScenarioAction, event: MouseEvent<HTMLButtonElement>) => {
     if (routes[next].target === null) return;
     returnFocus.current = event.currentTarget;
+    // Reload initial scene starts off each time the confirmation opens.
+    setReloadScene(false);
     // A Deployment Apply previews first; its impact is confirmed below. The
     // server refuses it while a run is in progress (Reset first).
     if (next === 'apply' && routes.apply.target === 'deployment') {
@@ -159,12 +185,36 @@ export function ScenarioActionControls({
     }
     setAction(next);
   };
+  const appliedProgram = runtime.state.applied?.program ?? null;
+  const draftProgram = programWorkspace?.draft.program ?? null;
+  const reloadOffered = initialScene !== null && initialSceneReloadOffered({
+    action,
+    target: action === null ? null : routes[action].target,
+    draftProgram,
+    appliedProgram,
+    savedDiffersFromApplied: programSavedDiffers,
+  });
+  const reloadPersistentKeys = declaresPersistentKeys(action === 'apply' ? draftProgram : appliedProgram);
   const confirm = () => {
     if (action === null) return;
     const target = routes[action].target;
     if (target === null) return;
-    if (action === 'apply' && resetsRun && resetApply !== null) {
-      void resetApply.confirm().then((refusal) => {
+    let expectation: InitialSceneExpectation | null = null;
+    if (action !== 'discard' && initialScene !== null) {
+      const targetProgramRevision = action === 'apply'
+        ? programWorkspace?.draft.programRevision : programWorkspace?.saved.programRevision;
+      if (targetProgramRevision != null) {
+        expectation = { target: 'program', targetProgramRevision, reload: reloadOffered && reloadScene };
+        initialScene.expect(expectation);
+      }
+    }
+    // A refused or failed Apply or Revert leaves nothing to reload.
+    const dropUnless = (applied: boolean) => {
+      if (!applied && expectation !== null) initialScene?.drop(expectation);
+    };
+    if (action !== 'discard' && resetsRun && resetApply !== null) {
+      void resetApply.confirm('program', null, action).then((refusal) => {
+        dropUnless(refusal === null);
         if (refusal === null) closeAction();
         else setApplyRefusal(refusal);
       });
@@ -172,25 +222,42 @@ export function ScenarioActionControls({
     }
     closeAction();
     if (action === 'discard') program.discardScenario();
-    else if (action === 'revert') program.revert();
-    else program.apply();
+    else {
+      (action === 'revert' ? program.revert() : program.apply())
+        .then((result) => dropUnless(result !== null), () => dropUnless(false));
+    }
   };
 
   // The Deployment Apply (or Revert) confirmation: its Preview.
   const preview = deployment.applyPreview;
   const reverting = deployment.applyPreviewKind === 'revert';
-  const previewResetsRun = deploymentResetsRun && !reverting && resetApply !== null;
+  const previewResetsRun = deploymentResetsRun && resetApply !== null;
   const cancelPreview = () => {
     setApplyRefusal(null);
     deployment.cancelApplyConfirmation();
   };
+  const previewAction = reverting ? 'revert' : 'apply';
+  const previewReloadOffered = initialScene !== null && initialSceneReloadOffered({
+    action: previewAction,
+    target: 'deployment',
+    draftProgram,
+    appliedProgram,
+    savedDiffersFromApplied: programSavedDiffers,
+  });
   const confirmPreview = () => {
     if (preview === null) return;
+    const expectation: InitialSceneExpectation | null = initialScene === null
+      ? null : { target: 'deployment', reload: previewReloadOffered && reloadScene };
+    if (expectation !== null) initialScene?.expect(expectation);
     if (!previewResetsRun || resetApply === null) {
-      void deployment.confirmApply();
+      // Not sent, or refused: nothing to reload (its end settles the rest).
+      void deployment.confirmApply().then((result) => {
+        if (result === null && expectation !== null) initialScene?.drop(expectation);
+      });
       return;
     }
-    void resetApply.confirm('deployment', preview.scope).then((refusal) => {
+    void resetApply.confirm('deployment', preview.scope, previewAction).then((refusal) => {
+      if (refusal !== null && expectation !== null) initialScene?.drop(expectation);
       if (refusal === null) {
         setApplyRefusal(null);
         deployment.cancelApplyConfirmation();
@@ -215,7 +282,7 @@ export function ScenarioActionControls({
       <button
         type="button"
         disabled={routes.revert.target === null}
-        title={routes.revert.reason ?? `Restore Draft and Applied to Saved: ${covers(routes.revert.target)}.`}
+        title={routes.revert.reason ?? `${resetsRun && routes.revert.target === 'program' ? 'Reset the current run, then revert' : 'Restore Draft and Applied to Saved'}: ${covers(routes.revert.target)}.`}
         onClick={(event) => beginAction('revert', event)}
       >{busyLabel(operation, ['revert_preview', 'revert'], 'Revert')}</button>
       <button
@@ -251,9 +318,19 @@ export function ScenarioActionControls({
         {action === 'revert' && (
           <div className="dialog-copy compact-confirmation">
             <p>Replace the Draft and Applied with the Saved Scenario: {covers(routes.revert.target)}.</p>
+            {reloadOffered && (
+              <ReloadInitialSceneOption
+                action="revert" resetsRun={resetsRun} checked={reloadScene} onChange={setReloadScene}
+                persistentKeys={reloadPersistentKeys} persistentValues={runtime.persistentValues}
+              />
+            )}
+            {resetsRun && <ResetsRunWarning action="revert" />}
+            {applyRefusal !== null && <p role="alert">{applyRefusal}</p>}
             <div className="dialog-actions">
               <button type="button" className="primary-action" disabled={routes.revert.target === null}
-                title={authoringAdmissionBlock ?? undefined} onClick={confirm}>Revert to saved</button>
+                title={applyAuthoringBlock ?? undefined} onClick={confirm}>
+                {resetsRun ? 'Reset run and Revert' : 'Revert to saved'}
+              </button>
             </div>
           </div>
         )}
@@ -279,11 +356,17 @@ export function ScenarioActionControls({
                 <span>{programWorkspace?.applicability.unavailableReason?.message}</span>
               </div>
             )}
+            {reloadOffered && (
+              <ReloadInitialSceneOption
+                action="apply" resetsRun={resetsRun} checked={reloadScene} onChange={setReloadScene}
+                persistentKeys={reloadPersistentKeys} persistentValues={runtime.persistentValues}
+              />
+            )}
             {resetsRun && <ResetsRunWarning />}
             {applyRefusal !== null && <p role="alert">{applyRefusal}</p>}
             <div className="dialog-actions">
               <button type="button" className="primary-action" disabled={routes.apply.target === null}
-                title={authoringAdmissionBlock ?? undefined} onClick={confirm}>
+                title={applyAuthoringBlock ?? undefined} onClick={confirm}>
                 {resetsRun ? 'Reset run and Apply' : 'Apply'}
               </button>
             </div>
@@ -306,7 +389,14 @@ export function ScenarioActionControls({
             {preview === null
               ? <p className="inline-message severity-info" role="status">Previewing impact…</p>
               : <ApplyImpact preview={preview} />}
-            {previewResetsRun && <ResetsRunWarning />}
+            {previewReloadOffered && (
+              <ReloadInitialSceneOption
+                action={previewAction} resetsRun={previewResetsRun} checked={reloadScene} onChange={setReloadScene}
+                persistentKeys={declaresPersistentKeys(reverting ? appliedProgram : draftProgram)}
+                persistentValues={runtime.persistentValues}
+              />
+            )}
+            {previewResetsRun && <ResetsRunWarning action={previewAction} />}
             {previewResetsRun && applyRefusal !== null && <p role="alert">{applyRefusal}</p>}
             <div className="dialog-actions">
               <button type="button" onClick={cancelPreview}>Cancel</button>
@@ -314,11 +404,13 @@ export function ScenarioActionControls({
                 type="button"
                 className="primary-action"
                 disabled={preview === null || confirmationReason !== null}
-                title={authoringAdmissionBlock ?? (preview === null ? 'Previewing impact…' : deploymentApplyCommon
+                title={applyAuthoringBlock
+                  ?? (preview === null ? 'Previewing impact…' : deploymentApplyCommon
                   ?? 'Apply the Deployment: affected components are disabled, applied and prepared again.')}
                 onClick={confirmPreview}
-              >{deployment.applying ? 'Applying Deployment' : reverting ? 'Confirm revert'
-                : previewResetsRun ? 'Reset run and Apply' : 'Confirm apply'}</button>
+              >{deployment.applying ? 'Applying Deployment'
+                : previewResetsRun ? (reverting ? 'Reset run and Revert' : 'Reset run and Apply')
+                  : reverting ? 'Confirm revert' : 'Confirm apply'}</button>
             </div>
           </div>
         </OverlayPanel>
@@ -328,18 +420,67 @@ export function ScenarioActionControls({
 }
 
 /**
- * The single, visually clear warning of an Apply while a Program run exists.
- * It is part of Apply's ordinary confirmation: no second dialog.
+ * The single, visually clear warning of an Apply (or Revert) while a Program
+ * run exists. It is part of the ordinary confirmation: no second dialog.
  */
-export function ResetsRunWarning() {
+export function ResetsRunWarning({ action = 'apply' }: { action?: 'apply' | 'revert' }) {
   return (
     <div className="document-apply-blocked document-apply-resets-run" role="alert">
-      <strong>Applying Resets the current run.</strong>
+      <strong>{action === 'revert' ? 'Reverting' : 'Applying'} Resets the current run.</strong>
       <span>
         The whole run ends, including any repeating part, and does not resume
-        where it stopped. When the cycle is Idle, exactly this Draft is
-        Applied. Nothing is saved, executed or run automatically.
+        where it stopped. When the cycle is Idle,
+        {action === 'revert' ? ' the Saved Scenario is Applied.' : ' exactly this Draft is Applied.'}
+        {' '}Nothing is saved, executed or run automatically.
       </span>
     </div>
+  );
+}
+
+/**
+ * Reload initial scene with an Apply or Revert: once it is Applied, one Reset
+ * with Reload initial scene, as the Reset confirmation describes it. Off by
+ * default.
+ */
+export function ReloadInitialSceneOption({
+  action,
+  resetsRun,
+  checked,
+  onChange,
+  persistentKeys,
+  persistentValues,
+}: {
+  action: 'apply' | 'revert';
+  resetsRun: boolean;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  persistentKeys: boolean;
+  persistentValues: ProgramRuntimeController['persistentValues'];
+}) {
+  const after = action === 'revert' ? 'Revert' : 'Apply';
+  return (
+    <>
+      <fieldset className="transport-reset-options">
+        <label className="toggle-control">
+          <input
+            type="checkbox"
+            name="reloadInitialScene"
+            checked={checked}
+            onChange={(event) => onChange(event.target.checked)}
+          />
+          <span>Reload initial scene</span>
+        </label>
+        <small className="transport-reset-option-note">
+          {resetsRun
+            ? `After the ${after}, a second Reset reloads the initial scene. `
+            : `After the ${after}, a Reset reloads the initial scene. `}
+          {RELOAD_INITIAL_SCENE_NOTE}
+          {persistentKeys && PERSISTENT_KEYS_RESET_NOTE}
+          {' '}Otherwise the live cell keeps its current scene until a Reset with Reload initial scene.
+        </small>
+      </fieldset>
+      {checked && persistentKeys && <PersistentKeyResetNotice client={persistentValues} />}
+      {checked && <p>Robot positions stay as they are.</p>}
+    </>
   );
 }

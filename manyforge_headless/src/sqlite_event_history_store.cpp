@@ -31,7 +31,7 @@ namespace {
 using content_identity::CanonicalValue;
 
 constexpr int kHistorianApplicationId = 0x4D464548;
-constexpr int kHistorianUserVersion = 7;
+constexpr int kHistorianUserVersion = 8;
 /// A maximal record (256-KiB payload plus its bounded envelope) always fits
 /// one capture, so a trigger is never dropped for its size.
 constexpr std::int64_t kMinimumCaptureBytes = 512LL * 1024LL;

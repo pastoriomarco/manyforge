@@ -132,6 +132,47 @@ def _pose_query() -> SceneResourcePoseQuery:
     )
 
 
+def test_manager_command_waits_for_its_reply_or_the_closed_connection(
+    tmp_path: Path,
+) -> None:
+    # OD-298 (a): only the connection is limited; a reply later than the
+    # limit still arrives, and a connection closed without a reply is the
+    # Manager not answering.
+    socket_path = tmp_path / "manager-command.sock"
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    server.bind(str(socket_path))
+    socket_path.chmod(0o600)
+    server.listen(2)
+
+    def serve() -> None:
+        connection, _address = server.accept()
+        with connection:
+            connection.recv(16 * 1024)
+            time.sleep(0.5)
+            connection.send(
+                b'{"api_version":"manyforge.manager_command_response.v3",'
+                b'"error":{"code":"kernel_owner_unavailable",'
+                b'"message":"Apply is unavailable"},"ok":false,'
+                b'"request_key":"' + _APPLY_KEY.encode() + b'"}'
+            )
+        connection, _address = server.accept()
+        with connection:
+            connection.recv(16 * 1024)
+
+    worker = threading.Thread(target=serve)
+    worker.start()
+    try:
+        client = ManagerCommandClient(tmp_path, timeout_seconds=0.2)
+        assert client.apply(_request())["ok"] is False
+        with pytest.raises(HeadlessApiError) as captured:
+            client.apply(_request())
+        assert captured.value.code == "manager_command_unavailable"
+    finally:
+        server.close()
+        worker.join(timeout=2.0)
+    assert not worker.is_alive()
+
+
 def test_manager_client_uses_one_canonical_bounded_seqpacket(tmp_path: Path) -> None:
     socket_path = tmp_path / "manager-command.sock"
     server = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)

@@ -435,25 +435,6 @@ void ManagedKernelAdmissionGate::ReleaseFence(
   held_fences_.erase(found);
 }
 
-void ManagedKernelAdmissionGate::ReleaseFenceDurably(
-    const core::ConfigurationFenceId &fence_id,
-    const core::ConfigurationFenceScopeDTO &scope,
-    const std::function<void()> &commit_durable_release) {
-  Require(!fence_id.empty() && scope.valid() &&
-              static_cast<bool>(commit_durable_release),
-          "durable fence release identity, scope or commit is invalid");
-  std::lock_guard lock(*admission_mutex_);
-  const auto found = std::find_if(
-      held_fences_.begin(), held_fences_.end(), [&](const auto &held) {
-        return held.fence_id == fence_id && held.scope == scope;
-      });
-  Require(
-      found != held_fences_.end() && found->active_effect_count == 0U,
-      "durable release names an absent fence or an active composition effect");
-  commit_durable_release();
-  held_fences_.erase(found);
-}
-
 void ManagedKernelAdmissionGate::RunWithExactHeldFence(
     const core::ConfigurationFenceId &fence_id,
     const core::ConfigurationFenceScopeDTO &scope,

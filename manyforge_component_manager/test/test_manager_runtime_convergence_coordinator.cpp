@@ -504,9 +504,11 @@ public:
     return idle_state;
   }
 
-  [[nodiscard]] bool CloseAdmissionAndProveClosed() override {
+  [[nodiscard]] AdmissionCloseState
+  CloseAdmissionAndProveClosed(bool) override {
     if (on_close) on_close();
-    return close_succeeds;
+    return close_succeeds ? AdmissionCloseState::kClosed
+                          : AdmissionCloseState::kNotClosed;
   }
 
   bool close_succeeds{true};
@@ -896,6 +898,7 @@ public:
     if (throw_after_ensure_effect) {
       throw std::runtime_error("simulated lost process-start response");
     }
+    if (ensure_typed_error) throw core::TypedError(*ensure_typed_error, "component_manager");
     return Presence(query);
   }
 
@@ -909,9 +912,11 @@ public:
     return Presence(query);
   }
 
+  [[nodiscard]] std::uint64_t ProgressRequestMark() override { return 0U; }
+
   [[nodiscard]] std::optional<RuntimeUnitSourceReport>
   ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
-                  const RuntimeEpoch &runtime_epoch) override {
+                  const RuntimeEpoch &runtime_epoch, std::uint64_t) override {
     ++progress_calls;
     if (!report_available) {
       return std::nullopt;
@@ -950,6 +955,7 @@ public:
   void RefreshCurrentProcessObservation() { ++observation_sequence_; }
 
   bool throw_after_ensure_effect{false};
+  std::optional<ErrorDTO> ensure_typed_error;
   bool stop_remains_present{false};
   bool report_available{true};
   bool saw_durable_intent_before_ensure{false};
@@ -1441,6 +1447,26 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   EXPECT_EQ(fixture.runtime_ports.ensure_calls, 1);
   EXPECT_EQ(fixture.runtime_ports.start_effect_calls, 1);
   EXPECT_EQ(fixture.kernel.acquire_calls, 1);
+}
+
+// OD-270: the adapter's typed answer keeps its code and details through the
+// Ensure boundary, so it reaches the Apply record's cause.
+TEST(ManagerApplyRuntimeConvergenceCoordinator,
+     TypedEnsureFailureKeepsItsCodeAndDetails) {
+  ScopedPackageRoot root;
+  CoordinatorFixture fixture(root.path());
+  fixture.runtime_ports.ensure_typed_error = ErrorDTO{
+      "application_stopping", "the application is stopping",
+      {{"exchange", "projection_prepare"}, {"effect", "none"}}};
+  try {
+    static_cast<void>(fixture.Run());
+    FAIL() << "expected the typed Ensure failure";
+  } catch (const core::TypedError &error) {
+    EXPECT_EQ(error.code(), "application_stopping");
+    EXPECT_EQ(error.details().at("effect"), "none");
+    EXPECT_EQ(error.details().at("exchange"), "projection_prepare");
+    EXPECT_EQ(error.producer(), "component_manager");
+  }
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
@@ -3074,9 +3100,9 @@ TEST(ManagerNamedApplyCoordinator,
                          {{"effect", "none"}}}};
     if (failing_call == 7 || failing_call == 8) {
       core::ErrorDTO late{std::string(kExecutionHostLateCode),
-                          "the execution host did not answer within its bound; the outcome "
-                          "of the request is unknown",
-                          {{"exchange", "host_apply"}, {"bound_ms", "750"}}};
+                          "the execution host has not answered an earlier host_apply "
+                          "request yet",
+                          {{"exchange", "host_apply"}}};
       if (failing_call == 7) late.details.emplace("effect", "none");
       runtime_composition.error_result = std::move(late);
     }
@@ -3162,8 +3188,8 @@ TEST(ManagerNamedApplyCoordinator,
               : failing_call == 6
                   ? "Execution host: retained native owner differs from the planned predecessor"
               : failing_call == 7 || failing_call == 8
-                  ? "the execution host did not answer within its bound; the outcome "
-                    "of the request is unknown"
+                  ? "the execution host has not answered an earlier host_apply "
+                    "request yet"
                   : "scripted exact host Apply failure");
     if (failing_call == 7 || failing_call == 8) {
       // The late answer is the Manager adapter's own, never the host's.
@@ -4152,38 +4178,20 @@ void ExpectNewReleasesAndALaterApplyIsAccepted(PendingAfterFenceFixture &fixture
   EXPECT_NE(later.apply_id, failed.apply_id);
 }
 
-TEST(ManagerNamedApplyCoordinator, PendingApplyTimesOutAtItsBoundAndNewClearsIt) {
+// OD-270: an Apply has no overall time limit; a pending step ends only on
+// its own events, however long it takes.
+TEST(ManagerNamedApplyCoordinator, PendingApplyHasNoOverallTimeLimit) {
   ScopedPackageRoot root;
   ScopedPackageRoot state;
   PendingAfterFenceFixture fixture(root.path(), state.path());
-  const auto bound = static_cast<std::uint64_t>(
-      ManagerApplyBound(*fixture.previous.bundle, *fixture.candidate.bundle).count());
-  // The Composer's formula: each component's budget plus the stop grace.
-  EXPECT_GE(bound, static_cast<std::uint64_t>(
-      (std::chrono::nanoseconds(deployment::kDefaultLifecycleBudgetNs) +
-       core::kControllerLaunchStopGrace).count()));
-  const auto accepted = fixture.coordinator.AcceptOrReplay(fixture.Request("request.timeout"));
+  const auto accepted = fixture.coordinator.AcceptOrReplay(fixture.Request("request.long"));
   ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
   ASSERT_EQ(fixture.coordinator.RecoverIncompleteApply()->state, ManagerNamedApplyResultState::kPending);
-  ASSERT_TRUE(fixture.journal.ReadFenceAcceptance(accepted.apply_id, accepted.apply_generation));
-
-  // Just before the deadline a pending pass is unaffected.
-  fixture.now = 1'000U + bound - 1U;
-  const auto before = fixture.coordinator.RecoverIncompleteApply();
-  ASSERT_TRUE(before.has_value());
-  EXPECT_EQ(before->state, ManagerNamedApplyResultState::kPending);
+  fixture.now += 24ULL * 3600ULL * 1'000'000'000ULL;
+  const auto later = fixture.coordinator.RecoverIncompleteApply();
+  ASSERT_TRUE(later.has_value());
+  EXPECT_EQ(later->state, ManagerNamedApplyResultState::kPending);
   EXPECT_FALSE(fixture.journal.ReadTerminalOutcome(accepted.apply_id, accepted.apply_generation));
-
-  fixture.now = 1'000U + bound;
-  const auto timed_out = fixture.coordinator.RecoverIncompleteApply();
-  ASSERT_TRUE(timed_out && timed_out->terminal_outcome && timed_out->terminal_outcome->failure);
-  EXPECT_EQ(timed_out->state, ManagerNamedApplyResultState::kUnknownEffect);
-  EXPECT_EQ(timed_out->terminal_outcome->failure->failure_code, "apply_timed_out");
-  EXPECT_EQ(timed_out->terminal_outcome->failure->cause_code, "apply_timed_out");
-  EXPECT_EQ(timed_out->terminal_outcome->failure->effect_disposition,
-            ManagerApplyEffectDisposition::kUnknown);
-  EXPECT_FALSE(fixture.coordinator.RecoverIncompleteApply().has_value());
-  ExpectNewReleasesAndALaterApplyIsAccepted(fixture, *timed_out);
 }
 
 TEST(ManagerNamedApplyCoordinator, ThrowingStepEndsTheApplyTypedAndNewClearsIt) {
@@ -4209,7 +4217,8 @@ TEST(ManagerNamedApplyCoordinator, NewAndAcknowledgeDuringAStepAreBusyAtOnceWith
   ScopedPackageRoot root;
   ScopedPackageRoot state;
   PendingAfterFenceFixture fixture(root.path(), state.path());
-  const auto accepted = fixture.coordinator.AcceptOrReplay(fixture.Request("request.held-step"));
+  const auto held_request = fixture.Request("request.held-step");
+  const auto accepted = fixture.coordinator.AcceptOrReplay(held_request);
   ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
   std::promise<void> entered;
   std::promise<void> release;
@@ -4245,6 +4254,20 @@ TEST(ManagerNamedApplyCoordinator, NewAndAcknowledgeDuringAStepAreBusyAtOnceWith
     fixture.coordinator.AcknowledgeFailedApply(accepted.apply_id, accepted.apply_generation,
         TestRequestKey("acknowledge.during-step"), "manyforge_composer");
   });
+  // OD-270: a new Apply request does not wait for the step either.
+  const auto new_request = fixture.Request("request.during-step");
+  expect_busy([&] {
+    static_cast<void>(fixture.coordinator.AcceptOrReplay(new_request));
+  });
+  // The replay of the running Apply is answered from the journal at once.
+  auto replayed = std::async(std::launch::async, [&] {
+    return fixture.coordinator.AcceptOrReplay(held_request);
+  });
+  ASSERT_EQ(replayed.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  const auto replay = replayed.get();
+  EXPECT_EQ(replay.apply_id, accepted.apply_id);
+  EXPECT_EQ(replay.state, ManagerNamedApplyResultState::kPending);
+  EXPECT_TRUE(replay.request_replayed);
   fixture.step_hook = {};
   release.set_value();
   ASSERT_TRUE(step.get().has_value());

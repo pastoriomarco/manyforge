@@ -579,8 +579,7 @@ Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
     }
   }
   auto captured = operation->state;
-  auto durable = record_operation_state_locked(
-      state_lock, captured, nullptr,
+  auto durable = record_operation_state_locked(captured, nullptr,
       cancellation_failure.has_value() ? "coordinated_prepare_cancel_failed"
       : admission_refusal              ? "admission_refused_before_dispatch"
                                        : "coordinated_prepare_failed_before_dispatch");
@@ -960,7 +959,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           operation->participants.begin(), operation->participants.end(),
           [](const auto& candidate) { return candidate.prepared_participant.has_value(); });
       if (!all_prepared) {
-        auto durable = record_operation_state_locked(state_lock, prepared_state,
+        auto durable = record_operation_state_locked(prepared_state,
                                                      operation->runtime_scale_status.has_value()
                                                          ? &*operation->runtime_scale_status
                                                          : nullptr,
@@ -1002,8 +1001,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
                   [](const auto& left, const auto& right) {
                     return left.participant_id < right.participant_id;
                   });
-        auto durable = record_operation_state_locked(
-            state_lock, prepared_state,
+        auto durable = record_operation_state_locked(prepared_state,
             operation->runtime_scale_status.has_value() ? &*operation->runtime_scale_status
                                                         : nullptr,
             operation->participants.size() == 1U ? (operation->participants.front().payload_kind ==
@@ -1419,7 +1417,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           if (operation->state.state != OperationStateKind::kInterventionRequired)
             executing_state.state = aggregate_participant_state(executing_state.participants);
           executing_state.updated_at_ns = clock_.now();
-          auto durable = record_operation_state_locked(state_lock, executing_state,
+          auto durable = record_operation_state_locked(executing_state,
                                                        operation->runtime_scale_status.has_value()
                                                            ? &*operation->runtime_scale_status
                                                            : nullptr,
@@ -2196,8 +2194,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
       active_operation->has_pending_io_rule_response())
     observed_state.state = OperationStateKind::kStopping;
   observed_state.updated_at_ns = clock_.now();
-  auto durable_state = record_operation_state_locked(
-      state_lock, observed_state,
+  auto durable_state = record_operation_state_locked(observed_state,
       active_operation->runtime_scale_status.has_value() ? &*active_operation->runtime_scale_status
                                                          : nullptr,
       "subordinate_state_observed");
@@ -2220,7 +2217,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
       failed_participant.terminal_error = transition.error();
       intervention.updated_at_ns = clock_.now();
       auto durable_failure =
-          record_operation_state_locked(state_lock, intervention,
+          record_operation_state_locked(intervention,
                                         active_operation->runtime_scale_status.has_value()
                                             ? &*active_operation->runtime_scale_status
                                             : nullptr,
@@ -2304,7 +2301,25 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     std::optional<StopControlWorkToken> escalation_wakeup;
     {
       std::lock_guard state_lock(state_mutex_);
-      const auto operation_id = find_event_operation_locked(engine, event.execution_id, subscription_id);
+      auto operation_id = find_event_operation_locked(engine, event.execution_id, subscription_id);
+      if (!operation_id.has_value() && event.execution_id != 0U) {
+        // OD-175 D4: between a hand-over's "decide" and "apply" steps the
+        // engine still names the old motion's execution; a collision report
+        // naming it counts for the candidate that carries the mark with that
+        // source id (collision reports only; no other event is aliased).
+        for (const auto& [id, candidate] : active_operations_) {
+          const auto marked = std::find_if(
+              candidate->participants.begin(), candidate->participants.end(),
+              [&](const auto& row) {
+                return row.engine_subscription_id == subscription_id &&
+                       row.handover_source_execution_id == event.execution_id;
+              });
+          if (marked != candidate->participants.end()) {
+            operation_id = id;
+            break;
+          }
+        }
+      }
       auto* operation =
           operation_id.has_value() ? find_active_operation_locked(*operation_id) : nullptr;
       auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
@@ -2635,8 +2650,12 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
         continue;
       }
       for (auto& participant : operation->participants) {
+        // A candidate between its hand-over's "decide" and "close" steps
+        // (OD-175 D3, gate 1): its engine is not adopted yet; the next pass
+        // reads it.
         if (participant.stop_owns_reconciliation() || participant.reconciliation_in_flight || participant.prepare_in_flight ||
-            participant.dispatch_effect_in_flight || participant.subordinate_id == 0U) {
+            participant.dispatch_effect_in_flight || participant.subordinate_id == 0U ||
+            participant.handover_source_execution_id != 0U) {
           continue;
         }
         const auto public_participant =
@@ -2713,8 +2732,7 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
                 row->state = RuntimeScaleApplicationState::kFailed;
                 row->error = scale_status.error();
               }
-              applied = retain_runtime_scale_observation_locked(
-                  state_lock, *active_operation, std::move(public_status),
+              applied = retain_runtime_scale_observation_locked(*active_operation, std::move(public_status),
                   "runtime_scale_reconcile_unavailable");
             }
           }

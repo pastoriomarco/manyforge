@@ -31,6 +31,17 @@ enum class ManagementIdleState {
 
 [[nodiscard]] const char *ToString(ManagementIdleState state) noexcept;
 
+/// The admission close of a planned transition, observed as an event
+/// (OD-295 (3)(a)): the close is posted to its owner and its result picked up
+/// on a later drive, with no wait on another lane.
+enum class AdmissionCloseState {
+  kClosed,
+  kNotClosed,
+  /// Posted; its result is not in yet. The caller returns pending and asks
+  /// again, with `continue_posted`, when it is driven next.
+  kPending,
+};
+
 /// The two effects a planned transition needs from its admission owner.
 ///
 /// Implementations must read truth and must not start, stop, quiesce or resume
@@ -42,10 +53,13 @@ public:
   /// Read the exact idle state of the affected execution surface.
   [[nodiscard]] virtual ManagementIdleState ReadIdleState() const = 0;
 
-  /// Close admission for new work and prove it is closed. Returns false when
-  /// closure could not be established, in which case the caller must not
-  /// destroy anything.
-  [[nodiscard]] virtual bool CloseAdmissionAndProveClosed() = 0;
+  /// Close admission for new work and prove it is closed. The first call
+  /// (`continue_posted` false) posts a new close; a later call with
+  /// `continue_posted` true picks up that close's result. kPending until the
+  /// result is in; kNotClosed when closure could not be established, in which
+  /// case the caller must not destroy anything. Never waits on another lane.
+  [[nodiscard]] virtual AdmissionCloseState
+  CloseAdmissionAndProveClosed(bool continue_posted) = 0;
 };
 
 /// How one planned transition attempt ended.
@@ -58,6 +72,9 @@ enum class ManagerPlannedMaintenanceOutcome {
   kFailedBeforeEffect,
   /// An admission/runtime effect may have begun and could not be established.
   kUnknownEffect,
+  /// The admission close is posted and its result not in yet (OD-295 (3)(a)):
+  /// not terminal; the caller is driven again and continues the close.
+  kAdmissionClosePending,
 };
 
 /// Truthful, bounded result of one planned transition attempt.
@@ -77,9 +94,14 @@ struct ManagerPlannedMaintenanceResult final {
     return outcome == ManagerPlannedMaintenanceOutcome::kEnteredIdleMaintenance;
   }
 
+  [[nodiscard]] bool admission_close_pending() const noexcept {
+    return outcome == ManagerPlannedMaintenanceOutcome::kAdmissionClosePending;
+  }
+
   /// A terminal failure that must be retained exactly once.
   [[nodiscard]] bool terminal_failure() const noexcept {
-    return outcome != ManagerPlannedMaintenanceOutcome::kEnteredIdleMaintenance;
+    return outcome == ManagerPlannedMaintenanceOutcome::kFailedBeforeEffect ||
+           outcome == ManagerPlannedMaintenanceOutcome::kUnknownEffect;
   }
 
   [[nodiscard]] bool valid() const noexcept;
@@ -122,9 +144,12 @@ public:
       const ManagerApplyIntentDTO &intent,
       const manyforge::core::ProjectionRevisionDTO &expected_predecessor) const;
 
+  /// `continue_posted`: an earlier call of this transition answered
+  /// kAdmissionClosePending; this one picks up that close's result.
   [[nodiscard]] ManagerPlannedMaintenanceResult EnterIdleMaintenance(
       const ManagerApplyIntentDTO &intent,
-      const manyforge::core::ProjectionRevisionDTO &expected_predecessor);
+      const manyforge::core::ProjectionRevisionDTO &expected_predecessor,
+      bool continue_posted = false);
 
   ManagerPlannedMaintenanceCoordinator(
       const ManagerPlannedMaintenanceCoordinator &) = delete;

@@ -319,7 +319,7 @@ def _model_request_contract(value: Any) -> dict[str, Any]:
             "supports_response_tools",
             "tool_call_family",
         }
-        # EXPERIMENTAL optional `reasoning: on|off`; optional `sampling`.
+        # Optional `reasoning: on|off` (model reasoning switch); optional `sampling`.
         | ({"reasoning", "sampling"} & set(contract)),
         "model_endpoint.request_contract",
     )

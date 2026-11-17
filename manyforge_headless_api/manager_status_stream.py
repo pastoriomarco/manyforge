@@ -100,7 +100,8 @@ class ManagerStatusFollower:
     On the follower thread, ``on_control_change`` runs when what the control
     state shows changed (not for pose samples alone), ``on_viewer_change``
     when the viewer's scene-runtime or pose-session sources changed, and both
-    whenever the Manager starts or stops answering. They must not block; if
+    whenever the Manager starts or stops answering. ``on_disconnect`` runs,
+    before them, when a connected subscription ended. They must not block; if
     one raises, the follower logs it and reconnects.
     """
 
@@ -112,6 +113,7 @@ class ManagerStatusFollower:
         silence_seconds: float,
         on_control_change: Callable[[], None],
         on_viewer_change: Callable[[], None],
+        on_disconnect: Callable[[], None] = lambda: None,
         backoff_seconds: tuple[float, float] = RECONNECT_BACKOFF_SECONDS,
     ) -> None:
         if silence_seconds <= 0:
@@ -121,6 +123,7 @@ class ManagerStatusFollower:
         self._silence_seconds = silence_seconds
         self._on_control_change = on_control_change
         self._on_viewer_change = on_viewer_change
+        self._on_disconnect = on_disconnect
         self._backoff_seconds = backoff_seconds
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -188,6 +191,7 @@ class ManagerStatusFollower:
     def _disconnected(self, _error: BaseException) -> None:
         self._answering = False
         if self._core.mark_manager_status_disconnected():
+            self._on_disconnect()
             self._notify()
 
     def _notify(self) -> None:

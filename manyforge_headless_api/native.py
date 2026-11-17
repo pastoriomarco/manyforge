@@ -81,10 +81,9 @@ class HeadlessApiConfig:
     freshness_milliseconds: int = 2_000
     historian_queue_capacity: int = 1_024
     historian_record_retention: int = 100_000
-    # Apply and scene commits are durable Manager transactions, not health
-    # probes. Keep their local transport wait bounded but long enough for the
-    # owner to return the authoritative result instead of reporting an
-    # ambiguous timeout after the mutation has committed.
+    # Limits connecting to the Manager's command socket only; a connected
+    # command waits for the Manager's answer, ended by the reply or the
+    # Manager closing the connection (OD-298 (a)).
     manager_timeout_seconds: float = DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS
     # Limits connecting to the execution host only; a connected request
     # waits for the host's answer (OD-214).

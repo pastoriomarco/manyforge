@@ -13,6 +13,7 @@ import {
   resetApplyDismissible,
   resetApplyPhaseText,
   resetApplyTerminal,
+  type ResetApplyAction,
   type ResetApplyDocument,
   type ResetApplyFacts,
   type ResetApplyPhase,
@@ -95,13 +96,17 @@ export function useResetApply({
    * Why Program Apply (with its Reset) is unavailable while a run exists, or
    * null. Never depends on a motion preview.
    */
-  const unavailableReason = useCallback((document: ResetApplyDocument = 'program'): string | null => {
+  const unavailableReason = useCallback((
+    document: ResetApplyDocument = 'program',
+    action: ResetApplyAction = 'apply',
+  ): string | null => {
+    // One chain at a time, whichever action it carries.
     if (inProgress) return 'An Apply that Resets the run is in progress.';
     // The Draft is editable only while all Program motion is stopped; the
-    // same holds for Applying it.
+    // same holds for Applying it or Reverting to Saved.
     const reason = document === 'deployment'
-      ? deploymentActionUnavailableReason(deploymentWorkspace, 'apply', deployment.mutationUnavailableReason)
-      : programActionUnavailableReason(programWorkspace, 'apply', program.mutationUnavailableReason);
+      ? deploymentActionUnavailableReason(deploymentWorkspace, action, deployment.mutationUnavailableReason)
+      : programActionUnavailableReason(programWorkspace, action, program.mutationUnavailableReason);
     if (reason !== null) return reason;
     // The Reset would meet another Program command and be refused (OD-144).
     if (runtime.runnerBusyReason !== null) return runtime.runnerBusyReason;
@@ -132,9 +137,11 @@ export function useResetApply({
     document: ResetApplyDocument = 'program',
     /** Deployment only: the Preview the operator confirmed. */
     scope: ApplyPreview['scope'] | null = null,
+    /** Apply the Draft, or Revert to Saved, after the Reset. */
+    action: ResetApplyAction = 'apply',
   ): Promise<string | null> => {
     if (chain.current !== null) return 'An Apply that Resets the run is in progress.';
-    const reason = unavailableReason(document);
+    const reason = unavailableReason(document, action);
     if (reason !== null) return reason;
     const cycle = snapshot?.programCycle ?? null;
     if (cycle === null || cycle.programRunId === null) {
@@ -143,7 +150,9 @@ export function useResetApply({
     let draft: Pick<ResetApplyPlan, 'draftId' | 'draftRevision' | 'draftContentRevision' | 'appliedRevision'>;
     if (document === 'deployment') {
       if (deploymentWorkspace === null || scope === null) {
-        return 'Preview the Deployment Draft before Reset and Apply.';
+        return action === 'revert'
+          ? 'Preview the Deployment Revert before Reset and Revert.'
+          : 'Preview the Deployment Draft before Reset and Apply.';
       }
       draft = {
         draftId: deploymentWorkspace.draft.id,
@@ -166,6 +175,7 @@ export function useResetApply({
     const plan: ResetApplyPlan = {
       correlationId: identity('reset-apply'),
       document,
+      action,
       programRunId: cycle.programRunId,
       cycleGeneration: cycle.cycleGeneration,
       ...draft,
@@ -264,8 +274,10 @@ export function useResetApply({
       message: `Apply was refused or its reply was lost${detail ? `: ${detail}` : ''}. The Draft keeps its edits; Activity shows any accepted activation.`,
     });
     if (plan.document === 'deployment') {
-      // The server Apply runs to its end: its result settles the chain.
-      void latest.current.deployment.applyConfirmedScope(plan.scope ?? {}).then((result) => {
+      // The server Apply (or Revert) runs to its end: its result settles the chain.
+      const { deployment: owner } = latest.current;
+      const send = plan.action === 'revert' ? owner.revertConfirmedScope : owner.applyConfirmedScope;
+      void send(plan.scope ?? {}).then((result) => {
         if (result === null) lost(latest.current.deployment.error);
         else if (result.outcome === 'failed') {
           fail(correlationId, { kind: 'failed', stage: 'apply', unknown: false, apply: null,
@@ -274,7 +286,8 @@ export function useResetApply({
       }, refused);
       return;
     }
-    void latest.current.program.apply({
+    const { program: owner } = latest.current;
+    void (plan.action === 'revert' ? owner.revert : owner.apply)({
       expectedDraft: {
         draftId: plan.draftId,
         draftRevision: plan.draftRevision,
@@ -283,7 +296,7 @@ export function useResetApply({
     }).then((result) => {
       if (result === null) {
         lost(latest.current.program.state.error);
-      } else if (result.transitionStatus === 'applied') {
+      } else if (result.transitionStatus === 'applied' || result.transitionStatus === 'reverted') {
         advance(correlationId, { kind: 'applied', apply: null });
       } else if (result.acceptedApply) {
         advance(correlationId, { kind: 'awaiting_apply', apply: result.acceptedApply });
@@ -344,6 +357,7 @@ export function resetApplyNotice(
   const { phase, plan } = sequence;
   const failedPhase = phase.kind === 'failed';
   const name = plan.document === 'program' ? 'Program' : 'Deployment';
+  const revert = plan.action === 'revert';
   return {
     id: `reset-apply.${plan.correlationId}`,
     // A stopped Apply blocks nothing: a warning until acknowledged.
@@ -351,11 +365,11 @@ export function resetApplyNotice(
     acknowledgeable: failedPhase,
     domain: 'activation',
     title: failedPhase
-      ? `${name} Apply stopped`
+      ? `${name} ${revert ? 'Revert' : 'Apply'} stopped`
       : phase.kind === 'applied'
-        ? `${name} Applied after Reset`
-        : `Resetting the run to Apply the ${name}`,
-    message: `${resetApplyPhaseText(phase, applicationStartId)} Correlation ${plan.correlationId}.`,
+        ? `${name} ${revert ? 'Reverted' : 'Applied'} after Reset`
+        : `Resetting the run to ${revert ? 'Revert' : 'Apply'} the ${name}`,
+    message: `${resetApplyPhaseText(phase, applicationStartId, plan.action)} Correlation ${plan.correlationId}.`,
     busy: !resetApplyTerminal(phase),
     actions: resetApplyDismissible(phase) && phase.kind !== 'applied'
       ? [failedPhase

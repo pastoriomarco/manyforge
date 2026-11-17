@@ -34,14 +34,6 @@ ValidateManagerPneumaticNoneProcessOwner(
     const ManagerComponentProcessInventoryRequestDTO &expected_inventory_request,
     const ManagerComponentProcessOccurrenceDTO &occurrence);
 
-/// The bound of one Apply, from its acceptance (OD-188 P2). Every component of the predecessor or the candidate takes its
-/// lifecycle budget (the candidate's, else the predecessor's; the authored
-/// one, else `deployment::kDefaultLifecycleBudgetNs`) plus the host's stop
-/// grace `core::kControllerLaunchStopGrace`; at least one default budget.
-[[nodiscard]] std::chrono::nanoseconds
-ManagerApplyBound(const manyforge::deployment::RetainedBundle &predecessor,
-                  const manyforge::deployment::RetainedBundle &candidate);
-
 class ManagerNamedApplyCoordinatorError : public std::runtime_error {
 public:
   using std::runtime_error::runtime_error;
@@ -167,7 +159,10 @@ public:
   /// Validate and durably accept one exact request without advancing any
   /// runtime effect. Exact replay returns terminal evidence when it already
   /// exists; otherwise the sole progression owner resumes it through
-  /// RecoverIncompleteApply().
+  /// RecoverIncompleteApply(). Never waits behind an Apply step (OD-270):
+  /// while one runs, a replay is answered from the journal when the pending
+  /// settlement cannot change it, and anything else is refused `apply_busy`
+  /// with `effect: none`.
   [[nodiscard]] ManagerNamedApplyResult
   AcceptOrReplay(const ManagerNamedApplyRequestDTO &request,
                  OriginalPrepareAcknowledgement original_prepare_acknowledgement = {});
@@ -176,9 +171,9 @@ public:
   /// transaction is an integrity failure because this coordinator owns one
   /// serialized progression lane. An Apply progresses only with this
   /// process's captured original claim and inputs. A step that fails
-  /// unexpectedly ends the Apply `apply_progression_failed`, and a pass that
-  /// is still pending past the Apply's bound (ManagerApplyBound) ends it
-  /// `apply_timed_out`; both with unknown effect (OD-188 P1, P2).
+  /// unexpectedly ends the Apply `apply_progression_failed` with unknown
+  /// effect (OD-188 P1). An Apply has no overall time limit: a step ends only
+  /// on its own events (OD-270).
   [[nodiscard]] std::optional<ManagerNamedApplyResult> RecoverIncompleteApply();
 
   /// Advisory availability of acknowledgement for a failed, before-effect
@@ -236,8 +231,9 @@ private:
     bool original_scene_begin_consumed{};
     bool original_scene_complete_consumed{};
     std::optional<manyforge::core::ProjectionMaintenanceInitializationStatusDTO> original_scene_completed{};
-    /// Acceptance time plus ManagerApplyBound, on the injected clock.
-    std::uint64_t deadline_ns{};
+    // The fence is held and the admission close posted; its result is picked
+    // up on the next drive (OD-295 (3)(a)).
+    bool maintenance_close_pending{};
   };
 
   [[nodiscard]] ManagerNamedApplyResult
@@ -286,6 +282,9 @@ private:
   /// For a command that would wait for operation_mutex_: refused at once,
   /// `apply_busy` with `effect: none`, while an Apply step holds it (OD-145).
   [[nodiscard]] std::unique_lock<std::mutex> LockUnlessStepInProgress();
+  /// The same single look, without the refusal: the lock is not owned while
+  /// an Apply step holds it.
+  [[nodiscard]] std::unique_lock<std::mutex> TryLockUnlessStepInProgress();
 
   SqliteManagerApplyJournal &apply_journal_;
   IManagerActiveRuntimePlanSource &active_plan_source_;
@@ -306,9 +305,6 @@ private:
   SuccessfulSettlementPreparation successful_settlement_preparation_;
   /// This machine's site facts: every component spec is derived with them.
   manyforge::deployment::SiteFacts site_facts_;
-  /// The injected clock of the Apply deadline (declared before the members
-  /// the constructor moves it into).
-  RuntimeObservationReducer::Clock clock_ns_;
   ManagerApplyFenceCoordinator fence_coordinator_;
   ManagerPlannedMaintenanceCoordinator &planned_maintenance_;
   ManagerActiveRuntimeCoordinator active_runtime_coordinator_;

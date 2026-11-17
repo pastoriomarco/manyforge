@@ -310,24 +310,6 @@ TEST(SqliteRecordWriter, DrainAndStopWritesEverythingQueued) {
   EXPECT_EQ(database.Values().size(), 100U);
 }
 
-TEST(SqliteRecordWriter, DeadlineCountsRecordsNotDrained) {
-  TemporaryDirectory directory;
-  Database database(directory.path() / "store.sqlite3");
-  Gate gate;
-  InstallGate(database.handle(), gate);
-  SqliteRecordWriter writer;
-  const auto slot = writer.RegisterConnection(database.handle(), "store", kMark);
-  ASSERT_TRUE(writer.Post(slot, GateRecord()));
-  gate.entered.get_future().wait();
-  ASSERT_TRUE(writer.Post(slot, Insert(1, "late")));
-  // The release may reach the writer before or after the stop; either way
-  // the record is written or counted, never lost silently.
-  std::thread release([&gate] { gate.release.set_value(); });
-  writer.DrainAndStop(std::chrono::steady_clock::time_point::min());
-  release.join();
-  EXPECT_EQ(database.Values().size() + writer.records_not_written(), 1U);
-}
-
 TEST(SqliteRecordWriter, FullQueueStartsOneEpisodeUntilTheQueueIsWrittenEmpty) {
   TemporaryDirectory directory;
   Database database(directory.path() / "store.sqlite3");
@@ -366,7 +348,7 @@ TEST(SqliteRecordWriter, FullQueueStartsOneEpisodeUntilTheQueueIsWrittenEmpty) {
       Count(
           output,
           "store records not written in this start: store=store "
-          "queue_full=5 write_failed=0 not_drained=0;\n"),
+          "queue_full=5 write_failed=0;\n"),
       1U)
       << output;
   EXPECT_EQ(writer.records_dropped(), 5U);
@@ -404,7 +386,7 @@ TEST(SqliteRecordWriter, FailedWritesStartOneEpisodeOnlyForTheirStore) {
       Count(
           output,
           "store records not written in this start: store=store "
-          "queue_full=0 write_failed=2 not_drained=0;\n"),
+          "queue_full=0 write_failed=2;\n"),
       1U)
       << output;
   EXPECT_EQ(writer.records_not_written(), 2U);

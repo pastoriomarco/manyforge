@@ -22338,7 +22338,7 @@ TEST(ResourceAddressedExecutionKernelTest,
         {2U, ProgramCycleStateDTO::kRunning,
          ProgramRunNumber(1U), CellAdmissionClaimGeneration(1U), std::nullopt},
         "program_runner_liveness_probe",
-        "connection refused"};
+        "connection refused", "program_runner_contact_lost"};
     if (scenario == 2) loss.established_cycle.program_run_id = ProgramRunNumber(109U);
     if (scenario == 3)
       loss.established_cycle.cycle_claim_generation = CellAdmissionClaimGeneration(9U);
@@ -22398,7 +22398,7 @@ TEST(ResourceAddressedExecutionKernelTest,
       {2U, ProgramCycleStateDTO::kRunning,
        ProgramRunNumber(1U), acquired.value().claim_generation, std::nullopt},
       "program_runner_liveness_probe",
-      "connection refused"};
+      "connection refused", "program_runner_contact_lost"};
   CellAdmissionReadinessSnapshotDTO closed{
       false, loss.established_cycle, false, 1U, 0U, false, false, 0U, 0U, 0U};
   closed.program_runner_loss = loss;
@@ -22919,6 +22919,69 @@ TEST(ResourceAddressedExecutionKernelTest,
   engine.translate_stop_stage_hook = {};
 }
 
+// OD-285: a take-over newcomer whose replacement was sent, then retired by a
+// cold promotion of its spring successor, never ends "no effect" (OD-264
+// would hold it as unstarted): here the successor's cold activation is
+// refused after the promotion.
+TEST(ResourceAddressedExecutionKernelTest, ColdPromotedSentNewcomerNeverEndsWithNoEffect) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.default_operator_stop_profile->stop_mode = MotionInterruptStopMode::kSpringBackHold;
+  row.default_operator_stop_profile->allow_natural_completion_on_short_path = false;
+  row.motion_takeover_preparation_budget_s = 10.0;
+  ResourceAddressedExecutionKernelConfig config{kTestApplicationStartId,
+                                                CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  auto kernel_owner = make_uncaptured_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *kernel_owner;
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(spring_fallback_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(scoped_motion_operation("cold.sent.original"));
+  ASSERT_TRUE(original.ok()) << original.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto candidate = kernel.execute(spring_fallback_intent("cold.sent.candidate"));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());  // the replacement's send
+  ASSERT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+  // The hand-over's proof is refused: the spring fallback stops the old
+  // motion and attaches the cold successor to the sent replacement.
+  engine.replacement_phase.store(PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+  engine.prove_refusal = ErrorDTO{"execution_rejected", "Replacement adoption was refused", {}};
+  engine.prepare_cold_refusal = ErrorDTO{"execution_rejected", "cold activation refused", {}};
+  HeldSettlementCall returning;
+  engine.translate_stop_stage_hook = returning.Blocker();
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  ASSERT_TRUE(returning.Entered());
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    std::lock_guard lock(engine.prepared_motion_mutex_);
+    return engine.attached_cold_snapshot.has_value();
+  }));
+  returning.Release();
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    const auto observed = kernel.get_operation_projection(candidate.value().operation_id);
+    return observed.ok() && observed.value().operation.participants.front().terminal_fact;
+  }));
+  EXPECT_EQ(engine.prepare_cold_motion_calls.load(), 1);  // after the promotion
+  EXPECT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+  const auto ended = kernel.get_operation_projection(candidate.value().operation_id);
+  ASSERT_TRUE(ended.ok());
+  EXPECT_EQ(ended.value().operation.state, OperationStateKind::kFailed);
+  const auto& fact = *ended.value().operation.participants.front().terminal_fact;
+  EXPECT_EQ(fact.kind, ParticipantExecutionFactKind::kLocalFailure);
+  EXPECT_EQ(fact.effect, ParticipantEffectKnowledge::kEffectSettled);
+  ASSERT_TRUE(fact.error);
+  EXPECT_EQ(fact.error->message, "cold activation refused");
+  engine.translate_stop_stage_hook = {};
+}
+
 // The Runner owns Program Stop and Halt. A new Runner loss therefore stops
 // that Program run's motion through the ordinary Stop path, once: a
 // program-run Stop, not a Full Stop, and no motion inhibit.
@@ -22948,7 +23011,7 @@ TEST(ResourceAddressedExecutionKernelTest, RunnerLossStopsTheProgramRunMotionOnc
       {2U, ProgramCycleStateDTO::kRunning,
        ProgramRunNumber(1U), acquired.value().claim_generation, std::nullopt},
       "program_runner_liveness_probe",
-      "connection refused"};
+      "connection refused", "program_runner_contact_lost"};
   CellAdmissionReadinessSnapshotDTO closed{
       false, loss.established_cycle, false, 1U, 0U, false, false, 0U, 0U, 0U};
   closed.program_runner_loss = loss;
@@ -23022,7 +23085,7 @@ TEST(ResourceAddressedExecutionKernelTest, RunnerLossStopsOncePerLossAndFollowsT
       {2U, ProgramCycleStateDTO::kRunning,
        ProgramRunNumber(1U), acquired.value().claim_generation, std::nullopt},
       "program_runner_liveness_probe",
-      "connection refused"};
+      "connection refused", "program_runner_contact_lost"};
   CellAdmissionReadinessSnapshotDTO lost{
       false, loss.established_cycle, false, 1U, 0U, false, false, 0U, 0U, 0U};
   lost.program_runner_loss = loss;
@@ -23050,9 +23113,10 @@ TEST(ResourceAddressedExecutionKernelTest, RunnerLossStopsOncePerLossAndFollowsT
   ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(heard).ok());
   EXPECT_FALSE(kernel.get_program_runner_loss().has_value());
 
-  // (c) A publication fault reported on every probe is one Stop.
-  lost.program_runner_loss->failure_predicate = "program_runner_publication_fault";
-  lost.program_runner_loss->message = "program_bbkey_publication_failed: refused";
+  // (c) A Runner fault reported on every probe is one Stop.
+  lost.program_runner_loss->failure_predicate = "program_runner_fault";
+  lost.program_runner_loss->message = "refused";
+  lost.program_runner_loss->fault_code = "program_bbkey_publication_failed";
   for (int report = 0; report < 4; ++report)
     ASSERT_TRUE(kernel.UpdateCellAdmissionReadiness(lost).ok());
   EXPECT_EQ(runner_loss_stops(), 3U);
@@ -23913,6 +23977,17 @@ TEST(ResourceAddressedExecutionKernelTest,
   // Neither failed handover nor unproved containment may fabricate settlement
   // of Y. Z never acquired an engine membership or a controller command.
   engine.next_stop_result = {false, ErrorDTO{"takeover_stop_failed", "containment unproved", {}}};
+  // The failed-Stop Halt's own attempt on the old motion is held in its
+  // stage, so that Stop has not ended yet (OD-272).
+  HeldSettlementCall halt_stage;
+  std::optional<StopEventId> first_stop;  // Only the Stop lane reads or writes it.
+  engine.translate_stop_stage_hook = [&engine, &first_stop, hold = halt_stage.Blocker()] {
+    const auto event = engine.LastStopStageSnapshot().value().stop_event_id;
+    if (!first_stop)
+      first_stop = event;
+    else if (event != *first_stop)
+      hold();
+  };
   engine.replacement_phase.store(PreparedMotionReplacementPhaseDTO::kEffectUncertain);
   ASSERT_TRUE(wait_until([&] {
     static_cast<void>(kernel.reconcile_subordinate_state());
@@ -23936,9 +24011,25 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(next_row.terminal_fact->kind, ParticipantExecutionFactKind::kCancelledBeforeDispatch);
   EXPECT_EQ(next_row.terminal_fact->effect, ParticipantEffectKnowledge::kNoEffect);
   EXPECT_EQ(next_row.terminal_fact->error, next_row.terminal_error);
-  // Y, possibly sent, ends at once as intervention required with its effect
-  // uncertain, under the same Halt; it does not wait for the old motion's
-  // Stop to be confirmed.
+  // Y, possibly sent, stays stopping under the same Halt while the old
+  // motion's Stop has not ended (OD-272): no terminal fact or error.
+  ASSERT_TRUE(halt_stage.Entered());
+  static_cast<void>(kernel.reconcile_subordinate_state());
+  const auto stopping = kernel.get_operation_projection(pending.value().operation_id);
+  ASSERT_TRUE(stopping.ok());
+  EXPECT_TRUE(stopping.value().resident);
+  EXPECT_EQ(stopping.value().operation.state, OperationStateKind::kStopping);
+  EXPECT_EQ(stopping.value().operation.stop_event_id, ended_next.value().operation.stop_event_id);
+  EXPECT_FALSE(stopping.value().operation.participants.front().terminal_fact);
+  EXPECT_FALSE(stopping.value().operation.participants.front().terminal_error);
+  // When that Stop fails, Y ends as intervention required with its effect
+  // uncertain.
+  halt_stage.Release();
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    const auto observed = kernel.get_operation_projection(pending.value().operation_id);
+    return observed.ok() && observed.value().operation.participants.front().terminal_fact;
+  }));
   const auto unresolved = kernel.get_operation_projection(pending.value().operation_id);
   ASSERT_TRUE(unresolved.ok());
   EXPECT_TRUE(unresolved.value().resident);
@@ -24754,7 +24845,7 @@ TEST(ResourceAddressedExecutionKernelTest,
           {2U, ProgramCycleStateDTO::kRunning,
            ProgramRunNumber(1U), claim.value().claim_generation, std::nullopt},
           "program_runner_liveness_probe",
-          "connection refused"};
+          "connection refused", "program_runner_contact_lost"};
       CellAdmissionReadinessSnapshotDTO closed{
           false, loss.established_cycle, false, 1U, 0U, false, false, 0U, 0U, 0U};
       closed.program_runner_loss = loss;
@@ -27824,7 +27915,8 @@ TEST(ResourceAddressedExecutionKernelTest,
   established.cycle_claim_generation = baseline.scope.claim_generation;
   closed.program_runner_loss = ProgramRunnerContactLossDTO{
       established,
-      "program_runner_publication_fault", "publisher failed"};
+      "program_runner_fault", "publisher failed",
+      "program_bbkey_publication_failed"};
   // The readiness advances in memory; no journal write can fail it.
   EXPECT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(closed).ok());
   EXPECT_TRUE(fixture.kernel->get_program_runner_loss().has_value());
@@ -27881,7 +27973,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   lost.program_cycle_status_current = false;
   lost.program_cycle_status = established;
   lost.program_runner_loss = ProgramRunnerContactLossDTO{
-      established, "program_runner_liveness_probe", "connection refused"};
+      established, "program_runner_liveness_probe", "connection refused", "program_runner_contact_lost"};
   ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(lost).ok());
 
   auto update = fixture.update(2U, true);
@@ -27950,7 +28042,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   lost.program_cycle_status_current = false;
   lost.program_cycle_status = established;
   lost.program_runner_loss = ProgramRunnerContactLossDTO{
-      established, "program_runner_liveness_probe", "connection refused"};
+      established, "program_runner_liveness_probe", "connection refused", "program_runner_contact_lost"};
   ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(lost).ok());
   ASSERT_TRUE(fixture.kernel->ProcessIoRuleEvidence().ok());
   ASSERT_TRUE(fixture.service->EvaluateRules().ok());
@@ -28742,6 +28834,31 @@ TEST(ResourceAddressedExecutionKernelTest, IoRuleIsRemovedInTheStopsTerminalStep
   EXPECT_TRUE(observed->retired_evidence);
   EXPECT_EQ(fixture.service->ReadRuleEvidence(registration).value().state,
             IoRuleRegistrationState::kRetired);
+}
+
+// A rule whose removal fails at the Stop's terminal step keeps the removal's
+// error on its outcome, and the outcome is still finalized.
+TEST(ResourceAddressedExecutionKernelTest, IoRuleRetireFailureAtStopIsKeptOnTheOutcome) {
+  IoRuleIntegrationFixture fixture;
+  const auto observed = observe_motion_rules(fixture);
+  ASSERT_TRUE(fixture.Publish(1, false).ok());
+  const auto accepted = fixture.kernel->execute(fixture.Intent());
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  ASSERT_TRUE(fixture.Registered(accepted.value().operation_id));
+  const auto before = fixture.kernel->get_operation_state(accepted.value().operation_id).value();
+  observed->retire_error =
+      ErrorDTO{"execution_rejected", "stale", {{"reason", "io_rule_generation_stale"}}};
+  const auto stopped = fixture.kernel->stop(stop_request(
+      "io.retire.failure.stop", accepted.value(), before.operation_revision.value()));
+  ASSERT_TRUE(wait_stop_complete(*fixture.kernel, stopped.event_id));
+  const auto ended = fixture.kernel->get_operation_state(accepted.value().operation_id);
+  ASSERT_TRUE(ended.ok());
+  const auto& row = ended.value().participants.front();
+  ASSERT_EQ(row.io_rule_outcomes.size(), 1U);
+  const auto& outcome = row.io_rule_outcomes.front();
+  EXPECT_TRUE(outcome.stop_result);
+  ASSERT_TRUE(outcome.error);
+  EXPECT_EQ(outcome.error->details.at("reason"), "io_rule_generation_stale");
 }
 
 // A source lost while the Stop is containing, and seen by no rule evidence
@@ -30124,7 +30241,7 @@ TEST(ResourceAddressedExecutionKernelTest, BbKernelGlobalKeyRuleCannotWatchWhile
   lost.program_cycle_status_current = false;
   lost.program_cycle_status = established;
   lost.program_runner_loss = ProgramRunnerContactLossDTO{
-      established, "program_runner_liveness_probe", "connection refused"};
+      established, "program_runner_liveness_probe", "connection refused", "program_runner_contact_lost"};
   std::shared_ptr<IIoSignalService> wake;
   ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(lost, &wake).ok());
   EXPECT_EQ(wake, fixture.installed_service);
@@ -30168,7 +30285,7 @@ TEST(ResourceAddressedExecutionKernelTest,
   lost.program_cycle_status_current = false;
   lost.program_cycle_status = established;
   lost.program_runner_loss = ProgramRunnerContactLossDTO{
-      established, "program_runner_liveness_probe", "connection refused"};
+      established, "program_runner_liveness_probe", "connection refused", "program_runner_contact_lost"};
   std::shared_ptr<IIoSignalService> wake;
   ASSERT_TRUE(fixture.kernel->UpdateCellAdmissionReadiness(lost, &wake).ok());
   EXPECT_EQ(wake, fixture.installed_service);
@@ -31913,6 +32030,234 @@ TEST(ResourceAddressedExecutionKernelTest, GroupStopDuringATakeoverEndsThePrepar
   const auto scope = kernel.get_program_execution_scope(ProgramRunNumber(1U));
   ASSERT_TRUE(scope.ok()) << scope.error().message;
   EXPECT_EQ(scope.value().held_nodes.size(), 2U);
+}
+
+// OD-269: the operator's group Stop ends a take-over newcomer that was
+// already sent (its effect settled, retired at once). The Kernel keeps its
+// rest for the node's next attempt, as Resume keeps it for any stopped
+// motion; the slot is released when that attempt completes. Without a
+// verified send, or for a Cartesian path (its progress is unknown before
+// the hand-over), that attempt is refused as such a Resume is. A newcomer
+// never sent keeps nothing: the next attempt is a fresh one.
+TEST(ResourceAddressedExecutionKernelTest,
+     GroupStopDuringATakeoverKeepsTheSentNewcomersRestForItsNextAttempt) {
+  enum class Newcomer { kSentJoint, kSentCartesian, kSentUnverified, kUnsent };
+  for (const auto kind : {Newcomer::kSentJoint, Newcomer::kSentCartesian,
+                          Newcomer::kSentUnverified, Newcomer::kUnsent}) {
+    SCOPED_TRACE(static_cast<int>(kind));
+    const bool sent = kind != Newcomer::kUnsent;
+    FakeClock clock;
+    ManualScheduler scheduler;
+    FakeParticipantEngine engine;
+    FakeOperationJournal journal;
+    engine.supports_motion_replacement = true;
+    engine.replacement_send_receipt_missing = kind == Newcomer::kSentUnverified;
+    const auto physical =
+        make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular);
+    const auto row_for = [&](const RuntimeParticipantBinding& binding) {
+      auto row = registration(binding, engine);
+      row.motion_takeover_preparation_budget_s = 1.0;
+      return row;
+    };
+    ResourceAddressedExecutionKernelConfig config{kTestApplicationStartId, CellId("cell.test"), 8U};
+    config.manager_liveness_required_set = EmptyManagerLivenessSet();
+    if (kind == Newcomer::kSentCartesian) {
+      const auto cartesian = with_planner_capability(physical, "planning.motion.cartesian_path");
+      config.participant_resolver =
+          [&, cartesian](const OperationIntentDTO& operation, const std::size_t,
+                         const ProgramRunResolutionContext&)
+          -> Result<RuntimeParticipantExecutionRegistration> {
+        const auto& motion =
+            std::get<MotionParticipantIntentDTO>(operation.participants.front().payload);
+        return Result<RuntimeParticipantExecutionRegistration>::Ok(
+            row_for(std::holds_alternative<CartesianPathDTO>(motion.motion) ? cartesian
+                                                                            : physical));
+      };
+    }
+    auto owner = make_uncaptured_kernel({row_for(physical)}, clock, scheduler, journal,
+                                        std::move(config));
+    auto& kernel = *owner;
+    ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+    start_program_motion(kernel);
+    const auto incumbent = kernel.execute(takeover_intent(0U, "od269.incumbent"));
+    ASSERT_TRUE(incumbent.ok()) << incumbent.error().message;
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    auto newcomer_intent = takeover_intent(1U, "od269.newcomer");
+    if (kind == Newcomer::kSentCartesian) {
+      auto& motion =
+          std::get<MotionParticipantIntentDTO>(newcomer_intent.participants.front().payload);
+      motion.motion = CartesianPathDTO{.waypoints = {Pose3DTO{}, Pose3DTO{{0.0, 0.0, 0.1}, {}}}};
+      motion.per_joint_dynamics_limits.clear();
+    }
+    engine.defer_prepare_completion = !sent;
+    const auto newcomer = kernel.execute(newcomer_intent);
+    ASSERT_TRUE(newcomer.ok()) << newcomer.error().message;
+    const auto newcomer_id = newcomer.value().operation_id;
+    std::optional<ResolvedMotionSpecDTO> sent_motion;
+    if (sent) {
+      ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());  // the send
+      ASSERT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+      std::lock_guard lock(engine.prepared_motion_mutex_);
+      ASSERT_TRUE(engine.replacement_snapshot && engine.replacement_snapshot->participant);
+      sent_motion = std::get<PreparedMotionExecutionDTO>(
+                        engine.replacement_snapshot->participant->payload)
+                        .plan_request.motion;
+    } else {
+      (void)kernel.reconcile_subordinate_state();
+    }
+
+    const auto stopped =
+        kernel.stop_program_selection(program_selection_request("od269.stop", "all"));
+    ASSERT_TRUE(stopped.state.has_value());
+    if (!sent) (void)engine.complete_preparation();
+    // As the host's reconcile lane: a pass before the incumbent's Stop has
+    // ended leaves a sent newcomer stopping and pending (OD-272); the first
+    // pass after it ends the newcomer settled and retires it.
+    ASSERT_TRUE(wait_until([&] {
+      (void)kernel.reconcile_subordinate_state();
+      const auto stop = kernel.read_stop(stopped.stop.event_id);
+      const auto projection = kernel.get_operation_projection(newcomer_id);
+      return stop.ok() && stop.value().complete && projection.ok() &&
+             !projection.value().resident;
+    }));
+    const auto ended = kernel.get_operation_state(newcomer_id);
+    ASSERT_TRUE(ended.ok()) << ended.error().message;
+    EXPECT_EQ(ended.value().state, OperationStateKind::kStopped);
+    const auto& row = ended.value().participants.front();
+    EXPECT_FALSE(row.terminal_error.has_value());
+    ASSERT_TRUE(row.terminal_fact.has_value());
+    EXPECT_EQ(row.terminal_fact->kind,
+              sent ? ParticipantExecutionFactKind::kPreemptedByAddressedStop
+                   : ParticipantExecutionFactKind::kCancelledBeforeDispatch);
+    EXPECT_EQ(row.terminal_fact->effect, sent ? ParticipantEffectKnowledge::kEffectSettled
+                                              : ParticipantEffectKnowledge::kNoEffect);
+    EXPECT_FALSE(kernel.get_operation_projection(newcomer_id).value().resident);
+
+    // Resume: the stopped incumbent is retired by its own Resume, the run's
+    // hold is released, and the newcomer's node makes its next attempt.
+    const auto source = kernel.get_operation_state(incumbent.value().operation_id);
+    ASSERT_TRUE(source.ok()) << source.error().message;
+    KernelRecoveryActionRequestDTO replan{TestRequestKey("od269.replan"),
+                                          RecoveryAction::kReplanFromStoppedState,
+                                          "program_runner", 1U, 1U, 41U, "resume"};
+    engine.next_recovery_result = {replan.request_key, replan.action, true, {}, std::nullopt};
+    const auto replanned = kernel.apply_operation_recovery_action(
+        incumbent.value().operation_id, source.value().operation_revision, replan);
+    ASSERT_TRUE(replanned.ok()) << replanned.error().message;
+    ASSERT_TRUE(replanned.value().accepted);
+    const auto held = kernel.get_program_execution_scope(ProgramRunNumber(1U));
+    ASSERT_TRUE(held.ok()) << held.error().message;
+    ASSERT_TRUE(kernel
+                    .release_program_selection(program_selection_request("od269.resume", "all"),
+                                               held.value().hold_revision)
+                    .ok());
+    auto next = newcomer_intent;
+    next.request_context.request_key = TestRequestKey("od269.next");
+    next.participants.front().execution_scope->node_attempt_id = NodeAttemptNumber(2U);
+    const int prepared_before = engine.prepare_motion_calls.load();
+    const auto again = kernel.execute(next);
+    if (kind == Newcomer::kSentCartesian || kind == Newcomer::kSentUnverified) {
+      ASSERT_FALSE(again.ok());
+      EXPECT_EQ(again.error().code, "operation_recovery_invalid");
+      EXPECT_EQ(again.error().details.at("reason"),
+                kind == Newcomer::kSentCartesian ? "cartesian_resume_progress_unavailable"
+                                                 : "motion_continuation_dispatch_unsettled");
+      EXPECT_EQ(engine.prepare_motion_calls.load(), prepared_before);
+      continue;
+    }
+    ASSERT_TRUE(again.ok()) << again.error().message;
+    ASSERT_TRUE(engine.last_prepared_request);
+    if (!sent) {
+      EXPECT_FALSE(engine.last_prepared_request->continuation);
+      continue;
+    }
+    ASSERT_TRUE(engine.last_prepared_request->continuation);
+    EXPECT_EQ(engine.last_prepared_request->continuation->motion, *sent_motion);
+    // Released when the attempt that planned the rest completes.
+    engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kCompleted);
+    const auto current = kernel.get_operation_state(again.value().operation_id);
+    ASSERT_TRUE(current.ok()) << current.error().message;
+    ASSERT_TRUE(kernel
+                    .acknowledge_completed(control_request("od269.ack", again.value(),
+                                                           current.value().operation_revision.value()))
+                    .ok());
+    ASSERT_TRUE(wait_until([&] {
+      return !kernel.get_operation_projection(again.value().operation_id).value().resident;
+    }));
+    next.request_context.request_key = TestRequestKey("od269.next-visit");
+    next.participants.front().execution_scope->node_attempt_id = NodeAttemptNumber(3U);
+    ASSERT_TRUE(kernel.execute(next).ok());
+    ASSERT_TRUE(engine.last_prepared_request);
+    EXPECT_FALSE(engine.last_prepared_request->continuation);
+  }
+}
+
+// OD-272: while the old motion's Stop has not ended, a sent newcomer that
+// the Stop cancelled stays stopping (no terminal fact or error, resident),
+// as any moving motion under a Stop; once that Stop ends settled, it ends
+// Stopped with its effect settled and is retired.
+TEST(ResourceAddressedExecutionKernelTest,
+     GroupStopKeepsASentNewcomerStoppingUntilTheOldMotionsStopEnds) {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{kTestApplicationStartId, CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  auto owner = make_uncaptured_kernel({row}, clock, scheduler, journal, std::move(config));
+  auto& kernel = *owner;
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto incumbent = kernel.execute(takeover_intent(0U, "od272.incumbent"));
+  ASSERT_TRUE(incumbent.ok()) << incumbent.error().message;
+  engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  const auto newcomer = kernel.execute(takeover_intent(1U, "od272.newcomer"));
+  ASSERT_TRUE(newcomer.ok()) << newcomer.error().message;
+  const auto newcomer_id = newcomer.value().operation_id;
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());  // the send
+  ASSERT_EQ(engine.dispatch_prepared_motion_calls.load(), 2);
+
+  // The old motion's Stop is held in its stage: it has not ended.
+  HeldSettlementCall stage;
+  engine.translate_stop_stage_hook = stage.Blocker();
+  const auto stopped =
+      kernel.stop_program_selection(program_selection_request("od272.stop", "all"));
+  ASSERT_TRUE(stopped.state.has_value());
+  ASSERT_TRUE(stage.Entered());
+  for (int pass = 0; pass < 3; ++pass) (void)kernel.reconcile_subordinate_state();
+  const auto stopping = kernel.get_operation_projection(newcomer_id);
+  ASSERT_TRUE(stopping.ok()) << stopping.error().message;
+  EXPECT_TRUE(stopping.value().resident);
+  EXPECT_EQ(stopping.value().operation.state, OperationStateKind::kStopping);
+  EXPECT_EQ(stopping.value().operation.stop_event_id, stopped.stop.event_id);
+  const auto& stopping_row = stopping.value().operation.participants.front();
+  EXPECT_EQ(stopping_row.state, OperationStateKind::kStopping);
+  EXPECT_FALSE(stopping_row.terminal_error.has_value());
+  EXPECT_FALSE(stopping_row.terminal_fact.has_value());
+  EXPECT_FALSE(kernel.read_stop(stopped.stop.event_id).value().complete);
+
+  stage.Release();
+  ASSERT_TRUE(wait_until([&] {
+    (void)kernel.reconcile_subordinate_state();
+    const auto stop = kernel.read_stop(stopped.stop.event_id);
+    const auto projection = kernel.get_operation_projection(newcomer_id);
+    return stop.ok() && stop.value().complete && projection.ok() &&
+           !projection.value().resident;
+  }));
+  const auto ended = kernel.get_operation_state(newcomer_id);
+  ASSERT_TRUE(ended.ok()) << ended.error().message;
+  EXPECT_EQ(ended.value().state, OperationStateKind::kStopped);
+  const auto& ended_row = ended.value().participants.front();
+  EXPECT_FALSE(ended_row.terminal_error.has_value());
+  ASSERT_TRUE(ended_row.terminal_fact.has_value());
+  EXPECT_EQ(ended_row.terminal_fact->kind, ParticipantExecutionFactKind::kPreemptedByAddressedStop);
+  EXPECT_EQ(ended_row.terminal_fact->effect, ParticipantEffectKnowledge::kEffectSettled);
 }
 
 // `fail_node` keeps the run going: no hold; the next motion in scope
@@ -33739,7 +34084,7 @@ TEST(ResourceAddressedExecutionKernelTest, ExecuteAfterRunnerLossDoesNotGrantMot
       {2U, ProgramCycleStateDTO::kRunning, ProgramRunNumber(1U), claim.value().claim_generation,
        std::nullopt},
       "program_runner_liveness_probe",
-      "connection refused"};
+      "connection refused", "program_runner_contact_lost"};
   CellAdmissionReadinessSnapshotDTO closed{
       false, loss.established_cycle, false, 1U, 0U, false, false, 0U, 0U, 0U};
   closed.program_runner_loss = loss;
@@ -34993,6 +35338,514 @@ TEST(ResourceAddressedExecutionKernelTest, OperationTableListsEveryResidentOpera
   ASSERT_TRUE(wait_until([&] { return kernel.get_operation_table().resident.empty(); }));
   EXPECT_EQ(kernel.get_operation_table().resident_total, 0U);
   EXPECT_FALSE(kernel.get_operation_projection(accepted.value().operation_id).value().resident);
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// OD-175: the take-over hand-over in four steps (prove, decide, apply,
+// close). The fake engine's test points run between them, on the thread that
+// advances the take-over, with no Kernel lock held; rows name the design's
+// interleaving table (§10).
+// ---------------------------------------------------------------------------
+namespace {
+
+struct HandoverWorld {
+  FakeClock clock;
+  ManualScheduler scheduler;
+  FakeParticipantEngine engine;
+  FakeOperationJournal journal;
+  std::unique_ptr<ResourceAddressedExecutionKernel> kernel;
+  std::optional<OperationAcceptedDTO> original;
+  std::optional<OperationAcceptedDTO> candidate;
+};
+
+// A moving take-over at its hand-over: the replacement is sent and the engine
+// reports it ready; the next reconcile pass runs P, D, A and K.
+void PrepareHandover(HandoverWorld& world, const std::string& name) {
+  world.engine.supports_motion_replacement = true;
+  auto row = registration(
+      make_binding("arm", "execution.trajectory.execute", CoordinateKind::kAngular), world.engine);
+  row.motion_takeover_preparation_budget_s = 1.0;
+  ResourceAddressedExecutionKernelConfig config{kTestApplicationStartId, CellId("cell.test"), 8U};
+  config.manager_liveness_required_set = EmptyManagerLivenessSet();
+  world.kernel = make_uncaptured_kernel({row}, world.clock, world.scheduler, world.journal,
+                                        std::move(config));
+  auto& kernel = *world.kernel;
+  ASSERT_TRUE(claim_program_execution(kernel).ok());
+  ASSERT_TRUE(kernel.register_program_run_capture(takeover_capture()).ok());
+  start_program_motion(kernel);
+  const auto original = kernel.execute(takeover_intent(0U, name + ".original"));
+  ASSERT_TRUE(original.ok()) << original.error().message;
+  world.original = original.value();
+  world.engine.emit_transition(ExecutionState::kPlanning, ExecutionState::kExecuting);
+  const auto candidate = kernel.execute(takeover_intent(1U, name + ".candidate"));
+  ASSERT_TRUE(candidate.ok()) << candidate.error().message;
+  world.candidate = candidate.value();
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());  // the replacement's send
+  ASSERT_EQ(world.engine.dispatch_prepared_motion_calls, 2);
+  world.engine.replacement_phase.store(PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+}
+
+std::uint64_t CurrentRevision(ResourceAddressedExecutionKernel& kernel,
+                              const OperationNumber& operation) {
+  return kernel.get_operation_state(operation).value().operation_revision.value();
+}
+
+// Rows 6 and 8 (test 1, gates 2-3): a Stop of the candidate between "decide"
+// and "apply" (Dc) or between "apply" and "close" (Ap) is accepted at once;
+// its stage starts only after the close, exactly once.
+TEST(ResourceAddressedExecutionKernelTest, HandoverStopInTheGapStartsItsStageOnlyAfterTheClose) {
+  for (const bool after_apply : {false, true}) {
+    SCOPED_TRACE(after_apply ? "Ap" : "Dc");
+    HandoverWorld world;
+    ASSERT_NO_FATAL_FAILURE(PrepareHandover(world, after_apply ? "gap.stop.ap" : "gap.stop.dc"));
+    auto& kernel = *world.kernel;
+    auto& engine = world.engine;
+    bool stopped_in_gap = false;
+    auto stop_in_gap = [&] {
+      const auto accepted = kernel.stop(stop_request(
+          "gap.stop", *world.candidate, CurrentRevision(kernel, world.candidate->operation_id)));
+      ASSERT_EQ(accepted.covered.size(), 1U);
+      EXPECT_EQ(accepted.covered.front().operation_id, world.candidate->operation_id);
+      // The mark holds the stage back until the close.
+      EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
+      stopped_in_gap = true;
+    };
+    if (after_apply)
+      engine.after_apply_hook = stop_in_gap;
+    else
+      engine.before_apply_hook = stop_in_gap;
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());  // P, D, A, K
+    engine.before_apply_hook = {};
+    engine.after_apply_hook = {};
+    EXPECT_TRUE(stopped_in_gap);
+    EXPECT_EQ(engine.replacement_owner_commits, 1);
+    ASSERT_TRUE(wait_until([&] { return engine.translate_stop_stage_calls.load() >= 1; }));
+    ASSERT_TRUE(wait_until([&] {
+      static_cast<void>(kernel.reconcile_subordinate_state());
+      const auto state = kernel.get_operation_state(world.candidate->operation_id);
+      return state.ok() && state.value().state != OperationStateKind::kStopping;
+    }));
+    EXPECT_EQ(engine.translate_stop_stage_calls.load(), 1);
+  }
+}
+
+// Rows 3 and 4 (test 2): a Stop of the old motion after "prove" is accepted
+// at once (the prove step holds no Kernel lock: today this call, made inside
+// the commit, could not even be accepted); "decide" then refuses and nothing
+// is handed over.
+TEST(ResourceAddressedExecutionKernelTest, HandoverStopAfterProveIsAcceptedAtOnceAndDecideRefuses) {
+  HandoverWorld world;
+  ASSERT_NO_FATAL_FAILURE(PrepareHandover(world, "prove.stop"));
+  auto& kernel = *world.kernel;
+  auto& engine = world.engine;
+  bool accepted_in_gap = false;
+  engine.after_prove_hook = [&] {
+    const auto accepted = kernel.stop(stop_request(
+        "prove.stop.old", *world.original, CurrentRevision(kernel, world.original->operation_id)));
+    ASSERT_EQ(accepted.covered.size(), 1U);
+    EXPECT_EQ(accepted.covered.front().operation_id, world.original->operation_id);
+    accepted_in_gap = true;
+  };
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  engine.after_prove_hook = {};
+  EXPECT_TRUE(accepted_in_gap);
+  EXPECT_EQ(engine.commit_replacement_calls.load(), 1);
+  EXPECT_EQ(engine.close_replacement_hazard_calls.load(), 0);
+  EXPECT_EQ(engine.replacement_owner_commits, 0);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, world.original->operation_id);
+  }
+  ASSERT_TRUE(wait_until([&] {
+    static_cast<void>(kernel.reconcile_subordinate_state());
+    const auto state = kernel.get_operation_state(world.original->operation_id);
+    return state.ok() && state.value().state != OperationStateKind::kStopping;
+  }));
+  EXPECT_EQ(engine.replacement_owner_commits, 0);
+}
+
+// Row 18 (test 5, D4): a collision report that still names the old motion's
+// execution between "decide" and "apply" stops the candidate (containment).
+TEST(ResourceAddressedExecutionKernelTest, HandoverCollisionNamingTheOldExecutionStopsTheCandidate) {
+  HandoverWorld world;
+  ASSERT_NO_FATAL_FAILURE(PrepareHandover(world, "gap.collision"));
+  auto& kernel = *world.kernel;
+  auto& engine = world.engine;
+  bool reported = false;
+  engine.before_apply_hook = [&] {
+    engine.emit_collision();  // names the engine's current (old) execution
+    const auto candidate = kernel.get_operation_state(world.candidate->operation_id);
+    ASSERT_TRUE(candidate.ok());
+    EXPECT_TRUE(candidate.value().stop_event_id);
+    EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
+    reported = true;
+  };
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  engine.before_apply_hook = {};
+  EXPECT_TRUE(reported);
+  EXPECT_EQ(engine.replacement_owner_commits, 1);
+  ASSERT_TRUE(wait_until([&] { return engine.translate_stop_stage_calls.load() >= 1; }));
+  // The old motion keeps its own preempted end; the Stop covers the candidate.
+  EXPECT_FALSE(kernel.get_operation_state(world.original->operation_id).value().stop_event_id);
+}
+
+// Row 20 (test 5): an error report naming the old execution in the gap is
+// not aliased: it is dropped, as after today's commit.
+TEST(ResourceAddressedExecutionKernelTest, HandoverErrorNamingTheOldExecutionIsNotAliased) {
+  HandoverWorld world;
+  ASSERT_NO_FATAL_FAILURE(PrepareHandover(world, "gap.error"));
+  auto& kernel = *world.kernel;
+  auto& engine = world.engine;
+  bool reported = false;
+  engine.before_apply_hook = [&] {
+    engine.emit_error(ErrorDTO{"execution_aborted", "old execution error", {}});
+    const auto candidate = kernel.get_operation_state(world.candidate->operation_id);
+    ASSERT_TRUE(candidate.ok());
+    EXPECT_FALSE(candidate.value().stop_event_id);
+    EXPECT_EQ(candidate.value().state, OperationStateKind::kExecuting);
+    reported = true;
+  };
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  engine.before_apply_hook = {};
+  EXPECT_TRUE(reported);
+  EXPECT_EQ(engine.replacement_owner_commits, 1);
+  EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
+}
+
+// Rows 28 and 29 (test 7, gate 5, variant V-b): a second take-over accepted
+// after "prove" (it becomes the next one, moved at "decide"), before "apply"
+// or after it (the candidate's own pending one, which meets the mark) is not
+// prepared inside the hand-over; the next reconcile pass prepares it.
+TEST(ResourceAddressedExecutionKernelTest, HandoverSecondTakeoverInTheGapIsPreparedOnTheNextPass) {
+  for (const int point : {0, 1, 2}) {
+    SCOPED_TRACE(point);
+    HandoverWorld world;
+    ASSERT_NO_FATAL_FAILURE(PrepareHandover(world, "gap.c2." + std::to_string(point)));
+    auto& kernel = *world.kernel;
+    auto& engine = world.engine;
+    std::optional<OperationAcceptedDTO> second;
+    auto accept_second = [&] {
+      const auto accepted =
+          kernel.execute(takeover_intent(2U, "gap.c2.second." + std::to_string(point)));
+      ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+      second = accepted.value();
+      EXPECT_EQ(engine.prepare_motion_calls, 2);
+    };
+    if (point == 0) engine.after_prove_hook = accept_second;
+    if (point == 1) engine.before_apply_hook = accept_second;
+    if (point == 2) engine.after_apply_hook = accept_second;
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    engine.after_prove_hook = {};
+    engine.before_apply_hook = {};
+    engine.after_apply_hook = {};
+    ASSERT_TRUE(second);
+    EXPECT_EQ(engine.replacement_owner_commits, 1);
+    EXPECT_EQ(engine.prepare_motion_calls, 2);  // nothing prepared in the hand-over
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    EXPECT_EQ(engine.prepare_motion_calls, 3);
+    std::lock_guard lock(engine.prepared_motion_mutex_);
+    ASSERT_TRUE(engine.replacement_request);
+    EXPECT_EQ(engine.replacement_request->execution_request.binding.operation_id,
+              second->operation_id);
+  }
+}
+
+// Row 40 (gate 1): a reconcile pass in the gap skips the marked candidate
+// (no engine status read for it); the pass after the close reads it again.
+TEST(ResourceAddressedExecutionKernelTest, HandoverReconcilePassInTheGapLeavesTheCandidateAlone) {
+  HandoverWorld world;
+  ASSERT_NO_FATAL_FAILURE(PrepareHandover(world, "gap.reconcile"));
+  auto& kernel = *world.kernel;
+  auto& engine = world.engine;
+  bool passed = false;
+  engine.before_apply_hook = [&] {
+    const auto reads = engine.status_read_calls.load();
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+    EXPECT_EQ(engine.status_read_calls.load(), reads);
+    passed = true;
+  };
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  engine.before_apply_hook = {};
+  EXPECT_TRUE(passed);
+  EXPECT_EQ(engine.replacement_owner_commits, 1);
+  const auto reads = engine.status_read_calls.load();
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_GT(engine.status_read_calls.load(), reads);
+}
+
+// Row 33 (test 10): "prove" refuses; today's route (the take-over fallback,
+// with the refusal as its cause) and nothing handed over.
+TEST(ResourceAddressedExecutionKernelTest, HandoverProveRefusalTakesTheFallbackWithItsReason) {
+  HandoverWorld world;
+  ASSERT_NO_FATAL_FAILURE(PrepareHandover(world, "prove.refused"));
+  auto& kernel = *world.kernel;
+  auto& engine = world.engine;
+  engine.prove_refusal = ErrorDTO{
+      "execution_rejected", "Replacement adoption was refused",
+      {{"reason", "motion_replacement_runtime_protection_stale"}}};
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(engine.replacement_owner_commits, 0);
+  EXPECT_EQ(engine.close_replacement_hazard_calls.load(), 0);
+  EXPECT_TRUE(kernel.get_operation_state(world.original->operation_id).value().stop_event_id);
+  const auto candidate = kernel.get_operation_state(world.candidate->operation_id);
+  ASSERT_TRUE(candidate.ok());
+  ASSERT_TRUE(candidate.value().motion_takeover);
+  ASSERT_TRUE(candidate.value().motion_takeover->cause);
+  EXPECT_EQ(candidate.value().motion_takeover->cause->details.at("reason"),
+            "motion_replacement_runtime_protection_stale");
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, world.original->operation_id);
+  }
+}
+
+// Rows 16 and 34 (tests 10 and 13, D2): a lookahead claim that won before
+// "decide" makes the decision's close fail; the take-over falls back with the
+// reason the engine's proof gave for a claimed source before OD-175.
+TEST(ResourceAddressedExecutionKernelTest, HandoverDecideRefusesAHazardClaimThatWonFirst) {
+  HandoverWorld world;
+  ASSERT_NO_FATAL_FAILURE(PrepareHandover(world, "decide.hazard"));
+  auto& kernel = *world.kernel;
+  auto& engine = world.engine;
+  engine.replacement_hazard_claimed.store(true);
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_EQ(engine.close_replacement_hazard_calls.load(), 1);
+  EXPECT_EQ(engine.replacement_owner_commits, 0);
+  EXPECT_TRUE(kernel.get_operation_state(world.original->operation_id).value().stop_event_id);
+  const auto candidate = kernel.get_operation_state(world.candidate->operation_id);
+  ASSERT_TRUE(candidate.ok());
+  ASSERT_TRUE(candidate.value().motion_takeover);
+  ASSERT_TRUE(candidate.value().motion_takeover->cause);
+  EXPECT_EQ(candidate.value().motion_takeover->cause->details.at("reason"),
+            "motion_replacement_source_hazard_authority");
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, world.original->operation_id);
+  }
+}
+
+// Test 6, row 25 (gate 4): a speed request for the candidate between
+// "decide" and "apply" (Dc) or between "apply" and "close" (Ap). The setting
+// reaches the participant at once; the candidate's speed step stays pending
+// (no engine acceptance, no new generation) and the host's next reconcile
+// pass after the close runs it for the candidate.
+TEST(ResourceAddressedExecutionKernelTest, HandoverSpeedStepInTheGapRunsOnTheNextPassAfterTheClose) {
+  for (const bool after_apply : {false, true}) {
+    SCOPED_TRACE(after_apply ? "Ap" : "Dc");
+    HandoverWorld world;
+    ASSERT_NO_FATAL_FAILURE(
+        PrepareHandover(world, after_apply ? "gap.speed.ap" : "gap.speed.dc"));
+    auto& kernel = *world.kernel;
+    auto& engine = world.engine;
+    int calls_in_gap = -1;
+    std::optional<RuntimeScaleGeneration> generation_in_gap;
+    auto speed_in_gap = [&] {
+      calls_in_gap = engine.runtime_scale_calls.load();
+      const auto before = kernel.get_operation_state(world.candidate->operation_id);
+      ASSERT_TRUE(before.ok());
+      generation_in_gap = before.value().runtime_scale_generation;
+      const auto accepted = kernel.set_runtime_scale_control(
+          runtime_scale_control_request("gap.speed.request", 0U, 0.4));
+      ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+      // The setting is stored at once (the physical path).
+      const auto stored = engine.StoredRuntimeScaleSettings();
+      ASSERT_FALSE(stored.empty());
+      EXPECT_DOUBLE_EQ(stored.back().first, 0.4);
+      // The candidate's step is left pending by the mark.
+      EXPECT_EQ(engine.runtime_scale_calls.load(), calls_in_gap);
+      const auto during = kernel.get_operation_state(world.candidate->operation_id);
+      ASSERT_TRUE(during.ok());
+      EXPECT_EQ(during.value().runtime_scale_generation, generation_in_gap);
+    };
+    if (after_apply)
+      engine.after_apply_hook = speed_in_gap;
+    else
+      engine.before_apply_hook = speed_in_gap;
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());  // P, D, A, K
+    engine.before_apply_hook = {};
+    engine.after_apply_hook = {};
+    ASSERT_GE(calls_in_gap, 0);
+    EXPECT_EQ(engine.replacement_owner_commits, 1);
+    // This pass collected its speed steps before the hand-over.
+    EXPECT_EQ(engine.runtime_scale_calls.load(), calls_in_gap);
+    ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());  // the next pass
+    EXPECT_EQ(engine.runtime_scale_calls.load(), calls_in_gap + 1);
+    const auto command = engine.RuntimeScaleCommandSnapshot();
+    ASSERT_TRUE(command.has_value());
+    EXPECT_EQ(command->operation_id, world.candidate->operation_id);
+    EXPECT_DOUBLE_EQ(command->requested_scale, 0.4);
+    const auto after = kernel.get_operation_state(world.candidate->operation_id);
+    ASSERT_TRUE(after.ok());
+    ASSERT_TRUE(after.value().runtime_scale_generation.has_value());
+    ASSERT_TRUE(generation_in_gap.has_value());
+    EXPECT_EQ(after.value().runtime_scale_generation->value(), generation_in_gap->value() + 1U);
+  }
+}
+
+// Row 49 (test 11), as the speed path stands since OD-149: the old motion's
+// speed step accepted before "decide", whose engine call is still out while
+// the hand-over decides, applies and closes. The hand-over does not wait for
+// it; when the call returns it applies nothing to either motion (status
+// follows the reconcile poll) and leaves no failure; the setting itself was
+// stored before "decide".
+TEST(ResourceAddressedExecutionKernelTest, HandoverSpeedStepStraddlingDecideAppliesNothingLate) {
+  HandoverWorld world;
+  ASSERT_NO_FATAL_FAILURE(PrepareHandover(world, "straddle.speed"));
+  auto& kernel = *world.kernel;
+  auto& engine = world.engine;
+  const auto calls_before = engine.runtime_scale_calls.load();
+  std::mutex gate_mutex;
+  std::condition_variable gate_changed;
+  bool entered = false;
+  bool released = false;
+  engine.SetRuntimeScaleEffectHook([&] {
+    std::unique_lock lock(gate_mutex);
+    entered = true;
+    gate_changed.notify_all();
+    gate_changed.wait(lock, [&] { return released; });
+  });
+  auto speed = std::async(std::launch::async, [&] {
+    return kernel.set_runtime_scale_control(
+        runtime_scale_control_request("straddle.speed.request", 0U, 0.4));
+  });
+  {
+    std::unique_lock lock(gate_mutex);
+    gate_changed.wait(lock, [&] { return entered; });
+  }
+  // Accepted for the old motion before "decide"; its engine call is held.
+  const auto accepted_old = kernel.get_operation_state(world.original->operation_id);
+  ASSERT_TRUE(accepted_old.ok());
+  const auto old_generation = accepted_old.value().runtime_scale_generation;
+  const auto candidate_before = kernel.get_operation_state(world.candidate->operation_id);
+  ASSERT_TRUE(candidate_before.ok());
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());  // P, D, A, K with the call out
+  EXPECT_EQ(engine.replacement_owner_commits, 1);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, world.candidate->operation_id);
+  }
+  {
+    std::lock_guard lock(gate_mutex);
+    released = true;
+  }
+  gate_changed.notify_all();
+  const auto speed_result = speed.get();
+  engine.SetRuntimeScaleEffectHook({});
+  ASSERT_TRUE(speed_result.ok()) << speed_result.error().message;
+  EXPECT_EQ(engine.runtime_scale_calls.load(), calls_before + 1);
+  const auto stored = engine.StoredRuntimeScaleSettings();
+  ASSERT_FALSE(stored.empty());
+  EXPECT_DOUBLE_EQ(stored.back().first, 0.4);
+  // Nothing late: the old motion keeps the generation accepted before
+  // "decide", the candidate's is not moved by the old motion's step.
+  const auto old_after = kernel.get_operation_state(world.original->operation_id);
+  if (old_after.ok()) {
+    EXPECT_EQ(old_after.value().runtime_scale_generation, old_generation);
+  }
+  const auto candidate_after = kernel.get_operation_state(world.candidate->operation_id);
+  ASSERT_TRUE(candidate_after.ok());
+  EXPECT_EQ(candidate_after.value().runtime_scale_generation,
+            candidate_before.value().runtime_scale_generation);
+  EXPECT_FALSE(candidate_after.value().stop_event_id);
+}
+
+// Row 47 (test 8): a Reset of the candidate between "decide" and "apply" is
+// accepted at once; its own Stop is a gap Stop, held back by the mark, and
+// its stage starts after the close.
+TEST(ResourceAddressedExecutionKernelTest, HandoverResetOfTheCandidateInTheGapStopsAfterTheClose) {
+  HandoverWorld world;
+  ASSERT_NO_FATAL_FAILURE(PrepareHandover(world, "gap.reset.candidate"));
+  auto& kernel = *world.kernel;
+  auto& engine = world.engine;
+  bool reset_in_gap = false;
+  engine.before_apply_hook = [&] {
+    const auto reset = kernel.reset(control_request(
+        "gap.reset.candidate.request", *world.candidate,
+        CurrentRevision(kernel, world.candidate->operation_id)));
+    ASSERT_TRUE(reset.ok()) << reset.error().message;
+    const auto candidate = kernel.get_operation_state(world.candidate->operation_id);
+    ASSERT_TRUE(candidate.ok());
+    EXPECT_TRUE(candidate.value().stop_event_id);
+    EXPECT_EQ(engine.translate_stop_stage_calls.load(), 0);
+    reset_in_gap = true;
+  };
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());  // P, D, A, K
+  engine.before_apply_hook = {};
+  EXPECT_TRUE(reset_in_gap);
+  EXPECT_EQ(engine.replacement_owner_commits, 1);
+  ASSERT_TRUE(wait_until([&] { return engine.translate_stop_stage_calls.load() >= 1; }));
+}
+
+// Row 35: "apply" throws (a defect; the fake's test point throws before its
+// swaps). The close runs during unwinding: the mark is cleared, so the next
+// reconcile pass reads the candidate again, and the take-over flag is
+// cleared.
+TEST(ResourceAddressedExecutionKernelTest, HandoverApplyDefectStillRunsTheClose) {
+  HandoverWorld world;
+  ASSERT_NO_FATAL_FAILURE(PrepareHandover(world, "apply.throws"));
+  auto& kernel = *world.kernel;
+  auto& engine = world.engine;
+  engine.before_apply_hook = [] { throw std::runtime_error("apply defect"); };
+  EXPECT_THROW(static_cast<void>(kernel.reconcile_subordinate_state()), std::runtime_error);
+  engine.before_apply_hook = {};
+  EXPECT_EQ(engine.replacement_owner_commits, 0);
+  EXPECT_EQ(engine.close_replacement_hazard_calls.load(), 1);
+  const auto reads = engine.status_read_calls.load();
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());
+  EXPECT_GT(engine.status_read_calls.load(), reads);
+}
+
+// Row 48: a Reset of the old motion between "decide" and "apply" is
+// accepted at once (the old motion is terminal and has no engine since
+// "decide", so the Reset has no effects), stays pending through the gap
+// (its settlement waits for the hand-over in flight), is settled by the close
+// step, and the old operation is retired as usual.
+TEST(ResourceAddressedExecutionKernelTest, HandoverResetOfTheOldMotionInTheGapSettlesAfterTheClose) {
+  HandoverWorld world;
+  ASSERT_NO_FATAL_FAILURE(PrepareHandover(world, "gap.reset.old"));
+  auto& kernel = *world.kernel;
+  auto& engine = world.engine;
+  bool reset_in_gap = false;
+  bool pending_after_apply = false;
+  engine.before_apply_hook = [&] {
+    const auto reset = kernel.reset(control_request(
+        "gap.reset.old.request", *world.original,
+        CurrentRevision(kernel, world.original->operation_id)));
+    ASSERT_TRUE(reset.ok()) << reset.error().message;
+    const auto old = kernel.get_operation_projection(world.original->operation_id);
+    ASSERT_TRUE(old.ok());
+    EXPECT_TRUE(old.value().resident);
+    EXPECT_TRUE(old.value().control_pending);
+    reset_in_gap = true;
+  };
+  engine.after_apply_hook = [&] {
+    const auto old = kernel.get_operation_projection(world.original->operation_id);
+    ASSERT_TRUE(old.ok());
+    EXPECT_TRUE(old.value().resident);
+    pending_after_apply = old.value().control_pending;
+  };
+  ASSERT_TRUE(kernel.reconcile_subordinate_state().ok());  // P, D, A, K
+  engine.before_apply_hook = {};
+  engine.after_apply_hook = {};
+  EXPECT_TRUE(reset_in_gap);
+  EXPECT_TRUE(pending_after_apply);
+  EXPECT_EQ(engine.replacement_owner_commits, 1);
+  // Settled by the close, and retired: no longer resident, nothing pending.
+  const auto old = kernel.get_operation_projection(world.original->operation_id);
+  ASSERT_TRUE(old.ok());
+  EXPECT_FALSE(old.value().resident);
+  EXPECT_FALSE(old.value().control_pending);
+  for (const auto& slot : kernel.resource_snapshot()) {
+    ASSERT_TRUE(slot.owner);
+    EXPECT_EQ(slot.owner->operation_id, world.candidate->operation_id);
+  }
+  // The candidate is untouched by the old motion's Reset.
+  const auto candidate = kernel.get_operation_state(world.candidate->operation_id);
+  ASSERT_TRUE(candidate.ok());
+  EXPECT_EQ(candidate.value().state, OperationStateKind::kExecuting);
+  EXPECT_FALSE(candidate.value().stop_event_id);
 }
 
 }  // namespace

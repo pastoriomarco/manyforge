@@ -172,7 +172,6 @@ _AUTHORED_SCENE_OPERATIONS: Final = frozenset(
         "set_collision_policy",
     }
 )
-_SCENE_RUNTIME_COMMAND_VERSION: Final = "manyforge.manager_command.v2"
 _SCENE_RUNTIME_RESPONSE_VERSION: Final = "manyforge.manager_command_response.v3"
 _SCENE_RUNTIME_IDENTITY_FIELDS: Final = frozenset(
     {
@@ -5565,7 +5564,6 @@ class HeadlessSceneProgramPort:
         self,
         transport: _SceneProgramTransport,
         *,
-        manager_command: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         resolve_attach_active_tcp: Callable[[str, Mapping[str, Any]], Mapping[str, Any]] | None = None,
         program_node_evidence: (
             Callable[[NodeAttemptIdentity, str], Mapping[str, Any]] | None
@@ -5579,10 +5577,7 @@ class HeadlessSceneProgramPort:
         ):
             if not callable(getattr(transport, method, None)):
                 raise TypeError(f"scene transport has no callable {method}")
-        if manager_command is not None and not callable(manager_command):
-            raise TypeError("manager_command must be callable")
         self._transport = transport
-        self._manager_command = manager_command
         self._resolve_attach_active_tcp = resolve_attach_active_tcp
         self._program_node_evidence = program_node_evidence
         # The ``A`` a Scene transaction names: its request key is minted in
@@ -5640,15 +5635,19 @@ class HeadlessSceneProgramPort:
     ) -> None:
         """Apply one exact Manager between-nodes latch to authoritative Scene.
 
-        Manager captures the current Scene at the command boundary. The exact
-        runtime identity fences the captured deployment; ordinary object-pose
-        updates do not invalidate an earlier, unnecessary Scene pre-read.
+        Sent through Headless, which answers once its logical-scene view shows
+        what the latch committed (OD-294). Manager captures the current Scene
+        at the command boundary. The exact runtime identity fences the
+        captured deployment; ordinary object-pose updates do not invalidate an
+        earlier, unnecessary Scene pre-read.
         """
 
         if not isinstance(identity, NodeAttemptIdentity):
             raise PoseSourceLatchError("between-nodes latch has no exact node identity")
-        if self._manager_command is None:
-            raise PoseSourceLatchError("Manager scene-runtime latch is unavailable")
+        read_owner = getattr(self._transport, "scene_runtime_owner", None)
+        latch = getattr(self._transport, "latch_scene_runtime_between_nodes", None)
+        if not callable(read_owner) or not callable(latch):
+            raise PoseSourceLatchError("scene-runtime latch is unavailable")
         resource_ids: tuple[str, ...] | None = None
         if scene_resource_ids is not None:
             try:
@@ -5675,12 +5674,7 @@ class HeadlessSceneProgramPort:
                     raise ProductionPortError(
                         "between-nodes latch has no captured Program-run context"
                     )
-                owner = self._manager_command(
-                    {
-                        "api_version": _SCENE_RUNTIME_COMMAND_VERSION,
-                        "command": "scene_runtime_owner_read",
-                    }
-                )
+                owner = read_owner()
                 self._raise_pose_latch_refusal(owner, phase="Manager identity read")
                 if set(owner) != {
                     "api_version",
@@ -5723,13 +5717,11 @@ class HeadlessSceneProgramPort:
                     )
 
                 request: dict[str, Any] = {
-                    "api_version": _SCENE_RUNTIME_COMMAND_VERSION,
-                    "command": "scene_runtime_latch_between_nodes",
                     "expected_runtime_identity": runtime_identity,
                 }
                 if resource_ids is not None:
                     request["scene_resource_ids"] = list(resource_ids)
-                response = self._manager_command(request)
+                response = latch(request)
                 self._raise_pose_latch_refusal(response, phase="between-nodes latch")
                 if (
                     set(response) != _SCENE_RUNTIME_LATCH_RESPONSE_FIELDS

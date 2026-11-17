@@ -3150,10 +3150,13 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.setEnabled(true);
     const socket = FakeWebSocket.instances[0]!;
     socket.onopen?.();
+    // Headless requires the browser's identity in the hello (it refuses the
+    // session without it).
     expect(JSON.parse(socket.sent[0]!)).toEqual({
       schema_version: 'manyforge.execution_control.v4',
       message_kind: 'client_hello',
       supported_versions: ['manyforge.execution_control.v4'],
+      client_incarnation: expect.stringMatching(/^control-client\.[A-Za-z0-9_-]{8,256}$/),
       source_label: 'operator_ui',
     });
     const hello = (override: Record<string, unknown>) => ({

@@ -1933,10 +1933,25 @@ export interface ManagerApplyAvailability {
   unavailableReasonCode: string | null;
 }
 
+/**
+ * What the Manager waits for now, as information only (OD-296 (a), OD-298 (a)):
+ * an exchange with the execution host or the Program Runner still outstanding
+ * at the Manager's next status tick. `sinceNs` is on the clock of the
+ * section's `observed_at_ns`.
+ */
+export interface ManagerOutstandingExchange {
+  peer: 'execution_host' | 'program_runner';
+  channel: string;
+  exchange: string;
+  sinceNs: number;
+}
+
 export interface ManagerRuntimeProjection {
   converged: boolean;
   desiredUnits: JsonValue[];
   observedUnits: JsonValue[];
+  /** Absent when nothing is outstanding. */
+  outstandingExchanges?: ManagerOutstandingExchange[];
 }
 
 export interface ManagerStatusProjection {
@@ -2137,6 +2152,8 @@ export interface ResetApplyContext {
   schemaVersion: 'manyforge.composer_reset_apply_context.v2';
   correlationId: string;
   document: 'program' | 'deployment';
+  /** The Reset is followed by an Apply of the Draft or a Revert to Saved. */
+  action: 'apply' | 'revert';
   programRunId: number;
   cycleGeneration: number;
   draftId: string;

@@ -433,9 +433,10 @@ TEST(ManagerSourcePublication,
               admission.retained_bundle(), admission.retained_bundle(), deployment::SiteFacts{}),
       }));
 
-  const auto bytes = content_identity::canonical_json(BuildManagerSourcePayload(
+  const auto payload = BuildManagerSourcePayload(
       admission.retained_bundle(), admission, Runtime(admission), journal,
-      ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
+      ManagerApplyMutationAvailability::kKernelOwnerUnavailable);
+  const auto bytes = content_identity::canonical_json(payload);
   EXPECT_NE(bytes.find("\"apply_id\":1,"), std::string::npos);
   EXPECT_NE(bytes.find("\"phase\":\"scope_persisted\""), std::string::npos);
   EXPECT_NE(bytes.find("\"state\":\"scope_persisted\""), std::string::npos);
@@ -443,6 +444,17 @@ TEST(ManagerSourcePublication,
   EXPECT_NE(bytes.find("\"manager_ready\":false"), std::string::npos);
   EXPECT_NE(bytes.find("\"converged\":false"), std::string::npos);
   EXPECT_EQ(bytes.find("\"configuration_fence_id\":\""), std::string::npos);
+  // OD-281: the status record's fence scope is the component scope only;
+  // domains, bindings and resources stay in the Apply journal.
+  const auto &records =
+      payload.find_object_member("apply")->find_object_member("records")->as_array();
+  ASSERT_EQ(records.size(), 1U);
+  const auto *scope =
+      records.front().find_object_member("fence")->find_object_member("scope");
+  ASSERT_NE(scope, nullptr);
+  ASSERT_TRUE(scope->is_object());
+  EXPECT_EQ(scope->as_object().size(), 1U);
+  EXPECT_NE(scope->find_object_member("controllable_component_ids"), nullptr);
 }
 
 TEST(ManagerSourcePublication,
@@ -499,6 +511,20 @@ TEST(ManagerSourcePublication,
     carried.push_back(record.find_object_member("apply_id")->as_number());
   }
   EXPECT_EQ(carried, (std::vector<double>{40.0, 80.0, 81.0}));
+  // OD-281: only the record of the Apply that installed the active
+  // configuration carries the preparation receipt; the others carry null.
+  ASSERT_EQ(records.size(), 3U);
+  const auto *const active_receipt =
+      records[0].find_object_member("prepared_activation");
+  ASSERT_NE(active_receipt, nullptr);
+  ASSERT_TRUE(active_receipt->is_object());
+  EXPECT_NE(active_receipt->find_object_member("padding"), nullptr);
+  for (const std::size_t index : {1U, 2U}) {
+    const auto *const receipt =
+        records[index].find_object_member("prepared_activation");
+    ASSERT_NE(receipt, nullptr);
+    EXPECT_EQ(*receipt, content_identity::CanonicalValue(nullptr));
+  }
   // ManagerStatusStream::kMaximumFrameBytes (manager_status_stream.hpp).
   EXPECT_LT(content_identity::canonical_json(payload).size(), 409'600U);
 }

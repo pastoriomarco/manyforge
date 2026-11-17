@@ -489,7 +489,7 @@ TEST(AssistantSettingsCodec, RetainedProjectionRejectsAnyTampering) {
                AssistantSettingsCodecError);
 }
 
-TEST(AssistantSettingsCodec, ExperimentalReasoningSwitchIsOptionalAndRetained) {
+TEST(AssistantSettingsCodec, ReasoningSwitchIsOptionalAndRetained) {
   const auto with = [](std::string_view value) {
     std::string contract = model_request_contract();
     contract.insert(1, "\"reasoning\":" + std::string(value) + ",");

@@ -25,6 +25,8 @@ import { requestKeyNamesWebSocketCommand } from '../api/applicationIdentity';
 import { applyMayHaveActed, type ManagerApplyIdentity } from './managerApply';
 
 export type ResetApplyDocument = 'program' | 'deployment';
+/** What follows the Reset: an Apply of the Draft or a Revert to Saved. */
+export type ResetApplyAction = 'apply' | 'revert';
 
 /**
  * A Deployment Apply must Reset the run first: one exists and isn't a
@@ -40,6 +42,7 @@ export interface ResetApplyPlan {
   /** Names this chain in its Activity notice and Composer's context log. */
   correlationId: string;
   document: ResetApplyDocument;
+  action: ResetApplyAction;
   programRunId: number;
   /** The held cycle the operator confirmed; Reset must end exactly this one. */
   cycleGeneration: number;
@@ -58,6 +61,7 @@ export function resetApplyContext(plan: ResetApplyPlan): ResetApplyContext {
     schemaVersion: 'manyforge.composer_reset_apply_context.v2',
     correlationId: plan.correlationId,
     document: plan.document,
+    action: plan.action,
     programRunId: plan.programRunId,
     cycleGeneration: plan.cycleGeneration,
     draftId: plan.draftId,
@@ -244,16 +248,22 @@ export function nextResetApplyStep(
 export function resetApplyPhaseText(
   phase: ResetApplyPhase,
   applicationStartId: ApplicationStartId | null = null,
+  action: ResetApplyAction = 'apply',
 ): string {
+  const verb = action === 'revert' ? 'Revert' : 'Apply';
   switch (phase.kind) {
     case 'recording': return 'Recording the Apply context…';
     case 'resetting': return 'Sending Reset…';
     case 'awaiting_idle': return phase.delivery === 'confirmed'
       ? 'Reset sent; waiting for the run to end and the cycle to reach Idle.'
       : 'Reset delivery unknown: reconciling from the observed cycle. Reset is not resent, and nothing is Applied until its settlement is observed.';
-    case 'applying': return phase.sent ? 'Applying the Draft…' : 'Idle reached; waiting for authoring admission to Apply.';
-    case 'awaiting_apply': return `Apply ${displayApplyId(applicationStartId, phase.apply.applyId)} accepted; waiting for activation to settle.`;
-    case 'applied': return 'Applied; awaiting Execute/Run; not saved to Scenario.';
+    case 'applying': return phase.sent
+      ? (action === 'revert' ? 'Reverting to Saved…' : 'Applying the Draft…')
+      : `Idle reached; waiting for authoring admission to ${verb}.`;
+    case 'awaiting_apply': return `${verb} ${displayApplyId(applicationStartId, phase.apply.applyId)} accepted; waiting for activation to settle.`;
+    case 'applied': return action === 'revert'
+      ? 'Reverted to Saved; awaiting Execute/Run.'
+      : 'Applied; awaiting Execute/Run; not saved to Scenario.';
     case 'failed': return phase.message;
   }
 }

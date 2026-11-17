@@ -276,9 +276,11 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
                                                    std::uint64_t candidate_id) override;
   Result<PreparedMotionReplacementSourceDTO> CaptureMotionReplacementSource(
       std::uint64_t execution_id) const override;
-  Result<bool> CommitPreparedMotionReplacement(std::uint64_t candidate_id,
-                                               const PreparedMotionReplacementSourceDTO& source,
-                                               PreparedMotionReplacementCommitDTO commit) override;
+  Result<bool> ProvePreparedMotionReplacement(
+      std::uint64_t candidate_id, const PreparedMotionReplacementSourceDTO& source) override;
+  bool CloseMotionReplacementHazard(
+      const PreparedMotionReplacementSourceDTO& source) noexcept override;
+  void ApplyPreparedMotionReplacement(std::uint64_t candidate_id) override;
   Result<bool> PrepareColdMotionAfterStop(std::uint64_t candidate_id,
                                           const ParticipantStopOutcomeDTO& incumbent) override;
 

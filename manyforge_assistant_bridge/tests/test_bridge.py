@@ -1682,7 +1682,7 @@ def test_a_refused_draft_edit_keeps_its_typed_code_for_the_model_and_recovery() 
     assert recovery["repeats"] == 2
 
 
-def test_experimental_reasoning_switch_maps_to_the_chat_template_kwarg(tmp_path: Path) -> None:
+def test_reasoning_switch_maps_to_the_chat_template_kwarg(tmp_path: Path) -> None:
     for reasoning, expected in ((None, None), ("off", False), ("on", True)):
         projection = _projection()
         if reasoning is not None:

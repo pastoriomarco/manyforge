@@ -492,7 +492,8 @@ core::CellAdmissionReadinessSnapshotDTO ReadinessWithRunnerLoss() {
       core::ProgramCycleStatusDTO{
           7U, core::ProgramCycleStateDTO::kRunning, core::ProgramRunNumber(1U),
           core::CellAdmissionClaimGeneration(3U), std::nullopt, std::nullopt},
-      "program_runner_liveness_probe", "Program Runner contact was lost."};
+      "program_runner_liveness_probe", "Program Runner contact was lost.",
+      "program_runner_contact_lost"};
   return readiness;
 }
 
@@ -523,9 +524,11 @@ TEST(KernelCellAdmissionRpcInternal,
      RunnerContactLossReadinessRoundTripsAndDispatches) {
   for (const auto *predicate :
        {"program_runner_liveness_probe", "program_runner_liveness_renewal",
-        "program_runner_reconciliation_renewal"}) {
+        "program_runner_reconciliation_renewal", "program_runner_fault"}) {
     auto readiness = ReadinessWithRunnerLoss();
     readiness.program_runner_loss->failure_predicate = predicate;
+    if (std::string_view(predicate) == "program_runner_fault")
+      readiness.program_runner_loss->fault_code = "program_tick_worker_failed";
     const auto encoded =
         component_manager::detail::EncodeKernelCellAdmissionRpcRequest(
             {"cell_admission_update_readiness", readiness});
@@ -548,7 +551,7 @@ TEST(KernelCellAdmissionRpcInternal,
 
 TEST(KernelCellAdmissionRpcInternal,
      RunnerContactLossReadinessRejectsInvalidDtoAndExtension) {
-  for (const int malformed : {2, 3, 4, 5, 6, 7}) {
+  for (const int malformed : {2, 3, 4, 5, 6, 7, 8}) {
     auto readiness = ReadinessWithRunnerLoss();
     auto &loss = *readiness.program_runner_loss;
     if (malformed == 2)
@@ -564,6 +567,8 @@ TEST(KernelCellAdmissionRpcInternal,
     if (malformed == 7)
       loss.established_cycle.state =
           core::ProgramCycleStateDTO::kTerminalAwaitingReset;
+    if (malformed == 8)
+      loss.fault_code = "program_tick_worker_failed";
     EXPECT_THROW(component_manager::detail::EncodeKernelCellAdmissionRpcRequest(
                      {"cell_admission_update_readiness", readiness}),
                  std::invalid_argument);

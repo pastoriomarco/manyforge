@@ -2218,9 +2218,11 @@ def test_a_held_failure_of_a_retired_operation_holds_without_an_owner_task() -> 
     assert "owner_task_id" not in required and "owner_assessment" not in required
 
 
-def _stopped_newcomer(effect: str = "no_effect") -> OwnerTaskSnapshot:
-    """A take-over newcomer ended by the operator's Stop before it was sent,
-    already retired by the Kernel (its assessment is unreadable)."""
+def _stopped_newcomer(
+    effect: str = "no_effect", kind: str = "cancelled_before_dispatch"
+) -> OwnerTaskSnapshot:
+    """A take-over newcomer ended by the operator's Stop (by default before it
+    was sent), already retired by the Kernel (its assessment is unreadable)."""
 
     task = _failed(None, state=OwnerTaskState.INTERRUPTED)
     return replace(
@@ -2233,7 +2235,7 @@ def _stopped_newcomer(effect: str = "no_effect") -> OwnerTaskSnapshot:
             "operation_failure": {
                 **_FACT,
                 "failure": {"code": "operation_stopped", "message": "native operation was interrupted"},
-                "terminal_facts": [{"kind": "cancelled_before_dispatch", "effect": effect}],
+                "terminal_facts": [{"kind": kind, "effect": effect}],
             },
             "recovery_assessment_failure": {
                 "reason_code": "owner_recovery_assessment_invalid",
@@ -2275,9 +2277,115 @@ def test_a_newcomer_ended_by_the_stop_that_holds_it_holds_and_resubmits_on_resum
     assert port.starts[1][0].node_attempt_id != port.starts[0][0].node_attempt_id
 
 
+def _moved_newcomer() -> OwnerTaskSnapshot:
+    """A take-over newcomer that moved before the operator's Stop ended it:
+    its effect settled, retired by the Kernel, which kept its rest."""
+
+    return _stopped_newcomer("effect_settled", "preempted_by_addressed_stop")
+
+
+def test_a_moved_newcomer_ended_by_the_stop_that_holds_it_holds_and_resubmits_on_resume() -> None:
+    """OD-269: the node holds as for a newcomer that never moved (the run is
+    not failed), and Resume's next attempt, a new node attempt, is the one
+    the Kernel plans from the kept rest."""
+
+    from manyforge_behavior.nodes.stop_policy import (
+        OperatorMotionStopSnapshot,
+        OperatorMotionStopState,
+    )
+
+    port = _MotionPort([_moved_newcomer(), _succeeded()])
+    _time, clock = _clocked()
+    stop_state = OperatorMotionStopState({"motion": ()})
+    stop_state.publish(OperatorMotionStopSnapshot(3, frozenset({"motion"})))
+    adapter = _motion(port, clock, hold=stop_state)
+
+    assert _tick(adapter) is _RUNNING
+    assert adapter.presented_held
+    assert adapter.failure_reason_code is None
+    assert port.closes == [] and adapter.owner_recovery_context is None
+    assert _tick(adapter) is _RUNNING and len(port.starts) == 1  # Held: nothing sent.
+    stop_state.publish(OperatorMotionStopSnapshot(4))  # Resume.
+    for _ in range(3):
+        if _tick(adapter) is not _RUNNING:
+            break
+    assert adapter.status is _SUCCESS
+    assert len(port.starts) == 2
+    assert port.starts[1][0].node_attempt_id != port.starts[0][0].node_attempt_id
+    assert port.starts[1][1] == port.starts[0][1]  # The same inputs; the Kernel plans the rest.
+
+
+def test_a_moved_newcomer_stopping_until_the_old_stop_ends_holds_and_resubmits_on_resume() -> None:
+    """OD-272: before the old motion's Stop ends, the Kernel shows the sent
+    newcomer stopping (resident, no terminal fact): the node waits and
+    rereads, then holds on the final Stopped fact (OD-269); the run is not
+    failed."""
+
+    from manyforge_behavior.nodes.stop_policy import (
+        OperatorMotionStopSnapshot,
+        OperatorMotionStopState,
+    )
+
+    stopping = _active(operation_state="stopping", resident=True, stop_event_id=49)
+    port = _MotionPort(
+        [stopping, _succeeded()], observes=[stopping, stopping, _moved_newcomer()]
+    )
+    _time, clock = _clocked()
+    stop_state = OperatorMotionStopState({"motion": ()})
+    stop_state.publish(OperatorMotionStopSnapshot(3, frozenset({"motion"})))
+    adapter = _motion(port, clock, hold=stop_state)
+
+    assert _tick(adapter) is _RUNNING  # Started: stopping.
+    assert _tick(adapter) is _RUNNING and _tick(adapter) is _RUNNING  # Rereads.
+    assert not adapter.presented_held and adapter.failure_reason_code is None
+    assert _tick(adapter) is _RUNNING  # The final Stopped fact: held.
+    assert adapter.presented_held
+    assert adapter.failure_reason_code is None
+    assert port.closes == [] and adapter.owner_recovery_context is None
+    assert _tick(adapter) is _RUNNING and len(port.starts) == 1  # Held: nothing sent.
+    stop_state.publish(OperatorMotionStopSnapshot(4))  # Resume.
+    for _ in range(3):
+        if _tick(adapter) is not _RUNNING:
+            break
+    assert adapter.status is _SUCCESS
+    assert len(port.starts) == 2
+
+
+def test_a_moved_newcomer_whose_rest_is_refused_on_resume_fails_its_node() -> None:
+    """OD-269: when the Kernel could not capture the rest (a Cartesian path
+    stopped before its hand-over), Resume's next attempt is refused as Resume
+    of any such stopped motion is, and the node fails with that refusal."""
+
+    from manyforge_behavior.nodes.stop_policy import (
+        OperatorMotionStopSnapshot,
+        OperatorMotionStopState,
+    )
+
+    refusal = KernelOperationAdmissionRejectedError(
+        "operation_recovery_invalid",
+        "Cartesian continuation lacks exact original-path progress",
+        {"reason": "cartesian_resume_progress_unavailable",
+         "continuation_error_code": "execution_rejected"},
+    )
+    port = _MotionPort([_moved_newcomer(), refusal])
+    _time, clock = _clocked()
+    stop_state = OperatorMotionStopState({"motion": ()})
+    stop_state.publish(OperatorMotionStopSnapshot(3, frozenset({"motion"})))
+    adapter = _motion(port, clock, hold=stop_state)
+
+    assert _tick(adapter) is _RUNNING and adapter.presented_held
+    stop_state.publish(OperatorMotionStopSnapshot(4))  # Resume.
+    for _ in range(3):
+        if _tick(adapter) is not _RUNNING:
+            break
+    assert adapter.status is _FAILURE
+    assert len(port.starts) == 2
+    assert "original-path progress" in adapter.feedback_message
+
+
 def test_a_stopped_newcomer_whose_node_is_not_held_still_fails() -> None:
     """A Stop that does not hold the node (the Program's own Stop) keeps the
-    failure path, as does a newcomer that may have moved."""
+    failure path, as does a newcomer whose effect is uncertain."""
 
     from manyforge_behavior.nodes.stop_policy import (
         OperatorMotionStopSnapshot,
@@ -2285,7 +2393,9 @@ def test_a_stopped_newcomer_whose_node_is_not_held_still_fails() -> None:
     )
 
     for task, held in ((_stopped_newcomer(), frozenset()),
-                       (_stopped_newcomer("effect_settled"), frozenset({"motion"}))):
+                       (_moved_newcomer(), frozenset()),
+                       (_stopped_newcomer("effect_uncertain", "local_failure"),
+                        frozenset({"motion"}))):
         port = _MotionPort([task])
         _time, clock = _clocked()
         stop_state = OperatorMotionStopState({"motion": ()})

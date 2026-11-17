@@ -41,7 +41,7 @@ export function manualOperationAdmissionCopy(
     : modeLabel === null
       ? `Manual motion on ${targetName} is running.`
       : `${targetName} is moving (${modeLabel}).`;
-  const message = 'Program editing resumes when it ends.';
+  const message = 'Editing resumes when it ends.';
   return {
     applicationStartId: state.status?.applicationStartId ?? 'unknown-owner',
     operationId: operation.operationId,
@@ -77,7 +77,7 @@ export function authoringAdmissionTooltip(
 ): string {
   if (manualOperation !== null) return manualOperation.tooltip;
   if (backgroundStep) return AUTHORING_ADMISSION_TOOLTIP;
-  if (authoringCause === 'execution_active') return 'Program execution is active; Program editing resumes when it ends.';
+  if (authoringCause === 'execution_active') return 'A Program run is active; editing resumes after Reset or when the run ends.';
   return 'Authoring is currently unavailable.';
 }
 
@@ -98,4 +98,17 @@ export function replacementAdmissionAllowed(
   return authoringAdmissionAllowed === false
     && (authoringCause === 'execution_active' || failedApplyHoldsCell)
     ? true : authoringAdmissionAllowed;
+}
+
+/**
+ * What blocks Apply: a run closes authoring, but Apply Resets that run first
+ * (AUD-4), and the Reset-and-Apply chain states its own reasons. Any other
+ * closed admission still blocks Apply.
+ */
+export function applyAdmissionBlock(
+  authoringBlock: string | null,
+  runExists: boolean,
+  authoringCause: AuthoringUnavailableCause | null,
+): string | null {
+  return runExists && authoringCause === 'execution_active' ? null : authoringBlock;
 }

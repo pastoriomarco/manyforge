@@ -266,7 +266,10 @@ class DiskRecordsCheck:
         self._publish_failed = False
         headline = details["failure"]["message"]
         _LOGGER.warning("ManyForge stops operation: %s", headline)
-        # The Halt first: it needs neither the core lock nor the disk.
+        # The alarm is wanted from entry on, whatever the Halt does; it is
+        # published after the Halt (step), which goes first: it needs neither
+        # the core lock nor the disk.
+        self._wanted = {"active": True, "details": details}
         try:
             response = self._halt()
             if response.get("ok") is not True:
@@ -275,7 +278,6 @@ class DiskRecordsCheck:
                 _LOGGER.error("disk check Halt was refused (%s); not retried", code)
         except HeadlessApiError as error:
             _LOGGER.error("disk check Halt could not be sent (%s); not retried", error.code)
-        self._wanted = {"active": True, "details": details}
 
     def _leave(self) -> None:
         self.active = False

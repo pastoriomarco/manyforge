@@ -115,6 +115,7 @@ function controller(
     feedback: null,
     busyOperation: null,
     applyConfirmationOpen: false,
+    applyEnd: null,
     applyPreview: null,
     applyPreviewKind: 'apply',
     comparisonUnavailableReason: null,
@@ -134,9 +135,10 @@ function controller(
     discard: vi.fn(),
     applyDraft: vi.fn(),
     applyConfirmedScope: vi.fn(),
+    revertConfirmedScope: vi.fn(),
     addComponents: vi.fn(),
     previewApply: vi.fn(),
-    confirmApply: vi.fn(),
+    confirmApply: vi.fn(async () => null),
     cancelApplyConfirmation: vi.fn(),
   };
 }

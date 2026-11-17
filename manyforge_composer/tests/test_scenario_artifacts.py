@@ -3143,6 +3143,17 @@ def test_f6b_manager_projection_unavailable_carries_bounded_diagnostics(
     assert http.detail["effect"] == "none"
     assert http.detail["context"] == detail
 
+    # OD-281: a section too large for the status frame is refused with its
+    # own typed cause.
+    oversized = deepcopy(current)
+    oversized["source"].update({
+        "freshness": "unavailable", "known_gaps": ["manager_status_section_oversized"],
+    })
+    with pytest.raises(DraftSessionError) as error:
+        ComposerState._manager_current(oversized, phase="scenario_load.claim")
+    assert error.value.code == "manager_status_section_oversized"
+    assert error.value.status_code == 503
+
     # No source at all: every check is named, nothing raises while reporting it.
     with pytest.raises(DraftSessionError) as missing:
         ComposerState._manager_current({}, phase="activation.after_preparation")

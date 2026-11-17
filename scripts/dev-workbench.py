@@ -41,7 +41,7 @@ from manyforge_operator.application_processes import (
     request_manager_shutdown,
     write_document as write_application_processes,
 )
-from scripts.lib.export_retention import _LEGACY_SESSION_ENTRIES, create_host_ros_log_session, run_session
+from scripts.lib.export_retention import create_host_ros_log_session, run_session
 from scripts.lib.workbench_session import Session
 
 
@@ -1297,8 +1297,7 @@ class Workbench:
                     # ManyForge's own obsolete files, only above their limits.
                     if time.monotonic() >= next_prune:
                         next_prune = time.monotonic() + run_session.DISK_PRUNE_PERIOD_SECONDS
-                        run_session.prune_while_running(self.session.root, self.session.fd, self.disk_limits,
-                                                        legacy_entries=_LEGACY_SESSION_ENTRIES)
+                        run_session.prune_while_running(self.session.root, self.session.fd, self.disk_limits)
                     continue
                 if status != MANAGER_STOPPED:
                     raise WorkbenchError(f"Manager ended the application with status {status}")

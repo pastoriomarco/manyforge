@@ -26,6 +26,7 @@ using test::StatusKeepaliveFrame;
 using test::StatusOversizedSectionFrame;
 using test::StatusSectionFrame;
 using test::StatusSnapshotFrame;
+using test::kStatusFrameStart;
 
 constexpr std::int64_t kSilenceNs = 2'000'000'000LL;
 const std::string kCellId = "cell-a";
@@ -391,7 +392,7 @@ TEST(RuntimeSnapshotAggregator,
   ASSERT_TRUE(RequiredBool(known.root, "complete"));
   ASSERT_TRUE(h.mirror.MarkDisconnected());
 
-  // A restarted Manager counts its ticks from 1 again.
+  // A resubscription within the silence bound (its tick does not count).
   h.now = 5'000;
   static_cast<void>(h.Apply(StatusSnapshotFrame(1U, 2U, 2U, 2U, 0U)));
   const auto waiting = h.Evaluate();
@@ -431,6 +432,29 @@ TEST(RuntimeSnapshotAggregator,
               CanonicalValue(2.0));
   }
   EXPECT_GT(complete.projection_generation, partial.projection_generation);
+}
+
+TEST(ManagerStatusMirror, ReconnectSnapshotCountsOnlyANewTickOrANewStart) {
+  // OD-284 (§5.3): the snapshot comes from the stream's own threads, so a
+  // reconnect to a Manager whose loop is held must not look alive.
+  Harness h;
+  h.ConnectFullState(3U);
+  ASSERT_TRUE(h.mirror.MarkDisconnected());
+  h.now = 1'000 + kSilenceNs + 1;
+  EXPECT_FALSE(h.Apply(StatusSnapshotFrame(3U)).tick_advanced);
+  EXPECT_EQ(RequiredMember(h.Evaluate().root, "reasons"),
+            Strings({"manager_status_unavailable"}));
+  ASSERT_TRUE(h.mirror.MarkDisconnected());
+  EXPECT_TRUE(h.Apply(StatusSnapshotFrame(4U)).tick_advanced);
+
+  // Another application start counts, whatever its tick.
+  ASSERT_TRUE(h.mirror.MarkDisconnected());
+  h.now += kSilenceNs + 1;
+  auto restarted = StatusSnapshotFrame(1U);
+  const auto at = restarted.find(kStatusFrameStart);
+  ASSERT_NE(at, std::string::npos);
+  restarted.replace(at, kStatusFrameStart.size(), "fedcba9876543210");
+  EXPECT_TRUE(h.Apply(restarted).tick_advanced);
 }
 
 TEST(RuntimeSnapshotAggregator, OversizedSectionKeepsItsLastValueOthersFresh) {

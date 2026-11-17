@@ -57,6 +57,7 @@ export function useDeploymentWorkspace(
   const [loading, setLoading] = useState(enabled);
   const [busy, setBusy] = useState(false);
   const [applying, setApplying] = useState(false);
+  const [applyEnd, setApplyEnd] = useState<{ succeeded: boolean } | null>(null);
   const [completedAdmission, setCompletedAdmission] = useState<{
     applicationStartId: ApplicationStartId;
     generation: number;
@@ -137,12 +138,18 @@ export function useDeploymentWorkspace(
     ?? authoring.editUnavailableReason
     ?? (workspace === null ? 'Deployment workspace is not loaded.' : null);
   const mutationAvailable = mutationUnavailableReason === null;
+  const awaitingAdmission = unavailableBefore === null
+    && completedAdmission?.applicationStartId === snapshot!.applicationStartId
+    && snapshot!.authoringAdmission.admissionGeneration <= completedAdmission.generation
+    ? 'Waiting for updated backend authoring permissions.'
+    : null;
   const documentUnavailableReason = unavailableBefore
-    ?? (completedAdmission?.applicationStartId === snapshot!.applicationStartId
-      && snapshot!.authoringAdmission.admissionGeneration <= completedAdmission.generation
-      ? 'Waiting for updated backend authoring permissions.'
-      : authoring.unavailableReason
-        ?? (workspace === null ? 'Deployment workspace is not loaded.' : null));
+    ?? awaitingAdmission
+    ?? authoring.unavailableReason
+    ?? (workspace === null ? 'Deployment workspace is not loaded.' : null);
+  // Revert previews like Apply (also while a run is held: Reset and Revert),
+  // once the generation a claim consumed has been replaced.
+  const revertPreviewUnavailableReason = awaitingAdmission ?? mutationUnavailableReason;
   // While the owner is read again after a publication, its comparisons are
   // unknown, so no Scenario action is offered; a failed read says so until a
   // later read succeeds. Draft edits stay available.
@@ -272,6 +279,7 @@ export function useDeploymentWorkspace(
     setFeedback(null);
     // The workspace is read again before the outcome is shown: the read
     // clears the error it last showed.
+    let succeeded = false;
     try {
       // Answered at acceptance; the outcome is the row's end (OD-214).
       const ended = await awaitCommandEnd(await operation(), applyRows);
@@ -289,6 +297,7 @@ export function useDeploymentWorkspace(
         return null;
       }
       const result = applyResultOfRow(ended);
+      succeeded = result.outcome === 'succeeded';
       if (mounted.current) {
         if (result.outcome === 'failed') setError(applyResultText(result));
         else setFeedback(applyResultText(result));
@@ -312,6 +321,7 @@ export function useDeploymentWorkspace(
       if (mounted.current) {
         setBusy(false);
         setApplying(false);
+        setApplyEnd({ succeeded });
       }
     }
   }, [applyRows, authoring, refresh]);
@@ -446,8 +456,9 @@ export function useDeploymentWorkspace(
      * Revert on the one Apply path: Preview the Saved Scenario's impact,
      * then the operator confirms it (`confirmApply`), which applies it.
      */
+    // Effect-free, so also while a run is held (Reset and Revert), as Apply.
     revert: () => (
-      deploymentActionUnavailableReason(workspace, 'revert', documentUnavailableReason) !== null
+      deploymentActionUnavailableReason(workspace, 'revert', revertPreviewUnavailableReason) !== null
         ? Promise.resolve(null)
         : showPreview('revert')
     ),
@@ -464,6 +475,10 @@ export function useDeploymentWorkspace(
     applyConfirmedScope: (scope: ApplyPreview['scope']) => (
       sendApply(() => api.cellApply.apply(scope), 'Deployment Apply request failed.', 'apply')
     ),
+    /** The Revert of a Preview confirmed earlier, sent by Reset and Revert. */
+    revertConfirmedScope: (scope: ApplyPreview['scope']) => (
+      sendApply(() => api.cellApply.revert(scope), 'Deployment Revert request failed.', 'revert')
+    ),
     /**
      * Send the Apply (or Revert) the operator confirmed, bound to the Preview
      * shown: the server refuses it when the input changed since.
@@ -477,7 +492,7 @@ export function useDeploymentWorkspace(
         : sendApply(() => api.cellApply.apply(scope), 'Deployment Apply request failed.', 'apply');
     },
     cancelApplyConfirmation: () => openConfirmation(false),
-  }), [applyPreview, applyPreviewKind, documentUnavailableReason, mutationUnavailableReason, openConfirmation, preview, run, sendApply, showPreview, workspace]);
+  }), [applyPreview, applyPreviewKind, mutationUnavailableReason, openConfirmation, revertPreviewUnavailableReason, preview, run, sendApply, showPreview, workspace]);
 
   return {
     workspace,
@@ -492,6 +507,8 @@ export function useDeploymentWorkspace(
     /** The authoring operation in progress (busy label and tooltip), or null. */
     busyOperation: withApplyStep(authoring.operation, snapshot?.applyCommands),
     applyConfirmationOpen,
+    /** The last Apply or Revert command's end: `succeeded` when it is Applied. */
+    applyEnd,
     applyPreview,
     applyPreviewKind,
     mutationAvailable,

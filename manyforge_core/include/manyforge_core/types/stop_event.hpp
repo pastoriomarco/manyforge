@@ -58,7 +58,6 @@ enum class StopMode : std::uint8_t {
   kInterrupt,
   kHard,
   kSpringReturn,
-  kPreDispatchCancel,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(StopMode value) noexcept {
@@ -73,8 +72,6 @@ enum class StopMode : std::uint8_t {
       return "hard";
     case StopMode::kSpringReturn:
       return "spring_return";
-    case StopMode::kPreDispatchCancel:
-      return "pre_dispatch_cancel";
   }
   return {};
 }

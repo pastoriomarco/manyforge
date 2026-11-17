@@ -116,7 +116,6 @@ from manyforge_headless_api.cell_admission import (
     CellAdmissionClient,
     CellAdmissionError,
 )
-from manyforge_headless_api.manager import ManagerCommandClient
 from .cycle_journal import ProgramCycleJournal
 from .bbkey_publication import (
     FAULT_CODE as BBKEY_PUBLICATION_FAULT_CODE,
@@ -128,6 +127,7 @@ from .execution_transport import ProgramRunnerExecutionTransport
 from .heap_settle import freeze_heap, settle_heap
 from .interrupt_state_mirror import InterruptRuleStateMirror, RuleCatalog
 from .liveness import (
+    TICK_WORKER_FAULT_CODE,
     ProgramRunnerLivenessError,
     ProgramRunnerLivenessReceiver,
 )
@@ -215,6 +215,12 @@ class ProgramRunnerError(RuntimeError):
         self.code = code
         self.details = deepcopy(dict(details or {}))
         self.producer = producer
+
+
+def _scheduling_cause(error: Exception) -> str | None:
+    """The typed cause a tick-host refusal carries (OD-267), else None."""
+
+    return error.code if isinstance(error, ProgramSchedulingError) else None
 
 
 # OD-214: the codes that decide a command row's outcome (contract §0.1).
@@ -622,17 +628,9 @@ class ProgramRuntime:
             config.headless_url,
             timeout_seconds=config.headless_timeout_seconds,
         )
-        # Production launchers place the Runner liveness socket beside
-        # Manager's command socket in the explicitly supplied manager-run root.
-        # Reuse that proven root; never infer a Manager endpoint from cwd.
-        self._manager_commands = (
-            None
-            if config.manager_liveness_socket is None
-            else ManagerCommandClient(
-                config.manager_liveness_socket.parent,
-                timeout_seconds=min(config.headless_timeout_seconds, 5.0),
-            )
-        )
+        # A Runner under a Manager latches pose observations into Scene
+        # between nodes, through Headless (OD-294).
+        scene_latch = config.manager_liveness_socket is not None
         if execution_transport is None:
             if config.execution_run_root is None:
                 raise ValueError(
@@ -659,9 +657,6 @@ class ProgramRuntime:
         self._scene = HeadlessSceneProgramPort(
             self._headless,
             resolve_attach_active_tcp=getattr(execution_transport, "resolve_attach_active_tcp", None),
-            manager_command=(
-                None if self._manager_commands is None else self._manager_commands._exchange
-            ),
             program_node_evidence=self._program_node_admission_evidence,
             application_start_id=self.application_start_id,
         )
@@ -699,16 +694,14 @@ class ProgramRuntime:
             self._kernel,
             active_tcp_result=self._apply_active_tcp_result,
             scene_pose_source_latch=(
-                None
-                if self._manager_commands is None
-                else self._scene.latch_between_nodes
+                self._scene.latch_between_nodes if scene_latch else None
             ),
         )
         simulator_control_port = self._simulation_control
         if simulator_control_port is not None:
             simulator_control_port = SimulationResetPoseSourceTaskPort(
                 simulator_control_port,
-                self._scene if self._manager_commands is not None else None,
+                self._scene if scene_latch else None,
                 on_reset=lambda _identity: self._reset_active_tcp(),
             )
         self._assistant = (
@@ -792,6 +785,7 @@ class ProgramRuntime:
             maximum_workers=config.tick_workers,
             terminal_observer=self._record_terminal_snapshot,
             state_observer=self._observe_run_state,
+            failure_observer=self._fence_tick_worker_failure,
         )
         if self._journal is not None:
             self._journal.set_change_observer(self._notify_control_state_change)
@@ -1035,8 +1029,21 @@ class ProgramRuntime:
             self._liveness.require_current()
         except ProgramRunnerLivenessError as error:
             raise ProgramRunnerError(
-                "program_runner_manager_liveness_unavailable", str(error)
+                error.code or "program_runner_manager_liveness_unavailable",
+                str(error),
             ) from error
+
+    def _fence_tick_worker_failure(self, error: Exception) -> None:
+        """A failed tick worker (OD-267) fences the cell as a Runner fault
+        that never clears."""
+
+        if self._liveness is None:
+            return
+        text = unicodedata.normalize(
+            "NFC", f"{type(error).__name__}: {error}"
+        ).encode("utf-8")[:1_024].decode("utf-8", errors="ignore")
+        fault = {"code": TICK_WORKER_FAULT_CODE, "message": text, "details": {}}
+        self._liveness.latch_runner_fault(fault, self._digest(fault))
 
     def _current_cycle_status_projection(self) -> dict[str, Any]:
         """Project durable cycle facts without claiming current ownership.
@@ -1365,7 +1372,7 @@ class ProgramRuntime:
         if isinstance(error, ProgramRunnerError):
             return error
         code = (
-            "program_run_scheduling_failed"
+            error.code or "program_run_scheduling_failed"
             if isinstance(error, ProgramSchedulingError)
             else "program_run_admission_failed"
         )
@@ -2431,6 +2438,8 @@ class ProgramRuntime:
             ) from error
         except (ProgramRunOwnerError, ProgramSchedulingError) as error:
             cause = self._runner_error(error)
+            if _scheduling_cause(error) is not None:
+                raise cause from error
             raise ProgramRunnerError(
                 "program_cycle_reset_scene_preparation_failed",
                 str(cause),
@@ -2897,7 +2906,7 @@ class ProgramRuntime:
             # source's last value can be admitted while its fate is unknown.
             token = object()
             with self._bbkey_fence_lock:
-                if liveness is not None and liveness.latch_publisher_fault(
+                if liveness is not None and liveness.latch_runner_fault(
                     fault, reference
                 ):
                     self._bbkey_fence_reference = reference
@@ -2984,7 +2993,7 @@ class ProgramRuntime:
                 self._bbkey_fence_reference = None
                 released = (
                     self._liveness is not None
-                    and self._liveness.clear_publisher_fault(reference)
+                    and self._liveness.clear_runner_fault(reference)
                 )
         _LOGGER.warning(
             "BB key source %s (%d); fence %s; BB-gated motion waits "
@@ -4709,7 +4718,9 @@ class ProgramRuntime:
             ) as error:
                 if effect_completed:
                     unresolved(error)
-                code = getattr(error, "code", "program_runtime_control_rejected")
+                code = (
+                    getattr(error, "code", None) or "program_runtime_control_rejected"
+                )
                 reject(
                     ProgramRunnerError(
                         code, str(error), details=getattr(error, "details", None)
@@ -5842,7 +5853,11 @@ class ProgramRuntime:
                 # however, the combined outcome is unknown.
                 if owner_effect_accepted:
                     unresolved(error)
-                reject(ProgramRunnerError("program_run_scheduling_failed", str(error)))
+                reject(
+                    ProgramRunnerError(
+                        error.code or "program_run_scheduling_failed", str(error)
+                    )
+                )
             except ProgramRunOwnerOutcomeUnknownError as error:
                 unresolved(error)
             except ProgramRunOwnerRecoveryIncompleteError as error:
@@ -6901,6 +6916,9 @@ class ProgramRuntime:
                     "running",
                     "recovery_required",
                 }:
+                    # A run whose cleanup failed gets one more attempt with
+                    # each Reset, never on later ticks (OD-279).
+                    self._host.retry_cleanup(request.program_run_id)
                     terminal = self._host.stop_run(
                         request.program_run_id,
                         reason=PROGRAM_RESET_STOP_REASON,
@@ -6970,7 +6988,9 @@ class ProgramRuntime:
             ) as error:
                 reject(
                     ProgramRunnerError(
-                        "program_cycle_reconciliation_required", str(error)
+                        _scheduling_cause(error)
+                        or "program_cycle_reconciliation_required",
+                        str(error),
                     )
                 )
             except ProgramRunOwnerError as error:
@@ -7094,7 +7114,8 @@ class ProgramRuntime:
                 except (ProgramRunOwnerError, ProgramSchedulingError) as error:
                     reject(
                         ProgramRunnerError(
-                            "program_cycle_reset_failed",
+                            _scheduling_cause(error)
+                            or "program_cycle_reset_failed",
                             str(error),
                         )
                     )
@@ -7256,7 +7277,7 @@ class ProgramRuntime:
         self._interrupt_state_stop.set()
         follower = self._interrupt_state_follower
         if follower is not None:
-            follower.join(timeout=2.0)
+            follower.join()
         if self._liveness is not None:
             try:
                 self._liveness.close()
@@ -7269,14 +7290,14 @@ class ProgramRuntime:
                 self._host.shutdown()
             except Exception as error:
                 errors.append(error)
-        # Ticks have stopped and no request is served: write the last state, bounded.
+        # Ticks have stopped and no request is served: write the last state.
         if self._journal is not None:
             try:
                 self._journal.close()
             except Exception as error:
                 errors.append(error)
         if self._persistent_keys is not None:
-            self._persistent_keys.close(timeout_s=1.0)
+            self._persistent_keys.close()
         if self._assistant is not None:
             try:
                 self._assistant.close()

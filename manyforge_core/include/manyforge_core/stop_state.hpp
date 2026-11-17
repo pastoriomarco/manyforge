@@ -305,11 +305,10 @@ using StopComponentTable = std::vector<ControllableComponentId>;
 
 /// Kernel-owned "stop unconfirmed" marks over the component table (sized at
 /// Apply): set at P5 for the failed participant's component, cleared only by
-/// a state of that component observed after `since_ns` with activity idle.
+/// an idle state of that component arriving after the mark.
 struct StopUnconfirmedComponents final {
   std::shared_ptr<const StopComponentTable> table{};
   std::vector<std::uint8_t> marked{};
-  std::vector<std::int64_t> since_ns{};
 };
 
 // ---------------------------------------------------------------------------
@@ -373,8 +372,8 @@ struct StopRequest final {
   std::string_view source_label{};
   std::string_view reason{};
   StopAttribution attribution_rank{};
-  /// Kernel-internal physical mode (`kFault`, `kHard`, `kSpringReturn`,
-  /// `kPreDispatchCancel`); absent: chosen as today's acceptance chooses it.
+  /// Kernel-internal physical mode (`kFault`, `kHard`, `kSpringReturn`);
+  /// absent: chosen as today's acceptance chooses it.
   std::optional<StopMode> mode{};
   /// S7: the rule that holds the run.
   const InterruptPolicyId* held_by_rule{};

@@ -143,7 +143,11 @@ TEST(ManagerCellAdmissionReadinessReducer,
                         std::string_view predicate =
                             "program_runner_liveness_probe",
                         std::string_view message = "contact failed") {
-    return MakeProgramRunnerContactLoss(cycle, predicate, message);
+    return MakeProgramRunnerContactLoss(
+        cycle, predicate, message,
+        predicate == "program_runner_fault"
+            ? std::optional<std::string_view>("program_tick_worker_failed")
+            : std::nullopt);
   };
   EXPECT_FALSE(loss(std::nullopt));
   EXPECT_FALSE(loss(IdleCycleStatus()));
@@ -157,7 +161,7 @@ TEST(ManagerCellAdmissionReadinessReducer,
     for (const auto predicate :
          {"program_runner_liveness_probe", "program_runner_liveness_renewal",
           "program_runner_reconciliation_renewal",
-          "program_runner_publication_fault"}) {
+          "program_runner_fault"}) {
       const auto fact = loss(cycle, predicate);
       ASSERT_TRUE(fact);
       EXPECT_EQ(fact->established_cycle, cycle);
@@ -165,6 +169,7 @@ TEST(ManagerCellAdmissionReadinessReducer,
     }
   }
   EXPECT_FALSE(loss(cycle, "required_native_receiver_observable"));
+  EXPECT_FALSE(loss(cycle, "program_runner_publication_fault"));
   cycle.state = core::ProgramCycleStateDTO::kTerminalAwaitingReset;
   cycle.terminal_or_settlement_reference =
       core::ContentDigest("sha256:" + std::string(64U, 'a'));
@@ -179,23 +184,27 @@ TEST(ManagerCellAdmissionReadinessReducer,
   EXPECT_EQ(bounded->message.size(), 1024U);
 }
 
-TEST(ManagerProgramRunnerPublicationFault,
-     NullableTypedErrorIsClosedAndBounded) {
+TEST(ManagerProgramRunnerFault, NullableTypedErrorIsClosedAndBounded) {
   using content_identity::CanonicalValue;
   const auto fault = [](std::string message =
-                            "final key write was not acknowledged") {
+                            "final key write was not acknowledged",
+                        std::string code = "program_bbkey_publication_failed") {
     return CanonicalValue(CanonicalValue::Object{
-        {"code", CanonicalValue("program_bbkey_publication_failed")},
+        {"code", CanonicalValue(std::move(code))},
         {"message", CanonicalValue(std::move(message))},
         {"details", CanonicalValue(CanonicalValue::Object{})}});
   };
-  EXPECT_FALSE(
-      detail::DecodeProgramRunnerPublisherFault(CanonicalValue(nullptr)));
-  const auto decoded = detail::DecodeProgramRunnerPublisherFault(fault());
-  ASSERT_TRUE(decoded);
-  EXPECT_EQ(decoded->code, "program_bbkey_publication_failed");
-  EXPECT_EQ(decoded->message, "final key write was not acknowledged");
-  EXPECT_TRUE(decoded->details.empty());
+  EXPECT_FALSE(detail::DecodeProgramRunnerFault(CanonicalValue(nullptr)));
+  // OD-267: the closed set of Runner-fault codes.
+  for (const auto code :
+       {"program_bbkey_publication_failed", "program_tick_worker_failed"}) {
+    const auto decoded = detail::DecodeProgramRunnerFault(
+        fault("final key write was not acknowledged", code));
+    ASSERT_TRUE(decoded);
+    EXPECT_EQ(decoded->code, code);
+    EXPECT_EQ(decoded->message, "final key write was not acknowledged");
+    EXPECT_TRUE(decoded->details.empty());
+  }
   for (const auto &invalid :
        {CanonicalValue(false),
         CanonicalValue(CanonicalValue::Object{
@@ -204,6 +213,8 @@ TEST(ManagerProgramRunnerPublicationFault,
             {"code", CanonicalValue("program_runner_liveness_probe")},
             {"message", CanonicalValue("alive")},
             {"details", CanonicalValue(CanonicalValue::Object{})}}),
+        fault("failed", "program_run_scheduling_failed"),
+        fault("failed", "program_runner_fault"),
         CanonicalValue(CanonicalValue::Object{
             {"code", CanonicalValue("program_bbkey_publication_failed")},
             {"message", CanonicalValue("failed")},
@@ -212,7 +223,7 @@ TEST(ManagerProgramRunnerPublicationFault,
                  {"failure_predicate", CanonicalValue("caller.asserted")}})}}),
         fault(std::string(1025U, 'x'))}) {
     EXPECT_THROW(
-        static_cast<void>(detail::DecodeProgramRunnerPublisherFault(invalid)),
+        static_cast<void>(detail::DecodeProgramRunnerFault(invalid)),
         std::invalid_argument);
   }
   // Invalid UTF-8 never reaches the decoder: no CanonicalValue can hold it.
@@ -221,7 +232,7 @@ TEST(ManagerProgramRunnerPublicationFault,
                content_identity::CanonicalValueError);
 }
 
-TEST(ManagerProgramRunnerPublicationFault,
+TEST(ManagerProgramRunnerFault,
      RawStateIsClosedBeforeDigestAndFaultClassification) {
   EXPECT_EQ(detail::DecodeProgramRunnerManagerState("current"),
             core::ManagerLivenessStateDTO::kCurrent);
@@ -234,7 +245,7 @@ TEST(ManagerProgramRunnerPublicationFault,
   }
 }
 
-TEST(ManagerProgramRunnerPublicationFault,
+TEST(ManagerProgramRunnerFault,
      CurrentFencedPublisherIsTypedWithoutInventingRunnerDeath) {
   auto cycle = IdleCycleStatus();
   cycle.state = core::ProgramCycleStateDTO::kRunning;
@@ -247,48 +258,47 @@ TEST(ManagerProgramRunnerPublicationFault,
           {"message", content_identity::CanonicalValue("key ACK missing")},
           {"details", content_identity::CanonicalValue(
                           content_identity::CanonicalValue::Object{})}});
-  EXPECT_NO_THROW(detail::CheckProgramRunnerPublicationHealth(
+  EXPECT_NO_THROW(detail::CheckProgramRunnerHealth(
       content_identity::CanonicalValue(nullptr), cycle, false));
-  EXPECT_THROW(detail::CheckProgramRunnerPublicationHealth(
-                   fault, cycle, false),
+  EXPECT_THROW(detail::CheckProgramRunnerHealth(fault, cycle, false),
                std::invalid_argument);
   try {
-    detail::CheckProgramRunnerPublicationHealth(fault, cycle, true);
+    detail::CheckProgramRunnerHealth(fault, cycle, true);
     FAIL() << "publisher failure did not stop normal renewal progression";
-  } catch (const detail::ProgramRunnerPublisherFault &error) {
+  } catch (const detail::ProgramRunnerFault &error) {
     EXPECT_EQ(error.cycle(), cycle);
     EXPECT_EQ(std::string(error.what()),
               "program_bbkey_publication_failed: key ACK missing");
     const auto loss = MakeProgramRunnerContactLoss(
-        cycle, "program_runner_publication_fault", error.what());
+        cycle, "program_runner_fault", error.error().message,
+        error.error().code);
     ASSERT_TRUE(loss);
     EXPECT_EQ(loss->established_cycle, cycle);
-    EXPECT_EQ(loss->failure_predicate, "program_runner_publication_fault");
+    EXPECT_EQ(loss->failure_predicate, "program_runner_fault");
+    EXPECT_EQ(loss->message, "key ACK missing");
+    EXPECT_EQ(loss->fault_code, "program_bbkey_publication_failed");
+    EXPECT_FALSE(MakeProgramRunnerContactLoss(cycle, "program_runner_fault",
+                                              error.error().message));
   }
 }
 
-TEST(ManagerProgramRunnerPublicationFault,
-     RetainedCauseRemainsTypedAtUtf8Boundary) {
-  std::string message;
-  for (std::size_t i = 0; i < 512U; ++i)
-    message += "é";
-  const auto retained = detail::ProgramRunnerPublisherFaultMessage(
-      {"program_bbkey_publication_failed", message, {}});
-  EXPECT_LE(retained.size(), 1024U);
-  EXPECT_TRUE(content_identity::is_utf8_nfc(retained));
-  EXPECT_TRUE(retained.starts_with("program_bbkey_publication_failed: "));
+TEST(ManagerProgramRunnerFault, FencedTickWorkerFailureIsTyped) {
   auto cycle = IdleCycleStatus();
-  cycle.state = core::ProgramCycleStateDTO::kRunning;
-  cycle.program_run_id = core::ProgramRunNumber(107U);
-  cycle.cycle_claim_generation = core::CellAdmissionClaimGeneration(9U);
-  const auto loss = MakeProgramRunnerContactLoss(
-      cycle, "program_runner_publication_fault", retained);
-  ASSERT_TRUE(loss);
-  EXPECT_EQ(loss->failure_predicate, "program_runner_publication_fault");
-  EXPECT_EQ(loss->message, retained);
-  EXPECT_EQ(loss->established_cycle, cycle);
-  EXPECT_FALSE(MakeProgramRunnerContactLoss(
-      IdleCycleStatus(), "program_runner_publication_fault", retained));
+  const auto fault =
+      content_identity::CanonicalValue(content_identity::CanonicalValue::Object{
+          {"code",
+           content_identity::CanonicalValue("program_tick_worker_failed")},
+          {"message", content_identity::CanonicalValue("RuntimeError: boom")},
+          {"details", content_identity::CanonicalValue(
+                          content_identity::CanonicalValue::Object{})}});
+  try {
+    detail::CheckProgramRunnerHealth(fault, cycle, true);
+    FAIL() << "tick worker failure did not stop normal renewal progression";
+  } catch (const detail::ProgramRunnerFault &error) {
+    EXPECT_EQ(error.cycle(), cycle);
+    EXPECT_EQ(std::string(error.what()),
+              "program_tick_worker_failed: RuntimeError: boom");
+  }
 }
 
 TEST(ManagerCellAdmissionReadinessReducer,
@@ -322,6 +332,28 @@ TEST(ManagerCellAdmissionReadinessReducer,
   changed = after;
   changed.program_cycle_status_current = false;
   EXPECT_FALSE(IsSameProgramAdmissionProgress(before, changed));
+}
+
+// K-6: `starting` names no run until its claim; idle -> unannounced start ->
+// announced start or run is forward progress, never an admission outage.
+TEST(ManagerCellAdmissionReadinessReducer,
+     UnannouncedStartDoesNotInventAnAdmissionOutage) {
+  const auto idle = ReduceManagerCellAdmissionReadiness(
+      {true, IdleCycleStatus(), true, 3U, 3U, true, true, 0U, 0U, 0U});
+  auto unannounced = idle;
+  unannounced.program_cycle_status->state = core::ProgramCycleStateDTO::kStarting;
+  EXPECT_TRUE(IsSameProgramAdmissionProgress(idle, unannounced));
+  auto announced = unannounced;
+  announced.program_cycle_status->program_run_id = core::ProgramRunNumber(107U);
+  announced.program_cycle_status->cycle_claim_generation =
+      core::CellAdmissionClaimGeneration(9U);
+  EXPECT_TRUE(IsSameProgramAdmissionProgress(unannounced, announced));
+  announced.program_cycle_status->state = core::ProgramCycleStateDTO::kRunning;
+  EXPECT_TRUE(IsSameProgramAdmissionProgress(unannounced, announced));
+  auto claimed_unannounced = unannounced;
+  claimed_unannounced.program_cycle_status->cycle_claim_generation =
+      core::CellAdmissionClaimGeneration(9U);
+  EXPECT_FALSE(IsSameProgramAdmissionProgress(idle, claimed_unannounced));
 }
 
 TEST(ManagerCellAdmissionReadinessReducer,
@@ -2095,10 +2127,10 @@ TEST(ManagerDaemonProcess, OneStoreWriterDrainsBeforeTheStoresClose) {
            "/proc/" + std::to_string(manager.pid()) + "/task")) {
     ++threads;
   }
-  // The main thread, the Apply lane, the one store writer and the status
-  // stream's acceptor (OD-216; no status reader is connected and no liveness
-  // socket is configured here).
-  EXPECT_EQ(threads, 4U);
+  // The main thread, the command lane (OD-298), the Apply lane, the one store
+  // writer and the status stream's acceptor (OD-216; no status reader is
+  // connected and no liveness socket is configured here).
+  EXPECT_EQ(threads, 5U);
   const auto stopped = manager.Stop(SIGTERM);
   ASSERT_TRUE(WIFEXITED(stopped));
   EXPECT_EQ(WEXITSTATUS(stopped), 0);
@@ -3249,9 +3281,12 @@ TEST(ManagerDaemonProcess,
     ASSERT_EQ(::kill(manager.pid(), SIGCONT), 0);
     expect_host_kept("Manager stall");
   }
+  // OD-296 (a): the Runner exchange has no time limit. A stalled (alive)
+  // Runner only holds the Manager's Runner lane: no contact loss is
+  // declared, so readiness and admission stay as they were.
   ASSERT_EQ(::kill(runner.pid(), SIGSTOP), 0);
   std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-  EXPECT_FALSE(ReadAuthoringAdmissionProjection(directory).authoring_allowed);
+  EXPECT_TRUE(ReadAuthoringAdmissionProjection(directory).authoring_allowed);
   EXPECT_EQ(::kill(host, 0), 0);
   ASSERT_EQ(::kill(runner.pid(), SIGCONT), 0);
   expect_host_kept("Program Runner stall");
@@ -3260,14 +3295,15 @@ TEST(ManagerDaemonProcess,
 }
 
 TEST(ManagerDaemonProcess,
-     ALateExecutionHostIsFaultedStoppedOnceAndKeptUntilItExits) {
-  // OD-120 (4), OD-121 (4), (16): a host that answers late is not stopped.
-  // The timed-out exchange stays the channel's one pending exchange; the
-  // Manager faults the host unit (readiness closed) and requests one
-  // cell-wide Stop on the Kernel's control socket; the late reply is
-  // discarded when it comes. Only the management status reply is late: the
-  // test-boundary build of the real host holds that one reply until the test
-  // releases it, and every other host lane keeps serving.
+     ALateExecutionHostReplyIsLoggedNeverHaltsAndTheHostIsKept) {
+  // OD-290 (a): a slow host reply is information, never a trigger. The
+  // status exchange waits with no time limit and never holds the Manager's
+  // loop; an exchange still outstanding at the next observation tick is
+  // logged once, and once more when its reply arrives. Nothing is halted,
+  // the host unit is not faulted and the host is kept. Only the management
+  // status reply is slow: the test-boundary build of the real host holds
+  // that one reply until the test releases it, and every other host lane
+  // keeps serving.
   const auto fixture = ReadManagerApplyFixtureMetadata();
   DaemonDirectory directory;
   std::filesystem::copy(MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT,
@@ -3327,19 +3363,14 @@ TEST(ManagerDaemonProcess,
             {"limit", CanonicalValue(1.0)}})));
   };
   constexpr std::string_view event = "\"code\":\"execution_host_late_reply\"";
-  constexpr std::string_view settled = "execution host late reply settled";
+  constexpr std::string_view settled =
+      "\"code\":\"execution_host_late_reply_settled\"";
   constexpr std::string_view shutdown_requested =
       "execution host child shutdown requested";
   const auto run_root = directory.execution_run_root();
   const auto entered = run_root / "reply-late.entered";
 
-  // No Stop before the late host: the Halt it causes is this start's first.
-  const auto before = read_events();
-  EXPECT_NE(before.find("\"last_stop_event_id\":null"), std::string::npos)
-      << before;
-
-  // Select the hold; the host's next periodic status reply is held, the
-  // Manager's bounded status exchange times out and the host is late.
+  // Select the hold; the host's next periodic status reply is held.
   {
     const auto staged = run_root / "reply-late.mode.staged";
     std::ofstream(staged, std::ios::binary | std::ios::trunc) << "status";
@@ -3349,25 +3380,19 @@ TEST(ManagerDaemonProcess,
       << ReadStartupStderr(directory);
   ASSERT_TRUE(wait_until([&] { return count(event) != 0U; }))
       << ReadStartupStderr(directory);
-  // One event naming the status exchange, and its one Halt, which the
-  // Kernel's control socket accepted.
+  // One line naming the status exchange; no Halt.
   EXPECT_EQ(count(event), 1U) << ReadStartupStderr(directory);
   const auto late_line = line_of(event);
   EXPECT_NE(late_line.find("\"exchange\":\"status\""), std::string::npos)
       << late_line;
-  EXPECT_NE(late_line.find("\"halt\":\"accepted\""), std::string::npos)
-      << late_line;
-  // Late, not lost: the host is kept.
+  EXPECT_EQ(late_line.find("\"halt\""), std::string::npos) << late_line;
+  const auto events = read_events();
+  EXPECT_NE(events.find("\"last_stop_event_id\":null"), std::string::npos)
+      << events;
+  // The host is kept and its unit is not faulted: authoring stays open.
   EXPECT_EQ(::kill(host, 0), 0);
   EXPECT_EQ(ReadDirectChildren(manager.pid()), std::vector<pid_t>{host});
-  // While the reply is outstanding the host unit counts as faulted: the
-  // still-serving host reports authoring closed.
-  ASSERT_TRUE(wait_until([&] { return authoring_allowed() == false; }))
-      << ReadStartupStderr(directory);
-  // The Halt the late host caused is the Kernel's newest Stop event.
-  const auto after_halt = read_events();
-  EXPECT_NE(after_halt.find("\"last_stop_event_id\":1"), std::string::npos)
-      << after_halt;
+  EXPECT_EQ(authoring_allowed(), std::optional<bool>(true));
   // A Stop never uses the management channel: while the status reply is
   // still held, the Kernel's control socket accepts a Halt.
   const auto stop = SendCommand(
@@ -3391,26 +3416,20 @@ TEST(ManagerDaemonProcess,
   EXPECT_NE(stop.find("\"event_id\""), std::string::npos) << stop;
   EXPECT_EQ(count(settled), 0U) << ReadStartupStderr(directory);
 
-  // Release the held reply: it arrives late, is recognised and discarded,
-  // and the channel is usable again. The host was never stopped or replaced.
+  // Release the held reply: the next observation consumes it and the
+  // Manager logs that it arrived. The host was never stopped or replaced.
   std::ofstream(run_root / "reply-late.release") << "release\n";
   ASSERT_TRUE(wait_until([&] { return count(settled) != 0U; }))
       << ReadStartupStderr(directory);
-  EXPECT_NE(line_of(settled).find("exchange=status"), std::string::npos)
+  EXPECT_NE(line_of(settled).find("\"exchange\":\"status\""),
+            std::string::npos)
       << line_of(settled);
   EXPECT_EQ(::kill(host, 0), 0);
   EXPECT_EQ(ReadDirectChildren(manager.pid()), std::vector<pid_t>{host});
   EXPECT_EQ(count(shutdown_requested), 0U) << ReadStartupStderr(directory);
   EXPECT_EQ(count("stopping execution host child"), 0U)
       << ReadStartupStderr(directory);
-  // Exactly one event, so exactly one cell-wide Stop request, per episode.
   EXPECT_EQ(count(event), 1U) << ReadStartupStderr(directory);
-
-  // The host unit counted as faulted only while its reply was outstanding:
-  // once the reply arrived the fault stops counting by itself, with no Reset
-  // and no latch (maintainer 2026-11-13), so authoring opens again.
-  ASSERT_TRUE(wait_until([&] { return authoring_allowed() == true; }))
-      << ReadStartupStderr(directory);
 
   // The host is kept until the application ends: the orderly stop is the
   // first and only time the Manager asks it to shut down.
@@ -3777,6 +3796,11 @@ TEST(ManagerDaemonProcess,
                            installed_manager.string(),
                            program_runner.socket_path().string());
     manager.WaitReady(directory);
+    // OD-290 (a): the host's status is consumed at a later observation, so
+    // the Manager answers before its runtime has converged. The Apply is
+    // available once it has; the Manager publishes that before readiness,
+    // which the Kernel's authoring admission follows.
+    ASSERT_TRUE(WaitForAuthoringAdmission(directory).authoring_allowed);
     StatusSectionReader manager_source(directory, "manager");
     StatusSectionReader scene_source(directory, "logical_scene");
     StatusSectionReader scene_runtime_source(directory, "scene_runtime");

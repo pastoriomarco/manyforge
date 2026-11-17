@@ -11,6 +11,25 @@ formats; such changes are listed explicitly.
 
 ### Breaking changes
 
+- **Manager Apply records carry only the fence's component scope (OD-281).**
+  In `GET /api/manager/status` (and the Manager status stream's `manager`
+  section) `apply.records[].fence.scope` is now
+  `{"controllable_component_ids": [...]}`; its `domains`, `bindings` and
+  `resources` are gone (nothing read them; the Manager's Apply journal keeps
+  them), and `apply.records[].prepared_activation` is `null` on every record
+  except the one of the Apply that installed the active configuration (the
+  only one read; the Apply journal keeps every receipt, and
+  `GET /api/manager/apply/status` still reports each Apply's prepared
+  activation identity). The `manager` section stays within the status frame's
+  409,600 bytes, the limit a default host's socket allows. A cell whose
+  Manager data exceeds it cannot be loaded: Load, Apply, Revert and Program
+  activation are refused with `manager_status_section_oversized` ("Manager
+  data too large to send") instead of `manager_projection_unavailable`, and
+  the Manager tile is offline with that reason instead of
+  `source_freshness_unknown`. When the Manager is not answering (no new
+  status tick for 2 s), its tile is offline with `manager_status_unavailable`
+  instead of waiting with `source_stale` (OD-284); a reconnect to a Manager
+  whose loop is held no longer counts as an answer.
 - **Deployment Apply, Revert, Load and New answer when they are accepted.**
   `POST /api/deployment/apply`, `/api/deployment/revert`, `/api/scenario/load`
   and `/api/scenario/new` require a `request_key` and reply
@@ -354,7 +373,7 @@ formats; such changes are listed explicitly.
 
   New: `manyforge.application_processes.v1`, the list of processes the
   launcher hands the Manager (`current/application-processes.json`).
-- **History is `history.v7.sqlite3`.** History is kept in a directory, one
+- **History is `history.v8.sqlite3`.** History is kept in a directory, one
   file per event format, `history.v<N>.sqlite3`; Headless takes
   `--historian-directory` instead of `--historian-database-path`. Only the
   current format's file is opened; an older file (`history.sqlite3` or a
@@ -574,6 +593,136 @@ formats; such changes are listed explicitly.
 
 ### Changed
 
+- **Add and rename initial-scene objects.** In the Scene editor, **Add object**
+  (formerly *Add box*) asks for the object's name and shape (box, sphere,
+  cylinder, or a mesh from the approved files). **Rename** renames the selected
+  object and every reference to it — Program nodes, keys, contacts, viewer
+  settings and the Deployment's pose-source links and contact inputs — as one
+  Draft edit (`scene_draft_rename_object`); a name in use or not matching the
+  Program rule is refused.
+
+- **A slow execution host no longer halts motion; no Manager request to the
+  host has a time limit (OD-290).** The host's launch (was 10 s for the exec
+  and 10 s for its readiness), its periodic status, the Apply fence, cell
+  admission, Host Apply (was the sum of the components' budgets), projection
+  requests and the Manager's liveness reports (were 750 ms) now wait for the
+  host's answer; the host's own replies wait for the Manager likewise. A wait
+  ends early only when the host exits (`execution_host_exited`) or ManyForge
+  stops (`application_stopping`). The Manager's loop never waits on the
+  host: it reads each status answer at a later tick. A slow answer sends no
+  Halt and no longer makes the host count as faulted (the cell stays ready).
+  While one request waits, other requests to the host answer
+  `execution_host_late` at once with `effect: none` (its text is now
+  "Execution host reply outstanding"; details `exchange`, `waited_ms`,
+  `effect`; `bound_ms` is gone), except that a request is sent behind an
+  unanswered status and answered once the host replies.
+  `execution_host_late_reply` is now an information line
+  (`{"code":"execution_host_late_reply","exchange":…,"waited_ms":…}`, without
+  `bound_ms` and `halt`) for a request still unanswered at the Manager's next
+  tick, followed by `execution_host_late_reply_settled` when it is answered.
+  The Halt with source `manager.execution_host_late` and its Composer text
+  "Halted: the execution host was late." are gone. The host logs its
+  start-up steps (`execution host start-up: …`). This replaces the late-host
+  handling of the entries below.
+- **An old component status report no longer closes the cell; a slow
+  execution host no longer pauses the Program Runner's liveness (OD-295).**
+  The Manager's 5 s limit on the age of a runtime unit's status report is
+  gone: a unit converges on its first report and its identity checks, and an
+  old report by itself makes nothing non-converged (Program start, the next
+  node, manual moves and Apply are no longer refused for it). The Manager's
+  liveness work now runs on two lanes: one renews the Program Runner on its
+  heartbeat whatever the execution host does, the other renews the host's
+  receivers and publishes liveness and cell readiness. Planned maintenance
+  and Apply settlement post their request to the second lane and pick up its
+  answer on the Apply's next step, which that lane requests when it is done;
+  the Apply lane no longer waits on another lane (an Apply's admission close
+  shows as a pending step, and a successful Apply's release may show as
+  pending settlement for a moment). A newly started Program Runner is
+  reconciled in a second renewal round, right after the host's receivers
+  are. Each runtime unit's report age (`report_age_ns`, optional) is
+  published in the Manager section's `runtime.observed_units` as information
+  only.
+- **A slow Program Runner no longer stops the run (OD-296).** The Manager's
+  liveness exchange with the Program Runner has no time limit any more (was
+  250 ms for the connection and 250 ms for the answer; the Runner's own
+  receive limit of 200 ms is gone too). It ends on the Runner's answer, on the
+  Runner refusing or closing the connection, or on ManyForge stopping; a slow
+  Runner holds only the Manager's Runner lane. A Runner that is really gone
+  still stops the run (`runner_loss` Stop), and the loss now carries the
+  typed code `program_runner_contact_lost` (new) in the Runner-loss alarm's
+  `fault_code`, which the operator panel shows as the cause; a Runner fault
+  keeps its own code. An exchange still outstanding at the Manager's next
+  status tick is published as information (below).
+- **Commands to the Manager wait for their answer; the Manager's loop only
+  ticks and supervises (OD-298).** Manager commands (scene commits, pose
+  latches, Apply acceptance, every other command) and the periodic
+  reconcile run on a command lane, in the same order as before; the main
+  loop keeps the status tick, signals, supervision of the application's
+  processes and the stop sequence. "Manager not answering" (status tick
+  silent for 2 s) now means only that loop: a command held by a slow
+  execution host no longer turns the Manager tile offline. The Headless
+  API's command wait (was 5 s for the whole command) and the execution
+  host's before-planning latch (was 5 s) now limit only the connection: a
+  connected command waits for its answer, ended by the reply, by the
+  Manager closing the connection (`manager_command_unavailable`, also for a
+  connection closed without an answer, which was
+  `manager_command_response_invalid`) or by shutdown. The Manager's own
+  250 ms limits on reading a command and sending its answer are gone; those
+  waits end when the client closes the connection or ManyForge stops.
+  `shutdown_runtime` is answered after the stop sequence, as before. New
+  optional field `runtime.outstanding_exchanges` in the Manager section (and
+  so in the REST runtime snapshot and Manager status projection): each
+  exchange the Manager is waiting for that was still outstanding at its
+  previous status tick, as `{peer: execution_host | program_runner,
+  channel, exchange, since_ns}` (`since_ns` on the clock of
+  `observed_at_ns`); information only, nothing acts on it.
+- **Scene editor orientation is roll, pitch and yaw.** An initial-scene object's
+  orientation is always shown and edited as roll, pitch and yaw in degrees; an
+  object stored as a quaternion is shown converted and saved as `rpy_deg` when
+  edited (same orientation).
+
+- **Projection preparation, process inspection and projection rebuild have
+  no time limit (OD-270).** They wait for the execution host's answer
+  instead of 10 s; the wait ends early only when the host exits (new code
+  `execution_host_exited`; ManyForge stops the application) or ManyForge
+  stops (new code `application_stopping`). While a process inspection or a
+  rebuild runs, other requests to the host answer
+  `runtime_unit_launch_in_progress` (phase `inspecting` or `rebuilding`) at
+  once instead of waiting. The Manager logs each projection preparation's
+  start and duration. A stop no longer waits behind such an exchange, and a
+  second stop request again ends a host that does not stop.
+- **A new Apply request no longer waits while an Apply step runs (OD-270).**
+  It is refused `apply_busy` with `effect: none`; the replay of an accepted
+  Apply is still answered.
+- **Apply and Revert keep the live Scene and can reload the initial scene.**
+  A Deployment Apply or Revert now keeps the live Scene like a Program Apply
+  or Revert (the Composer sends `scene_initialization: "preserve"` instead of
+  `"initialize"`); only Load and New initialize it. The Apply and Revert
+  confirmations offer **Reload initial scene** (off by default): on every
+  Deployment Apply and Revert, and on a Program Apply or Revert when the
+  Program's initial scene changes. Once the Apply or Revert is Applied, one
+  Reset with that option follows (objects back to their start poses,
+  persistent keys to their initial values); its refusal or failure is shown
+  as the Reset's own error and the Apply stays. Without it, the live cell
+  keeps its current scene. A Deployment Apply that
+  removes a component carrying an object fails as before
+  (`configuration_preservation_failed`): reload the initial scene first, then
+  apply. Objects placed relative to a moved component keep their old cell
+  pose until a reload. Revert, like Apply, now Resets a finished, stopped or
+  held run first ("Reset run and Revert", in the Program and Deployment
+  confirmations). The Composer's Reset-and-Apply
+  context (`POST /api/authoring/reset-apply-contexts`) takes an optional
+  `action` (`apply`, the default, or `revert`).
+- **The UR5 example Scenarios `mock_ur5_pick_and_place`,
+  `mock_ur5_pick_and_place_minimal` and `mock_ur5_vision_pose_pick` use the
+  UR5e with a Robotiq 2F-85** (`robotiq_2f_85` mounted on the arm's
+  `flange`), like `mock_ur5_vision_bin_pick`, instead of RoboPlan's UR5 model
+  with its box gripper. Their Programs close and open the Robotiq instead of
+  setting a simulated `gripper_closed` value, and attach the part to its
+  `tcp` (the mount, the UR5e `tool0`); the pick targets of
+  `mock_ur5_pick_and_place` sit 0.14 m above the part so the open fingers
+  straddle it. `mock_ur5_pick_and_place_minimal` loads again: its `table`
+  now sits in the cell frame, in front of the arm, at the arm's base height.
 - **A component fault raises the alarm "Component fault" (OD-247, OD-248).**
   Each component in fault (simulators excepted) now has one alarm,
   `manyforge.runtime.component_fault` (priority high), whose headline is the
@@ -1207,6 +1356,15 @@ formats; such changes are listed explicitly.
 
 ### Removed
 
+- **The `ur5_roboplan` model (`universal_robots.ur5_roboplan`, OD-283).** No
+  example used it; UR5 cells use `universal_robots.ur5e` with a gripper
+  component. What only it used went too: the installed-package model-resource
+  fallback in the deployment build, the `remove_unused_xacro_namespace` URDF
+  projection, the CI preparation of `.docker/roboplan` for generated checks
+  and Composer tests, and its old behavior test fixture.
+- **The Apply time bound (OD-270).** An Apply is no longer ended
+  `apply_timed_out` after the sum of its components' budgets; an Apply step
+  ends only on its own events, and the code `apply_timed_out` is gone.
 - **The public Program Stop.** `POST /api/program/runs/{program_run_id}/stop`
   and the control command `program_stop` are gone. The Program runner's own
   Stop routes (`/stop`, `/motion-stop`, `/full-stop` and
@@ -1310,6 +1468,45 @@ formats; such changes are listed explicitly.
 
 ### Fixed
 
+- **A stop request ends every wait on the execution host at once.** A
+  SIGTERM or SIGINT to the Manager (`compose-dev.sh stop`, `docker stop`)
+  while the host was still starting, or while a Scene commit or an Apply's
+  acceptance waited on a busy host, was not seen until the host answered, so
+  the orderly stop (planned Halt, process stop, records written) did not
+  start and Docker killed the Manager after its grace period. Such a wait now
+  ends at once with `application_stopping`: a running Manager then runs its
+  stop sequence (a second stop request forces it as before); a Manager still
+  starting ends its start (the host's launch is ended, the listed processes
+  are stopped, records are written) and exits with status 70.
+- **A read right after a Scene commit shows the commit again (OD-293).**
+  Since the Manager publishes its state on its status stream (OD-216), the
+  Headless answered a Scene commit before its own view of the logical scene
+  had received the new revision, so a read just after the reply could still
+  show the previous scene (Load reported a false "Initial scene may be
+  incomplete"). `POST /api/scene/transactions` now answers a successful
+  commit once that view shows the committed revision, a newer one or another
+  active bundle, graph or scene; when the Headless loses its status
+  connection to the Manager, or shuts down, the success reply is returned at
+  once. A Manager that only missed its status tick (a long commit holds its
+  loop) does not end the wait. No time limit applies to this wait.
+- **A read right after a Program's pose-observation latch shows it too
+  (OD-294).** The Program runner's latch of pose observations into the scene
+  between nodes (before a motion, before pick planning, after a
+  `simulation.reset` node) went straight to the Manager, so a read just after
+  it could still show the previous scene. It now goes through the Headless
+  (`GET /api/scene/runtime-owner`, `POST /api/scene/runtime-latch`), which
+  answers a latch that committed observations once its view of the logical
+  scene shows the latch's revision, under the same rules as a Scene commit;
+  a latch that committed none is answered at once. Its refusals keep their
+  typed codes. The runner no longer opens the Manager's command socket.
+
+- **A failed run cleanup no longer leaves Reset `stopping` forever (OD-279).**
+  When releasing an ended run's resources failed, the run's tick retried it
+  every tick (a flood of `program_ticks_late`) and Reset waited without end.
+  The cleanup is now retried only by a Reset: the Reset ends failed with
+  `program_cycle_recovery_required` (`details.cause_code`
+  `program_run_cleanup_failed`), the cycle needs recovery, and each further
+  Reset retries the cleanup once; Reset completes once it succeeds.
 - **A `hold` rule that trips while a move is being planned holds that move
   (OD-263).** The rule's Stop now also covers the held run's motion in its
   scope that is not sent yet, as the operator's Stop does: the move is
@@ -1329,6 +1526,29 @@ formats; such changes are listed explicitly.
   `program_terminal_scope_not_settled`. Its node now holds as for any motion
   the Stop prevented, and Resume makes a fresh attempt. A newcomer whose
   effect is uncertain (`motion_takeover_cleanup_unsettled`) still fails.
+- **A Stop during a motion take-over keeps the run held also after the new
+  motion started (OD-269).** A take-over newcomer that the Stop ended after it
+  was sent (effect settled) still failed the run with
+  `program_terminal_scope_not_settled`. The Kernel now keeps its remaining
+  motion, as for any stopped motion, and its node holds; Resume plans only
+  the rest (a relative move is not applied again). When the rest cannot be
+  captured (a Cartesian path stopped before the hand-over, or a send whose
+  outcome is not settled), Resume's attempt is refused as Resume of such a
+  stopped motion is, with `operation_recovery_invalid`
+  (`cartesian_resume_progress_unavailable` or
+  `motion_continuation_dispatch_unsettled`).
+  Until the old motion's Stop ends, such a newcomer is shown stopping, not
+  intervention required, so the run waits instead of failing; it is
+  intervention required (`motion_takeover_cleanup_unsettled`) only when that
+  Stop ends without settling (OD-272).
+- **A Stop during a motion take-over is accepted at once (OD-175).** The
+  Kernel recorded a take-over in one step that held the robot's engine and
+  participant locks under the lock a Stop needs, so a Stop arriving then
+  waited for the whole record. The take-over now checks everything that can
+  fail first, records the change under the Kernel lock alone, then completes
+  the engine's swap outside it. A new motion that the controller aborts or
+  cancels during the hand-over ends as that motion's own Failed or Stopped
+  result; the robot is held either way.
 - **The Deployment workspace read no longer fails while an Apply publishes
   (OD-265).** `GET /api/deployment/workspace` reads the Manager publication
   once. When that read was not ready it read the execution-ready Scenario as
@@ -1340,6 +1560,41 @@ formats; such changes are listed explicitly.
   it at exit; when that ran out, Python ended the thread inside rclpy's wait
   and the process aborted. It now stops the executor and waits for the thread
   to end, with no time limit.
+- **The Program runner no longer drops records when it stops on a slow
+  machine (OD-266).** Its shutdown waited at most 2 s for the event
+  follower, 2 s for each of the two liveness threads, 5 s for the tick
+  worker, 1 s for the Program-cycle journal and 1 s for the stored values;
+  when one ran out, the newest journal records or stored values were not
+  written, and a late tick worker failed the shutdown with "Program tick
+  worker did not stop". Each step now waits until its thread has ended, with
+  no time limit, in the same order. The journal's shutdown line now reads
+  `Program-cycle journal records not written in this start: queue full N,
+  failed N` (the `not drained` count is gone).
+- **Apply offers "Reset run and Apply" again while a run is stopped or held
+  (AUD-4).** The run's authoring lock was checked before the Reset-and-Apply
+  chain, so Apply stayed disabled with "Program execution is active" and the
+  operator had to Reset by hand. The run's lock no longer blocks Apply; the
+  chain states its own reasons (for example while robots still move). The
+  tooltip now reads "A Program run is active; editing resumes after Reset or
+  when the run ends", and a manual motion's says "Editing resumes when it
+  ends" (it also covers Deployment edits).
+- **A failed Program tick worker is logged, named and fences the cell
+  (OD-267).** When a tick worker failed, the Program Runner stopped ticking
+  Programs for good but logged nothing, every later New, Execute or Reset was
+  refused with a generic code (some saying "try Reset again"), and the cell
+  stayed admitted. Now the failure is logged once as
+  `manyforge_fault code=program_tick_worker_failed` with its traceback; the
+  refusals carry the new code `program_tick_worker_failed` ("Program Runner
+  failed": stop ManyForge, start it again and report the logs); and it is a
+  Runner fault that fences the cell like a failed BB key publication, but
+  never clears until ManyForge restarts, so a running Program is halted. The
+  Runner-loss failure predicate `program_runner_publication_fault` is renamed
+  `program_runner_fault` and covers both causes; the Kernel's readiness
+  decoder now accepts it (it accepted only the three liveness predicates, so a
+  Runner fault during a run, the BB publication one included, never reached
+  the Kernel and the run was not halted). The alarm "Program Runner
+  lost during a run" is now "Program Runner lost or failed during a run" and
+  shows its cause message as its headline.
 - **The Manager's start-up warning names its cause (OD-261).** Instead of
   "socket is not an exact same-user socket" for every case, it says
   "socket does not exist yet (the process has not started or is not ready)"

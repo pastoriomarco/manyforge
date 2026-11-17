@@ -101,22 +101,18 @@ void ResourceAddressedExecutionKernel::rebuild_stop_component_table_locked() {
   table->erase(std::unique(table->begin(), table->end()), table->end());
   // Keep the marks of components that stay in the cell.
   std::vector<std::uint8_t> marked(table->size(), 0U);
-  std::vector<std::int64_t> since(table->size(), 0);
   if (stop_unconfirmed_.table) {
     for (std::size_t old_index = 0U; old_index < stop_unconfirmed_.table->size(); ++old_index) {
       if (!stop_unconfirmed_.marked[old_index]) continue;
       const auto& id = (*stop_unconfirmed_.table)[old_index];
       const auto found = std::lower_bound(table->begin(), table->end(), id);
       if (found == table->end() || *found != id) continue;
-      const auto new_index = static_cast<std::size_t>(found - table->begin());
-      marked[new_index] = 1U;
-      since[new_index] = stop_unconfirmed_.since_ns[old_index];
+      marked[static_cast<std::size_t>(found - table->begin())] = 1U;
     }
   }
   std::shared_ptr<const StopComponentTable> shared = std::move(table);
   stop_unconfirmed_.table = shared;
   stop_unconfirmed_.marked = std::move(marked);
-  stop_unconfirmed_.since_ns = std::move(since);
   stop_component_count_.store(shared->size(), std::memory_order_release);
   stop_component_table_ = std::move(shared);
 }
@@ -197,8 +193,14 @@ void ResourceAddressedExecutionKernel::refresh_cell_latch_locked(const bool arm)
 
 bool ResourceAddressedExecutionKernel::cell_latched_locked() const {
   // The same causes `get_cell_latch` lists: a member offline through its
-  // owner counts as its owner.
-  return cell_latch_armed_ && !cell_latch_causes(latch_component_states_locked()).empty();
+  // owner counts as its owner. The stop-unconfirmed override needs a copy
+  // only after a failed Stop marked a component; otherwise the stored states
+  // are read as they are (a causes list is built only when latched).
+  if (!cell_latch_armed_) return false;
+  const bool marked = std::any_of(stop_unconfirmed_.marked.begin(), stop_unconfirmed_.marked.end(),
+                                  [](const std::uint8_t mark) { return mark != 0U; });
+  if (marked) return !cell_latch_causes(latch_component_states_locked()).empty();
+  return !cell_latch_causes(component_states_).empty();
 }
 
 std::optional<ErrorDTO> ResourceAddressedExecutionKernel::cell_latch_refusal_locked() const {

@@ -82,7 +82,6 @@ from .models import (
     MockIoInputRequest,
     ManagerDeploymentCandidatePreviewRequest,
     AuthoringMutationContext,
-    AuthoringMutationRecoveryRequest,
     AuthoringMutationSettlementRequest,
     ProgramModelAttemptRequest,
     ProgramDiagnosticRequest,
@@ -113,6 +112,7 @@ from .models import (
     MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES,
     decode_runtime_scale_selector_query,
     SceneResourcePoseQuery,
+    SceneRuntimeLatchRequest,
     SceneTransactionRequest,
     StopIntentRequest,
 )
@@ -580,13 +580,21 @@ def create_app(
         )
         # OD-216: the Manager's state from its status stream, followed for the
         # application's lifetime; each change or liveness change wakes the
-        # control state and the viewer pose streams.
+        # control state, the scene commits waiting for their publication
+        # (OD-293) and the viewer pose streams.
+        scene_commits_wake = service.manager_status_changed
+
+        def manager_control_changed() -> None:
+            control_state_source.notify_cold()
+            scene_commits_wake()
+
         manager_status_follower = ManagerStatusFollower(
             core,
             config.manager_run_root,
             silence_seconds=config.freshness_milliseconds / 1_000.0,
-            on_control_change=lambda: control_state_source.notify_cold(),
+            on_control_change=manager_control_changed,
             on_viewer_change=manager_status_changes.notify,
+            on_disconnect=service.manager_status_disconnected,
         )
         viewer_pose_sources = core.viewer_pose_sources
         event_pump = ExecutionEventPump(
@@ -1190,17 +1198,6 @@ def create_app(
         admission = service.settle_authoring_mutation(admitted(body))
         control_state_source.notify_cold()
         return {"admission": admission}
-
-    @app.post("/api/program/authoring-transactions/recovery-receipt")
-    def recover_authoring_transaction(
-        body: AuthoringMutationRecoveryRequest,
-    ) -> dict[str, Any]:
-        start_identity(body.application_start_id)
-        receipt = service.recover_authoring_mutation(
-            body
-        )
-        control_state_source.notify_cold()
-        return {"recovery_receipt": receipt}
 
     @app.get("/api/manager/status")
     def manager_status() -> dict[str, Any]:
@@ -2226,6 +2223,17 @@ def create_app(
         body: SceneResourcePoseQuery,
     ) -> dict[str, Any]:
         return service.scene_resource_poses(body)
+
+    @app.get("/api/scene/runtime-owner")
+    def scene_runtime_owner() -> dict[str, Any]:
+        return service.scene_runtime_owner()
+
+    @app.post("/api/scene/runtime-latch")
+    def scene_runtime_latch(body: SceneRuntimeLatchRequest) -> dict[str, Any]:
+        """The Program Runner's between-nodes latch (OD-294); answered once
+        the logical scene shows what it committed, like a Scene commit."""
+
+        return service.scene_runtime_latch_between_nodes(body)
 
     @app.post("/api/scene/transactions")
     def scene_commit(

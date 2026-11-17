@@ -199,8 +199,11 @@ bool KernelCellAdmissionOwner::MatchingStartingProgramCycleLocked(
     return false;
   }
   const auto& cycle = *readiness_.program_cycle_status;
-  return cycle.state == ProgramCycleStateDTO::kStarting && cycle.program_run_id.has_value() &&
-         intent.owner_transaction_id == CellAdmissionOwnerTransactionId(*cycle.program_run_id) &&
+  // K-6: `starting` names its run only after this claim; until then the run
+  // number is the cycle generation.
+  const auto run_id = cycle.program_run_id.value_or(ProgramRunNumber(cycle.cycle_generation));
+  return cycle.state == ProgramCycleStateDTO::kStarting &&
+         intent.owner_transaction_id == CellAdmissionOwnerTransactionId(run_id) &&
          !cycle.cycle_claim_generation.has_value() &&
          !cycle.terminal_or_settlement_reference.has_value();
 }

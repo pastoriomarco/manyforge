@@ -3,6 +3,7 @@
 #include <manyforge_core/execution_event_change_signal.hpp>
 
 #include <algorithm>
+#include <array>
 #include <utility>
 
 namespace manyforge::roboplan_backend::host_detail {
@@ -190,17 +191,24 @@ PlanningJobTable::Read(const std::string_view job_id) const {
 core::Result<PlanningJobSnapshot>
 PlanningJobTable::Cancel(const std::string_view job_id) {
   const NotifyStreamAfterUnlock notify;
-  std::lock_guard lock(mutex_);
-  auto *job = FindLocked(job_id);
-  if (job == nullptr) return core::Result<PlanningJobSnapshot>::Err(UnknownJob(job_id));
-  if (!Finished(job->snapshot.state)) {
-    job->cancel_requested = true;
-    job->stop.request_stop();
-    // Still waiting: the lane skips it (Begin), so it is cancelled now.
-    if (job->snapshot.state == PlanningJobState::kAccepted)
-      job->snapshot.state = PlanningJobState::kCancelled;
+  // request_stop runs the job's stop callbacks, so it is called after unlock.
+  std::optional<std::stop_source> stop;
+  PlanningJobSnapshot snapshot;
+  {
+    std::lock_guard lock(mutex_);
+    auto *job = FindLocked(job_id);
+    if (job == nullptr) return core::Result<PlanningJobSnapshot>::Err(UnknownJob(job_id));
+    if (!Finished(job->snapshot.state)) {
+      job->cancel_requested = true;
+      stop = job->stop;
+      // Still waiting: the lane skips it (Begin), so it is cancelled now.
+      if (job->snapshot.state == PlanningJobState::kAccepted)
+        job->snapshot.state = PlanningJobState::kCancelled;
+    }
+    snapshot = job->snapshot;
   }
-  return core::Result<PlanningJobSnapshot>::Ok(job->snapshot);
+  if (stop) stop->request_stop();
+  return core::Result<PlanningJobSnapshot>::Ok(std::move(snapshot));
 }
 
 core::Result<void> PlanningJobTable::Release(const std::string_view job_id) {
@@ -225,16 +233,22 @@ core::Result<void> PlanningJobTable::Release(const std::string_view job_id) {
 void PlanningJobTable::Preempt(
     const std::optional<core::ProgramRunNumber> ended_run) noexcept {
   const NotifyStreamAfterUnlock notify;
-  std::lock_guard lock(mutex_);
-  for (auto &job : jobs_) {
-    if (!Finished(job.snapshot.state)) job.stop.request_stop();
-    if (ended_run && job.program_run_id == ended_run) job.released = true;
+  // request_stop runs the jobs' stop callbacks, so it is called after unlock.
+  std::array<std::optional<std::stop_source>, kMaximumPlanningJobs> stops;
+  std::size_t stop_count = 0U;
+  {
+    std::lock_guard lock(mutex_);
+    for (auto &job : jobs_) {
+      if (!Finished(job.snapshot.state)) stops[stop_count++] = job.stop;
+      if (ended_run && job.program_run_id == ended_run) job.released = true;
+    }
+    // A finished job of the ended run goes now (a lane entry left by a job
+    // cancelled while it waited finds no row and is skipped).
+    std::erase_if(jobs_, [](const Job &job) {
+      return job.released && Finished(job.snapshot.state);
+    });
   }
-  // A finished job of the ended run goes now (a lane entry left by a job
-  // cancelled while it waited finds no row and is skipped).
-  std::erase_if(jobs_, [](const Job &job) {
-    return job.released && Finished(job.snapshot.state);
-  });
+  for (std::size_t index = 0U; index < stop_count; ++index) stops[index]->request_stop();
 }
 
 } // namespace manyforge::roboplan_backend::host_detail

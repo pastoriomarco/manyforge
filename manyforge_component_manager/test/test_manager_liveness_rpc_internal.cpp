@@ -163,14 +163,6 @@ TEST(ManagerLivenessBatchPolicy,
               RuntimeUnitId("program-runner.external"));
   }
 
-  const auto started = ManagerLivenessBatchDeadline::Clock::time_point(
-      std::chrono::nanoseconds(100));
-  const ManagerLivenessBatchDeadline deadline(started,
-                                              std::chrono::nanoseconds(750));
-  const std::array receiver_deadlines{deadline.value(), deadline.value()};
-  EXPECT_EQ(receiver_deadlines[0], started + std::chrono::nanoseconds(750));
-  EXPECT_EQ(receiver_deadlines[1], receiver_deadlines[0]);
-
 }
 
 TEST(ManagerLivenessRpcInternal,

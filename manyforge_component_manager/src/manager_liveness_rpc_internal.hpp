@@ -193,20 +193,6 @@ class ChildOwnedManagerLivenessReceiver final {
   std::unique_ptr<manyforge::core::ManagerLivenessReceiver> receiver_;
 };
 
-class ManagerLivenessBatchDeadline final {
- public:
-  using Clock = std::chrono::steady_clock;
-
-  ManagerLivenessBatchDeadline(Clock::time_point started_at,
-                               Clock::duration budget)
-      : deadline_(started_at + budget) {}
-
-  [[nodiscard]] Clock::time_point value() const noexcept { return deadline_; }
-
- private:
-  Clock::time_point deadline_;
-};
-
 [[nodiscard]] bool IsManagerLivenessRpcPacket(std::string_view bytes) noexcept;
 [[nodiscard]] std::string EncodeManagerLivenessRpcRequest(
     const ManagerLivenessTransportRequestDTO& request);

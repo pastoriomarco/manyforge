@@ -44,6 +44,8 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #if defined(__unix__)
@@ -1190,6 +1192,10 @@ class MockExecution : public IExecutionBackend {
     return ExecutionProgressHazardClaimResult::kGenerationMismatch;
   }
 
+  bool close_execution_progress_hazard(std::uint64_t /*execution_generation*/) noexcept override {
+    return false;
+  }
+
   void publish_observed_state(std::int64_t timestamp_ns, const std::vector<double>& positions,
                               const std::vector<double>& velocities) {
     static const std::vector<std::string> joints{"j1", "j2"};
@@ -1447,6 +1453,11 @@ class ControlledExecution : public IExecutionBackend {
     return execution_progress_publication_
                ? execution_progress_publication_->claim_hazard_authority(execution_generation)
                : ExecutionProgressHazardClaimResult::kGenerationMismatch;
+  }
+
+  bool close_execution_progress_hazard(std::uint64_t execution_generation) noexcept override {
+    return execution_progress_publication_ &&
+           execution_progress_publication_->close_hazard_authority(execution_generation);
   }
 
   void publish_observed_state(std::int64_t timestamp_ns, const std::vector<double>& positions,
@@ -14129,13 +14140,10 @@ TEST_F(PortParticipantKernelTest, RejectedReplacementIsNoEffectAndCannotBeAdopte
   const auto observed = participant->ObserveReplacement(source.value(), 2U);
   ASSERT_TRUE(observed.ok());
   EXPECT_EQ(observed.value().phase, PreparedMotionReplacementPhaseDTO::kNoEffect);
-  int commits = 0;
-  const PreparedMotionReplacementCommitDTO commit{&commits, [](void* context) noexcept {
-                                                    ++*static_cast<int*>(context);
-                                                    return Result<void>::Ok();
-                                                  }};
-  EXPECT_FALSE(participant->AdoptReplacement(source.value(), 2U, commit).ok());
-  EXPECT_EQ(commits, 0);
+  // OD-175: "prove" refuses, so the Kernel never decides and "apply" never runs.
+  const auto proven = participant->ProveReplacement(source.value(), 2U);
+  ASSERT_FALSE(proven.ok());
+  EXPECT_EQ(proven.error().details.at("reason"), "motion_replacement_not_ready");
   EXPECT_TRUE(participant->RetirePreparedExecution(2U).ok());
   // Candidate cleanup preserves the source preparation and original handle.
   EXPECT_EQ(participant->Dispatch(product, old)
@@ -14424,8 +14432,9 @@ TEST_F(PortParticipantKernelTest,
     Sample(0.1, 0.3 + 0.5 * factor * 0.03, 0.5, factor);
     ASSERT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
               PreparedMotionReplacementPhaseDTO::kReadyToCommit);
-    ASSERT_TRUE(participant->AdoptReplacement(
-        source.value(), 2U, {nullptr, [](void*) noexcept { return Result<void>::Ok(); }}).ok());
+    // OD-175: "prove", then (after the Kernel's "decide") "apply".
+    ASSERT_TRUE(participant->ProveReplacement(source.value(), 2U).ok());
+    participant->ApplyReplacement(2U);
     ASSERT_TRUE(participant->RetirePreparedExecution(1U).ok());
     const auto source2 = participant->CaptureReplacementSource(
         2U, sent.handle->execution_generation, next, successor.prepared_contract_digest);
@@ -14967,10 +14976,8 @@ TEST_F(PortParticipantKernelTest, PreparationHoldDefersSliderThroughAdoptedConne
   Sample(0.1, 0.3, 0.5);
   ASSERT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
             PreparedMotionReplacementPhaseDTO::kReadyToCommit);
-  ASSERT_TRUE(participant
-                  ->AdoptReplacement(source.value(), 2U,
-                                     {nullptr, [](void*) noexcept { return Result<void>::Ok(); }})
-                  .ok());
+  ASSERT_TRUE(participant->ProveReplacement(source.value(), 2U).ok());
+  participant->ApplyReplacement(2U);
   pclock.advance(10'000'000);
   Sample(0.4, 0.45, 0.5);
   EXPECT_FALSE(sent.handle->wait_for_completion(0));
@@ -14984,6 +14991,87 @@ TEST_F(PortParticipantKernelTest, PreparationHoldDefersSliderThroughAdoptedConne
   const auto scales = Calls<testing::FakeExecutionPort::SetScaleCall>();
   ASSERT_GT(scales.size(), count);
   EXPECT_NEAR(scales.back().value, 0.98, 1e-12);
+}
+
+// OD-175 design test 15 (the exits a participant sees; vendor TCP speed
+// limit, design §9): from the preparation hold to the adopted connector no
+// physical scale is written. A "prove" that refuses and a "prove" with no
+// "apply" (the Kernel's "decide" refused) both leave the hold standing;
+// "apply" turns it into the pin, which holds until the connector ends.
+TEST_F(PortParticipantKernelTest, ProveWithoutApplyKeepsTheHoldAndApplyPinsIt) {
+  const auto product = DirectBackendProduct();
+  participant->set_runtime_velocity_scale(1.0);
+  Sample(0.0, 0.0, 0.0);
+  const ControllerGoalId old{ControllerGoalId{OperationNumber(934U), 1U, 1U}};
+  const auto handle = participant->Dispatch(product, old);
+  pclock.advance(10'000'000);
+  Executing(old);
+  Sample(0.5, 0.25, 0.5);
+  ASSERT_FALSE(handle.wait_for_completion(0));
+  const auto source = participant->CaptureReplacementSource(1U, handle.execution_generation, old,
+                                                            product.prepared_contract_digest);
+  ASSERT_TRUE(source.ok());
+  ASSERT_TRUE(participant
+                  ->BeginReplacementPreparationScaleHold(source.value(), 2U,
+                                                         pclock.now() + 1'000'000'000, {})
+                  .ok());
+  const auto count = Calls<testing::FakeExecutionPort::SetScaleCall>().size();
+  participant->set_runtime_velocity_scale(0.5);
+  pclock.advance(10'000'000);
+  pscheduler.advance_to(pclock.now());
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
+  auto next_product = DirectSuccessor(product, source.value());
+  auto& motion = std::get<PreparedMotionExecutionDTO>(next_product.payload);
+  const auto& original = std::get<PreparedMotionExecutionDTO>(product.payload).trajectory;
+  const auto point = [&](double time) {
+    const auto sample = sample_trajectory(original, 0.5 + time);
+    if (!sample.ok()) throw std::logic_error(sample.error().message);
+    return TrajectoryWaypointDTO{time, sample.value().positions_rad,
+                                 sample.value().velocities_rad_s,
+                                 sample.value().accelerations_rad_s2};
+  };
+  motion.plan_request.moving_replacement->source_prefix_trajectory.waypoints = {point(0.0),
+                                                                                point(1.0)};
+  motion.trajectory.waypoints = {point(0.0), point(1.0), point(1.25), point(3.5)};
+  motion.trajectory.runtime_scale_bounds->max_rate_per_s = 2.0;
+  ASSERT_EQ(participant->PrepareReplacement(next_product, 2U, source.value()).state,
+            PrepareParticipantResultStateDTO::kPrepared);
+  const ControllerGoalId next{ControllerGoalId{OperationNumber(935U), 1U, 2U}};
+  const auto sent = participant->DispatchReplacement(source.value(), 2U, next_product, next,
+                                                     pclock.now() + 1'000'000'000);
+  ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched)
+      << (sent.command.error ? sent.command.error->message : "");
+  ASSERT_TRUE(sent.handle);
+  port->FinishGoal(old, ExecutionGoalResult::kPreemptedBy, next, pclock.now());
+  pclock.advance(30'000'000);
+  Executing(next);
+  Sample(0.1, 0.3, 0.5);
+  ASSERT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
+            PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+  // Exit 1: "prove" refuses (it names another candidate). The hold stands.
+  EXPECT_FALSE(participant->ProveReplacement(source.value(), 3U).ok());
+  pscheduler.advance_to(pclock.now());
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
+  // Exit 2: "prove" passes and no "apply" follows yet (as when "decide"
+  // refuses). The hold stands.
+  ASSERT_TRUE(participant->ProveReplacement(source.value(), 2U).ok());
+  pscheduler.advance_to(pclock.now());
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
+  // "Apply": the hold becomes the pin; still no physical write until the
+  // adopted connector ends.
+  participant->ApplyReplacement(2U);
+  pclock.advance(10'000'000);
+  Sample(0.4, 0.45, 0.5);
+  EXPECT_FALSE(sent.handle->wait_for_completion(0));
+  pscheduler.advance_to(pclock.now());
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
+  pclock.advance(10'000'000);
+  Sample(1.4, 0.95, 0.5);
+  EXPECT_FALSE(sent.handle->wait_for_completion(0));
+  pclock.advance(10'000'000);
+  pscheduler.advance_to(pclock.now());
+  // After the connector the deferred value is applied.
+  EXPECT_GT(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
 }
 
 TEST_F(PortParticipantKernelTest, ScheduledMovingReplacementKeepsExistingEvolvingRampAdmission) {
@@ -15216,16 +15304,8 @@ TEST_F(PortParticipantKernelTest,
       const auto before = participant->execution_progress_publication()->acquire();
       EXPECT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
                 PreparedMotionReplacementPhaseDTO::kPossiblySent);
-      int early_commits = 0;
-      EXPECT_FALSE(participant
-                       ->AdoptReplacement(source.value(), 2U,
-                                          {&early_commits,
-                                           [](void* count) noexcept {
-                                             ++*static_cast<int*>(count);
-                                             return Result<void>::Ok();
-                                           }})
-                       .ok());
-      EXPECT_EQ(early_commits, 0);
+      // OD-175: "prove" refuses; "apply" is never reached.
+      EXPECT_FALSE(participant->ProveReplacement(source.value(), 2U).ok());
       EXPECT_EQ(participant->execution_progress_publication()->acquire().sequence,
                 before.sequence);
       pclock.advance(50'000'000);
@@ -15246,20 +15326,76 @@ TEST_F(PortParticipantKernelTest,
       EXPECT_GE(*observed.value().recognition_delay_ns, 49'999'999);
       EXPECT_FALSE(observed.value().error);
     }
-    int commits = 0;
-    EXPECT_EQ(participant
-                  ->AdoptReplacement(source.value(), 2U,
-                                     {&commits, [](void* count) noexcept {
-                                        ++*static_cast<int*>(count);
-                                        return Result<void>::Ok();
-                                      }})
-                  .ok(),
-              late);
-    EXPECT_EQ(commits, late ? 1 : 0);
+    // OD-175: "apply" follows only a "prove" that passed.
+    const bool proven = participant->ProveReplacement(source.value(), 2U).ok();
+    EXPECT_EQ(proven, late);
+    if (proven) participant->ApplyReplacement(2U);
     EXPECT_FALSE(participant->RetirePreparedExecution(2U).ok());
     const auto replay = participant->DispatchReplacement(source.value(), 2U, successor, next, 0);
     EXPECT_EQ(replay.submitted_at_ns, sent.submitted_at_ns);
     EXPECT_EQ(Calls<testing::FakeExecutionPort::ReplaceCall>().size(), 1U);
+    Reset();
+  }
+}
+
+// OD-175 decision (1) (a), design §6.1 and test 9 (rows 23, 23b): the
+// controller ends the new goal between "prove" and "apply". It is adopted
+// anyway and ends as its own result: Failed (controller_result_failed) for an
+// abort, Stopped for a cancel, Completed for a finish (as before OD-175).
+TEST_F(PortParticipantKernelTest, SuccessorEndingBetweenProveAndApplyEndsAsItsOwnResult) {
+  struct Case {
+    ExecutionGoalResult result;
+    ExecutionState state;
+    bool controller_failure;
+  };
+  for (const auto& item : {Case{ExecutionGoalResult::kAbortedPathTolerance,
+                                ExecutionState::kFailed, true},
+                           Case{ExecutionGoalResult::kCanceled, ExecutionState::kStopped, false},
+                           Case{ExecutionGoalResult::kSucceeded, ExecutionState::kCompleted,
+                                false}}) {
+    SCOPED_TRACE(static_cast<int>(item.result));
+    const auto product = DirectBackendProduct();
+    Sample(0.0, 0.0, 0.0);
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(957U), 1U, 1U}};
+    const auto handle = participant->Dispatch(product, old);
+    pclock.advance(10'000'000);
+    Executing(old);
+    Sample(0.5, 0.25, 0.5);
+    EXPECT_FALSE(handle.wait_for_completion(0));
+    const auto source = participant->CaptureReplacementSource(
+        1U, handle.execution_generation, old, product.prepared_contract_digest);
+    ASSERT_TRUE(source.ok());
+    const auto successor = DirectSuccessor(product, source.value());
+    ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
+              PrepareParticipantResultStateDTO::kPrepared);
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(958U), 1U, 2U}};
+    const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next,
+                                                       pclock.now() + 1'000'000'000);
+    ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
+    ASSERT_TRUE(sent.handle);
+    port->FinishGoal(old, ExecutionGoalResult::kPreemptedBy, next, pclock.now());
+    pclock.advance(30'000'000);
+    Executing(next);
+    Sample(0.1, 0.3, 0.5);
+    ASSERT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
+              PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+    ASSERT_TRUE(participant->ProveReplacement(source.value(), 2U).ok());
+    // Between "prove" and "apply": the controller ends the new goal.
+    port->FinishGoal(next, item.result, std::nullopt, pclock.now());
+    participant->ApplyReplacement(2U);
+    // The old motion ended as preempted (adopted, not stopped by a fallback).
+    EXPECT_TRUE(handle.wait_for_completion(0));
+    EXPECT_EQ(handle.get_snapshot().state, ExecutionState::kStopped);
+    EXPECT_TRUE(sent.handle->wait_for_completion(0));
+    const auto ended = sent.handle->get_snapshot();
+    EXPECT_EQ(ended.state, item.state);
+    if (item.controller_failure) {
+      ASSERT_TRUE(ended.error);
+      EXPECT_EQ(ended.error->details.at("reason"), "controller_result_failed");
+    } else {
+      EXPECT_FALSE(ended.error);
+    }
+    EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
     Reset();
   }
 }
@@ -15300,10 +15436,8 @@ TEST_F(PortParticipantKernelTest, RecognitionUsesOneOriginAndRetirementRestoresO
   Sample(0.95, 0.735, 0.5);
   ASSERT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
             PreparedMotionReplacementPhaseDTO::kReadyToCommit);
-  ASSERT_TRUE(participant
-                  ->AdoptReplacement(source.value(), 2U,
-                                     {nullptr, [](void*) noexcept { return Result<void>::Ok(); }})
-                  .ok());
+  ASSERT_TRUE(participant->ProveReplacement(source.value(), 2U).ok());
+  participant->ApplyReplacement(2U);
   port->FinishGoal(next, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
   EXPECT_TRUE(sent.handle->wait_for_completion(0));
   EXPECT_EQ(sent.handle->get_snapshot().state, ExecutionState::kCompleted);
@@ -15378,14 +15512,9 @@ TEST_F(PortParticipantKernelTest, TimelyAdoptionPreservesRampDeliveryClockAndQua
             source.value().progress.trajectory_time_ns);
   EXPECT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
             PreparedMotionReplacementPhaseDTO::kReadyToCommit);
-  int commits = 0;
-  const auto adopted =
-      participant->AdoptReplacement(source.value(), 2U, {&commits, [](void* context) noexcept {
-                                                           ++*static_cast<int*>(context);
-                                                           return Result<void>::Ok();
-                                                         }});
-  ASSERT_TRUE(adopted.ok()) << adopted.error().message;
-  EXPECT_EQ(commits, 1);
+  const auto proven = participant->ProveReplacement(source.value(), 2U);
+  ASSERT_TRUE(proven.ok()) << proven.error().message;
+  participant->ApplyReplacement(2U);
   const auto progress = participant->execution_progress_publication()->acquire();
   EXPECT_EQ(progress.execution_generation, sent.handle->execution_generation);
   // The wire starts later than captured canonical zero; retain its actual
@@ -15878,7 +16007,9 @@ class KernelReplacementCommitExecution : public ReplacementObservationExecution 
   TrajectoryDTO candidate_curve;
   std::uint64_t next_generation{};
   int replacements{};
+  int proofs{};
   int adoptions{};
+  std::function<void()> apply_hook;
 
   ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& product,
                            const ControllerGoalId& goal) override {
@@ -15925,24 +16056,52 @@ class KernelReplacementCommitExecution : public ReplacementObservationExecution 
         {PreparedMotionReplacementPhaseDTO::kReadyToCommit, {}, {}, 1, {}});
   }
 
-  Result<void> AdoptReplacement(const PreparedMotionReplacementSourceDTO&, std::uint64_t,
-                                PreparedMotionReplacementCommitDTO commit) override {
+  // OD-175 D1: "prove" refuses nothing here (the real participant's proof is
+  // tested separately); "apply" makes the swaps.
+  Result<void> ProveReplacement(const PreparedMotionReplacementSourceDTO&,
+                                std::uint64_t) override {
+    ++proofs;
+    return Result<void>::Ok();
+  }
+
+  void ApplyReplacement(std::uint64_t) override {
     ++adoptions;
-    auto accepted = commit.owner_commit(commit.context);
-    if (!accepted.ok()) return accepted;
+    // Runs while the engine's "apply" holds its scale lock (OD-175 D1).
+    if (apply_hook) apply_hook();
     std::swap(last_execute_trajectory, candidate_curve);
     auto* progress = const_cast<ExecutionProgressPublication*>(execution_progress_publication());
     (void)progress->publish(next_generation, 0, 0, 0);
-    return Result<void>::Ok();
   }
 };
 
+// OD-175 design test 16: "apply" has no refusal (void) and is not noexcept,
+// so a defect that throws leaves the Kernel's close step to run during
+// unwinding instead of ending the process.
+TEST(ExecutionKernelHandoverShapeTest, ApplyHasNoRefusal) {
+  static_assert(std::is_same_v<decltype(std::declval<ExecutionKernel&>()
+                                            .ApplyPreparedMotionReplacement(1U)),
+                               void>);
+  static_assert(!noexcept(std::declval<ExecutionKernel&>().ApplyPreparedMotionReplacement(1U)));
+  static_assert(std::is_same_v<decltype(std::declval<IExecutionBackend&>().ApplyReplacement(1U)),
+                               void>);
+  static_assert(!noexcept(std::declval<IExecutionBackend&>().ApplyReplacement(1U)));
+  SUCCEED();
+}
+
 TEST_F(ExecutionKernelTest,
        MovingReplacementAdoptionPreservesWorkerAndRejectsPriorHazardOrOwnerRefusal) {
-  // 0: accepted handover; 1: a hazard already won before the owner CAS;
-  // 2: the existing owner CAS rejects. Each is deterministically ordered by
-  // the synchronous worker-ready event, with no clock sleeps.
-  for (const int mode : {0, 1, 2, 3}) {
+  // 0: accepted handover; 1: a hazard already won before the owner decision
+  // (the decision's close fails, OD-175 D2); 2: the owner decision refuses.
+  // Each is deterministically ordered by the synchronous worker-ready event,
+  // with no clock sleeps. The subscriber plays the Kernel's part: "prove" on
+  // the worker, "decide", then "apply" (OD-175 D1). 4: as 0, after "prove"
+  // was first called from a plain thread while the worker is parked: it
+  // refuses with "not now" and changes nothing (OD-175 §3.2, design test 14).
+  // 5: teardown (detach) starts while the worker is parked at its safe
+  // point: "prove" refuses on the detach flag and nothing is handed over
+  // (row 37). 6: teardown starts after "decide": "apply" still completes and
+  // detach's join waits for it (row 38, the engine's part).
+  for (const int mode : {0, 1, 2, 3, 4, 5, 6}) {
     SCOPED_TRACE(mode);
     planner.on_plan = {};
     context.on_validate = {};
@@ -15998,6 +16157,7 @@ TEST_F(ExecutionKernelTest,
     std::condition_variable result_changed;
     std::optional<Result<bool>> result;
     std::atomic<int> owner_commits{0};
+    std::future<Result<void>> detached;
     const auto subscription = owner.subscribe_events([&](const KernelEvent& event) {
       if (event.type != KernelEventType::kParticipantPrepared ||
           event.execution_id == started.value())
@@ -16019,19 +16179,61 @@ TEST_F(ExecutionKernelTest,
         return;
       if (mode == 1)
         (void)backend.claim_execution_progress_hazard(source.value().execution_generation);
-      struct CommitState {
-        std::atomic<int>& calls;
-        int mode;
-      } state{owner_commits, mode};
-      const PreparedMotionReplacementCommitDTO commit{
-          &state, [](void* opaque) noexcept -> Result<void> {
-            auto& value = *static_cast<CommitState*>(opaque);
-            ++value.calls;
-            return value.mode == 2 ? Result<void>::Err(ErrorCode::kStaleGeneration)
-                                   : Result<void>::Ok();
-          }};
-      auto committed =
-          owner.CommitPreparedMotionReplacement(event.execution_id, source.value(), commit);
+      if (mode == 4) {
+        auto off_worker = std::async(std::launch::async, [&] {
+          return owner.ProvePreparedMotionReplacement(event.execution_id, source.value());
+        });
+        const auto refused = off_worker.get();
+        EXPECT_TRUE(refused.ok());
+        if (refused.ok()) { EXPECT_FALSE(refused.value()); }
+        EXPECT_EQ(backend.proofs, 0);
+      }
+      if (mode == 5 || mode == 6) {
+        const auto start_detach = [&] {
+          detached = std::async(std::launch::async, [&] {
+            return owner.detach(std::chrono::steady_clock::time_point::max());
+          });
+          // Detach sets its flag before it joins this worker; "prove" reads
+          // that flag first, so it is the observable for "teardown started".
+          auto proven = owner.ProvePreparedMotionReplacement(event.execution_id, source.value());
+          while (proven.ok()) {
+            std::this_thread::yield();
+            proven = owner.ProvePreparedMotionReplacement(event.execution_id, source.value());
+          }
+          return proven;
+        };
+        Result<bool> outcome = Result<bool>::Ok(false);
+        if (mode == 5) {
+          outcome = start_detach();
+        } else {
+          outcome = owner.ProvePreparedMotionReplacement(event.execution_id, source.value());
+          if (outcome.ok() && outcome.value() && owner.CloseMotionReplacementHazard(source.value())) {
+            ++owner_commits;
+            const auto refused = start_detach();
+            EXPECT_EQ(refused.error().details.at("reason"), "scheduler_not_ready");
+            owner.ApplyPreparedMotionReplacement(event.execution_id);
+          }
+        }
+        {
+          std::lock_guard lock(result_mutex);
+          if (!result) result = std::move(outcome);
+        }
+        result_changed.notify_all();
+        return;
+      }
+      auto committed = owner.ProvePreparedMotionReplacement(event.execution_id, source.value());
+      if (committed.ok() && committed.value()) {
+        ++owner_commits;
+        if (mode == 2)
+          committed = Result<bool>::Err(ErrorCode::kStaleGeneration);
+        else if (!owner.CloseMotionReplacementHazard(source.value()))
+          committed = Result<bool>::Err(ErrorDTO{kErrorExecutionRejected,
+                                                 "Replacement adoption was refused",
+                                                 {{"reason",
+                                                   "motion_replacement_source_hazard_authority"}}});
+        else
+          owner.ApplyPreparedMotionReplacement(event.execution_id);
+      }
       {
         std::lock_guard lock(result_mutex);
         if (!result) result = std::move(committed);
@@ -16066,18 +16268,43 @@ TEST_F(ExecutionKernelTest,
       std::unique_lock lock(result_mutex);
       ASSERT_TRUE(result_changed.wait_for(lock, std::chrono::seconds(2),
                                           [&]() { return result.has_value(); }));
-      ASSERT_TRUE((mode != 0 && mode != 3) || result->ok())
+      ASSERT_TRUE((mode != 0 && mode != 3 && mode != 4 && mode != 6) || result->ok())
           << (result->ok() ? "" : result->error().message);
-      EXPECT_EQ(result->ok(), mode == 0 || mode == 3);
+      EXPECT_EQ(result->ok(), mode == 0 || mode == 3 || mode == 4 || mode == 6);
+    }
+    if (mode == 5 || mode == 6) {
+      ASSERT_TRUE(detached.valid());
+      EXPECT_TRUE(detached.get().ok());
+      if (mode == 5) {
+        ASSERT_FALSE(result->ok());
+        EXPECT_EQ(result->error().details.at("reason"), "scheduler_not_ready");
+        EXPECT_EQ(owner_commits.load(), 0);
+        EXPECT_EQ(backend.adoptions, 0);
+      } else {
+        ASSERT_TRUE(result->ok());
+        EXPECT_TRUE(result->value());
+        EXPECT_EQ(owner_commits.load(), 1);
+        EXPECT_EQ(backend.adoptions, 1);
+        EXPECT_EQ(owner.get_status().execution_id, candidate.value());
+      }
+      continue;
     }
     EXPECT_EQ(backend.replacements, 1);
-    EXPECT_EQ(owner_commits.load(), mode == 1 ? 0 : 1);
-    EXPECT_EQ(backend.adoptions, mode == 1 ? 0 : 1);
+    if (mode == 1) {
+      // The claim that won first is refused at the decision's close, with the
+      // reason the engine's proof gave for it before OD-175.
+      ASSERT_FALSE(result->ok());
+      EXPECT_EQ(result->error().details.at("reason"),
+                "motion_replacement_source_hazard_authority");
+    }
+    EXPECT_EQ(owner_commits.load(), 1);
+    EXPECT_EQ(backend.proofs, 1);
+    EXPECT_EQ(backend.adoptions, (mode == 0 || mode == 3 || mode == 4) ? 1 : 0);
     EXPECT_EQ(owner.get_status().execution_id,
-              (mode == 0 || mode == 3) ? candidate.value() : started.value());
+              (mode == 0 || mode == 3 || mode == 4) ? candidate.value() : started.value());
     owner.unsubscribe_events(subscription);
     unsubscribe.active = false;
-    if (mode == 0)
+    if (mode == 0 || mode == 4)
       backend.complete();
     else if (mode == 3)
       clock.advance(60'000'000);
@@ -16271,9 +16498,14 @@ class ScaleReplacementCommitExecution final : public KernelReplacementCommitExec
     if (!held) applied = scale;
   }
   RuntimeScaleMechanismStatusDTO runtime_velocity_scale_status() const override {
+    // One read held at a test point: `set_runtime_scale` makes it under its
+    // submission lock (OD-175 design test 12).
+    if (hold_status_once.exchange(false)) status_hook();
     std::lock_guard lock(scale_mutex);
     return {true, true, target, applied, 0.0, acknowledgement, 1, {}};
   }
+  mutable std::atomic<bool> hold_status_once{false};
+  std::function<void()> status_hook;
   void release_hold() {
     std::lock_guard lock(scale_mutex);
     held = false;
@@ -16327,9 +16559,14 @@ ResolvedPreparedMotionExecutionRequestDTO scale_replacement_request(const std::s
 
 TEST_F(ExecutionKernelTest,
        MovingReplacementTransfersLatestScaleWithoutSetScaleAndFencesPriorCommands) {
-  // Same target, target changed during freeze, refused owner CAS, old
-  // submission still in its backend call. All ordering uses worker callbacks and explicit gates.
-  for (const int mode : {0, 1, 2, 3}) {
+  // Same target, target changed during freeze, refused owner decision, old
+  // submission still in its backend call (adoption takes no submission lock,
+  // OD-175 D1). 4: a speed acceptance holds the submission lock across its
+  // backend read while the hand-over proves, decides and applies; "apply"
+  // completes without it, and the late acceptance gets the binding mismatch
+  // (design test 12, rows 14 and 26). All ordering uses worker callbacks and
+  // explicit gates.
+  for (const int mode : {0, 1, 2, 3, 4}) {
     SCOPED_TRACE(mode);
     planner.on_plan = {};
     context.on_validate = {};
@@ -16385,7 +16622,7 @@ TEST_F(ExecutionKernelTest,
     std::optional<Result<bool>> result;
     std::future<Result<ResolvedRuntimeScaleStatusDTO>> simultaneous_status;
     std::barrier query_started(2);
-    const double latest = mode == 0 ? 0.5 : 0.8;
+    const double latest = (mode == 0 || mode == 4) ? 0.5 : 0.8;
     const auto subscription = owner.subscribe_events([&](const KernelEvent& event) {
       if (event.type != KernelEventType::kParticipantPrepared || event.execution_id == started.value())
         return;
@@ -16407,45 +16644,54 @@ TEST_F(ExecutionKernelTest,
       std::mutex gate_mutex;
       std::condition_variable gate_changed;
       bool entered = false, released = false;
-      if (mode == 3) {
-        backend.scale_hook = [&] {
+      if (mode == 3 || mode == 4) {
+        const auto hold = [&] {
           std::unique_lock lock(gate_mutex);
           entered = true;
           gate_changed.notify_all();
           gate_changed.wait(lock, [&] { return released; });
         };
+        if (mode == 3) {
+          backend.scale_hook = hold;
+        } else {
+          auto late = update;
+          late.requested_scale = 0.8;
+          update = late;
+          backend.status_hook = hold;
+          backend.hold_status_once.store(true);
+        }
         in_flight = std::async(std::launch::async, [&] { return owner.set_runtime_scale(update); });
         std::unique_lock lock(gate_mutex);
         gate_changed.wait(lock, [&] { return entered; });
       } else {
         EXPECT_TRUE(owner.set_runtime_scale(update).ok());
       }
-      struct Context {
-        int mode;
-        ExecutionKernel* owner;
-        const ResolvedRuntimeScaleCommandDTO* command;
-        std::future<Result<ResolvedRuntimeScaleStatusDTO>>* observed;
-        std::barrier<>* query_started;
-      } state{mode, &owner, &successor_command, &simultaneous_status, &query_started};
-      const PreparedMotionReplacementCommitDTO callback{
-          &state, [](void* opaque) noexcept -> Result<void> {
-            auto& state = *static_cast<Context*>(opaque);
-            if (state.mode == 2) return Result<void>::Err(ErrorCode::kStaleGeneration);
-            // Rendezvous before the query: adoption still owns the scale
-            // mutex, so this exact successor read must remain pending.
-            *state.observed = std::async(
-                std::launch::async, [owner = state.owner, command = state.command,
-                                    started = state.query_started] {
-                  started->arrive_and_wait();
-                  return owner->runtime_scale_status(command->operation_id,
-                                                       command->control_binding_id);
-                });
-            state.query_started->arrive_and_wait();
-            EXPECT_EQ(state.observed->wait_for(std::chrono::milliseconds(20)),
+      // The subscriber plays the Kernel's part (OD-175 D1): "prove" on the
+      // worker, "decide" (mode 2 refuses there), then "apply".
+      auto adopted = owner.ProvePreparedMotionReplacement(event.execution_id, source.value());
+      if (adopted.ok() && adopted.value()) {
+        if (mode == 2) {
+          adopted = Result<bool>::Err(ErrorCode::kStaleGeneration);
+        } else if (!owner.CloseMotionReplacementHazard(source.value())) {
+          adopted = Result<bool>::Err(ErrorCode::kStaleGeneration);
+        } else {
+          backend.apply_hook = [&] {
+            // Rendezvous before the query: "apply" owns the scale mutex while
+            // the participant swaps, so this exact successor read must
+            // remain pending.
+            simultaneous_status = std::async(std::launch::async, [&] {
+              query_started.arrive_and_wait();
+              return owner.runtime_scale_status(successor_command.operation_id,
+                                                successor_command.control_binding_id);
+            });
+            query_started.arrive_and_wait();
+            EXPECT_EQ(simultaneous_status.wait_for(std::chrono::milliseconds(20)),
                       std::future_status::timeout);
-            return Result<void>::Ok();
-          }};
-      auto adopted = owner.CommitPreparedMotionReplacement(event.execution_id, source.value(), callback);
+          };
+          owner.ApplyPreparedMotionReplacement(event.execution_id);
+          backend.apply_hook = {};
+        }
+      }
       if (mode == 3) {
         // The operator value is accepted (recorded as the latest) before its
         // backend call, which runs outside the submission lock and is ordered
@@ -16461,6 +16707,18 @@ TEST_F(ExecutionKernelTest,
         gate_changed.notify_all();
         EXPECT_TRUE(in_flight.get().ok());
         backend.scale_hook = {};
+      } else if (mode == 4) {
+        // "Apply" did not wait for the held acceptance.
+        EXPECT_TRUE(adopted.ok());
+        if (adopted.ok()) { EXPECT_TRUE(adopted.value()); }
+        {
+          std::lock_guard lock(gate_mutex);
+          released = true;
+        }
+        gate_changed.notify_all();
+        const auto late = in_flight.get();
+        ASSERT_FALSE(late.ok());
+        EXPECT_EQ(late.error().details.at("reason"), "resolved_runtime_scale_binding_mismatch");
       }
       {
         std::lock_guard lock(result_mutex);
@@ -16481,7 +16739,9 @@ TEST_F(ExecutionKernelTest,
       EXPECT_EQ(result->ok(), mode != 2);
       if (result->ok()) { EXPECT_TRUE(result->value()); }
     }
-    EXPECT_EQ(backend.scale_calls.load(), 2);  // initial and operator, never adoption
+    // Initial and operator, never adoption; mode 4's late operator value was
+    // refused before its backend call.
+    EXPECT_EQ(backend.scale_calls.load(), mode == 4 ? 1 : 2);
     const auto& active = mode == 2 ? original_command : successor_command;
     auto status = owner.runtime_scale_status(active.operation_id, active.control_binding_id);
     ASSERT_TRUE(status.ok()) << status.error().message;

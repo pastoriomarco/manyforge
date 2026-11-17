@@ -1224,7 +1224,7 @@ def test_deployment_preview_and_apply_are_orchestrated_server_side(
         ("prepare", "lite6_robot"),
     ]
     assert submitted[-1]["expected_admission_generation"] == 3
-    assert submitted[-1]["scene_initialization"] == "initialize"
+    assert submitted[-1]["scene_initialization"] == "preserve"
     assert ended["end"]["outcome"] == "succeeded"
     # A succeeded Apply-level row keeps its component rows (OD-214 contract
     # §3.1): the panel's success text is built from them.
@@ -1453,7 +1453,7 @@ def test_scenario_revert_activates_saved_program_and_deployment_and_restores_bot
     assert len(effects) == 1
     assert effects[0]["deployment"] == compiled.document
     assert effects[0]["program"] == saved_program
-    assert effects[0]["scene_initialization"] == "initialize"
+    assert effects[0]["scene_initialization"] == "preserve"
     assert state.deployment_draft_session.retained_state()["document"] == compiled.document
     assert state.draft_session.retained_state()["authoring"]["description"] == (
         program_model.to_dict()["description"]

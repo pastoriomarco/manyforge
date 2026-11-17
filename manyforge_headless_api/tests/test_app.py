@@ -609,7 +609,22 @@ class FakeCore:
                 "manager": _section("component-manager.cell-a", self.manager_payload),
                 "logical_scene": _section(
                     "logical-scene.cell-a",
-                    {"api_version": "manyforge.logical_scene_source.v1"},
+                    {
+                        "api_version": "manyforge.logical_scene_source.v1",
+                        # FakeManager's committed revision: a scene commit
+                        # answers once the mirror shows it (OD-293).
+                        "access": {
+                            "active_projection": {
+                                "retained_bundle_id": "sha256:" + "b" * 64,
+                                "graph_revision": "sha256:" + "c" * 64,
+                                "scene_revision": {
+                                    "scene_id": "sha256:" + "d" * 64,
+                                    "revision_id": 2,
+                                    "content_hash": "sha256:" + "c" * 64,
+                                },
+                            },
+                        },
+                    },
                 ),
                 "scene_runtime": _section(
                     "scene-runtime.cell-a",

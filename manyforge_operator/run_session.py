@@ -38,11 +38,10 @@ _TERMINAL_OPERATION_STATES = (
 _ID = re.compile(r"[0-9a-f]{32}\Z")
 _MAX_SCAN_ENTRIES = 100_000
 # Exact atomic-write leftovers of this module at the root.
-_ROOT_TEMPORARIES = frozenset({"..legacy-session-transition.json.next", "..session-selection.json.next"})
+_ROOT_TEMPORARIES = frozenset({"..session-selection.json.next"})
 # Entries every session root holds once a session was selected.
 SESSION_ENTRIES = frozenset({
-    "current", "previous-runs", "session-reports",
-    ".legacy-session-transition.json", ".session-selection.json",
+    "current", "previous-runs", "session-reports", ".session-selection.json",
 })
 
 
@@ -397,58 +396,13 @@ def _report(root: Path, identity: str, marker: dict | None) -> dict:
     return value
 
 
-def _legacy(root: Path, stable: frozenset[str], legacy_entries: frozenset[str]) -> dict | None:
-    transition = root / ".legacy-session-transition.json"
-    names = set(os.listdir(root))
-    unknown = names - legacy_entries - stable - SESSION_ENTRIES
+def _check_root_entries(root: Path, stable: frozenset[str]) -> None:
+    """Refuse a root holding anything besides its own kept and session entries."""
+    unknown = set(os.listdir(root)) - stable - SESSION_ENTRIES
     # Only our exact atomic-write leftovers are recognized.
     unknown -= _ROOT_TEMPORARIES
     if unknown:
         raise ValueError("unknown state-root entries preserved; refusing session switch: " + ", ".join(sorted(unknown)[:20]))
-    if transition.exists():
-        plan = _read(transition)
-        if (plan.get("schema_version") != "manyforge.workbench_legacy_transition.v1"
-                or not _ID.fullmatch(str(plan.get("session_id", "")))
-                or not isinstance(plan.get("entries"), list)
-                or not set(plan["entries"]) <= legacy_entries):
-            raise ValueError("partial legacy session inventory is invalid; preserved")
-    else:
-        entries = sorted(names & legacy_entries)
-        if not entries:
-            return None
-        if (root / "current").exists():
-            raise ValueError("mixed legacy/current layout is unknown; preserved")
-        plan = {"schema_version": "manyforge.workbench_legacy_transition.v1", "session_id": uuid.uuid4().hex, "entries": entries}
-        _write(transition, plan)
-    previous = _directory(root, "previous-runs")
-    sealed = _safe_path(previous / plan["session_id"], root)
-    if sealed.exists():
-        if any((root / name).exists() or (root / name).is_symlink() for name in plan["entries"]):
-            raise ValueError("legacy archive conflicts with remaining source entries")
-    else:
-        partial = _directory(previous, "." + plan["session_id"] + ".partial")
-        for name in plan["entries"]:
-            source, destination = root / name, partial / name
-            source_present = source.exists() or source.is_symlink()
-            destination_present = destination.exists() or destination.is_symlink()
-            if source_present == destination_present:
-                raise ValueError("partial legacy inventory is missing or conflicting: " + name)
-            if source_present:
-                _safe_path(source, root)
-                if source.stat(follow_symlinks=False).st_dev != root.stat().st_dev:
-                    raise ValueError("cross-mount legacy source; preserved")
-                if source.is_dir() and any(mount == source or mount.is_relative_to(source) for mount in _mounted_children(root)):
-                    raise ValueError("mounted child in legacy session; preserved")
-                os.rename(source, destination)
-                _sync(partial)
-                _sync(root)
-        os.rename(partial, sealed)
-        _sync(previous)
-    _seal_archive(sealed)
-    report = _report(root, plan["session_id"], None)
-    # Keep the exact legacy handoff until a new-current marker containing this
-    # report is durable. A crash before selection must not lose its notice.
-    return report
 
 
 def _finish_selection(root: Path, plan: dict) -> dict:
@@ -493,14 +447,6 @@ def _finish_selection(root: Path, plan: dict) -> dict:
             raise ValueError("unmarked current contains unknown data; preserved")
         _write(current / "session.json", marker)
     _sync(root)
-    legacy = root / ".legacy-session-transition.json"
-    if legacy.exists():
-        legacy_plan = _read(legacy)
-        previous = marker.get("previous_session")
-        if not isinstance(previous, dict) or previous.get("session_id") != legacy_plan.get("session_id"):
-            raise ValueError("legacy notice handoff conflicts with selected session; preserved")
-        legacy.unlink()
-        _sync(root)
     (root / ".session-selection.json").unlink()
     _sync(root)
     return marker
@@ -508,13 +454,11 @@ def _finish_selection(root: Path, plan: dict) -> dict:
 
 def prepare_session(root: Path, session_id: str, *, lock_fd: int,
                     stable_entries: frozenset[str],
-                    legacy_entries: frozenset[str] = frozenset(),
                     process_boundary: dict | None = None) -> dict:
     """Select a fresh, empty current before any owner starts.
 
     ``stable_entries`` names the root's own kept entries besides the session
-    entries; any other entry is preserved and refused. ``legacy_entries`` names
-    a pre-session layout the development root may still hold.
+    entries; any other entry is preserved and refused.
     """
     if not _ID.fullmatch(session_id):
         raise ValueError("invalid session identity")
@@ -528,7 +472,8 @@ def prepare_session(root: Path, session_id: str, *, lock_fd: int,
     selection = root / ".session-selection.json"
     if selection.exists():
         _finish_selection(root, _read(selection))
-    report = _legacy(root, stable_entries, legacy_entries)
+    _check_root_entries(root, stable_entries)
+    report = None
     archive_id = None
     if (root / "current").exists() or (root / "current").is_symlink():
         current = _safe_path(root / "current", root)
@@ -702,7 +647,6 @@ def _remove_old_run(root: Path, root_fd: int, folder: Path,
 
 
 def prune_previous_runs(root: Path, root_fd: int, *,
-                        legacy_entries: frozenset[str] = frozenset(),
                         pressure: Callable[[int], bool] | None = None) -> tuple[tuple[str, ...], str | None]:
     """One bounded pass over previous runs, their reports and older History files.
 
@@ -715,9 +659,8 @@ def prune_previous_runs(root: Path, root_fd: int, *,
     below the part that always stays free), the same units are deleted, oldest
     first, below those limits too. Returns (deleted, warning).
     """
-    for name in (".session-selection.json", ".legacy-session-transition.json"):
-        if (root / name).exists() or (root / name).is_symlink():
-            return ((), "previous-run retention deferred during session selection")
+    if (root / ".session-selection.json").exists() or (root / ".session-selection.json").is_symlink():
+        return ((), "previous-run retention deferred during session selection")
 
     warnings: list[str] = []
     previous = _safe_path(root / "previous-runs", root)
@@ -743,8 +686,7 @@ def prune_previous_runs(root: Path, root_fd: int, *,
     if warnings:
         return ((), "; ".join(warnings))
 
-    root_names = set(os.listdir(root))
-    reserve = "current" in root_names or bool(root_names & legacy_entries)
+    reserve = "current" in os.listdir(root)
     target = MAXIMUM_PREVIOUS_RUNS - int(reserve)
     excess_archives = max(0, len(archives) - target)
     excess_reports = max(0, len(finalized) - target)
@@ -1101,7 +1043,6 @@ def _disk_pressure(root: Path, root_fd: int, limits: DiskLimits,
 
 def prune_own_files(root: Path, root_fd: int, limits: DiskLimits, *,
                     reader: Callable[[int], DiskReading] | None = None,
-                    legacy_entries: frozenset[str] = frozenset(),
                     only_over_limit: bool = False) -> tuple[tuple[str, ...], str | None]:
     """One bounded pass of :func:`prune_previous_runs` under the disk limits.
 
@@ -1113,7 +1054,7 @@ def prune_own_files(root: Path, root_fd: int, limits: DiskLimits, *,
     over = _disk_pressure(root, root_fd, limits, reader or read_disk, warnings)
     if only_over_limit and not over(0):
         return (), None
-    deleted, warning = prune_previous_runs(root, root_fd, legacy_entries=legacy_entries, pressure=over)
+    deleted, warning = prune_previous_runs(root, root_fd, pressure=over)
     return deleted, "; ".join([*warnings, *([warning] if warning else [])]) or None
 
 
@@ -1159,21 +1100,18 @@ def check_disk_floor(root: Path, root_fd: int, limits: DiskLimits, *,
 
 
 def prepare_disk(root: Path, root_fd: int, limits: DiskLimits, *,
-                 reader: Callable[[int], DiskReading] | None = None,
-                 legacy_entries: frozenset[str] = frozenset()) -> None:
+                 reader: Callable[[int], DiskReading] | None = None) -> None:
     """At start, before the session selection writes anything: prune, then check the floor."""
-    deleted, warning = prune_own_files(root, root_fd, limits, reader=reader, legacy_entries=legacy_entries)
+    deleted, warning = prune_own_files(root, root_fd, limits, reader=reader)
     _log_pruning(deleted, warning, limits)
     check_disk_floor(root, root_fd, limits, reader=reader)
 
 
 def prune_while_running(root: Path, root_fd: int, limits: DiskLimits, *,
-                        reader: Callable[[int], DiskReading] | None = None,
-                        legacy_entries: frozenset[str] = frozenset()) -> None:
+                        reader: Callable[[int], DiskReading] | None = None) -> None:
     """The launcher's periodic pass; a failure is logged and never ends the run."""
     try:
-        deleted, warning = prune_own_files(root, root_fd, limits, reader=reader,
-                                           legacy_entries=legacy_entries, only_over_limit=True)
+        deleted, warning = prune_own_files(root, root_fd, limits, reader=reader, only_over_limit=True)
     except (OSError, ValueError) as error:
         deleted, warning = (), f"pass failed: {str(error)[:200]}"
     _log_pruning(deleted, warning, limits)

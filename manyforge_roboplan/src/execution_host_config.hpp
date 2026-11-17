@@ -67,7 +67,11 @@ inline constexpr int kResponseSendDeadlineMilliseconds = 100;
 // admits one preview per cell target; this host-side bound keeps a
 // misbehaving client from accumulating sockets behind long work.
 inline constexpr std::size_t kMaximumPendingDeferredCommands = 8U;
-inline constexpr int kManagerSceneDeadlineMilliseconds = 5000;
+// Limits connecting to the Manager's command socket only (as the Headless
+// API does, OD-298 (a)); a connected scene request waits for the Manager's
+// answer, ended by the reply, the Manager closing the connection or the
+// host's own drain (the request's stop token).
+inline constexpr int kManagerConnectDeadlineMilliseconds = 5000;
 inline constexpr std::size_t kPlanningSceneSynchronizationAttempts = 32U;
 inline constexpr auto kPlanningSceneSynchronizationRetryDelay =
     std::chrono::milliseconds(10);

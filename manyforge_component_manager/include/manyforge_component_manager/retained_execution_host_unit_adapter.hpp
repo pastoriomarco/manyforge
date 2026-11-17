@@ -33,29 +33,44 @@ public:
 };
 
 /// Error code of the typed busy answer: a call met the execution host while it
-/// is being launched or while its projection bindings are being prepared
-/// (B13, OD-122 (16); contract 1.3). Details: `phase` (`launching` or
-/// `preparing`) and `runtime_unit_id`. The caller retries by its own action.
+/// is being launched, while its projection bindings are being prepared, while
+/// its component processes are being read or while a projection is being
+/// rebuilt (B13, OD-122 (16); contract 1.3; OD-270). Details: `phase`
+/// (`launching`, `preparing`, `inspecting` or `rebuilding`) and
+/// `runtime_unit_id`. The caller retries by its own action.
 inline constexpr std::string_view kRuntimeUnitLaunchInProgressCode =
     "runtime_unit_launch_in_progress";
 
-/// Error code of the typed late answer (OD-121 (4)): the execution host did
-/// not answer a management exchange within its bound. The outcome of that
-/// request is unknown; the host is not stopped. While the reply is
-/// outstanding every management call answers this code at once and sends
-/// nothing. Details: `exchange` (the timed-out exchange kind) and `bound_ms`.
+/// Error code of an exchange with the execution host (none has a time limit,
+/// OD-270, OD-290 (a)) that ended because the execution host exited. HostExit() is set when it is answered; the Manager
+/// then ends the application. Details: `exchange`; `effect: none` when the
+/// exit was seen before the request was sent.
+inline constexpr std::string_view kExecutionHostExitedCode =
+    "execution_host_exited";
+
+/// Error code of an exchange with the execution host that ended because the
+/// application is stopping (AbandonExchanges, OD-270). Its outcome is
+/// unknown; one that was refused before it was sent carries `effect: none`.
+/// Details: `exchange`.
+inline constexpr std::string_view kApplicationStoppingCode =
+    "application_stopping";
+
+/// Error code of the answer to a call that meets an outstanding exchange on
+/// the same channel (OD-290 (a)): the execution host has not answered an
+/// earlier request yet, so this one was refused before it was sent
+/// (`effect: none`). Nothing is halted and the host does not count as
+/// faulted. Details: `exchange` (the outstanding exchange kind),
+/// `waited_ms` and `effect`.
 inline constexpr std::string_view kExecutionHostLateCode =
     "execution_host_late";
 
-/// The late execution host, as the Manager's observation tick reads it.
-struct ExecutionHostLateDTO final {
-  /// Counts timed-out exchanges since the start; a new value is a new late
-  /// episode.
+/// The oldest exchange whose reply the execution host has not sent yet, as
+/// the Manager's observation tick reads it (OD-290 (a)).
+struct ExecutionHostReplyOutstandingDTO final {
+  /// The exchange's number; a new value is a new exchange.
   std::uint64_t episode{};
-  /// The timed-out exchange kind (static text).
-  std::string_view exchange;
-  std::chrono::milliseconds bound{};
-  /// Since the timed-out request was sent.
+  std::string exchange;
+  /// Since the request was sent.
   std::chrono::milliseconds waited{};
 };
 
@@ -148,7 +163,9 @@ public:
   EnsureStopped(const RuntimeUnitConvergenceQueryDTO &query) override;
   [[nodiscard]] std::optional<RuntimeUnitSourceReport>
   ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
-                  const manyforge::core::RuntimeEpoch &runtime_epoch) override;
+                  const manyforge::core::RuntimeEpoch &runtime_epoch,
+                  std::uint64_t answering_after) override;
+  [[nodiscard]] std::uint64_t ProgressRequestMark() override;
   [[nodiscard]] manyforge::core::ConfigurationFenceAdmissionSnapshotDTO
   ObserveAdmission(const manyforge::core::ConfigurationFenceAdmissionQueryDTO
                        &query) const override;
@@ -224,20 +241,35 @@ public:
   /// application on it (OD-122 (1)).
   [[nodiscard]] std::optional<ExecutionHostExitDTO> HostExit() const noexcept;
 
-  /// The late host, present exactly while a timed-out management exchange's
-  /// reply is outstanding (OD-121 (4); maintainer 2026-11-13: no separate
-  /// latch). It ends by itself when the late reply arrives and is settled.
-  /// A failed management channel with the host alive keeps it present until
-  /// the host is stopped. Lock-free: read by the Manager's observation tick, which requests one
-  /// Halt per episode, and by its readiness reduction, which counts the host
-  /// unit faulted while it is present.
-  [[nodiscard]] std::optional<ExecutionHostLateDTO> HostLate() const noexcept;
+  /// The oldest management exchange whose reply has not arrived yet
+  /// (OD-290 (a)); none when every reply is in. A failed management channel
+  /// with the host alive keeps its exchange outstanding until the host is
+  /// stopped. Information only: the Manager's observation tick logs an
+  /// exchange still outstanding at its next tick; nothing is halted or
+  /// faulted. Settles replies that arrived with non-blocking reads under the
+  /// adapter's leaf locks; never waits on the host.
+  [[nodiscard]] std::optional<ExecutionHostReplyOutstandingDTO>
+  HostReplyOutstanding() const noexcept;
 
   /// OD-187 (1): `force_requested` answers whether a second stop request
   /// came during the Manager's stop sequence. While the host's stop waits
   /// for its exit and it answers true, the host is ended with SIGKILL. Set
   /// once by the Manager before any stop; read lock-free; memory reads only.
   void SetShutdownForce(bool (*force_requested)() noexcept) noexcept;
+
+  /// OD-270: the application is stopping. Every exchange that waits for the
+  /// host (none has a time limit, OD-290 (a)) now ends with the typed
+  /// `application_stopping` answer, and later ones are refused before they
+  /// are sent; a waiting exchange stays the channel's pending one, so its
+  /// late reply is still recognised and settled. Called once by the Manager
+  /// first in its stop sequence; one eventfd write, lock-free.
+  void AbandonExchanges() noexcept;
+
+  /// The eventfd AbandonExchanges writes, open for the adapter's lifetime.
+  /// The Manager's stop signal handler writes it directly (one write(2),
+  /// async-signal-safe), so a stop request ends a host wait on any thread,
+  /// the waiting one included.
+  [[nodiscard]] int AbandonSignalFd() const noexcept;
 
   /// True while the adapter holds an execution host child whose exit it has
   /// not observed. Memory reads under the adapter's lock only.

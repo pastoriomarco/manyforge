@@ -178,7 +178,10 @@ CanonicalValue EventIdentityValue(const std::string &component,
   });
 }
 
-std::optional<std::string>
+// A model attempt's identity names its application start too: run numbers
+// and node-attempt counters restart in every start, the historian outlives
+// starts.
+std::optional<CanonicalValue>
 DedicatedEventIdentity(const std::string &component,
                        const std::string &event_type,
                        const CanonicalValue &payload) {
@@ -188,18 +191,19 @@ DedicatedEventIdentity(const std::string &component,
   }
   Require(payload.is_object(), "historian_event_invalid",
           "Program model-attempt event payload must be an object");
-  for (const auto &[name, value] : payload.as_object()) {
-    if (name != "model_attempt_id") {
-      continue;
-    }
-    const auto *identity = std::get_if<std::string>(&value.storage());
-    Require(identity != nullptr, "historian_event_invalid",
-            "Program model-attempt event identity must be text");
-    ValidateText(*identity, "model_attempt_id", kMaximumIdentityBytes);
-    return *identity;
-  }
-  HistorianFail("historian_event_invalid",
-                "Program model-attempt event identity is absent");
+  const auto member = [&](const char *name) {
+    const auto *value = payload.find_object_member(name);
+    const auto *text =
+        value == nullptr ? nullptr : std::get_if<std::string>(&value->storage());
+    Require(text != nullptr, "historian_event_invalid",
+            std::string("Program model-attempt event identity lacks ") + name);
+    ValidateText(*text, name, kMaximumIdentityBytes);
+    return CanonicalValue(*text);
+  };
+  return CanonicalValue(CanonicalValue::Object{
+      {"application_start_id", member("application_start_id")},
+      {"model_attempt_id", member("model_attempt_id")},
+  });
 }
 
 void Advance(std::uint64_t &value) noexcept {
@@ -405,9 +409,7 @@ HistorianEvent MakeHistorianEvent(std::string component, std::string event_type,
       session_report ? CanonicalValue(CanonicalValue::Object{
                            {"session_id", *session_id},
                        }) : dedicated_identity.has_value()
-          ? CanonicalValue(CanonicalValue::Object{
-                {"model_attempt_id", CanonicalValue(*dedicated_identity)},
-            })
+          ? *dedicated_identity
           : EventIdentityValue(component, event_type, severity, occurred_at_ns,
                                occurred_at_wall, payload);
   const auto digest = content_identity::framed_sha256(

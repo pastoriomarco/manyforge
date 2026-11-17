@@ -92,6 +92,7 @@ inline constexpr std::string_view kApiContractLimitExceeded{"api_contract_limit_
 inline constexpr std::string_view kApiVersionMismatch{"api_version_mismatch"};
 inline constexpr std::string_view kApplicationExited{"application_exited"};
 inline constexpr std::string_view kApplicationStopIncomplete{"application_stop_incomplete"};
+inline constexpr std::string_view kApplicationStopping{"application_stopping"};
 inline constexpr std::string_view kAppliedProgramProjectionInvalid{"applied_program_projection_invalid"};
 inline constexpr std::string_view kApplyAcknowledgementOutcomeUnknown{"apply_acknowledgement_outcome_unknown"};
 inline constexpr std::string_view kApplyAdmissionFailed{"apply_admission_failed"};
@@ -115,7 +116,6 @@ inline constexpr std::string_view kApplyRejected{"apply_rejected"};
 inline constexpr std::string_view kApplyRequiresInactiveComponent{"apply_requires_inactive_component"};
 inline constexpr std::string_view kApplyStatusNotFound{"apply_status_not_found"};
 inline constexpr std::string_view kApplyStatusUnavailable{"apply_status_unavailable"};
-inline constexpr std::string_view kApplyTimedOut{"apply_timed_out"};
 inline constexpr std::string_view kArmBindingEpochExhausted{"arm_binding_epoch_exhausted"};
 inline constexpr std::string_view kArrayRequired{"array_required"};
 inline constexpr std::string_view kAssessmentStale{"assessment_stale"};
@@ -783,6 +783,7 @@ inline constexpr std::string_view kExecutionFrameTransformUnavailable{"execution
 inline constexpr std::string_view kExecutionHostChildUnavailable{"execution_host_child_unavailable"};
 inline constexpr std::string_view kExecutionHostContractOfferChanged{"execution_host_contract_offer_changed"};
 inline constexpr std::string_view kExecutionHostContractOfferMissing{"execution_host_contract_offer_missing"};
+inline constexpr std::string_view kExecutionHostExited{"execution_host_exited"};
 inline constexpr std::string_view kExecutionHostIncompatible{"execution_host_incompatible"};
 inline constexpr std::string_view kExecutionHostInternalFault{"execution_host_internal_fault"};
 inline constexpr std::string_view kExecutionHostLate{"execution_host_late"};
@@ -2575,6 +2576,7 @@ inline constexpr std::string_view kProgramRunAdmissionInvariant{"program_run_adm
 inline constexpr std::string_view kProgramRunAppliedSelectionStale{"program_run_applied_selection_stale"};
 inline constexpr std::string_view kProgramRunBindingInvalid{"program_run_binding_invalid"};
 inline constexpr std::string_view kProgramRunCaptureInvalid{"program_run_capture_invalid"};
+inline constexpr std::string_view kProgramRunCleanupFailed{"program_run_cleanup_failed"};
 inline constexpr std::string_view kProgramRunContextUnavailable{"program_run_context_unavailable"};
 inline constexpr std::string_view kProgramRunDraftAppliedMismatch{"program_run_draft_applied_mismatch"};
 inline constexpr std::string_view kProgramRunHistoryFull{"program_run_history_full"};
@@ -2593,6 +2595,7 @@ inline constexpr std::string_view kProgramRunStopGenerationMismatch{"program_run
 inline constexpr std::string_view kProgramRunTerminalObserverUnavailable{"program_run_terminal_observer_unavailable"};
 inline constexpr std::string_view kProgramRunnerContactLossInvalid{"program_runner_contact_loss_invalid"};
 inline constexpr std::string_view kProgramRunnerContactLossStale{"program_runner_contact_loss_stale"};
+inline constexpr std::string_view kProgramRunnerContactLost{"program_runner_contact_lost"};
 inline constexpr std::string_view kProgramRunnerManagerLivenessUnavailable{"program_runner_manager_liveness_unavailable"};
 inline constexpr std::string_view kProgramRunnerRequestBodyOversized{"program_runner_request_body_oversized"};
 inline constexpr std::string_view kProgramRunnerResponseInvalid{"program_runner_response_invalid"};
@@ -2632,6 +2635,7 @@ inline constexpr std::string_view kProgramSelectionRevisionStale{"program_select
 inline constexpr std::string_view kProgramSelectionStale{"program_selection_stale"};
 inline constexpr std::string_view kProgramSelectionUnknown{"program_selection_unknown"};
 inline constexpr std::string_view kProgramTerminalScopeNotSettled{"program_terminal_scope_not_settled"};
+inline constexpr std::string_view kProgramTickWorkerFailed{"program_tick_worker_failed"};
 inline constexpr std::string_view kProgramTicksLate{"program_ticks_late"};
 inline constexpr std::string_view kProgramWorkspaceInvalid{"program_workspace_invalid"};
 inline constexpr std::string_view kProgressCursorStale{"progress_cursor_stale"};
@@ -3598,7 +3602,7 @@ inline constexpr std::string_view kXarmStatusUnavailable{"xarm_status_unavailabl
 inline constexpr std::string_view kZeroSpeedHoldTimeout{"zero_speed_hold_timeout"};
 
 /// Every catalogued code, sorted by code text (byte order).
-inline constexpr std::array<std::string_view, 3588> kSortedCodes{
+inline constexpr std::array<std::string_view, 3592> kSortedCodes{
     kAbsoluteMotionHasReference,
     kAbsoluteTargetHasReference,
     kAcceptanceException,
@@ -3683,6 +3687,7 @@ inline constexpr std::array<std::string_view, 3588> kSortedCodes{
     kApiVersionMismatch,
     kApplicationExited,
     kApplicationStopIncomplete,
+    kApplicationStopping,
     kAppliedProgramProjectionInvalid,
     kApplyAcknowledgementOutcomeUnknown,
     kApplyAdmissionFailed,
@@ -3706,7 +3711,6 @@ inline constexpr std::array<std::string_view, 3588> kSortedCodes{
     kApplyRequiresInactiveComponent,
     kApplyStatusNotFound,
     kApplyStatusUnavailable,
-    kApplyTimedOut,
     kArmBindingEpochExhausted,
     kArrayRequired,
     kAssessmentStale,
@@ -4374,6 +4378,7 @@ inline constexpr std::array<std::string_view, 3588> kSortedCodes{
     kExecutionHostChildUnavailable,
     kExecutionHostContractOfferChanged,
     kExecutionHostContractOfferMissing,
+    kExecutionHostExited,
     kExecutionHostIncompatible,
     kExecutionHostInternalFault,
     kExecutionHostLate,
@@ -6166,6 +6171,7 @@ inline constexpr std::array<std::string_view, 3588> kSortedCodes{
     kProgramRunAppliedSelectionStale,
     kProgramRunBindingInvalid,
     kProgramRunCaptureInvalid,
+    kProgramRunCleanupFailed,
     kProgramRunContextUnavailable,
     kProgramRunDraftAppliedMismatch,
     kProgramRunHistoryFull,
@@ -6184,6 +6190,7 @@ inline constexpr std::array<std::string_view, 3588> kSortedCodes{
     kProgramRunTerminalObserverUnavailable,
     kProgramRunnerContactLossInvalid,
     kProgramRunnerContactLossStale,
+    kProgramRunnerContactLost,
     kProgramRunnerManagerLivenessUnavailable,
     kProgramRunnerRequestBodyOversized,
     kProgramRunnerResponseInvalid,
@@ -6223,6 +6230,7 @@ inline constexpr std::array<std::string_view, 3588> kSortedCodes{
     kProgramSelectionStale,
     kProgramSelectionUnknown,
     kProgramTerminalScopeNotSettled,
+    kProgramTickWorkerFailed,
     kProgramTicksLate,
     kProgramWorkspaceInvalid,
     kProgressCursorStale,

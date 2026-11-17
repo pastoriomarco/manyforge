@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <exception>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
@@ -331,9 +332,10 @@ ObserveProcessSafely(IRuntimeUnitProcessPort &port,
 [[nodiscard]] std::optional<RuntimeUnitSourceReport>
 ObserveProgressSafely(IRuntimeUnitProgressPort &port,
                       const RuntimeUnitConvergenceQueryDTO &query,
-                      const RuntimeEpoch &runtime_epoch) {
+                      const RuntimeEpoch &runtime_epoch,
+                      const std::uint64_t answering_after) {
   try {
-    return port.ObserveProgress(query, runtime_epoch);
+    return port.ObserveProgress(query, runtime_epoch, answering_after);
   } catch (const std::exception &error) {
     Fail("runtime progress observation failed: " + std::string(error.what()));
   } catch (...) {
@@ -357,8 +359,9 @@ MakeExpectation(const RuntimeUnitConvergencePlanRowDTO &plan) {
       plan.runtime_unit_id.value(),
       ToObservationLifecycle(plan.lifecycle_control),
       plan.product_identity.value(), plan.configuration_identity.value(),
-      kManagerRuntimeMaximumPresenceAgeNs, kManagerRuntimeMaximumReportAgeNs,
-      std::nullopt, std::move(dependencies), std::move(roles),
+      // OD-295 (1)(a): no report-age limit; a report's age is information.
+      kManagerRuntimeMaximumPresenceAgeNs, std::nullopt, std::nullopt,
+      std::move(dependencies), std::move(roles),
       ManagedCommandSurfaceState::kClosedNoActiveEffect,
       plan.runtime_contract_offer_digest.value());
 }
@@ -710,6 +713,12 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
   std::lock_guard operation_lock(operation_mutex_);
 
   VerifyApplyInputs(apply_intent, predecessor, candidate);
+  if (!apply_progress_mark_ ||
+      apply_progress_mark_->apply_id != apply_intent.apply_id ||
+      apply_progress_mark_->apply_generation != apply_intent.apply_generation)
+    apply_progress_mark_.emplace(ApplyProgressMark{
+        apply_intent.apply_id, apply_intent.apply_generation,
+        progress_port_.ProgressRequestMark()});
   const auto host_continuity = VerifyExecutionHostContinuity(
       predecessor, candidate, artifact_source_);
   if (!host_continuity.ok()) {
@@ -849,6 +858,14 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
         const auto ensured = process_port_.EnsureRunning(query);
         IngestEnsuredPresence(reducer, query, process, ensured);
         process = ensured;
+      } catch (const manyforge::core::TypedError &error) {
+        // A typed answer keeps its code and details (`effect` included) up
+        // to the Apply record; the Apply still records the effect unknown.
+        throw manyforge::core::TypedError(
+            error.code(),
+            "managed runtime Ensure outcome is uncertain: " +
+                std::string(error.what()),
+            error.details(), error.producer());
       } catch (const std::exception &error) {
         throw ManagerRuntimeProcessEffectUncertainError(
             "managed runtime Ensure outcome is uncertain: " +
@@ -862,7 +879,8 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
     if (process.state() == ProcessPresenceState::kPresent) {
       const RuntimeEpoch runtime_epoch(process.process_incarnation());
       const auto report =
-          ObserveProgressSafely(progress_port_, query, runtime_epoch);
+          ObserveProgressSafely(progress_port_, query, runtime_epoch,
+                                apply_progress_mark_->mark);
       if (report.has_value()) {
         if (report->offered_runtime_contract_offer_digest() !=
             query.plan.runtime_contract_offer_digest.value()) {

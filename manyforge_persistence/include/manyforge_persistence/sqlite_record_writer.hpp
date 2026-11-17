@@ -1,7 +1,6 @@
 #pragma once
 
 #include <atomic>
-#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -32,7 +31,6 @@ class SqliteRecord final {
   /// Appends the next statement; the following binds apply to it.
   SqliteRecord& Statement(std::string sql);
   SqliteRecord& Bind(int index, std::int64_t value);
-  SqliteRecord& BindReal(int index, double value);
   SqliteRecord& Bind(int index, std::string_view text);
   SqliteRecord& BindBlob(int index, std::string_view bytes);
   SqliteRecord& BindNull(int index);
@@ -49,7 +47,7 @@ class SqliteRecord final {
     std::string bytes;
   };
   using Value =
-      std::variant<std::nullptr_t, std::int64_t, double, std::string, Blob>;
+      std::variant<std::nullptr_t, std::int64_t, std::string, Blob>;
   struct BoundStatement final {
     std::string sql;
     std::vector<std::pair<int, Value>> values;
@@ -66,7 +64,6 @@ class SqliteRecord final {
 enum class SqliteRecordNotWrittenReason {
   kQueueFull,
   kWriteFailed,
-  kNotDrained,
 };
 
 [[nodiscard]] std::string_view ToString(
@@ -120,11 +117,8 @@ class SqliteRecordWriter final {
   /// Queues the record without waiting. Returns false when it was dropped.
   bool Post(StoreSlot slot, SqliteRecord record);
 
-  /// Writes every queued record, then joins the thread. Records still queued
-  /// at the optional deadline are counted as not written.
-  void DrainAndStop(
-      std::optional<std::chrono::steady_clock::time_point> deadline =
-          std::nullopt);
+  /// Writes every queued record, then joins the thread.
+  void DrainAndStop();
 
   [[nodiscard]] std::uint64_t records_dropped() const noexcept {
     return records_dropped_.load(std::memory_order_relaxed);
@@ -145,7 +139,6 @@ class SqliteRecordWriter final {
     LossMark mark;
     std::uint64_t dropped;
     std::uint64_t failed;
-    std::uint64_t not_drained;
   };
   struct Queued final {
     std::size_t slot;
@@ -164,9 +157,9 @@ class SqliteRecordWriter final {
       std::size_t slot,
       SqliteRecordNotWrittenReason reason,
       std::string_view detail);
-  // Writer thread only, under `lock`: retries the pending marks after a
-  // clean drain (when `drained`), then prints the shutdown line.
-  void FinishStop(std::unique_lock<std::mutex>& lock, bool drained);
+  // Writer thread only, under `lock`: retries the pending marks after the
+  // drain, then prints the shutdown line.
+  void FinishStop(std::unique_lock<std::mutex>& lock);
   [[nodiscard]] bool WriteMark(
       sqlite3* connection,
       const std::string& records_lost_mark);
@@ -179,7 +172,6 @@ class SqliteRecordWriter final {
   std::vector<Slot> slots_;
   bool stopping_{};
   bool drops_unreported_{};
-  std::optional<std::chrono::steady_clock::time_point> deadline_;
   std::atomic<std::uint64_t> records_dropped_{};
   std::atomic<std::uint64_t> records_not_written_{};
   std::thread thread_;

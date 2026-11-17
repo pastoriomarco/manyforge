@@ -14,11 +14,21 @@ import type {
   ComposerHeadlessState,
 } from '../types/headless';
 import type { ApplicationStartId } from '../api/applicationIdentity';
+import { errorCatalogRow } from './commandRefusal';
 import { heldRunEditReason, manualOperationSettled } from './heldRunAuthoring';
 import type { WorkbenchNotice } from './workbenchNotices';
 
 /** Component reason the alarm owner issues for active alarms it can report. */
 const ACTIVE_FUNCTIONAL_ALARM_REASON = 'active_functional_alarm';
+
+/**
+ * Manager status reasons whose catalogue text the notice shows: a section too
+ * large to send (OD-281) and a Manager not answering (OD-284).
+ */
+const CATALOGUE_TEXT_REASONS: ReadonlySet<string> = new Set([
+  'manager_status_section_oversized',
+  'manager_status_unavailable',
+]);
 
 /**
  * One installed composite authoring publication.
@@ -234,7 +244,9 @@ export function requiredComponentFaultNotices(snapshot: ComposerHeadlessState | 
       severity: 'error',
       domain: 'runtime',
       title: `${component.label} unavailable`,
-      message: component.detail,
+      message: component.reasonCode !== null && CATALOGUE_TEXT_REASONS.has(component.reasonCode)
+        ? errorCatalogRow(component.reasonCode)?.[1] || component.detail
+        : component.detail,
       expectedDuringTransition: true,
     }));
 }

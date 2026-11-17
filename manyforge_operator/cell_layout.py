@@ -34,8 +34,7 @@ _TOP_LEVEL_ROOTS: Final = ("data", "history", "operator")
 # Entries the shared run selection keeps beside them (run_session).
 SESSION_ROOT_ENTRIES: Final = frozenset({
     "current", "previous-runs", "session-reports",
-    ".legacy-session-transition.json", ".session-selection.json",
-    "..legacy-session-transition.json.next", "..session-selection.json.next",
+    ".session-selection.json", "..session-selection.json.next",
 })
 
 

@@ -45,7 +45,7 @@ describe('activation failure notice', () => {
     expect(notice.actions).toBeUndefined();
   });
 
-  it.each(['apply_progression_failed', 'apply_timed_out'] as const)(
+  it.each(['apply_progression_failed'] as const)(
     'shows the catalogue text of a Manager-ended Apply (%s)',
     (code) => {
       const notice = shownNotice(
@@ -575,7 +575,7 @@ describe('the way out of an ended Apply', () => {
     expect(beforeEffect.actions?.[0]?.title).toContain('Release this failed Apply');
   });
 
-  it.each(['runtime_convergence_failed', 'apply_timed_out', 'apply_progression_failed'])(
+  it.each(['runtime_convergence_failed', 'apply_progression_failed'])(
     'class 4: unknown effect after the fence (%s): New clears it, no lock or restart',
     (code) => {
       const notice = shownNotice('activation.c4:1', '3f9a/apply4', {

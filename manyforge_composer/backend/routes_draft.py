@@ -27,6 +27,7 @@ from manyforge_headless_api.program_binding_projection import (
 )
 from pydantic import BaseModel, ConfigDict, Field
 
+from .deployment_draft import DeploymentDraftError
 from .draft_session import (
     DraftSessionError,
     OPERATOR_DRAFT_MUTATIONS,
@@ -284,6 +285,12 @@ def _raise_workspace_error(error: Exception) -> NoReturn:
         raise HTTPException(
             status_code=error.status_code,
             detail=detail,
+        ) from error
+    if isinstance(error, DeploymentDraftError):
+        # A scene-object rename that also renames Deployment Draft links.
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code, "message": str(error)},
         ) from error
     if isinstance(error, AuthoringWorkspaceError):
         detail = {"code": error.code, "message": str(error)}
@@ -1043,7 +1050,8 @@ def _observed_scene_arguments(
             status_code=503,
             detail={"headless_code": error.code},
         ) from error
-    logical = projection.get("logical_scene")
+    section = projection.get("logical_scene")
+    logical = section.get("payload") if isinstance(section, dict) else None
     access = logical.get("access") if isinstance(logical, dict) else None
     snapshot = logical.get("snapshot") if isinstance(logical, dict) else None
     active = access.get("active_projection") if isinstance(access, dict) else None
@@ -1129,6 +1137,58 @@ def _observed_scene_arguments(
         "scene_resource_id": arguments["scene_resource_id"],
     }
     return {"scene_resource": resource}, source_identity
+
+
+_SCENE_RENAME_MUTATION = "scene_draft_rename_object"
+
+
+def _commit_scene_rename(
+    state: ComposerState,
+    body: DraftMutationRequest,
+    prepared: Any,
+    details: dict[str, Any],
+) -> tuple[Any, list[str]]:
+    """Commit a prepared scene-object rename with the Deployment Draft's links.
+
+    A Deployment Draft that names the renamed object (pose-source links, their
+    stream budgets, geometric-contact inputs) is renamed in the same Draft-only
+    whole-Scenario commit as the Program Draft, the way Scenario Discard
+    commits both Drafts. Otherwise this is an ordinary Program Draft edit.
+    """
+
+    deployment = state.deployment_draft_session
+    draft_id, revision, compiled, paths = deployment.preview_scene_resource_rename(
+        details["previous_scene_resource_id"], details["renamed_scene_resource_id"]
+    )
+    if compiled is None:
+        return (
+            commit_draft_edit(
+                state,
+                body,
+                operation_kind="mutate_draft",
+                install=lambda: state.draft_session.install_prepared_mutation(prepared),
+            ),
+            [],
+        )
+
+    def install() -> bool:
+        changed = state.draft_session.install_prepared_mutation(prepared)
+        return deployment.commit_compiled(
+            compiled, draft_id=draft_id, expected_revision=revision
+        ) or changed
+
+    return (
+        commit_draft_edit(
+            state,
+            body,
+            operation_kind="mutate_draft",
+            session="scenario",
+            # Both Draft fences before either install.
+            validate=lambda: deployment.require_current(draft_id, revision),
+            install=install,
+        ),
+        paths,
+    )
 
 
 def _source_resolved_mutation(
@@ -1522,19 +1582,27 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 catalog=state.node_catalog,
                 draft_id=body.draft_id,
             )
-            commit = commit_draft_edit(
-                state,
-                body,
-                operation_kind="mutate_draft",
-                install=lambda: state.draft_session.install_prepared_mutation(
-                    prepared
-                ),
-            )
+            details = thaw_json(prepared.details)
+            if body.mutation == _SCENE_RENAME_MUTATION and prepared.changed:
+                commit, details["deployment_references"] = _commit_scene_rename(
+                    state, body, prepared, details
+                )
+            else:
+                if body.mutation == _SCENE_RENAME_MUTATION:
+                    details["deployment_references"] = []
+                commit = commit_draft_edit(
+                    state,
+                    body,
+                    operation_kind="mutate_draft",
+                    install=lambda: state.draft_session.install_prepared_mutation(
+                        prepared
+                    ),
+                )
         except Exception as error:
             _raise_workspace_error(error)
         return {
             "mutation": prepared.tool_id,
-            "details": thaw_json(prepared.details),
+            "details": details,
             "workspace": _workspace(state),
             "authoringWorkspace": commit.snapshot.as_dict(),
         }

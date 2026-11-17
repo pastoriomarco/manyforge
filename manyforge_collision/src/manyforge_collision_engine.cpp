@@ -120,8 +120,7 @@ struct UrdfJoint {
 };
 
 std::map<std::string, UrdfJoint> urdf_joints_by_child_link(
-    const std::filesystem::path& urdf_path) {
-  const std::string xml = read_text_file(urdf_path);
+    const std::string& xml) {
   const std::regex joint_re(R"(<joint\b([^>]*)>([\s\S]*?)</joint>)");
   std::map<std::string, UrdfJoint> out;
   for (auto it = std::sregex_iterator(xml.begin(), xml.end(), joint_re);
@@ -141,10 +140,10 @@ std::map<std::string, UrdfJoint> urdf_joints_by_child_link(
 }
 
 std::vector<std::string> joints_for_chain_group(
-    const std::filesystem::path& urdf_path,
+    const std::string& urdf_xml,
     const std::string& base_link,
     const std::string& tip_link) {
-  const auto by_child = urdf_joints_by_child_link(urdf_path);
+  const auto by_child = urdf_joints_by_child_link(urdf_xml);
   std::vector<std::string> reversed;
   std::string cursor = tip_link;
   std::set<std::string> seen;
@@ -168,15 +167,14 @@ std::vector<std::string> joints_for_chain_group(
   return reversed;
 }
 
-std::vector<std::string> group_joint_names_from_srdf(
-    const std::filesystem::path& srdf_path,
-    const std::filesystem::path& urdf_path,
+/// `urdf_xml()` supplies the URDF text only when the group is an SRDF chain.
+template <typename UrdfXml>
+std::vector<std::string> group_joint_names_from_srdf_xml(
+    const std::string& xml, UrdfXml&& urdf_xml,
     const std::string& group_name) {
-  if (group_name.empty() || srdf_path.empty() ||
-      !std::filesystem::exists(srdf_path)) {
+  if (group_name.empty()) {
     return {};
   }
-  const std::string xml = read_text_file(srdf_path);
   const std::regex group_re("<group\\b[^>]*name\\s*=\\s*[\"']" +
                             regex_escape(group_name) +
                             R"(["'][^>]*>([\s\S]*?)</group>)");
@@ -205,10 +203,23 @@ std::vector<std::string> group_joint_names_from_srdf(
     auto base = xml_attr(chain_match[1].str(), "base_link");
     auto tip = xml_attr(chain_match[1].str(), "tip_link");
     if (base && tip) {
-      return joints_for_chain_group(urdf_path, *base, *tip);
+      return joints_for_chain_group(urdf_xml(), *base, *tip);
     }
   }
   return {};
+}
+
+std::vector<std::string> group_joint_names_from_srdf(
+    const std::filesystem::path& srdf_path,
+    const std::filesystem::path& urdf_path,
+    const std::string& group_name) {
+  if (group_name.empty() || srdf_path.empty() ||
+      !std::filesystem::exists(srdf_path)) {
+    return {};
+  }
+  return group_joint_names_from_srdf_xml(
+      read_text_file(srdf_path), [&] { return read_text_file(urdf_path); },
+      group_name);
 }
 
 bool supported_required_capability(const std::string& capability,
@@ -1034,6 +1045,34 @@ ManyForgeCollisionEngine::load_shared_model(
   }
   shared->group_joint_names =
       group_joint_names_from_srdf(srdf_path, urdf_path, shared->group_name);
+  return shared;
+}
+
+ManyForgeCollisionEngine::SharedModelPtr
+ManyForgeCollisionEngine::bind_shared_model_group(
+    const SharedModelPtr& loaded, const std::string& urdf_xml,
+    const std::string& srdf_xml, std::string group_name) {
+  if (!loaded) {
+    throw std::invalid_argument("collision group binding requires a model");
+  }
+  auto shared = std::make_shared<SharedModel>();
+  shared->model_name = loaded->model_name;
+  shared->package_paths = loaded->package_paths;
+  shared->model = loaded->model;
+  // Copies the geometry inventory and pairs; the loaded collision shapes stay
+  // shared, exactly as every prepared scene already shares them.
+  shared->base_collision_model = loaded->base_collision_model;
+  shared->group_name = std::move(group_name);
+  if (loaded->scene_asset_root_fd >= 0) {
+    shared->scene_asset_root_fd =
+        ::fcntl(loaded->scene_asset_root_fd, F_DUPFD_CLOEXEC, 3);
+    if (shared->scene_asset_root_fd < 0) {
+      throw std::runtime_error(
+          "collision scene-asset root descriptor could not be duplicated");
+    }
+  }
+  shared->group_joint_names = group_joint_names_from_srdf_xml(
+      srdf_xml, [&] { return urdf_xml; }, shared->group_name);
   return shared;
 }
 

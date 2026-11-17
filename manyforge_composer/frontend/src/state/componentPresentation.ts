@@ -366,8 +366,6 @@ export interface RunEndPresentation {
   text: string;
 }
 
-/** The late execution host's Halt (Manager source label). */
-const EXECUTION_HOST_LATE_SOURCE = 'manager.execution_host_late';
 /** The disk check's Halt (Headless source label, OD-215). */
 const DISK_CANNOT_KEEP_RECORDS_SOURCE = 'headless.disk_cannot_keep_records';
 
@@ -378,7 +376,6 @@ const DISK_CANNOT_KEEP_RECORDS_SOURCE = 'headless.disk_cannot_keep_records';
 export function haltCauseText(halt: { kind: string; sourceLabel: string | null } | null): string | null {
   switch (halt?.kind) {
     case 'halt':
-      if (halt.sourceLabel === EXECUTION_HOST_LATE_SOURCE) return 'Halted: the execution host was late.';
       if (halt.sourceLabel === DISK_CANNOT_KEEP_RECORDS_SOURCE) {
         return "Halted: the disk cannot keep ManyForge's records.";
       }

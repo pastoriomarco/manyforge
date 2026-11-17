@@ -1,6 +1,6 @@
 schema_version: manyforge.operator_alarm_catalog.v1
 catalog_version: 2.13.0
-descriptor_digest: sha256:9b3af691c1019f307d403a15195c90d240dd604c62fa135a51a59563beb82f0e
+descriptor_digest: sha256:5d3199014adcc6b3dba1fc832cccf09e6ec195178668b51a70780a15e17e5a9e
 definitions:
   - definition_id: manyforge.motion.runtime_collision
     version: 2
@@ -318,17 +318,17 @@ definitions:
 
   - definition_id: manyforge.runtime.program_runner_loss
     version: 1
-    title: Program Runner lost during a run
-    message_template: "The Program Runner stopped answering during a run, and the run was halted. The alarm clears when it answers again."
+    title: Program Runner lost or failed during a run
+    message_template: "The Program Runner stopped answering or failed during a run, and the run was halted. The alarm clears when the Program Runner works again."
     alarm_class: runtime_health
     priority: high
     priority_rationale: >-
       A running Program was halted because its Program Runner stopped
-      answering; the operator must act to continue.
+      answering or failed; the operator must act to continue.
     consequence: >-
       The run was halted and stays halted until the operator continues or
-      resets it. While the Program Runner does not answer, the Program cannot
-      be continued. Acknowledgement never gates motion.
+      resets it. While the Program Runner does not answer or has failed, the
+      Program cannot be continued. Acknowledgement never gates motion.
     operator_response: >-
       Wait for the alarm to clear: it clears by itself when the Program Runner
       answers again. Then press Execute to continue the halted Program, and

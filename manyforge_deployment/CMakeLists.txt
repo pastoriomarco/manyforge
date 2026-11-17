@@ -1518,11 +1518,7 @@ if(BUILD_TESTING)
   # One preparation per model family row of the maintained description,
   # so a family added as data needs no CMake edit. URDF/SRDF and the resource
   # root come from the row's `source`; distinct historical files are extra
-  # inputs. A family whose resources may come from an installed package names
-  # a sentinel file here: the local root is used only when it holds that file,
-  # otherwise the package named by the accepted `package://` prefix.
-  # The strict family-row loaders accept no extra field, so it stays here.
-  set(MANYFORGE_INSTALLED_MODEL_SENTINEL_ur5_roboplan "meshes/visual/base.dae")
+  # inputs.
   file(READ "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}"
     _maintained_description)
   string(JSON _family_count LENGTH "${_maintained_description}" model_families)
@@ -1540,33 +1536,10 @@ if(BUILD_TESTING)
     endforeach()
     set(_family_resource_root
       "${_MANYFORGE_WORKSPACE_ROOT}/${_family_resource_root}")
-    set(_family_sentinel "${MANYFORGE_INSTALLED_MODEL_SENTINEL_${_family_id}}")
-    if(_family_sentinel AND
-       NOT EXISTS "${_family_resource_root}/${_family_sentinel}")
-      string(REGEX MATCH "^package://([^/]+)/(.*)/$" _package_match
-        "${_family_accepted_package_uri_prefix}")
-      set(_package_name "${CMAKE_MATCH_1}")
-      set(_package_path "${CMAKE_MATCH_2}")
-      find_package(${_package_name} CONFIG REQUIRED)
-      get_filename_component(_family_installed_root
-        "${${_package_name}_DIR}/../../../share/${_package_name}/${_package_path}"
-        REALPATH)
-      foreach(_field historical_urdf_path historical_srdf_path)
-        string(REPLACE "${_family_resource_root}" "${_family_installed_root}"
-          _family_${_field}
-          "${_MANYFORGE_WORKSPACE_ROOT}/${_family_${_field}}")
-      endforeach()
-      set(_family_resource_root "${_family_installed_root}")
-      if(NOT EXISTS "${_family_resource_root}/${_family_sentinel}")
-        message(FATAL_ERROR
-          "model family ${_family_id} requires the installed example model resources")
-      endif()
-    else()
-      foreach(_field historical_urdf_path historical_srdf_path)
-        set(_family_${_field}
-          "${_MANYFORGE_WORKSPACE_ROOT}/${_family_${_field}}")
-      endforeach()
-    endif()
+    foreach(_field historical_urdf_path historical_srdf_path)
+      set(_family_${_field}
+        "${_MANYFORGE_WORKSPACE_ROOT}/${_family_${_field}}")
+    endforeach()
     set(_family_extra_inputs "")
     foreach(_kind urdf srdf)
       set(_family_${_kind}_path

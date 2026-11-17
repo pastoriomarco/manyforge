@@ -188,7 +188,7 @@ def test_the_latest_values_are_on_disk_after_a_quiet_moment_and_after_close(
 
     for value in range(51, 101):
         register.commit(_SCENARIO, _declaration("count"), value, edit=_node(value))
-    assert register.close(5.0)
+    register.close()
     reopened = PersistentKeyRegister(tmp_path, application_start_id=_A)
     assert {key: row["value"] for key, row in reopened.values(_SCENARIO).items()} == {
         "index": 50,
@@ -406,7 +406,7 @@ def test_the_file_is_read_only_at_construction(
 ) -> None:
     first = PersistentKeyRegister(tmp_path, application_start_id=_A)
     first.commit(_SCENARIO, _declaration("index"), 1)
-    assert first.close(5.0)
+    first.close()
     loads: list[int] = []
     load = PersistentKeyRegister._load  # noqa: SLF001
 
@@ -428,5 +428,5 @@ def test_the_file_is_read_only_at_construction(
     register.clear(_SCENARIO, {"index": index})
     register.restore(_SCENARIO, {"index": index})
     register.values(_SCENARIO)
-    assert register.close(5.0)
+    register.close()
     assert loads == [1]

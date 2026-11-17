@@ -574,6 +574,116 @@ describe('viewer object panel', () => {
   });
 });
 
+describe('adding and renaming objects', () => {
+  const render = async () => {
+    const { host, created } = stubDom();
+    const mutate = vi.fn(async () => ({}) as never);
+    const onSelectResource = vi.fn();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    await act(() => {
+      root.render(
+        <ProgramSceneEditor
+          program={program}
+          draftRevision={3}
+          busy={false}
+          busyReason={null}
+          mutate={mutate}
+          liveObjects={[]}
+          selectedResourceId="part"
+          onSelectResource={onSelectResource}
+        />,
+      );
+    });
+    const input = (label: string) => {
+      const element = created.find((candidate) => reactProps(candidate)?.['aria-label'] === label);
+      if (element === undefined) throw new Error(`${label} is not mounted`);
+      return reactProps(element)!;
+    };
+    return { host, mutate, onSelectResource, input, root };
+  };
+
+  it('adds an object with the chosen name, refusing a malformed or used one', async () => {
+    const { host, mutate, input, root } = await render();
+    await clickMountedButton(host, 'Add object');
+    await act(() => { input('New object name').onChange!({ target: { value: 'Part 2' } }); });
+    expect(mountedButton(host, 'Add').disabled).toBe(true);
+    await act(() => { input('New object name').onChange!({ target: { value: 'part' } }); });
+    expect(mountedButton(host, 'Add').disabled).toBe(true);
+    await act(() => { input('New object name').onChange!({ target: { value: 'bench_top' } }); });
+    await clickMountedButton(host, 'Add');
+    expect(mutate).toHaveBeenCalledExactlyOnceWith('scene_draft_add_object', {
+      scene_resource: expect.objectContaining({ scene_resource_id: 'bench_top' }),
+    });
+    await act(() => { root.unmount(); });
+  });
+
+  it('renames through the one Draft operation and selects the new name', async () => {
+    const { host, mutate, onSelectResource, input, root } = await render();
+    await clickMountedButton(host, 'Rename');
+    await act(() => { input('Object new name').onChange!({ target: { value: 'workpiece' } }); });
+    await clickMountedButton(host, 'Rename', true);
+    expect(mutate).toHaveBeenCalledExactlyOnceWith('scene_draft_rename_object', {
+      scene_resource_id: 'part',
+      new_scene_resource_id: 'workpiece',
+    });
+    expect(onSelectResource).toHaveBeenLastCalledWith('workpiece');
+    await act(() => { root.unmount(); });
+  });
+});
+
+describe('object orientation fields', () => {
+  it('shows a stored quaternion as roll, pitch and yaw and commits an edit as rpy_deg', async () => {
+    const { host, created } = stubDom();
+    const mutate = vi.fn(async () => null);
+    const half = Math.SQRT1_2;
+    const turned = {
+      ...program,
+      scene: [{
+        ...program.scene![0],
+        pose: { ...program.scene![0]!.pose, orientation: { xyzw: [0, 0, half, half] } },
+      }],
+    } as unknown as ProgramAuthoringDocument;
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    await act(() => {
+      root.render(
+        <ProgramSceneEditor
+          program={turned}
+          draftRevision={3}
+          busy={false}
+          busyReason={null}
+          mutate={mutate}
+          liveObjects={[]}
+          selectedResourceId="part"
+          onSelectResource={() => undefined}
+        />,
+      );
+    });
+    const mounted = (label: string) => {
+      const element = created.find((candidate) => reactProps(candidate)?.['aria-label'] === label);
+      if (element === undefined) throw new Error(`${label} is not mounted`);
+      return reactProps(element)!;
+    };
+    expect(mounted('Draft yaw (deg)').value).toBe(90);
+    expect(mounted('Draft roll (deg)').value).toBe(0);
+    await act(() => {
+      mounted('Draft roll (deg)').onChange!({ currentTarget: { valueAsNumber: 10 } });
+    });
+    const editor = created.find((candidate) => (
+      reactProps(candidate)?.['data-testid'] === 'program-scene-editor'));
+    await act(() => {
+      reactProps(editor!)!.onBlurCapture!({ target: { tagName: 'INPUT' } });
+    });
+    expect(mutate).toHaveBeenCalledExactlyOnceWith('scene_draft_update_object', {
+      scene_resource: expect.objectContaining({
+        pose: expect.objectContaining({ orientation: { rpy_deg: [10, 0, 90] } }),
+      }),
+    });
+    await act(() => { root.unmount(); });
+  });
+});
+
 describe('object mass field', () => {
   const withMetadata = (metadata?: Record<string, unknown>) => ({
     ...program,

@@ -8,8 +8,7 @@ namespace manyforge::core {
 /// The host's stop grace of a component's controller launch group: the
 /// launch leader gets SIGINT, and the group SIGKILL once this has passed
 /// (ControllerLaunchSupervisor). Retiring a hung component therefore takes
-/// this, then the kill and reap; the Manager's host-Apply bound adds it for
-/// every component that may leave the cell (HostApplyTimeout).
+/// this, then the kill and reap.
 inline constexpr std::chrono::milliseconds kControllerLaunchStopGrace{10'000};
 
 enum class ControllerLaunchCleanupState {

@@ -313,15 +313,19 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(const Value &v) {
   if (has_runner_loss) {
     result.program_runner_loss = Optional<core::ProgramRunnerContactLossDTO>(
         v, "program_runner_loss", [](const Value &x) {
-          Exact(x, 3U);
+          Exact(x, 4U);
           const auto predicate = Text(x, "failure_predicate", 128U);
           Require(predicate == "program_runner_liveness_probe" ||
                       predicate == "program_runner_liveness_renewal" ||
-                      predicate == "program_runner_reconciliation_renewal",
+                      predicate == "program_runner_reconciliation_renewal" ||
+                      predicate == "program_runner_fault",
                   "Program Runner loss predicate is unsupported");
           return core::ProgramRunnerContactLossDTO{
               CycleStatus(Member(x, "established_cycle")), predicate,
-              Text(x, "message", 1024U)};
+              Text(x, "message", 1024U),
+              Member(x, "fault_code").is_null()
+                  ? std::nullopt
+                  : std::optional<std::string>(Text(x, "fault_code", 128U))};
         });
   }
   result.required_component_status_current =
@@ -567,6 +571,8 @@ Value ProgramRunnerLossValue(const core::ProgramRunnerContactLossDTO &loss,
        Value(std::string(core::FormatApplicationStartId(application_start_id).data(), 16U))},
       {"failure_predicate", Value(loss.failure_predicate)},
       {"message", Value(loss.message)},
+      {"fault_code", OptionalValue(loss.fault_code,
+                                   [](const std::string &code) { return Value(code); })},
       {"established_cycle", Value(Value::Object{
           {"cycle_generation", Value(static_cast<double>(cycle.cycle_generation))},
           {"state", Value(std::string(core::to_string(cycle.state)))},

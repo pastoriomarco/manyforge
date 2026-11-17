@@ -207,9 +207,11 @@ public:
     return Presence(query, id);
   }
 
+  [[nodiscard]] std::uint64_t ProgressRequestMark() override { return 0U; }
+
   [[nodiscard]] std::optional<RuntimeUnitSourceReport>
   ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
-                  const RuntimeEpoch &runtime_epoch) override {
+                  const RuntimeEpoch &runtime_epoch, std::uint64_t) override {
     const auto id = query.plan.runtime_unit_id.value();
     events.push_back("progress:" + id);
     const auto found = epochs.find(id);

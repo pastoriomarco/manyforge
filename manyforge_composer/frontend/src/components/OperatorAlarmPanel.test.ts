@@ -3,6 +3,7 @@
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it } from 'vitest';
+import { ERROR_CATALOG } from '../api/errorCatalog.generated';
 import { OperatorAlarmPanel, operatorAlarmCause, operatorAlarmStatus } from './OperatorAlarmPanel';
 
 describe('operator alarm presentation', () => {
@@ -73,5 +74,32 @@ describe('operator alarm presentation', () => {
     // Without a failure message the alarm message is the cause.
     expect(operatorAlarmCause({ ...alarm, details: { failure: { message: '' } } }))
       .toBe('Program operation failed');
+  });
+
+  it('heads a Program Runner loss with its typed code\'s catalog text', () => {
+    const alarm = {
+      definitionId: 'manyforge.runtime.program_runner_loss',
+      message: 'The Program Runner stopped answering or failed during a run, and the run was halted.',
+      details: {
+        failure_predicate: 'program_runner_fault',
+        fault_code: 'program_tick_worker_failed',
+        message: 'RuntimeError: tick failed',
+      },
+    };
+    expect(operatorAlarmCause(alarm)).toBe(ERROR_CATALOG.program_tick_worker_failed[1]);
+    // A lost contact carries program_runner_contact_lost (OD-296 (a)).
+    expect(operatorAlarmCause({
+      ...alarm,
+      details: {
+        failure_predicate: 'program_runner_liveness_probe',
+        fault_code: 'program_runner_contact_lost',
+        message: 'connection refused',
+      },
+    })).toBe(ERROR_CATALOG.program_runner_contact_lost[1]);
+    // A fault message without a known code: the alarm message.
+    expect(operatorAlarmCause({
+      ...alarm,
+      details: { failure_predicate: 'program_runner_fault', fault_code: 'unexpected', message: 'unexpected' },
+    })).toBe(alarm.message);
   });
 });

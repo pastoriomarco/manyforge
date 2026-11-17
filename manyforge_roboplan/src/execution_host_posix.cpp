@@ -516,10 +516,12 @@ void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
           bytes.size() <=
               component_manager::detail::kMaximumManagedRuntimeRpcPacketBytes,
       "managed runtime response is empty or oversized");
+  // No time limit (OD-290 (a)): the wait ends when the Manager's channel
+  // takes the response, hangs up, or this host is asked to stop.
   pollfd descriptor{fd, POLLOUT | POLLHUP, 0};
   int ready = -1;
   do {
-    ready = ::poll(&descriptor, 1U, 750);
+    ready = ::poll(&descriptor, 1U, -1);
   } while (ready < 0 && errno == EINTR && g_stop_requested == 0);
   Require(ready > 0 && (descriptor.revents & POLLOUT) != 0,
           "managed runtime parent did not accept a response");
@@ -608,7 +610,7 @@ ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
     Require(!stop_token.stop_requested(), "Manager scene request cancelled");
     int ready = -1;
     do {
-      ready = ::poll(&connected, 1, kManagerSceneDeadlineMilliseconds);
+      ready = ::poll(&connected, 1, kManagerConnectDeadlineMilliseconds);
     } while (ready < 0 && errno == EINTR);
     Require(ready > 0 && (connected.revents & POLLOUT) != 0,
             "Manager command socket connection timed out");
@@ -620,14 +622,18 @@ ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
             "Manager command socket connection was rejected");
   }
 
+  // OD-298 (a): no time limit once connected. Each wait ends on its event,
+  // on the Manager closing the connection (POLLHUP) or on the stop token,
+  // whose callback shuts the socket down (also POLLHUP).
   pollfd outbound{descriptor.get(), POLLOUT, 0};
   Require(!stop_token.stop_requested(), "Manager scene request cancelled");
   int ready = -1;
   do {
-    ready = ::poll(&outbound, 1, kManagerSceneDeadlineMilliseconds);
+    ready = ::poll(&outbound, 1, -1);
   } while (ready < 0 && errno == EINTR);
+  Require(!stop_token.stop_requested(), "Manager scene request cancelled");
   Require(ready > 0 && (outbound.revents & POLLOUT) != 0,
-          "Manager did not accept a scene request in time");
+          "Manager closed the connection before the scene request was sent");
   ssize_t sent = -1;
   do {
     sent = ::send(descriptor.get(), bytes.data(), bytes.size(), MSG_NOSIGNAL);
@@ -638,10 +644,11 @@ ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
   pollfd inbound{descriptor.get(), POLLIN, 0};
   Require(!stop_token.stop_requested(), "Manager scene request cancelled");
   do {
-    ready = ::poll(&inbound, 1, kManagerSceneDeadlineMilliseconds);
+    ready = ::poll(&inbound, 1, -1);
   } while (ready < 0 && errno == EINTR);
+  Require(!stop_token.stop_requested(), "Manager scene request cancelled");
   Require(ready > 0 && (inbound.revents & POLLIN) != 0,
-          "Manager scene response timed out");
+          "Manager closed the connection before answering the scene request");
   std::vector<char> buffer(kMaximumManagerResponseBytes);
   iovec vector{buffer.data(), buffer.size()};
   msghdr message{};

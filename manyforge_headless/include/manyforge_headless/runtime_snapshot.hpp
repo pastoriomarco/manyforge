@@ -93,6 +93,8 @@ public:
   };
   struct View final {
     Connection connection{Connection::kNeverConnected};
+    /// The Manager start the tick belongs to (empty before the first frame).
+    std::string application_start_id;
     std::uint64_t tick{};
     /// Monotonic receive time of the last frame that advanced the tick.
     std::int64_t last_tick_advance_ns{};

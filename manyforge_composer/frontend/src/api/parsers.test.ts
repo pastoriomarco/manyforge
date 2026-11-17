@@ -1152,8 +1152,8 @@ describe('Program product projections', () => {
   it('carries the Stop that froze a halted run, kinds kept as text', () => {
     expect(parseProgramRunStatus(runStatus()).halt).toBeNull();
     expect(parseProgramRunStatus({ ...runStatus('halted'), halt: {
-      kind: 'halt', source_label: 'manager.execution_host_late',
-    } }).halt).toEqual({ kind: 'halt', sourceLabel: 'manager.execution_host_late' });
+      kind: 'halt', source_label: 'manager.carried_object_lost',
+    } }).halt).toEqual({ kind: 'halt', sourceLabel: 'manager.carried_object_lost' });
     // An unknown kind is accepted as text (it maps to no cause line).
     expect(parseProgramRunStatus({ ...runStatus('halted'), halt: {
       kind: 'some_future_kind', source_label: null,
@@ -3712,7 +3712,7 @@ describe('headless projection parsers', () => {
     expect(failed.state).toBe('unknown_effect');
     // OD-188: the Manager ends an Apply with its own code in the existing
     // terminal state; no new state value.
-    for (const code of ['apply_progression_failed', 'apply_timed_out']) {
+    for (const code of ['apply_progression_failed']) {
       const ended = parseManagerApplyStatus({
         ...base,
         failure: {
@@ -3924,8 +3924,30 @@ describe('headless projection parsers', () => {
     expect(status.status.apply.records[0]?.phase).toBe('fence_held');
     expect(graph.retainedBundleId).toBe('bundle.1');
     expect(diff.converged).toBe(true);
+    expect(status.status.runtime.outstandingExchanges).toBeUndefined();
 
-    for (const receipt of [undefined, null, {}, {
+    // OD-296 (a), OD-298 (a): what the Manager waits for, information only.
+    const waiting = structuredClone(statusWire);
+    (waiting.status.runtime as Record<string, unknown>).outstanding_exchanges = [
+      { channel: 'management', exchange: 'scene_frame', peer: 'execution_host', since_ns: 1200 },
+    ];
+    expect(parseManagerStatusProjection(waiting).status.runtime.outstandingExchanges).toEqual([
+      { peer: 'execution_host', channel: 'management', exchange: 'scene_frame', sinceNs: 1200 },
+    ]);
+    (waiting.status.runtime as Record<string, unknown>).outstanding_exchanges = [
+      { channel: 'liveness', exchange: 'probe', peer: 'kernel', since_ns: 1 },
+    ];
+    expect(() => parseManagerStatusProjection(waiting)).toThrow();
+
+    // OD-281: only the active configuration's record carries the receipt;
+    // every other record carries null.
+    const withoutReceipt = managerApplyRecordFixture();
+    withoutReceipt.prepared_activation = null;
+    statusWire.status.apply.records = [withoutReceipt];
+    expect(parseManagerStatusProjection(statusWire).status.apply.records[0]?.phase)
+      .toBe('fence_held');
+
+    for (const receipt of [undefined, {}, {
       ...(managerApplyRecordFixture().prepared_activation as Record<string, unknown>),
       unexpected_field: true,
     }]) {

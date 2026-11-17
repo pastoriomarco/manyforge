@@ -100,7 +100,7 @@ RuntimeUnitExpectation::RuntimeUnitExpectation(
     std::string product_identity,
     std::string configuration_identity,
     const std::uint64_t maximum_presence_age_ns,
-    const std::uint64_t maximum_report_age_ns,
+    const std::optional<std::uint64_t> maximum_report_age_ns,
     const std::optional<std::uint64_t> maximum_progress_age_ns,
     std::vector<std::string> dependency_runtime_unit_ids,
     std::vector<std::string> required_runtime_role_ids,
@@ -130,7 +130,9 @@ RuntimeUnitExpectation::RuntimeUnitExpectation(
   ValidateIdentifier(product_identity_, "product_identity");
   ValidateIdentifier(configuration_identity_, "configuration_identity");
   ValidatePositive(maximum_presence_age_ns_, "maximum_presence_age_ns");
-  ValidatePositive(maximum_report_age_ns_, "maximum_report_age_ns");
+  if (maximum_report_age_ns_) {
+    ValidatePositive(*maximum_report_age_ns_, "maximum_report_age_ns");
+  }
   if (maximum_progress_age_ns_) {
     ValidatePositive(*maximum_progress_age_ns_, "maximum_progress_age_ns");
   }
@@ -172,7 +174,8 @@ std::uint64_t RuntimeUnitExpectation::maximum_presence_age_ns()
   return maximum_presence_age_ns_;
 }
 
-std::uint64_t RuntimeUnitExpectation::maximum_report_age_ns() const noexcept {
+std::optional<std::uint64_t>
+RuntimeUnitExpectation::maximum_report_age_ns() const noexcept {
   return maximum_report_age_ns_;
 }
 
@@ -1318,7 +1321,8 @@ class RuntimeObservationReducer::Impl final {
         now_ns,
         report->second.progress_received_at_ns,
         "progress time");
-    if (report_age > expectation.maximum_report_age_ns()) {
+    if (expectation.maximum_report_age_ns() &&
+        report_age > *expectation.maximum_report_age_ns()) {
       reasons.insert("source_report_stale");
     }
     if (expectation.maximum_progress_age_ns() &&

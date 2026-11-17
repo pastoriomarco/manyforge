@@ -683,7 +683,8 @@ TEST(CellAdmissionCommandCodec, RunnerContactLossSharesTheClosedCycleCodec) {
       {3U, core::ProgramCycleStateDTO::kRunning,
        core::ProgramRunNumber(1U), core::CellAdmissionClaimGeneration(7U), std::nullopt,
        std::nullopt},
-      "program_runner_liveness_probe", "Runner contact failed"};
+      "program_runner_liveness_probe", "Runner contact failed",
+      "program_runner_contact_lost"};
   const auto projection =
       ProgramRunnerLossValue(loss, core::ApplicationStartId{0x3f9aU});
   EXPECT_EQ(projection.find_object_member("application_start_id")->as_string(),
@@ -707,7 +708,8 @@ TEST(CellAdmissionCommandCodec, RunnerContactLossSharesTheClosedCycleCodec) {
   ASSERT_TRUE(legacy);
   EXPECT_FALSE(std::get<core::CellAdmissionReadinessSnapshotDTO>(legacy->request)
                    .program_runner_loss);
-  for (const auto& name : {"failure_predicate", "established_cycle", "message"}) {
+  for (const auto& name :
+       {"failure_predicate", "established_cycle", "message", "fault_code"}) {
     auto malformed = loss_fields;
     for (auto& [key, value] : malformed)
       if (key == name) value = Value(false);
@@ -720,6 +722,24 @@ TEST(CellAdmissionCommandCodec, RunnerContactLossSharesTheClosedCycleCodec) {
   for (auto& [key, value] : ineligible)
     if (key == "failure_predicate") value = Value("readiness_closed");
   EXPECT_THROW(decode(Value(std::move(ineligible))), std::invalid_argument);
+  // A Runner fault carries its typed code as its own field.
+  auto fault = loss;
+  fault.failure_predicate = "program_runner_fault";
+  fault.message = "key ACK missing";
+  fault.fault_code = "program_bbkey_publication_failed";
+  auto fault_fields =
+      ProgramRunnerLossValue(fault, core::ApplicationStartId{0x3f9aU}).as_object();
+  std::erase_if(fault_fields, [](const auto& member) {
+    return member.first == "application_start_id";
+  });
+  const auto typed = decode(Value(fault_fields));
+  ASSERT_TRUE(typed);
+  EXPECT_EQ(std::get<core::CellAdmissionReadinessSnapshotDTO>(typed->request)
+                .program_runner_loss, fault);
+  auto misattributed = loss_fields;
+  for (auto& [key, value] : misattributed)
+    if (key == "fault_code") value = Value("program_bbkey_publication_failed");
+  EXPECT_THROW(decode(Value(std::move(misattributed))), std::invalid_argument);
 }
 
 TEST(CellAdmissionCommandCodec, SelectedIdleResetHasClosedAcceptedContext) {

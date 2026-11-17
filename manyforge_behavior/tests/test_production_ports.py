@@ -3689,56 +3689,65 @@ def _pose_latch_success_response(request: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_between_nodes_latch_sends_sorted_scope_and_accepts_authoritative_commit() -> None:
-    transport = _SceneTransport()
-    requests: list[dict[str, Any]] = []
+class _LatchTransport(_SceneTransport):
+    """The Headless client's latch routes (OD-294) over one fake Manager answer."""
 
-    def manager_command(request: dict[str, Any]) -> dict[str, Any]:
-        requests.append(deepcopy(request))
-        if request["command"] == "scene_runtime_owner_read":
-            return _pose_latch_owner_response()
-        assert request["command"] == "scene_runtime_latch_between_nodes"
-        return _pose_latch_success_response(request)
+    def __init__(self, latch=None) -> None:
+        super().__init__()
+        self.latch_bodies: list[dict[str, Any]] = []
+        self._latch = latch or _pose_latch_success_response
 
-    scene = HeadlessSceneProgramPort(transport, manager_command=manager_command)
+    def scene_runtime_owner(self) -> dict[str, Any]:
+        return _pose_latch_owner_response()
+
+    def latch_scene_runtime_between_nodes(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        self.latch_bodies.append(deepcopy(dict(body)))
+        return self._latch(body)
+
+
+class _HeadlessRefusal(RuntimeError):
+    """A typed Headless HTTP refusal, as the Headless client raises it."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def test_between_nodes_latch_goes_through_headless_with_sorted_scope() -> None:
+    transport = _LatchTransport()
+    scene = HeadlessSceneProgramPort(transport)
     scene.bind(_scene_context())
 
     scene.latch_between_nodes(
         _identity("latch"), scene_resource_ids=("alpha", "zeta")
     )
 
-    assert requests[1] == {
-        "api_version": "manyforge.manager_command.v2",
-        "command": "scene_runtime_latch_between_nodes",
+    assert transport.latch_bodies == [{
         "expected_runtime_identity": _pose_latch_owner_response()["runtime_identity"],
         "scene_resource_ids": ["alpha", "zeta"],
-    }
+    }]
 
 
 def test_between_nodes_capture_uses_manager_scene_without_a_stale_pre_read() -> None:
-    class NoScenePreRead(_SceneTransport):
+    class NoScenePreRead(_LatchTransport):
         def scene(self):
             raise AssertionError("between-nodes capture must not pre-read Scene")
 
-    def manager_command(request):
-        if request["command"] == "scene_runtime_owner_read":
-            return _pose_latch_owner_response()
+    def latch(request):
         assert "expected_projection_revision" not in request
         result = _pose_latch_success_response(request)
         result["initial_projection_revision"]["scene_revision"]["revision_id"] = 20
         result["projection_revision"]["scene_revision"]["revision_id"] = 21
         return result
 
-    scene = HeadlessSceneProgramPort(NoScenePreRead(), manager_command=manager_command)
+    scene = HeadlessSceneProgramPort(NoScenePreRead(latch))
     scene.bind(_scene_context())
     scene.latch_between_nodes(_identity("latch"), scene_resource_ids=("part",))
 
 
 @pytest.mark.parametrize("crossed", ["bundle", "scene", "revision"])
 def test_between_nodes_capture_retains_deployment_and_scene_fences(crossed) -> None:
-    def manager_command(request):
-        if request["command"] == "scene_runtime_owner_read":
-            return _pose_latch_owner_response()
+    def latch(request):
         result = _pose_latch_success_response(request)
         if crossed == "bundle":
             result["initial_projection_revision"]["retained_bundle_id"] = _DIGEST_A
@@ -3748,7 +3757,7 @@ def test_between_nodes_capture_retains_deployment_and_scene_fences(crossed) -> N
             result["initial_projection_revision"]["scene_revision"]["revision_id"] = 3
         return result
 
-    scene = HeadlessSceneProgramPort(_SceneTransport(), manager_command=manager_command)
+    scene = HeadlessSceneProgramPort(_LatchTransport(latch))
     scene.bind(_scene_context())
     with pytest.raises(PoseSourceLatchError):
         scene.latch_between_nodes(_identity("latch"), scene_resource_ids=("part",))
@@ -3759,31 +3768,19 @@ def test_between_nodes_capture_retains_deployment_and_scene_fences(crossed) -> N
     [
         ({"api_version": "manyforge.manager_command_response.v3", "ok": True},
          "scene_runtime_latch_failed"),
-        (
-            {
-                "api_version": "manyforge.manager_command_response.v3",
-                "ok": False,
-                "error": {"code": "stale_scene_projection", "message": "stale"},
-            },
-            "stale_scene_projection",
-        ),
+        (_HeadlessRefusal("stale_scene_projection"), "stale_scene_projection"),
     ],
 )
 def test_between_nodes_latch_malformed_or_refused_response_fails_before_motion_dispatch(
-    latch_response: Mapping[str, Any], expected_reason: str
+    latch_response: Mapping[str, Any] | Exception, expected_reason: str
 ) -> None:
-    scene_transport = _SceneTransport()
-    latch_requests: list[dict[str, Any]] = []
-
-    def manager_command(request: dict[str, Any]) -> dict[str, Any]:
-        if request["command"] == "scene_runtime_owner_read":
-            return _pose_latch_owner_response()
-        latch_requests.append(deepcopy(request))
+    def latch(_request: Mapping[str, Any]) -> dict[str, Any]:
+        if isinstance(latch_response, Exception):
+            raise latch_response
         return deepcopy(dict(latch_response))
 
-    scene = HeadlessSceneProgramPort(
-        scene_transport, manager_command=manager_command
-    )
+    scene_transport = _LatchTransport(latch)
+    scene = HeadlessSceneProgramPort(scene_transport)
     scene.bind(_scene_context())
     kernel_transport = _Transport()
     native = NativeKernelProgramPort(
@@ -3810,7 +3807,7 @@ def test_between_nodes_latch_malformed_or_refused_response_fails_before_motion_d
 
     assert error.value.reason_code == "pose_source_apply_failed"
     assert error.value.details == {"reason": expected_reason}
-    assert latch_requests[0]["scene_resource_ids"] == ["alpha", "zeta"]
+    assert scene_transport.latch_bodies[0]["scene_resource_ids"] == ["alpha", "zeta"]
     assert kernel_transport.submissions == []
 
 

@@ -74,7 +74,7 @@ CanonicalValue ModelRequestContract(
        CanonicalValue(std::string(core::to_string(contract.tool_call_family)))},
   };
   if (contract.reasoning.has_value()) {
-    // EXPERIMENTAL: the model server's reasoning (thinking) switch. The
+    // The model server's reasoning (thinking) switch. The
     // object constructor puts members in canonical order.
     result.emplace_back("reasoning",
                         CanonicalValue(std::string(*contract.reasoning ? "on" : "off")));

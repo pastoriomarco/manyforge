@@ -472,29 +472,6 @@ TEST(ManagedKernelAdmissionGate,
   gate.ReleaseFence(fence_id, scope);
 }
 
-TEST(ManagedKernelAdmissionGate,
-     DurableReleaseChecksActiveEffectBeforeCommit) {
-  ManagedKernelAdmissionGate gate;
-  const auto scope = AffectedScope();
-  const core::ConfigurationFenceId fence("selected.effect.pin");
-  HoldFence(gate, fence, scope);
-  unsigned commits = 0U;
-  gate.RunWithExactHeldFence(fence, scope, [&] {
-    EXPECT_THROW(gate.ReleaseFenceDurably(fence, scope, [&] { ++commits; }),
-                 std::runtime_error);
-  });
-  EXPECT_EQ(commits, 0U);
-  EXPECT_TRUE(gate.exact_fence_is_held(fence, scope));
-  EXPECT_THROW(
-      gate.ReleaseFenceDurably(
-          fence, scope, [] { throw std::runtime_error("unknown commit"); }),
-      std::runtime_error);
-  EXPECT_TRUE(gate.exact_fence_is_held(fence, scope));
-  gate.ReleaseFenceDurably(fence, scope, [&] { ++commits; });
-  EXPECT_EQ(commits, 1U);
-  EXPECT_FALSE(gate.exact_fence_is_held(fence, scope));
-}
-
 } // namespace
 
 TEST(ManagedKernelApplyFenceOwner,

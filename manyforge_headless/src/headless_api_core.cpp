@@ -1192,14 +1192,20 @@ CanonicalValue HeadlessApiCore::ObserveRuntimeFaultConditions(
       static_cast<void>(RequiredCounter(fact, "later_count", 0U));
     } else {
       closed(fact, {"application_start_id", "established_cycle",
-                    "failure_predicate", "message"});
+                    "failure_predicate", "message", "fault_code"});
       static_cast<void>(text(fact, "application_start_id", 16U));
       const auto predicate = text(fact, "failure_predicate", 128U);
       Require(predicate == "program_runner_liveness_probe" ||
                   predicate == "program_runner_liveness_renewal" ||
                   predicate == "program_runner_reconciliation_renewal" ||
-                  predicate == "program_runner_publication_fault",
+                  predicate == "program_runner_fault",
               code, "runtime fault is not a Runner contact failure");
+      // Every Runner loss is typed: a Runner fault carries its own error
+      // code, a lost contact `program_runner_contact_lost` (OD-296 (a)).
+      const auto fault_code = text(fact, "fault_code", 128U);
+      Require((predicate == "program_runner_fault") !=
+                  (fault_code == manyforge::core::kProgramRunnerContactLostCode),
+              code, "Runner loss carries the wrong typed code");
       const auto message = RequiredString(fact, "message");
       Require(message.size() <= 1024U && content_identity::is_utf8_nfc(message),
               code, "Runner contact error message is invalid");
@@ -1658,7 +1664,11 @@ const CanonicalValue &HeadlessApiCore::ActiveAppliedRecordLocked(
                                    "succeeded",
           "program_applied_selection_not_active",
           "the active Apply has no successful terminal evidence");
+  // Only the active configuration's record carries its preparation receipt
+  // (OD-281); the other records carry null.
   const auto &prepared = RequiredMember(*record, "prepared_activation");
+  Require(prepared.is_object(), "program_applied_selection_invalid",
+          "the active Apply record carries no preparation receipt");
   // Development cutover: an active Apply recorded before the removal of
   // launch-time parameter overrides is refused, never reinterpreted.
   Require(RequiredString(prepared, "schema_version") ==

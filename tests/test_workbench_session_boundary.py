@@ -142,9 +142,19 @@ def test_simulated_plc_settings_survive_a_session_switch(state):
     assert (settings / "plc_io.yaml").read_text() == "ready: false\n"
 
 
-def test_unknown_root_needs_exact_stopped_capture(state):
+def test_an_old_pre_session_layout_is_refused_and_preserved(state):
     root, descriptor = state
     (root / "program-cycle.sqlite3").write_bytes(b"preserved legacy")
+    with pytest.raises(ValueError, match="unknown state-root entries preserved"):
+        sessions.prepare_docker_session(root, uuid.uuid4().hex, lock_fd=descriptor)
+    assert (root / "program-cycle.sqlite3").read_bytes() == b"preserved legacy"
+    assert not (root / "current").exists()
+
+
+def test_unmarked_current_needs_exact_stopped_capture(state):
+    root, descriptor = state
+    (root / "current").mkdir()
+    (root / "current" / "program-cycle.sqlite3").write_bytes(b"preserved unmarked")
     with pytest.raises(ValueError, match="no exact stopped process-set proof"):
         sessions.prepare_docker_session(root, uuid.uuid4().hex, lock_fd=descriptor)
     receipt = root.parent / "docker-inspect.json"
@@ -153,7 +163,7 @@ def test_unknown_root_needs_exact_stopped_capture(state):
         "mounts": [{"Type": "bind", "Source": str(root), "Destination": "/tmp/manyforge-state"}]}))
     current = sessions.prepare_docker_session(root, uuid.uuid4().hex, lock_fd=descriptor, stopped_container_receipt=receipt)
     assert current["previous_session"]["shutdown"] == "unknown"
-    assert (root / current["previous_session"]["archive_relative_path"] / "program-cycle.sqlite3").read_bytes() == b"preserved legacy"
+    assert (root / current["previous_session"]["archive_relative_path"] / "program-cycle.sqlite3").read_bytes() == b"preserved unmarked"
 
 
 def test_direct_start_can_use_recorded_exact_docker_proof(state, monkeypatch):

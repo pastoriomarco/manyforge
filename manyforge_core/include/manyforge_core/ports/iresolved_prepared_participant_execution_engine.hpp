@@ -215,13 +215,29 @@ class IResolvedPreparedParticipantExecutionEngine {
     return Result<PreparedMotionReplacementSourceDTO>::Err(ErrorCode::kUnsupportedCapability);
   }
 
-  /// Nonblocking adoption at the existing worker safe point. False means not
-  /// parked/ready yet; no ownership transfer or worker wait occurs in that case.
-  virtual Result<bool> CommitPreparedMotionReplacement(
-      std::uint64_t /*candidate_id*/, const PreparedMotionReplacementSourceDTO& /*source*/,
-      PreparedMotionReplacementCommitDTO /*commit*/) {
+  /// The take-over's "prove" step (OD-175 D1), on the incumbent's own motion
+  /// worker at its parked safe point only: every adoption check that can
+  /// fail, with no Kernel lock held. False means not this worker or not
+  /// parked yet; nothing changes in that case. An error refuses the
+  /// hand-over (the Kernel's fallback route).
+  virtual Result<bool> ProvePreparedMotionReplacement(
+      std::uint64_t /*candidate_id*/, const PreparedMotionReplacementSourceDTO& /*source*/) {
     return Result<bool>::Err(ErrorCode::kUnsupportedCapability);
   }
+
+  /// The "decide" step's last check (OD-175 D2), called under the Kernel's
+  /// state lock: closes the source generation's collision-claim window with
+  /// one compare-and-swap, no lock. False when a claim already won.
+  virtual bool CloseMotionReplacementHazard(
+      const PreparedMotionReplacementSourceDTO& /*source*/) noexcept {
+    return false;
+  }
+
+  /// The "apply" step (OD-175 D1), on the same worker after the Kernel
+  /// decided the hand-over, with no Kernel lock held: the engine's and the
+  /// participant's swaps. No refusal; not noexcept (a defect that throws
+  /// leaves the Kernel's close step to run during unwinding).
+  virtual void ApplyPreparedMotionReplacement(std::uint64_t /*candidate_id*/) {}
 
   /// Reuse one cold sealed spring-return candidate only after exact source
   /// Stop/local settlement. `incumbent` is the source participant's stop

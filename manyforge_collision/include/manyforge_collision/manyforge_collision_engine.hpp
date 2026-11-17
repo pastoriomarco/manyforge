@@ -159,6 +159,17 @@ class ManyForgeCollisionEngine final : public core::ICollisionQueryEngine {
       std::string group_name,
       std::optional<int> scene_asset_root_fd = std::nullopt);
 
+  /// The model `load_shared_model` returns for `group_name` over the same
+  /// URDF/SRDF, without loading again: `loaded`'s kinematic and collision
+  /// models are copied (collision shapes stay shared), its scene-asset root
+  /// descriptor is duplicated, and the group's joints are resolved from the
+  /// exact URDF/SRDF text it was loaded from. Scene-mesh digests are pinned
+  /// per returned model, as for a fresh load.
+  static SharedModelPtr bind_shared_model_group(const SharedModelPtr& loaded,
+                                                const std::string& urdf_xml,
+                                                const std::string& srdf_xml,
+                                                std::string group_name);
+
   /// Content digest (`sha256:<hex>`) of the bytes this model's collision
   /// contexts use for one relative scene mesh URI. The first read of a URI
   /// below the approved root, by a collision load or by this query, pins its

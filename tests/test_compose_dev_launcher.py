@@ -1266,8 +1266,10 @@ def test_start_completes_mounted_stopped_predecessor_capture_and_preserves_durab
     fake = fake.replace('    : > "$FAKE_DOCKER_STARTED"',
         '    rm -f -- "$FAKE_DOCKER_STOPPED"\n    : > "$FAKE_DOCKER_STARTED"')
     docker.write_text(fake)
-    durable = root/'execution-state/operation-journal.sqlite3'
-    durable.parent.mkdir()
+    # The predecessor's owner data in its session folder (the pre-session
+    # root layout is no longer migrated, OD-276).
+    durable = root/'current/execution-state/operation-journal.sqlite3'
+    durable.parent.mkdir(parents=True)
     durable.write_bytes(b'owner journal')
     before = durable.read_bytes()
     partial = root/'evidence'/('.mounted-'+'d'*64+'.partial')

@@ -519,8 +519,15 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     if (prepare_call_failure.has_value()) return Result<std::uint64_t>::Err(*prepare_call_failure);
     if (request.replacement) {
       std::lock_guard lock(prepared_motion_mutex_);
+      const bool attach = request.replacement->spring_return &&
+                          request.replacement->spring_return->abandoned_preparation_id != 0U;
       if (!supports_motion_replacement ||
-          (replacement_snapshot &&
+          (attach && (!replacement_snapshot ||
+                      replacement_snapshot->execution_id !=
+                          request.replacement->spring_return->abandoned_preparation_id ||
+                      replacement_snapshot->state !=
+                          ResolvedPreparedMotionExecutionStateDTO::kDispatched)) ||
+          (!attach && replacement_snapshot &&
            replacement_snapshot->state !=
                ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch)) {
         return Result<std::uint64_t>::Err(ErrorCode::kUnsupportedCapability);
@@ -554,6 +561,16 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
         source.binding_epoch = spring.point->binding_epoch;
         source.prepared_contract_digest = last_dispatched_participant->prepared_contract_digest;
         source.controller_sample = spring.point->trip;
+      }
+      if (attach) {
+        // As the engine's attachment: the sent replacement keeps its session
+        // and reports the cold successor's reserved identity beside it.
+        const auto abandoned = request.replacement->spring_return->abandoned_preparation_id;
+        attached_cold_request = std::move(request);
+        attached_cold_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
+            next_replacement_id++, ResolvedPreparedMotionExecutionStateDTO::kColdPrepared,
+            retained, std::nullopt, std::nullopt};
+        return Result<std::uint64_t>::Ok(abandoned);
       }
       replacement_request = std::move(request);
       replacement_snapshot = ResolvedPreparedMotionExecutionSnapshotDTO{
@@ -614,6 +631,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       if (replacement_snapshot && replacement_snapshot->execution_id == execution_id) {
         auto snapshot = *replacement_snapshot;
         snapshot.replacement = PreparedMotionReplacementObservationDTO{replacement_phase.load()};
+        if (attached_cold_snapshot)
+          snapshot.spring_cold_result = ResolvedPreparedMotionSpringColdResultDTO{
+              attached_cold_snapshot->execution_id, attached_cold_snapshot->state,
+              attached_cold_snapshot->participant, std::nullopt};
         return Result<ResolvedPreparedMotionExecutionSnapshotDTO>::Ok(std::move(snapshot));
       }
       if (!prepared_snapshot || prepared_snapshot->execution_id != execution_id) {
@@ -645,6 +666,10 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
           return Result<void>::Err(ErrorCode::kInvalidRequest);
         }
         replacement_snapshot->state = ResolvedPreparedMotionExecutionStateDTO::kDispatched;
+        // As the engine records a replacement's send (its handle returned);
+        // its stopped cursor stays unknown until adoption.
+        if (!replacement_send_receipt_missing)
+          replacement_snapshot->last_dispatched_participant = replacement_snapshot->participant;
         replacement_phase.store(replacement_dispatch_phase);
         return Result<void>::Ok();
       }
@@ -805,6 +830,13 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     }
     replacement_snapshot.reset();
     replacement_request.reset();
+    if (stopped && attached_cold_snapshot) {
+      replacement_snapshot = std::move(attached_cold_snapshot);
+      replacement_request = std::move(attached_cold_request);
+      replacement_phase.store(PreparedMotionReplacementPhaseDTO::kPrepared);
+    }
+    attached_cold_snapshot.reset();
+    attached_cold_request.reset();
     return Result<bool>::Ok(true);
   }
 
@@ -825,6 +857,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   Result<bool> PrepareColdMotionAfterStop(std::uint64_t candidate_id,
                                           const ParticipantStopOutcomeDTO& incumbent) override {
     ++prepare_cold_motion_calls;
+    if (prepare_cold_refusal) return Result<bool>::Err(*prepare_cold_refusal);
     std::unique_lock lock(prepared_motion_mutex_);
     if (!replacement_snapshot || !replacement_request || !replacement_request->replacement ||
         !replacement_request->replacement->spring_return ||
@@ -897,10 +930,58 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     return Result<bool>::Ok(true);
   }
 
-  Result<bool> CommitPreparedMotionReplacement(std::uint64_t candidate_id,
-                                               const PreparedMotionReplacementSourceDTO& source,
-                                               PreparedMotionReplacementCommitDTO commit) override {
+  // OD-175 D1: "prove" (every check that can fail) and "apply" (the swaps,
+  // no refusal), split around the Kernel's "decide" step.
+  Result<bool> ProvePreparedMotionReplacement(
+      std::uint64_t candidate_id, const PreparedMotionReplacementSourceDTO& source) override {
     ++commit_replacement_calls;
+    const auto proven = ProveLocked(candidate_id, source);
+    // Test point between "prove" and "decide" (no lock of the fake held).
+    if (proven.ok() && proven.value() && after_prove_hook) after_prove_hook();
+    return proven;
+  }
+
+  bool CloseMotionReplacementHazard(
+      const PreparedMotionReplacementSourceDTO& source) noexcept override {
+    ++close_replacement_hazard_calls;
+    last_closed_hazard_generation = source.execution_generation;
+    // A lookahead claim that won before "decide" (OD-175 D2).
+    return !replacement_hazard_claimed.load();
+  }
+
+  void ApplyPreparedMotionReplacement(std::uint64_t candidate_id) override {
+    // Test point in the gap's first half, after "decide" (Dc).
+    if (before_apply_hook) before_apply_hook();
+    {
+      std::lock_guard lock(prepared_motion_mutex_);
+      ++replacement_owner_commits;
+      Trace("engine:commit_replacement");
+      prepared_snapshot = std::move(replacement_snapshot);
+      replacement_snapshot.reset();
+      last_prepared_request = std::move(replacement_request);
+      replacement_request.reset();
+      last_dispatched_participant = prepared_snapshot->participant;
+      {
+        std::lock_guard execute_lock(last_execute_mutex_);
+        last_execute = last_prepared_request->execution_request;
+      }
+      next_execution_id = candidate_id;
+      next_execute_result = Result<std::uint64_t>::Ok(candidate_id);
+      ++replacement_execution_generation;
+      replacement_phase.store(PreparedMotionReplacementPhaseDTO::kCommitted);
+      {
+        std::lock_guard status_lock(status_mutex_);
+        status.execution_id = candidate_id;
+        status.state = ExecutionState::kExecuting;
+        status.fact.reset();
+      }
+    }
+    // Test point in the gap's second half, after "apply" (Ap).
+    if (after_apply_hook) after_apply_hook();
+  }
+
+  Result<bool> ProveLocked(std::uint64_t candidate_id,
+                           const PreparedMotionReplacementSourceDTO& source) {
     std::lock_guard lock(prepared_motion_mutex_);
     if (!replacement_snapshot || !replacement_request || !replacement_request->replacement ||
         replacement_snapshot->execution_id != candidate_id || !prepared_snapshot ||
@@ -939,30 +1020,7 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
     if (replacement_phase.load() != PreparedMotionReplacementPhaseDTO::kReadyToCommit) {
       return Result<bool>::Ok(false);
     }
-    if (!commit.owner_commit) return Result<bool>::Err(ErrorCode::kInvalidRequest);
-    const auto accepted = commit.owner_commit(commit.context);
-    if (!accepted.ok()) return Result<bool>::Err(accepted.error());
-    ++replacement_owner_commits;
-    Trace("engine:commit_replacement");
-    prepared_snapshot = std::move(replacement_snapshot);
-    replacement_snapshot.reset();
-    last_prepared_request = std::move(replacement_request);
-    replacement_request.reset();
-    last_dispatched_participant = prepared_snapshot->participant;
-    {
-      std::lock_guard lock(last_execute_mutex_);
-      last_execute = last_prepared_request->execution_request;
-    }
-    next_execution_id = candidate_id;
-    next_execute_result = Result<std::uint64_t>::Ok(candidate_id);
-    ++replacement_execution_generation;
-    replacement_phase.store(PreparedMotionReplacementPhaseDTO::kCommitted);
-    {
-      std::lock_guard status_lock(status_mutex_);
-      status.execution_id = candidate_id;
-      status.state = ExecutionState::kExecuting;
-      status.fact.reset();
-    }
+    if (prove_refusal) return Result<bool>::Err(*prove_refusal);
     return Result<bool>::Ok(true);
   }
 
@@ -1665,6 +1723,18 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   mutable std::atomic<int> capture_replacement_source_calls{};
   std::atomic<int> commit_replacement_calls{};
   std::atomic<int> replacement_owner_commits{};
+  /// OD-175 test points and knobs of the take-over hand-over: after "prove"
+  /// (before "decide"), before "apply" (Dc) and after "apply" (Ap); a refusal
+  /// of "prove"; a lookahead claim that makes the "decide" step's close fail.
+  std::function<void()> after_prove_hook;
+  std::function<void()> before_apply_hook;
+  std::function<void()> after_apply_hook;
+  std::optional<ErrorDTO> prove_refusal;
+  /// Refusal of PrepareColdMotionAfterStop (cold activation).
+  std::optional<ErrorDTO> prepare_cold_refusal;
+  std::atomic<bool> replacement_hazard_claimed{false};
+  std::atomic<int> close_replacement_hazard_calls{};
+  std::uint64_t last_closed_hazard_generation{};
   std::atomic<int> retire_cancelled_replacement_calls{};
   std::atomic<int> prepare_cold_motion_calls{};
   std::atomic<int> cold_participant_preparations{};
@@ -1769,6 +1839,8 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
       PreparedMotionReplacementPhaseDTO::kPreparing};
   PreparedMotionReplacementPhaseDTO replacement_dispatch_phase{
       PreparedMotionReplacementPhaseDTO::kPossiblySent};
+  /// A replacement send whose handle never returned: no verified source.
+  bool replacement_send_receipt_missing{};
   bool prepare_bounded_time_law{};
   /// Optional prepared trajectory waypoints and bounds (the binding's joints).
   std::optional<TrajectoryDTO> prepared_trajectory;
@@ -1818,6 +1890,9 @@ class FakeParticipantEngine final : public IResolvedParticipantExecutionEngine,
   mutable std::optional<ResolvedPreparedMotionExecutionSnapshotDTO> prepared_snapshot;
   std::optional<ResolvedPreparedMotionExecutionRequestDTO> replacement_request;
   std::optional<ResolvedPreparedMotionExecutionSnapshotDTO> replacement_snapshot;
+  /// A spring successor attached to the sent replacement (OD-285 test).
+  std::optional<ResolvedPreparedMotionExecutionRequestDTO> attached_cold_request;
+  std::optional<ResolvedPreparedMotionExecutionSnapshotDTO> attached_cold_snapshot;
   std::shared_ptr<const PreparedOperationParticipantDTO> last_dispatched_participant;
   std::optional<ResolvedPreparedCapabilityCommandExecutionRequestDTO> last_prepared_command_request;
   mutable std::optional<ResolvedPreparedCapabilityCommandSnapshotDTO> prepared_command_snapshot;
