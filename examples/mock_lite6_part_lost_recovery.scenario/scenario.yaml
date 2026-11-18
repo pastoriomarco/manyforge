@@ -13,7 +13,7 @@
   "saved_status": {
     "checked_content_digest": "sha256:c98c974dc19dfc2eed51cff60f40a9a088a9067bc10f13d8af92007611d5bd91",
     "last_known_status": "unknown",
-    "manyforge_version": "0.2.0"
+    "manyforge_version": "0.3.0"
   },
   "scenario_id": "mock_lite6_part_lost_recovery",
   "source_snapshot": {

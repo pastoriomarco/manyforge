@@ -13,7 +13,7 @@
   "saved_status": {
     "checked_content_digest": "sha256:0fb932bf9db54c57deff845a8f5692ab335ba92ebfce07f61c8696213996df63",
     "last_known_status": "unknown",
-    "manyforge_version": "0.2.0"
+    "manyforge_version": "0.3.0"
   },
   "scenario_id": "mock_lite6_motion_preemption",
   "source_snapshot": {

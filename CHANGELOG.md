@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Before 1.0, a minor release (0.x.0) may change public interfaces and file
 formats; such changes are listed explicitly.
 
-## Unreleased
+## 0.3.0 – 2026-11-18
 
 ### Breaking changes
 
@@ -1916,6 +1916,14 @@ formats; such changes are listed explicitly.
   further command, heartbeat or Manager-loss Stop was handled. The heartbeat
   now waits without holding that state; if the runner's liveness changed
   meanwhile, the heartbeat is refused and the Manager's next one reconciles.
+- **A Stop or take-over on a real robot no longer speeds the arm up for an
+  instant.** Its replacement trajectory started at a fixed 20 ms guess of
+  when the controller would take it, 12–17 ms further along the path than
+  the arm was, so the controller jumped ahead for one cycle (3–5 mrad at
+  moderate speed) and the arm sped up to catch up. Real lanes now stamp the
+  replacement with a start time on the controller's own clock, as Mock
+  already did, so it starts exactly where the original is. Isaac still uses
+  the estimate.
 
 ## 0.2.1 – 2026-11-10
 

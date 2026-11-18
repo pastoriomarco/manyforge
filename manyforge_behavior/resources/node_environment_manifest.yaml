@@ -6,19 +6,19 @@
     "catalog_id": "manyforge_builtin",
     "content_version": "3.0.0"
   },
-  "environment_digest": "sha256:8e710a24f7deab07d900a5c05206ee1f41c6bf2cf4c0a5328b6457440c283928",
+  "environment_digest": "sha256:41b4e76652075b7747a556ea7f72412187639023ef5881098cc581dac8528a8d",
   "executable_packages": [
     {
-      "content_digest": "sha256:4430c950d3e68beceb22d68c15c41eca048128e56a5e8db591a13fd569596811",
+      "content_digest": "sha256:ab58f6e8c5f2f26d3a7ff30ed90edb330f23af32eefb2dd963b86064910c71b6",
       "executable_package_id": "manyforge_behavior",
       "package_format": "manyforge.python-source-package.v1",
-      "package_version": "0.2.1"
+      "package_version": "0.3.0"
     },
     {
-      "content_digest": "sha256:2c73dde19e3fb4401838c67b024c778f7e3d22119ca01aac662b6b2a7fe452a8",
+      "content_digest": "sha256:ed978d2df65604cdd53d2d03c5bb12261c6f5de9d39227053c56f81ace0adb53",
       "executable_package_id": "manyforge_example_nodes",
       "package_format": "manyforge.python-source-package.v1",
-      "package_version": "0.2.1"
+      "package_version": "0.3.0"
     }
   ],
   "executable_registry": [
@@ -596,7 +596,7 @@
       "source_id": "python-module:manyforge_behavior.program_scheduling"
     },
     {
-      "content_digest": "sha256:473f535cd3994cbf18c1ddcf7572fea1e2ed6838eed1b0629dc0945889460024",
+      "content_digest": "sha256:08a902b5726de543bec9aa94613b4fb5f8f2ea5e71149338167cea0c69f9b951",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-module:manyforge_behavior.qualified_node_extensions"
     },
@@ -661,7 +661,7 @@
       "source_id": "python-module:manyforge_behavior.value_path"
     },
     {
-      "content_digest": "sha256:5bb444cb466f38e12ffda84bdd20afc5cdf205cb5dac9662ec9f2e621e865a17",
+      "content_digest": "sha256:9151b216bc237793de44119fb4e55293c906443fa9dbf19794ef1c05f356f9cd",
       "executable_package_id": "manyforge_behavior",
       "source_id": "python-project:manyforge_behavior"
     },
@@ -681,7 +681,7 @@
       "source_id": "skill-artifact:place_object"
     },
     {
-      "content_digest": "sha256:9645933096d3eb1918e9b353525c739bf3cb0a53c91641f8439f1e4d4e22cd0e",
+      "content_digest": "sha256:b0a8f539a71ed86d4bd4d619bde020fea6fbc7641d8d7cf37ab6deb0442b3207",
       "executable_package_id": "manyforge_example_nodes",
       "source_id": "node-extension-descriptor:manyforge_example_nodes"
     },
@@ -691,7 +691,7 @@
       "source_id": "python-module:manyforge_example_nodes"
     },
     {
-      "content_digest": "sha256:cdc44bf4a8044f4779170fe2962c565e53027a521293da73d3dfe565df0446d3",
+      "content_digest": "sha256:a71ee17524232666dfd47b60c4fd7658a640c88fc664c1b6c73503ed8473aca0",
       "executable_package_id": "manyforge_example_nodes",
       "source_id": "python-project:manyforge_example_nodes"
     }

@@ -1453,7 +1453,7 @@ def test_untitled_scenario_resource_is_the_canonical_empty_project(tmp_path: Pat
     document = build_scenario_document(
         scenario_id="Untitled", name="Untitled", description="",
         program_draft=authoring, deployment_draft=deepcopy(_UNTITLED_DEPLOYMENT),
-        manyforge_version="0.2.0", last_known_status="incomplete",
+        manyforge_version="0.3.0", last_known_status="incomplete",
     )
     members, manifest = scenario_artifacts._project_payload(document, source_snapshot={
         "schema_version": scenario_artifacts.SCENARIO_SOURCE_SNAPSHOT_VERSION, "entries": [],

@@ -207,8 +207,9 @@ make_ros2_control_jtc_config(const std::string &runtime_namespace,
   // motion or a Stop is a fault on this lane. The age is the component's
   // effective `measured_joints` budget (measured_joints_budget_ns).
   participant.stop.controller_state_max_age_ns = controller_state_max_age_ns;
-  // Decided simulation-lane allowance and two actual CM periods;
-  // live lanes still require measurement. ROS timing stays monitor-only.
+  // On scheduled lanes (Mock, Real) the lead from the latest controller sample
+  // to the stamped start; on Isaac still the unscheduled start estimate
+  // (OD-313). ROS timing stays monitor-only.
   participant.stop.replacement_start_allowance_s = 0.020;
   participant.late_cycle_margin_s = 2.0 / rates.controller_update_rate_hz;
   participant.tracking = core::ExecutionTrackingPolicy{
@@ -604,7 +605,7 @@ make_retained_mock_ros2_control_backend_config(
       row.runtime_scale_supported.value());
   config.arm.measured_joint_state_lane = std::move(measured_lane);
   config.arm.mock_reset_position = artifacts.mock_reset_position;
-  // Only the generated Mock controllers enable stock JTC scheduled replacement.
+  // Stock JTC scheduled replacement (Mock and Real; Isaac not yet, OD-313).
   config.arm.adapter.lane_facts.supports_scheduled_replacement = true;
   config.arm.adapter.lane_facts.experiment = experimental_replacement_flags();
   constexpr auto kAllowance = "MANYFORGE_EXPERIMENTAL_REPLACEMENT_START_ALLOWANCE_MS";
@@ -706,6 +707,10 @@ make_retained_real_ros2_control_backend_config(
           motion_binding.value().controllable_component_id, stream_overrides),
       row.runtime_scale_supported.value());
   config.participant.stop.trip_authority = core::StateAuthorityClass::kMeasured;
+  // Controller-stamped replacement, as on Mock (OD-313): a Stop's or
+  // take-over's replacement starts at a header stamp on the controller's own
+  // tick grid, so its time 0 is exactly where the original's cursor will be.
+  config.arm.adapter.lane_facts.supports_scheduled_replacement = true;
   // The component's Deployment setting: the soft Stop lead-in starts at the
   // controller's command position (absent or `commanded`) or at the measured
   // position (`measured`).

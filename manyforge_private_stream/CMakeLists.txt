@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_private_stream VERSION 0.2.1 LANGUAGES CXX)
+project(manyforge_private_stream VERSION 0.3.0 LANGUAGES CXX)
 
 # Server side shared by ManyForge's private SEQPACKET streams: descriptor
 # holder, send with deadline, error frame, peer check and subscriber pool.

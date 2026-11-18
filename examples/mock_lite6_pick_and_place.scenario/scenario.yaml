@@ -13,7 +13,7 @@
   "saved_status": {
     "checked_content_digest": "sha256:2498f6358080666cf4a7cc77430d34047e97ae73a2be5376e84f9698313a90ad",
     "last_known_status": "ready",
-    "manyforge_version": "0.2.1"
+    "manyforge_version": "0.3.0"
   },
   "scenario_id": "mock_lite6_pick_and_place",
   "source_snapshot": {

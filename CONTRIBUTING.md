@@ -94,11 +94,11 @@ without explicit authorization.
 3. Check the companion pins: the xArm driver fork commit
    (`XARM_SOURCE_COMMIT` in `Dockerfile.ros-lyrical-full`, the same commit in
    `manyforge_xarm_control/vendor/driver.yaml`) is on the fork's
-   `lyrical-no-gazebo` branch. For `v0.2.1`:
+   `lyrical-no-gazebo` branch. For `v0.3.0`:
    `3654c9afef9c51c3bd6723d65ccecca166bc38b0`.
 4. Run the applicable gates, squash-merge `dev` into `main` and tag
-   `vX.Y.Z` (for this release `v0.2.1`; `v0.2.0` is `main` at `3cc3e5d5`,
-   `v0.1.0` is `main` at `8ae05265`).
+   `vX.Y.Z` (for this release `v0.3.0`; `v0.2.1` is `main` at `34bb5f4a`,
+   `v0.2.0` is `main` at `3cc3e5d5`, `v0.1.0` is `main` at `8ae05265`).
 5. Tag the maintainer's private specification repository with the same `vX.Y.Z`
    at the commit that matches the release.
 
