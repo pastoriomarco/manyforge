@@ -19,6 +19,7 @@ from typing import Any, Final, NoReturn
 import unicodedata
 from urllib.parse import urlsplit
 
+import httpx
 import rfc8785
 
 from manyforge_behavior.assistant_program_port import (
@@ -89,6 +90,7 @@ from manyforge_behavior.program_scheduling import (
     ProgramSchedulingError,
 )
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.internal_http import INTERNAL_HTTP_CLIENT_LIMITS
 from manyforge_headless_api.program_cycle import (
     MAXIMUM_ENDED_COMMAND_ROWS,
     PROGRAM_COMMAND_REPLY_SCHEMA,
@@ -768,12 +770,27 @@ class ProgramRuntime:
         self._pending_terminal_snapshots: dict[str, dict[str, Any]] = {}
         self._runtime_controls: dict[str, ProgramRuntimeControls] = {}
         self._runtime_controls_lock = RLock()
-        # A separate bounded-time HTTP client prevents forensic I/O from
-        # occupying the tree/command lanes or their shared connection pool.
-        self._diagnostic_client = (
-            HeadlessHttpClient(config.headless_url, timeout_seconds=0.25)
+        # A separate HTTP client keeps forensic I/O off the tree/command lanes
+        # and their shared connection pool. Only its connection is limited,
+        # as the Program-runner client's commands (OD-309): a delivery ends by
+        # Headless's answer or by the connection failing.
+        self._diagnostic_http = (
+            httpx.Client(
+                base_url=config.headless_url.rstrip("/"),
+                timeout=httpx.Timeout(None, connect=config.headless_timeout_seconds),
+                limits=INTERNAL_HTTP_CLIENT_LIMITS,
+            )
             if headless_client is None
             else None
+        )
+        self._diagnostic_client = (
+            None
+            if self._diagnostic_http is None
+            else HeadlessHttpClient(
+                config.headless_url,
+                timeout_seconds=config.headless_timeout_seconds,
+                client=self._diagnostic_http,
+            )
         )
         diagnostic_client = self._diagnostic_client or self._headless
         self._diagnostics = ProgramDiagnosticPublisher(
@@ -7383,13 +7400,11 @@ class ProgramRuntime:
                 self._assistant.close()
             except Exception as error:
                 errors.append(error)
-        try:
-            self._diagnostics.close()
-        except Exception as error:
-            errors.append(error)
-        if self._diagnostic_client is not None:
+        # Waits for the one in-flight delivery (OD-309).
+        self._diagnostics.close()
+        if self._diagnostic_http is not None:
             try:
-                self._diagnostic_client.close()
+                self._diagnostic_http.close()
             except Exception as error:
                 errors.append(error)
         if self._snapshot_source is not None:

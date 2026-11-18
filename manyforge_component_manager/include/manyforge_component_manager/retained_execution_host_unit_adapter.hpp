@@ -272,7 +272,8 @@ public:
   [[nodiscard]] int AbandonSignalFd() const noexcept;
 
   /// True while the adapter holds an execution host child whose exit it has
-  /// not observed. Memory reads under the adapter's lock only.
+  /// not observed, a host being stopped included (OD-308). Memory reads
+  /// under the adapter's lock only.
   [[nodiscard]] bool HasHostChild() const;
 
   /// The PID of the host child ended by SIGKILL for a second stop request,

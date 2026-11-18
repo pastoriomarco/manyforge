@@ -8,7 +8,6 @@ import os
 import socket
 import struct
 import threading
-import time
 from typing import Any
 
 import pytest
@@ -326,13 +325,13 @@ def test_operator_alarm_attention_is_published_on_the_cell_admission_port(
 ) -> None:
     client = CellAdmissionClient(tmp_path)
     sent: list[dict[str, Any]] = []
-    deadlines: list[float | None] = []
+    stop_fds: list[Any] = []
     socket_files: list[str | None] = []
     command = "cell_admission_publish_operator_alarm_attention"
 
     def exchange(packet: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         sent.append(packet)
-        deadlines.append(kwargs.get("deadline"))
+        stop_fds.append(kwargs.get("stop_fd"))
         socket_files.append(kwargs.get("socket_file"))
         return {
             "api_version": "manyforge.execution_command_response.v5",
@@ -343,13 +342,12 @@ def test_operator_alarm_attention_is_published_on_the_cell_admission_port(
 
     monkeypatch.setattr(client, "_exchange", exchange)
     projection = _attention_projection()
-    deadline = time.monotonic() + 0.2
-    assert client.publish_operator_alarm_attention(projection, deadline=deadline) == {
+    assert client.publish_operator_alarm_attention(projection, stop_fd=7) == {
         "generation": 4,
     }
-    # The overall publication deadline reaches the socket exchange, and the
-    # heartbeat travels on the independent component socket.
-    assert deadlines == [deadline]
+    # The publisher's stop pipe reaches the socket exchange (no deadline,
+    # OD-307), and the heartbeat travels on the independent component socket.
+    assert stop_fds == [7]
     assert socket_files == [cell_admission.EXECUTION_COMPONENT_SOCKET_FILE]
     assert cell_admission.EXECUTION_COMPONENT_SOCKET_FILE == "execution-component.sock"
     assert sent == [
@@ -369,58 +367,91 @@ def test_operator_alarm_attention_is_published_on_the_cell_admission_port(
         },
     )
     with pytest.raises(CellAdmissionError) as mismatched:
-        client.publish_operator_alarm_attention(
-            projection, deadline=time.monotonic() + 0.2
-        )
+        client.publish_operator_alarm_attention(projection)
     assert mismatched.value.code == "execution_command_response_invalid"
 
 
-def test_publication_deadline_bounds_the_whole_exchange_not_each_step(
-    tmp_path,
-) -> None:
-    """A peer that accepts but never answers ends the call at its deadline.
-
-    The per-operation timeout (1 s here) would let connect, send and receive
-    each take that long; the overall monotonic deadline caps them together.
-    """
+def test_publication_waits_for_its_answer_until_stopped(tmp_path) -> None:
+    """OD-307: a peer that accepts but never answers is waited for; only the
+    caller's stop pipe (or the peer closing) ends the wait."""
     run_root = tmp_path / "run"
     run_root.mkdir(mode=0o700)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
     listener.bind(str(run_root / cell_admission.EXECUTION_COMPONENT_SOCKET_FILE))
     os.chmod(run_root / cell_admission.EXECUTION_COMPONENT_SOCKET_FILE, 0o600)
-    listener.listen(1)
-    accepted: list[socket.socket] = []
+    listener.listen(2)
+    received, done = threading.Event(), threading.Event()
 
-    def accept() -> None:
+    def serve() -> None:
         connection, _address = listener.accept()
-        accepted.append(connection)
-        connection.recv(cell_admission.MAXIMUM_PACKET_BYTES)  # never answers
+        with connection:
+            connection.recv(cell_admission.MAXIMUM_PACKET_BYTES)
+            received.set()
+            done.wait()  # never answers
 
-    peer = threading.Thread(target=accept, daemon=True)
+    peer = threading.Thread(target=serve)
     peer.start()
+    stop_read, stop_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+    failures: list[CellAdmissionError] = []
+
+    def publish() -> None:
+        try:
+            CellAdmissionClient(run_root, timeout_seconds=1.0).publish_operator_alarm_attention(
+                _attention_projection(), stop_fd=stop_read
+            )
+        except CellAdmissionError as error:
+            failures.append(error)
+
+    publisher = threading.Thread(target=publish)
+    publisher.start()
     try:
-        client = CellAdmissionClient(run_root, timeout_seconds=1.0)
-        started = time.monotonic()
-        with pytest.raises(CellAdmissionError) as failed:
-            client.publish_operator_alarm_attention(
-                _attention_projection(), deadline=started + 0.15
+        assert received.wait(timeout=5.0)
+        assert publisher.is_alive() and not failures
+        os.write(stop_write, b"\0")
+        publisher.join(timeout=5.0)
+        assert not publisher.is_alive()
+        assert len(failures) == 1
+        assert failures[0].code == "execution_owner_unavailable"
+        assert failures[0].outcome_unknown
+        assert "stopped" in str(failures[0])
+        # An exchange started after the stop ends at once: the pipe stays
+        # readable, so its wait for the answer returns immediately (the
+        # listener's backlog takes the connection; nobody answers it).
+        with pytest.raises(CellAdmissionError) as stopped:
+            CellAdmissionClient(run_root, timeout_seconds=1.0).publish_operator_alarm_attention(
+                _attention_projection(), stop_fd=stop_read
             )
-        elapsed = time.monotonic() - started
-        assert failed.value.code == "execution_owner_unavailable"
-        assert failed.value.outcome_unknown
-        assert 0.15 <= elapsed < 0.5
-        # An already elapsed deadline sends nothing.
-        with pytest.raises(CellAdmissionError) as elapsed_deadline:
-            client.publish_operator_alarm_attention(
-                _attention_projection(), deadline=time.monotonic()
-            )
-        assert "deadline elapsed" in str(elapsed_deadline.value)
-        assert len(accepted) == 1
+        assert stopped.value.code == "execution_owner_unavailable"
+        assert "stopped" in str(stopped.value)
     finally:
+        done.set()
         peer.join(timeout=5.0)
-        for connection in accepted:
-            connection.close()
+        publisher.join()
         listener.close()
+        os.close(stop_read)
+        os.close(stop_write)
+
+
+def test_publication_ends_when_the_host_closes_the_connection(tmp_path) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir(mode=0o700)
+    listener, peer = _host_that_exits_before_answering(
+        run_root, cell_admission.EXECUTION_COMPONENT_SOCKET_FILE
+    )
+    stop_read, stop_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        # The stop pipe is never written: the peer's close ends the wait.
+        with pytest.raises(CellAdmissionError) as lost:
+            CellAdmissionClient(run_root, timeout_seconds=1.0).publish_operator_alarm_attention(
+                _attention_projection(), stop_fd=stop_read
+            )
+        peer.join(timeout=5.0)
+    finally:
+        listener.close()
+        os.close(stop_read)
+        os.close(stop_write)
+    assert lost.value.code == "execution_command_response_invalid"
+    assert lost.value.outcome_unknown
 
 
 def test_transport_failure_logs_syscall_errno_and_peer_without_changing_error(
@@ -612,7 +643,7 @@ def test_connected_requests_wait_for_their_answer_with_only_the_connection_limit
     client._run_root = RunRoot()
     monkeypatch.setattr(cell_admission.socket, "socket", lambda *_args: admission_reply)
     assert client.get()["authoring_allowed"] is True
-    assert admission_reply.timeouts == [1.5, None, None]
+    assert admission_reply.timeouts == [1.5, None]
 
     execution_reply = _RecordingSocket(rfc8785.dumps({
         "api_version": execution_module.EXECUTION_RESPONSE_VERSION,

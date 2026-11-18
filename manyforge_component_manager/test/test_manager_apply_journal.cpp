@@ -2392,7 +2392,10 @@ void EnsureLargeRefusedApply(SqliteManagerApplyJournal &journal,
 TEST(ManagerApplyJournal, FileByteLimitDeletesWhatTheCountRuleWouldDelete) {
   TemporaryDirectory directory;
   const auto path = directory.path() / "file-bytes.sqlite3";
-  persistence::SqliteRecordWriter writer;
+  // The test posts about one file budget of bytes in two seconds: a queue
+  // that holds all of it, so a slow disk cannot drop records (OD-185 drops
+  // over the bound by design, which is not what this test is about).
+  persistence::SqliteRecordWriter writer({4096U, 1024U * 1024U * 1024U});
   std::uint64_t file_bytes = 0U;
   std::uint64_t oldest = 100U;
   {
@@ -2425,6 +2428,7 @@ TEST(ManagerApplyJournal, FileByteLimitDeletesWhatTheCountRuleWouldDelete) {
   }
   // Every record reached the file: it never met its page limit.
   EXPECT_EQ(writer.records_not_written(), 0U);
+  EXPECT_EQ(writer.records_dropped(), 0U);
   EXPECT_EQ(QueryInteger(path, "SELECT records_lost FROM apply_journal_metadata"),
             0);
   EXPECT_LE(QueryInteger(path, "PRAGMA page_count") * 4096,

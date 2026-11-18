@@ -281,9 +281,20 @@ TEST(StopStateCoreTest, StopBetweenInsertionAndDispatchDecisionDispatchesNothing
   const auto stopped = harness.kernel.stop(stop_request(
       "request.predispatch.stop", operation.value(), state.operation_revision.value()));
   ASSERT_EQ(stopped.covered.size(), 1U);
+  // The Stop lane settles the cancelled-before-dispatch participant on its own
+  // thread: wait for the Stop to complete, then check the settled outcome
+  // (the acceptance-time kCancelledPreDispatch is transient).
+  ASSERT_TRUE(wait_until([&] {
+    StopControlExecutorTestAccess::WakeAfterClockAdvance(harness.kernel);
+    const auto status = harness.kernel.read_stop(stopped.event_id);
+    return status.ok() && status.value().complete;
+  }));
+  EXPECT_EQ(harness.kernel.read_stop(stopped.event_id).value().result, StopEventResult::kStopped);
   const auto after = harness.kernel.get_operation_state(operation.value().operation_id).value();
-  EXPECT_EQ(after.participants.front().state, OperationStateKind::kCancelledPreDispatch);
+  EXPECT_EQ(after.participants.front().state, OperationStateKind::kStopped);
+  // Nothing was dispatched and no Stop stage was sent.
   EXPECT_EQ(harness.engine.stop_calls.load(), 0);
+  EXPECT_EQ(harness.engine.translate_stop_stage_calls.load(), 0);
 }
 
 TEST(StopStateCoreTest, FenceDegradedRecordedNotPrinted) {

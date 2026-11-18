@@ -948,41 +948,48 @@ def _reconcile_runtime(
     return runtime, journal, admission
 
 
-def test_diagnostic_join_failure_still_closes_transport_and_releases_worker(
-    monkeypatch, tmp_path
-):
+def test_shutdown_waits_for_the_in_flight_diagnostic_delivery(tmp_path):
+    """OD-309: no join limit; the delivery's own end ends the shutdown wait."""
     from manyforge_program_runner.diagnostics import ProgramDiagnosticPublisher
 
     runtime, _journal, _admission = _reconcile_runtime(
         tmp_path,
         inventory={},
     )
-    entered, closed = Event(), Event()
+    entered, answer = Event(), Event()
+    delivered: list[dict[str, Any]] = []
 
-    def send(_record):
+    def send(record):
         entered.set()
-        assert closed.wait(timeout=2)
-        raise OSError("transport closed during pending delivery")
+        answer.wait()
+        delivered.append(record)
+        return {"recorded": True}
 
     publisher = ProgramDiagnosticPublisher(send)
     runtime._diagnostics = publisher
-    runtime._diagnostic_client = SimpleNamespace(close=closed.set)
     publisher.submit({"state": "succeeded"})
-    assert entered.wait(timeout=2)
-    thread = publisher._thread
-    join = thread.join
-    # Explicitly hit an expired join while delivery is held; no wall-clock
-    # two-second wait is needed to qualify the cleanup failure branch.
-    monkeypatch.setattr(thread, "join", lambda **_kwargs: None)
-    try:
-        with pytest.raises(ProgramRunnerError, match="shutdown bound"):
+    assert entered.wait(timeout=5)
+    shutdown_errors: list[BaseException] = []
+
+    def shut_down() -> None:
+        try:
             runtime.shutdown()
-        assert closed.is_set()
-    finally:
-        closed.set()
-        join(timeout=2)
-    assert not thread.is_alive()
-    assert publisher.health()["delivery_failed"]
+        except BaseException as error:  # pragma: no cover - reported below
+            shutdown_errors.append(error)
+
+    closer = Thread(target=shut_down, name="test-runtime-shutdown")
+    closer.start()
+    # Shutdown is held by the delivery, not by a timer: it has marked the
+    # publisher closed and waits on its thread.
+    with publisher._condition:
+        assert publisher._condition.wait_for(lambda: publisher._closed, timeout=5)
+    assert closer.is_alive() and not delivered
+    answer.set()  # Headless answers
+    closer.join(timeout=5)
+    assert not closer.is_alive() and not shutdown_errors
+    assert len(delivered) == 1
+    assert not publisher._thread.is_alive()
+    assert not publisher.health()["delivery_failed"]
 
 
 def _program_cycle_claim() -> dict[str, Any]:

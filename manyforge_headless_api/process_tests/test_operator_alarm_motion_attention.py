@@ -23,7 +23,6 @@ import pytest
 
 from manyforge_headless_api.alarm_attention import (
     KERNEL_FRESHNESS_SECONDS,
-    PUBLICATION_DEADLINE_SECONDS,
     PUBLICATION_PERIOD_SECONDS,
     OperatorAlarmAttentionPublisher,
 )
@@ -64,7 +63,8 @@ class _KernelRelay:
     It forwards every packet unchanged and records, for each publication, when
     the request arrived and when the Kernel's acceptance came back. A
     configurable delay holds the publication before the Kernel sees it, which
-    is a Kernel that answers late; abandoned client sockets are tolerated.
+    is a Kernel that answers late; client sockets the publisher's shutdown
+    ended are tolerated.
     """
 
     def __init__(self, upstream: Path, run_root: Path) -> None:
@@ -128,7 +128,7 @@ class _KernelRelay:
             try:
                 connection.send(response)
             except OSError:
-                pass  # the publisher abandoned this exchange at its deadline
+                pass  # the publisher's shutdown ended this exchange
 
     def mark(self) -> tuple[int, int]:
         with self.lock:
@@ -231,16 +231,20 @@ def _native_host_stack() -> Iterator[ProcessStack]:
                 stack.close()
 
 
-def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
+def test_attention_publication_stays_within_freshness_on_the_real_core_and_kernel(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Real Headless core + real native host: P + D < F under adversity.
+    """Real Headless core + real native host: receipts far inside F under
+    adversity, with no publication deadline (OD-307).
 
     The publisher reads the real core while other threads hold its
     coordination lock with source refreshes, while the Kernel answers late,
     and is shut down with one exchange outstanding.
     """
-    period, deadline = PUBLICATION_PERIOD_SECONDS, PUBLICATION_DEADLINE_SECONDS
+    period = PUBLICATION_PERIOD_SECONDS
+    # Qualification margin for one exchange on a loaded machine; a measure
+    # of this test only, not a limit of the publisher.
+    slack = 0.2
     with _native_host_stack() as stack:
         relay = _KernelRelay(
             stack.execution_run_root / EXECUTION_COMPONENT_SOCKET_FILE,
@@ -281,7 +285,7 @@ def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
         )
         publisher = OperatorAlarmAttentionPublisher(
             source,
-            CellAdmissionClient(relay.run_root, timeout_seconds=deadline),
+            CellAdmissionClient(relay.run_root, timeout_seconds=1.0),
         )
         report: list[str] = []
         load_stop = threading.Event()
@@ -326,7 +330,7 @@ def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
                 "a reconciled motion-attention projection",
             )
             _requested, baseline = phase("baseline", 16)
-            assert max(_intervals(baseline)) < period + deadline
+            assert max(_intervals(baseline)) < period + slack
 
             loaders = [
                 threading.Thread(target=core_load, name=f"core-load-{index}", daemon=True)
@@ -338,22 +342,24 @@ def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
             _requested, contended = phase("core-lock contention (4 refresh loops)", 40)
             contended_reads = source.read_seconds[reads:]
             assert load_calls[0] > 100
-            assert max(contended_reads) < deadline
-            assert max(_intervals(contended)) < period + deadline
+            assert max(contended_reads) < slack
+            assert max(_intervals(contended)) < period + slack
             assert source.last is not None and source.last["reconciled"] is True
 
-            relay.delay_seconds = deadline / 2
-            _requested, delayed = phase(f"Kernel answers after {deadline / 2:.2f}s", 16)
-            assert max(_intervals(delayed)) < period + deadline
+            relay.delay_seconds = 0.1
+            _requested, delayed = phase("Kernel answers after 0.10s", 16)
+            assert max(_intervals(delayed)) < period + slack
             before = publisher.counts
-            relay.delay_seconds = deadline + 0.15
-            requested, late = phase(f"Kernel answers after {deadline + 0.15:.2f}s (> D)", 12)
+            late_delay = 0.35  # later than the period and the former 200 ms deadline
+            relay.delay_seconds = late_delay
+            _requested, late = phase(f"Kernel answers after {late_delay:.2f}s (> P)", 12)
             after = publisher.counts
-            abandoned = after.abandoned - before.abandoned
-            report.append(f"abandoned at D in the late phase: {abandoned}")
-            assert abandoned >= 10
-            # An abandoned publication never delays the next period's start.
-            assert max(_intervals(requested)) < period + 0.1
+            # A late answer is waited for and acknowledged, never abandoned:
+            # receipts follow the Kernel's answer time, still far inside F.
+            assert after.failed == before.failed
+            assert after.published - before.published >= 12
+            assert max(_intervals(late)) < late_delay + slack
+            assert max(_intervals(late)) < KERNEL_FRESHNESS_SECONDS / 4
             load_stop.set()
             for loader in loaders:
                 loader.join(timeout=10.0)
@@ -366,7 +372,8 @@ def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
             publisher.shutdown()
             shutdown_seconds = time.monotonic() - started
             report.append(f"shutdown with an outstanding exchange: {shutdown_seconds * 1000:.1f}ms")
-            assert shutdown_seconds <= deadline + 0.1
+            # The publisher's stop ends the held exchange at once.
+            assert shutdown_seconds < 1.0
         finally:
             load_stop.set()
             publisher.shutdown()
@@ -378,8 +385,7 @@ def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
         with capsys.disabled():
             print(
                 "\nalarm attention real-path qualification "
-                f"(P={period}s D={deadline}s F={KERNEL_FRESHNESS_SECONDS}s, "
-                f"P+D={period + deadline:.2f}s < F):"
+                f"(P={period}s F={KERNEL_FRESHNESS_SECONDS}s, no publication deadline):"
             )
             for line in report:
                 print("  " + line)

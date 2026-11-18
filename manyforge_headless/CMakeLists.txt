@@ -288,6 +288,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_manager_response_transport
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_manager_local_exchange
+    test/test_manager_local_exchange.cpp)
+  target_link_libraries(test_manager_local_exchange PRIVATE
+    GTest::gtest_main)
+  gtest_discover_tests(test_manager_local_exchange
+    PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_scene_runtime_pose_projector
     test/test_scene_runtime_pose_projector.cpp)
   target_link_libraries(test_scene_runtime_pose_projector PRIVATE

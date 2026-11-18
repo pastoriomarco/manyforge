@@ -1097,11 +1097,24 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     }
   }
 
+  // OD-308 (a): the hosts are stopped with no lock held; each unit is busy
+  // `stopping` meanwhile, and erased afterwards.
   ~Impl() {
-    std::lock_guard lock(mutex);
-    for (auto &[runtime_id, child] : children) {
+    std::map<std::string, std::shared_ptr<Child>> stopping;
+    {
+      std::lock_guard lock(mutex);
+      for (const auto &[runtime_id, child] : children)
+        busy_units.insert_or_assign(runtime_id, "stopping");
+      stopping = children;
+    }
+    for (const auto &[runtime_id, child] : stopping) {
       StopChildNoThrow(*child);
       EraseLivenessEndpoint(runtime_id);
+    }
+    std::lock_guard lock(mutex);
+    for (const auto &[runtime_id, child] : stopping) {
+      children.erase(runtime_id);
+      busy_units.erase(runtime_id);
     }
   }
 
@@ -1122,6 +1135,7 @@ struct RetainedExecutionHostUnitAdapter::Impl final
         phase == "launching"    ? "being launched"
         : phase == "preparing"  ? "preparing its projections"
         : phase == "inspecting" ? "reading its component processes"
+        : phase == "stopping"   ? "stopping"
                                 : "rebuilding a projection";
     return {std::string(kRuntimeUnitLaunchInProgressCode),
             "the execution host is " + std::string(activity) +
@@ -1143,6 +1157,13 @@ struct RetainedExecutionHostUnitAdapter::Impl final
   [[nodiscard]] std::optional<manyforge::core::ErrorDTO> AnyBusyLocked() const {
     if (busy_units.empty()) return std::nullopt;
     return BusyError(busy_units.begin()->first, busy_units.begin()->second);
+  }
+
+  // Under `mutex`: the unit's host is being stopped (OD-308 (a)). Its child
+  // is the stopper's alone until the stop erases it, and still present.
+  [[nodiscard]] bool IsStoppingLocked(const std::string &runtime_unit_id) const {
+    const auto found = busy_units.find(runtime_unit_id);
+    return found != busy_units.end() && found->second == "stopping";
   }
 
   void ThrowIfBusyLocked(const std::string &runtime_unit_id) const {
@@ -1509,11 +1530,13 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     if (end == HostWaitEnd::kExited) {
       {
         // HostExit is set when the exchange is answered. A host not yet
-        // registered is its launcher's, which reaps it as the launch fails.
+        // registered is its launcher's, which reaps it as the launch fails;
+        // a stopping host is its stopper's (OD-308 (a)).
         std::lock_guard reap(mutex);
         for (const auto &[runtime_id, child] : children)
           for (const auto &exchange : exchanges)
-            if (!exchange.received && child == exchange.host)
+            if (!exchange.received && child == exchange.host &&
+                !IsStoppingLocked(runtime_id))
               static_cast<void>(ChildIsLive(*child));
       }
       throw manyforge::core::TypedError(ExitedError(name),
@@ -2148,8 +2171,10 @@ struct RetainedExecutionHostUnitAdapter::Impl final
   // yet.
   [[nodiscard]] std::optional<detail::NativeShutdownProgress>
   ReadShutdownProgress(Child &child) {
-    // StopChild owns the ordinary mutex/channel. Heartbeat renewals keep their
-    // independent existing endpoint, stream and mutex throughout host drain.
+    // StopChild owns the management channel: the unit's `stopping` phase
+    // keeps every other caller off it (OD-308 (a)). Heartbeat renewals keep
+    // their independent existing endpoint, stream and mutex throughout host
+    // drain.
     // An exchange abandoned or outstanding before the stop is answered
     // first; its reply is settled here, never read as the shutdown's
     // (OD-270).
@@ -2205,9 +2230,10 @@ struct RetainedExecutionHostUnitAdapter::Impl final
     }
     // No time limit (OD-187 (1)): the host's exit (waitpid) ends the wait;
     // each change of its published phase is logged, so the last line names
-    // where it waits. A second stop request ends the host with SIGKILL; this
-    // runs under `mutex`, so only the signal and memory work happen here and
-    // the Manager logs the kill (HostForceKilledPid).
+    // where it waits. A second stop request ends the host with SIGKILL; the
+    // Manager logs the kill (HostForceKilledPid). No adapter lock is held
+    // here (OD-308 (a)): the caller keeps the child busy `stopping` or holds
+    // it alone (a launch that failed).
     std::optional<detail::NativeShutdownProgress> last_progress;
     std::string last_observation_error;
     while (ChildIsLive(child)) {
@@ -2397,14 +2423,19 @@ struct RetainedExecutionHostUnitAdapter::Impl final
         admission.product().product_identity().value(),
         admission.product().configuration_identity().value(),
         admission.runtime_contract_offer_digest());
+    bool inserted = false;
     {
       std::lock_guard lock(liveness_mutex);
-      const auto [_, inserted] = liveness_endpoints.emplace(
-          admission.product().runtime_unit_id().value(), child);
-      if (!inserted) {
-        StopChildNoThrow(*child);
-        Fail("execution host liveness endpoint insertion conflicted");
-      }
+      inserted = liveness_endpoints
+                     .emplace(admission.product().runtime_unit_id().value(),
+                              child)
+                     .second;
+    }
+    if (!inserted) {
+      // OD-308 (a): stopped with no lock held. The child is registered
+      // nowhere and the unit stays busy `launching` until the launch fails.
+      StopChildNoThrow(*child);
+      Fail("execution host liveness endpoint insertion conflicted");
     }
     try {
       PrepareChildProjectionBindings(child, bundle,
@@ -2532,39 +2563,59 @@ struct RetainedExecutionHostUnitAdapter::Impl final
                     inserted->second->runtime_epoch.value());
   }
 
+  // The host's drain runs with no lock held (OD-308 (a)): under `mutex` the
+  // unit is marked busy `stopping` and its child kept; StopChild then runs
+  // unlocked, and the child is erased under `mutex` afterwards. A stopping
+  // unit still counts as present (HasHostChild); concurrent calls get the
+  // typed busy answer at once.
   [[nodiscard]] ProcessPresenceObservation
   EnsureStopped(const RuntimeUnitConvergenceQueryDTO &query) {
     auto [bundle, admission] = Admission(query);
     static_cast<void>(bundle);
-    std::unique_lock lock(mutex);
-    // The application's stop (OD-270, OD-290 (a)): its abandon signal ends
-    // every exchange wait at once, so the unit's busy phase and any awaited
-    // exchange end promptly; the stop then proceeds instead of answering
-    // busy.
-    if (ExchangesAbandoned())
-      busy_changed.wait(lock, [&] {
-        const auto &runtime_id = query.plan.runtime_unit_id.value();
-        const auto child = children.find(runtime_id);
-        return !busy_units.contains(runtime_id) &&
-               (child == children.end() ||
-                !child->second->management.pending ||
-                !child->second->management.pending->awaited);
-      });
-    ThrowIfBusyLocked(query.plan.runtime_unit_id.value());
-    const auto found = children.find(query.plan.runtime_unit_id.value());
-    if (found == children.end()) {
-      return Presence(query, ProcessPresenceState::kAbsent);
+    const auto &runtime_id = query.plan.runtime_unit_id.value();
+    std::shared_ptr<Child> stopping;
+    {
+      std::unique_lock lock(mutex);
+      // The application's stop (OD-270, OD-290 (a)): its abandon signal ends
+      // every exchange wait at once, so the unit's busy phase and any
+      // awaited exchange end promptly; the stop then proceeds instead of
+      // answering busy. A unit already stopping is answered busy at once.
+      if (ExchangesAbandoned())
+        busy_changed.wait(lock, [&] {
+          const auto child = children.find(runtime_id);
+          return IsStoppingLocked(runtime_id) ||
+                 (!busy_units.contains(runtime_id) &&
+                  (child == children.end() ||
+                   !child->second->management.pending ||
+                   !child->second->management.pending->awaited));
+        });
+      ThrowIfBusyLocked(runtime_id);
+      const auto found = children.find(runtime_id);
+      if (found == children.end()) {
+        return Presence(query, ProcessPresenceState::kAbsent);
+      }
+      if (!SameChildProduct(admission, found->second->product_identity,
+                            found->second->configuration_identity,
+                            found->second->runtime_contract_offer_digest)) {
+        Fail("execution host stop query differs from the tracked child");
+      }
+      stopping = found->second;
+      busy_units.emplace(runtime_id, "stopping");
     }
-    if (!SameChildProduct(admission, found->second->product_identity,
-                          found->second->configuration_identity,
-                          found->second->runtime_contract_offer_digest)) {
-      Fail("execution host stop query differs from the tracked child");
+    std::cerr << "stopping execution host child: runtime_unit=" << runtime_id
+              << " epoch=" << stopping->runtime_epoch.value() << '\n';
+    try {
+      StopChild(*stopping);
+    } catch (...) {
+      EndBusyPhase(runtime_id);
+      throw;
     }
-    std::cerr << "stopping execution host child: runtime_unit="
-              << query.plan.runtime_unit_id.value() << " epoch="
-              << found->second->runtime_epoch.value() << '\n';
-    StopChild(*found->second);
-    EraseChild(found);
+    {
+      std::lock_guard lock(mutex);
+      EraseChild(children.find(runtime_id));
+      busy_units.erase(runtime_id);
+    }
+    busy_changed.notify_all();
     return Presence(query, ProcessPresenceState::kAbsent);
   }
 
@@ -2721,11 +2772,12 @@ struct RetainedExecutionHostUnitAdapter::Impl final
   std::map<std::string, AdmissionCacheEntry> admission_cache;
   // Guarded by `mutex`: the registered host children.
   std::map<std::string, std::shared_ptr<Child>> children;
-  // Guarded by `mutex`. A unit being launched, prepared, inspected or
-  // rebuilt, with its phase ("launching", "preparing", "inspecting" or
-  // "rebuilding"). The fork, the handshake and these exchanges run with no
-  // lock; a call that meets the unit here gets the typed busy answer instead
-  // of waiting (B13, contract 1.3; OD-270).
+  // Guarded by `mutex`. A unit being launched, prepared, inspected, rebuilt
+  // or stopped, with its phase ("launching", "preparing", "inspecting",
+  // "rebuilding" or "stopping"). The fork, the handshake, these exchanges and
+  // the host's drain run with no lock; a call that meets the unit here gets
+  // the typed busy answer instead of waiting (B13, contract 1.3; OD-270,
+  // OD-308).
   std::map<std::string, std::string_view> busy_units;
   // OD-270: written once by AbandonExchanges or the Manager's stop signal
   // handler (the application is stopping) and never read empty, so every
@@ -3037,8 +3089,13 @@ int RetainedExecutionHostUnitAdapter::AbandonSignalFd() const noexcept {
 
 bool RetainedExecutionHostUnitAdapter::HasHostChild() const {
   std::lock_guard lock(impl_->mutex);
+  // A stopping host is present until its stop erases it (OD-308 (a)); its
+  // child is the stopper's to read.
   return std::any_of(impl_->children.begin(), impl_->children.end(),
-                     [](const auto &entry) { return !entry.second->reaped; });
+                     [&](const auto &entry) {
+                       return impl_->IsStoppingLocked(entry.first) ||
+                              !entry.second->reaped;
+                     });
 }
 
 std::optional<pid_t>

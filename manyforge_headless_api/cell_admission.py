@@ -7,9 +7,9 @@ import json
 import logging
 import os
 from pathlib import Path
+import select
 import socket
 import struct
-import time
 from typing import Any, Final
 
 import rfc8785
@@ -160,25 +160,12 @@ class CellAdmissionClient:
             )
         return value
 
-    def _socket_timeout(self, deadline: float | None, *, connected: bool) -> float | None:
-        """Without a deadline only the connection is limited (OD-214): a
-        connected request waits for its answer, ended by the host's answer or
-        by the socket closing when the host exits. With a deadline each step
-        gets what remains of it."""
-
-        if deadline is None:
-            return None if connected else self._timeout_seconds
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            raise TimeoutError("cell-admission command deadline elapsed")
-        return min(remaining, self._timeout_seconds)
-
     def _exchange(
         self,
         packet: dict[str, Any],
         *,
-        deadline: float | None = None,
         socket_file: str = EXECUTION_SOCKET_FILE,
+        stop_fd: int | None = None,
     ) -> dict[str, Any]:
         try:
             encoded = rfc8785.dumps(packet)
@@ -204,11 +191,12 @@ class CellAdmissionClient:
                         socket.SO_RCVBUF,
                         MAXIMUM_RESPONSE_BYTES,
                     )
-                    # With a deadline every blocking step (connect, send,
-                    # receive) gets only the time that remains of it;
-                    # without one only the connection is limited.
+                    # Only the connection is limited (OD-214): a connected
+                    # request waits for its answer, ended by the host's
+                    # answer, by the socket closing when the host exits
+                    # (an empty read), or by the caller's stop pipe.
                     operation = "settimeout"
-                    client.settimeout(self._socket_timeout(deadline, connected=False))
+                    client.settimeout(self._timeout_seconds)
                     operation = "connect"
                     client.connect(socket_address)
                     if hasattr(socket, "SO_PEERCRED"):
@@ -221,12 +209,24 @@ class CellAdmissionClient:
                         if peer_uid != os.geteuid():
                             raise OSError("peer is not owned by the current user")
                     operation = "settimeout"
-                    client.settimeout(self._socket_timeout(deadline, connected=True))
+                    client.settimeout(None)
+                    if stop_fd is not None:
+                        # The host taking the packet or the caller's stop: a
+                        # host whose queue is full never holds a shutdown.
+                        operation = "select"
+                        _, writable, _ = select.select([stop_fd], [client], [])
+                        if not writable:
+                            raise ConnectionAbortedError("the exchange was stopped")
                     operation = "send"
                     if client.send(encoded) != len(encoded):
                         raise OSError("command packet was truncated")
-                    operation = "settimeout"
-                    client.settimeout(self._socket_timeout(deadline, connected=True))
+                    if stop_fd is not None:
+                        # The answer, the host closing the connection or
+                        # the caller's stop (OD-296 pattern).
+                        operation = "select"
+                        readable, _, _ = select.select([client, stop_fd], [], [])
+                        if stop_fd in readable:
+                            raise ConnectionAbortedError("the exchange was stopped")
                     operation = "recvmsg"
                     payload, _ancillary, flags, _address = client.recvmsg(
                         MAXIMUM_RESPONSE_BYTES
@@ -264,7 +264,7 @@ class CellAdmissionClient:
         command: str,
         request: Mapping[str, Any] | None,
         *,
-        deadline: float | None = None,
+        stop_fd: int | None = None,
         program_cycle_status: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if command not in _COMMANDS:
@@ -284,7 +284,7 @@ class CellAdmissionClient:
             packet["program_cycle_status"] = dict(program_cycle_status)
         response = self._exchange(
             packet,
-            deadline=deadline,
+            stop_fd=stop_fd,
             socket_file=(
                 EXECUTION_COMPONENT_SOCKET_FILE
                 if command == "cell_admission_publish_operator_alarm_attention"
@@ -437,19 +437,21 @@ class CellAdmissionClient:
         return result
 
     def publish_operator_alarm_attention(
-        self, projection: Mapping[str, Any], *, deadline: float
+        self, projection: Mapping[str, Any], *, stop_fd: int | None = None
     ) -> dict[str, Any]:
         """Publish the Alarm Lifecycle Owner's fenced motion-attention view.
 
         The Kernel retains the newest generation and alone
-        evaluates it at Run/Resume/recovery admission. The
-        whole exchange (connect, send, receive) ends by the monotonic
-        ``deadline``; a later Kernel acceptance is then unobserved here.
+        evaluates it at Run/Resume/recovery admission, judging its age by
+        its own freshness bound. The wait for the acceptance has no time
+        limit (OD-307): it ends by the Kernel's answer, by the socket closing
+        when the host exits, or by ``stop_fd`` (the read end of the caller's
+        stop pipe) becoming readable.
         """
         result = self._call(
             "cell_admission_publish_operator_alarm_attention",
             projection,
-            deadline=deadline,
+            stop_fd=stop_fd,
         )
         if (
             set(result) != _ATTENTION_ACCEPTED_KEYS

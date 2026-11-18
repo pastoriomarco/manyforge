@@ -4,6 +4,7 @@
 #include "manyforge_headless/owner_publication.hpp"
 #include "manyforge_headless/scene_runtime_pose_projector.hpp"
 #include "manyforge_headless/scene_runtime_state_owner.hpp"
+#include "manager_local_exchange_internal.hpp"
 #include "manager_response_transport_internal.hpp"
 #include "manager_status_stream.hpp"
 #include "program_runner_publisher_fault_internal.hpp"
@@ -136,11 +137,6 @@ constexpr std::size_t kMaximumPoseObserverSessions =
     kDefaultMaximumPoseObservationKeys;
 constexpr std::size_t kRandomTokenBytes = 16U;
 constexpr std::size_t kSocketBacklog = 16U;
-/// The Kernel Stop control exchanges' connect and reply limit (Stop, planned
-/// Halt and its reads, the carried-object-lost signal). Not used by the
-/// Program Runner exchange (OD-296 (a)) or the command socket (OD-298 (a)),
-/// whose waits end on their events.
-constexpr int kKernelControlTimeoutMilliseconds = 250;
 /// The main loop's status tick (OD-216): each one shows the status stream's
 /// readers that the loop runs. Fixed, independent of the reconcile period, so
 /// a long reconcile period never reads as a Manager that does not answer.
@@ -1032,13 +1028,14 @@ RequiredProgramCycleStatus(const CanonicalValue &value) {
   return result;
 }
 
-/// A Program Runner exchange ended by the application's stop (OD-296 (a)):
-/// not a lost contact, so it is never reported as one.
-class ProgramRunnerExchangeStopped final : public std::runtime_error {
+/// A local exchange (Program Runner, Kernel Stop control) ended by its
+/// caller's application stop (OD-296 (a), OD-306 (a)): not a lost contact,
+/// so it is never reported as one.
+class LocalExchangeStopped final : public std::runtime_error {
 public:
-  ProgramRunnerExchangeStopped()
-      : std::runtime_error(
-            "Program Runner exchange ended by the application stop") {}
+  explicit LocalExchangeStopped(const std::string &peer_name)
+      : std::runtime_error(peer_name +
+                           " exchange ended by the application stop") {}
 };
 
 /// The Program Runner exchanges outstanding now (OD-296 (a)), read by the
@@ -1091,50 +1088,34 @@ private:
   std::array<Row, 4U> slots_{};
 };
 
-/// How a Program Runner exchange ends besides its reply (OD-296 (a)): the
-/// Runner refusing or closing the connection (a lost contact), or its
-/// caller's stop event becoming readable (`ProgramRunnerExchangeStopped`).
-/// There is no time limit: a slow Runner is waited for.
-struct ProgramRunnerExchangeEnd final {
+/// How a local exchange ends besides its reply (OD-296 (a), OD-306 (a)):
+/// the peer refusing or closing the connection (a lost contact), or its
+/// caller's application stop (`LocalExchangeStopped`). There is no time
+/// limit: a slow Program Runner or execution host is waited for.
+struct LocalExchangeEnd final {
   /// An eventfd that stays readable once the caller's stop came: the Runner
   /// lane's own stop, or the execution host adapter's abandon signal (the
   /// application stop) for the other lanes.
   int stop_fd{-1};
+  /// Program Runner exchanges only: the outstanding-exchange board.
   ProgramRunnerExchangeBoard *board{};
   const char *exchange{};
+  /// In place of `stop_fd` where the abandon signal is already written for
+  /// the whole stop (the application-stop Halt): true once the stop is
+  /// forced, checked between short poll slices.
+  bool (*stop_requested)() noexcept = nullptr;
 };
 
-/// Waits for `events` on `fd` (OD-296 (a)): true when they are ready, false
-/// when the peer closed or failed the connection; the stop throws
-/// ProgramRunnerExchangeStopped. No time limit.
-bool WaitForProgramRunner(const int fd, const short events, const int stop_fd) {
-  std::array<pollfd, 2U> descriptors{
-      {{fd, events, 0}, {stop_fd, POLLIN, 0}}};
-  const nfds_t count = stop_fd >= 0 ? 2U : 1U;
-  for (;;) {
-    descriptors[0].revents = 0;
-    descriptors[1].revents = 0;
-    if (::poll(descriptors.data(), count, -1) < 0) {
-      if (errno == EINTR) continue;
-      FailErrno("wait for the Program Runner");
-    }
-    if (count == 2U && (descriptors[1].revents & POLLIN) != 0)
-      throw ProgramRunnerExchangeStopped();
-    if ((descriptors[0].revents & events) != 0) return true;
-    if ((descriptors[0].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0)
-      return false;
-  }
-}
-
-// One request and one reply over an exact same-user SEQPACKET socket. With
-// `runner` the exchange is a Program Runner exchange without a time limit
-// (OD-296 (a)); without it each wait has the Kernel Stop control limit.
+// One request and one reply over an exact same-user SEQPACKET socket, with no
+// time limit (OD-296 (a), OD-306 (a)): each wait ends on its event, on the
+// peer refusing or closing the connection, or on `end`'s stop, which throws
+// LocalExchangeStopped.
 CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
                                    const CanonicalValue &request,
                                    const std::string_view peer_name,
                                    const content_identity::CanonicalJsonParseLimits
                                        &limits,
-                                   const ProgramRunnerExchangeEnd *runner = nullptr) {
+                                   const LocalExchangeEnd &end) {
   const std::string label(peer_name);
   // Information only: the exchange is outstanding until this returns.
   struct Outstanding final {
@@ -1144,21 +1125,15 @@ CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
       if (board != nullptr) board->End(episode);
     }
   } const outstanding{
-      runner != nullptr ? runner->board : nullptr,
-      runner != nullptr && runner->board != nullptr
-          ? runner->board->Begin(runner->exchange)
-          : 0U};
-  // True when `events` are ready; false when the peer closed the connection
-  // (Runner) or the limit passed (Kernel Stop control).
+      end.board,
+      end.board != nullptr ? end.board->Begin(end.exchange) : 0U};
+  // True when `events` are ready; false when the peer closed the connection.
   const auto wait = [&](const int fd, const short events) {
-    if (runner != nullptr)
-      return WaitForProgramRunner(fd, events, runner->stop_fd);
-    pollfd ready{fd, events, 0};
-    int polled = -1;
-    do {
-      polled = ::poll(&ready, 1, kKernelControlTimeoutMilliseconds);
-    } while (polled < 0 && errno == EINTR);
-    return polled == 1 && (ready.revents & events) != 0;
+    const auto ended =
+        detail::WaitForLocalPeer(fd, events, end.stop_fd, end.stop_requested);
+    if (ended == detail::LocalPeerWaitEnd::kStopped)
+      throw LocalExchangeStopped(label);
+    return ended == detail::LocalPeerWaitEnd::kReady;
   };
   const auto maximum_bytes = limits.maximum_bytes;
   const auto spelling = path.string();
@@ -1184,9 +1159,7 @@ CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
       errno != EINPROGRESS) {
     FailErrno("connect " + label + " socket");
   }
-  Require(wait(connection.get(), POLLOUT),
-          runner != nullptr ? label + " connection was closed"
-                            : label + " connection timed out");
+  Require(wait(connection.get(), POLLOUT), label + " connection was closed");
   int socket_error = 0;
   socklen_t socket_error_size = sizeof(socket_error);
   Require(::getsockopt(connection.get(), SOL_SOCKET, SO_ERROR, &socket_error,
@@ -1208,9 +1181,7 @@ CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
   Require(sent == static_cast<ssize_t>(encoded.size()),
           label + " request was not sent exactly");
   Require(wait(connection.get(), POLLIN),
-          runner != nullptr
-              ? label + " connection was closed before the acknowledgement"
-              : label + " acknowledgement timed out");
+          label + " connection was closed before the acknowledgement");
   std::vector<char> response(maximum_bytes + 1U);
   iovec vector{response.data(), response.size()};
   msghdr message{};
@@ -1241,18 +1212,18 @@ CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
 CanonicalValue
 ExchangeProgramRunnerLivenessPacket(const std::filesystem::path &path,
                                     const CanonicalValue &request,
-                                    ProgramRunnerExchangeEnd end,
+                                    LocalExchangeEnd end,
                                     const char *exchange) {
   end.exchange = exchange;
   return ExchangeLocalPacket(
       path, request, "Program Runner liveness",
-      {kMaximumProgramRunnerLivenessPacketBytes, 4U, 64U}, &end);
+      {kMaximumProgramRunnerLivenessPacketBytes, 4U, 64U}, end);
 }
 
 ProgramRunnerLivenessIdentity
 ProbeProgramRunnerLiveness(const std::filesystem::path &path,
                            const core::CellId &cell_id,
-                           const ProgramRunnerExchangeEnd &end) {
+                           const LocalExchangeEnd &end) {
   const auto response = ExchangeProgramRunnerLivenessPacket(
       path, CanonicalValue(CanonicalValue::Object{
                 {"api_version",
@@ -1279,7 +1250,7 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
     const core::ManagerLivenessRequiredSetDTO &required_set,
     const std::uint64_t sequence,
     const std::optional<core::ContentDigest> &reconciliation_digest,
-    const ProgramRunnerExchangeEnd &end) {
+    const LocalExchangeEnd &end) {
   const auto response = ExchangeProgramRunnerLivenessPacket(
       path,
       CanonicalValue(CanonicalValue::Object{
@@ -3526,8 +3497,8 @@ public:
       stop_incomplete_ = true;
       std::cerr << "execution host shutdown failed\n";
     }
-    // The adapter kills the host under its own lock, where nothing is
-    // printed; its lines come here.
+    // The adapter's stop records the kill of the host (a second stop
+    // request); the Manager prints its lines here.
     if (const auto killed = execution_host_adapter_.HostForceKilledPid()) {
       LogStopForced("execution_host");
       std::cerr << "{\"code\":\"application_process_killed\",\"role\":"
@@ -4355,8 +4326,8 @@ private:
           std::nullopt, std::nullopt, false};
     };
     try {
-      const ProgramRunnerExchangeEnd end{runner_lane_stop_fd_.get(),
-                                         &runner_exchanges_, nullptr};
+      const LocalExchangeEnd end{runner_lane_stop_fd_.get(),
+                                 &runner_exchanges_, nullptr};
       const auto runner = ProbeProgramRunnerLiveness(
           config_.program_runner_liveness_socket, admission_.cell_id(), end);
       attempt.runner_probed = true;
@@ -4449,7 +4420,7 @@ private:
       fail(error.what());
       attempt.failure->fault = error.error();
       attempt.failure->fault_cycle = error.cycle();
-    } catch (const ProgramRunnerExchangeStopped &) {
+    } catch (const LocalExchangeStopped &) {
       // The lane is stopping: not a lost contact; nothing is handed over.
       attempt.stopped = true;
     } catch (const std::exception &error) {
@@ -5578,7 +5549,10 @@ private:
   // Kernel's Stop control socket, as the public Stop route does.
   // It names the holder and every component it is mounted on, from the
   // active bundle's cell graph, so a loss during an arm move stops the arm.
-  // A component with no running motion is a no-effect Stop.
+  // A component with no running motion is a no-effect Stop. No time limit
+  // (OD-306 (a)): the exchange ends on the host's reply, on the host closing
+  // or refusing the connection (`carrier_stop_unavailable`), or on the
+  // application stop (`application_stopping`).
   std::optional<core::ErrorDTO>
   RequestCarrierStop(const SceneRuntimeCarriedObjectLoss &loss) {
     constexpr std::string_view source = "manager.carried_object_lost";
@@ -5617,7 +5591,8 @@ private:
                     CanonicalValue(CanonicalValue::Object{
                         {"request_key", RequestKeyValue(MintRequestKey())},
                         {"source_label", CanonicalValue(std::string(source))}})}})}}),
-          "Kernel Stop control", {kMaximumKernelStopResponseBytes, 32U});
+          "Kernel Stop control", {kMaximumKernelStopResponseBytes, 32U},
+          {execution_host_adapter_.AbandonSignalFd()});
       const auto *ok = response.find_object_member("ok");
       if (ok != nullptr && std::get_if<bool>(&ok->storage()) != nullptr &&
           std::get<bool>(ok->storage())) {
@@ -5630,6 +5605,10 @@ private:
           code != nullptr && code->is_string() ? code->as_string()
                                                : "carrier_stop_refused",
           "Kernel refused the carried-object-lost Stop", {}};
+    } catch (const LocalExchangeStopped &error) {
+      return core::ErrorDTO{
+          std::string(component_manager::kApplicationStoppingCode),
+          error.what(), {}};
     } catch (const std::exception &error) {
       return core::ErrorDTO{"carrier_stop_unavailable", error.what(), {}};
     }
@@ -5667,10 +5646,12 @@ private:
   /// Planned application stop (OD-121 (7), (19); stop state model S17): one
   /// Halt on the Kernel's existing Stop control socket (the channel
   /// RequestCarrierStop uses), then `read_stop` polls until its event is
-  /// complete. No time limit (OD-187 (1)): the wait ends when the Stop is
-  /// complete, when the host refuses or cannot be reached (the exchange
-  /// fails), or when a second stop request forces the stop. Returns true
-  /// only when the Stop completed.
+  /// complete. No time limit (OD-187 (1), OD-306 (a)): the wait ends when the
+  /// Stop is complete, when the host refuses, cannot be reached or closes the
+  /// connection (the exchange fails), or when a second stop request forces
+  /// the stop. The abandon signal is already written here, so each exchange
+  /// re-checks the forced stop between short poll slices instead. Returns
+  /// true only when the Stop completed.
   [[nodiscard]] bool RequestPlannedStopAndWait() noexcept {
     std::cerr << "application stop: waiting at halt: the Stop to complete\n";
     const auto socket = config_.execution_run_root / "execution-control.sock";
@@ -5679,6 +5660,8 @@ private:
         {"principal_id", CanonicalValue(nullptr)},
         {"transport", CanonicalValue("internal")}});
     const char *outcome = "not_settled";
+    const LocalExchangeEnd forced_end{-1, nullptr, nullptr,
+                                      &StopForceRequested};
     try {
       const auto response = ExchangeLocalPacket(
           socket,
@@ -5693,7 +5676,8 @@ private:
                         {"request_key", RequestKeyValue(MintRequestKey())},
                         {"source_label",
                          CanonicalValue("manager.planned_application_stop")}})}})}}),
-          "Kernel Stop control", {kMaximumKernelStopResponseBytes, 32U});
+          "Kernel Stop control", {kMaximumKernelStopResponseBytes, 32U},
+          forced_end);
       const auto *accepted = response.find_object_member("accepted");
       const auto *event_id =
           accepted != nullptr ? accepted->find_object_member("event_id") : nullptr;
@@ -5712,7 +5696,8 @@ private:
                 {"attribution", attribution},
                 {"command", CanonicalValue("read_stop")},
                 {"event_id", *event_id}}),
-            "Kernel Stop control", {kMaximumKernelStopResponseBytes, 32U});
+            "Kernel Stop control", {kMaximumKernelStopResponseBytes, 32U},
+            forced_end);
         const auto *status = read.find_object_member("stop_status");
         if (status == nullptr) {
           // The host answered the read with an error: the Stop's state
@@ -5727,6 +5712,9 @@ private:
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
       }
+    } catch (const LocalExchangeStopped &) {
+      LogStopForced("halt");
+      return false;
     } catch (const std::exception &) {
       outcome = "unavailable";
     }
@@ -5744,7 +5732,9 @@ private:
   // into the execution host's signal ingress, on the same control socket and
   // envelope as the loss Stop. `loss` (attachment, object,
   // loss event id, stored key) is present iff the level is `true`. The
-  // host records the level even while no composition holds the signal.
+  // host records the level even while no composition holds the signal. No
+  // time limit (OD-306 (a)): ends on the reply, the host closing or refusing
+  // the connection, or the application stop (`application_stopping`).
   std::optional<core::ErrorDTO> PublishCarriedObjectLostLevel(
       const core::ControllableComponentId &component,
       const core::CommandTargetId &target,
@@ -5778,7 +5768,8 @@ private:
                                    ? CanonicalValue(*loss->set_key)
                                    : CanonicalValue(nullptr)}})}}),
           "Kernel carried-object-lost signal",
-          {kMaximumKernelStopResponseBytes, 32U});
+          {kMaximumKernelStopResponseBytes, 32U},
+          {execution_host_adapter_.AbandonSignalFd()});
       const auto *ok = response.find_object_member("ok");
       if (ok == nullptr || !ok->is_bool() || !ok->as_bool()) {
         const auto *error = response.find_object_member("error");
@@ -5800,6 +5791,10 @@ private:
                               "signal level recorded but not yet delivered",
                               {}};
       return std::nullopt;
+    } catch (const LocalExchangeStopped &error) {
+      return core::ErrorDTO{
+          std::string(component_manager::kApplicationStoppingCode),
+          error.what(), {}};
     } catch (const std::exception &error) {
       return core::ErrorDTO{"carried_object_lost_signal_unavailable",
                             error.what(), {}};

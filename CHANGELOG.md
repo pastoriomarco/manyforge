@@ -1499,6 +1499,37 @@ formats; such changes are listed explicitly.
 
 ### Fixed
 
+- **A loaded machine no longer refuses motion through the alarm-attention
+  heartbeat (OD-307).** Headless gave each publication of the operator-alarm
+  motion attention to the Kernel 200 ms; six slower answers in a row (about
+  2 s) let the Kernel's copy age out, so Run, Resume and recovery were refused
+  although the Kernel was answering. A publication now waits for the Kernel's
+  answer, the Kernel's closed connection or Headless's own shutdown; the
+  Kernel's 2 s freshness bound alone judges whether its copy is current.
+  Publication counts no longer have an `abandoned` outcome.
+- **Program forensic records are no longer dropped on a slow machine
+  (OD-309).** The Program Runner's delivery of diagnostic captures to the
+  Historian gave each request 0.25 s and its shutdown 2 s; a slower Headless
+  answer counted the record as lost, and a slower shutdown raised a shutdown
+  error. Only the connection is now limited (as for runner commands); the
+  shutdown waits for the one delivery in flight.
+- **A slow execution host no longer fails the Manager's Stops (OD-306).**
+  The Manager's exchanges on the host's Stop control socket (the
+  carried-object-lost signal and Stop, and the Halt at the application stop
+  with its reads of the Stop's state) gave up after 250 ms. A slow but live
+  host then made the carried-object-lost Stop read `carrier_stop_unavailable`
+  and the planned application stop end incomplete (exit 74, an unclean
+  shutdown reported at the next start). These exchanges now have no time
+  limit, like the Program Runner exchange: each ends on the host's reply, on
+  the host closing or refusing the connection, or on the application stop
+  (typed `application_stopping`; at the application stop's Halt, a second
+  stop request).
+- **The execution host is stopped without holding the adapter's lock
+  (OD-308).** Stopping the host held the adapter's main lock for the whole
+  drain (seconds, no limit), so every other host call waited behind it. The
+  unit is now marked busy `stopping` while the host drains with no lock held:
+  other calls get the typed `runtime_unit_launch_in_progress` answer (phase
+  `stopping`) at once, and the host still counts as present until it is gone.
 - **The scene status never goes back to an older value (OD-302).** The
   Manager publishes the `logical_scene` and `scene_runtime` status sections
   from the command strand and from the Apply lane. A slower publication could

@@ -129,10 +129,7 @@ from .native import (
 from .service import HeadlessService, TrustedAttribution, warm_builtin_node_environment
 from .program_runner_client import ProgramRunnerHttpClient
 from .cell_admission import CellAdmissionClient
-from .alarm_attention import (
-    PUBLICATION_DEADLINE_SECONDS,
-    OperatorAlarmAttentionPublisher,
-)
+from .alarm_attention import OperatorAlarmAttentionPublisher
 from .activation_preparer import ActivationPreparer
 from .disk_check import (
     EVENT_HISTORY,
@@ -606,14 +603,13 @@ def create_app(
         )
         # Its own thread, reading the owner's published projection without the
         # core lock: neither event-pump work nor any core call can delay the
-        # Kernel heartbeat; each publication ends by its deadline D < P.
+        # Kernel heartbeat. Each publication waits for the Kernel's answer;
+        # the Kernel's freshness bound alone judges staleness (OD-307).
         alarm_attention = OperatorAlarmAttentionPublisher(
             core,
             CellAdmissionClient(
                 config.execution_run_root,
-                timeout_seconds=min(
-                    config.execution_timeout_seconds, PUBLICATION_DEADLINE_SECONDS
-                ),
+                timeout_seconds=config.execution_timeout_seconds,
             ),
         )
         if config.disk_free_floor_bytes is not None:
