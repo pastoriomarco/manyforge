@@ -177,15 +177,7 @@ core::ActionResult PointCloudSourceAdapter::Run(const core::ComponentAction acti
       }
       // State keeps the last completed forwarding value while middleware runs.
       // The process pin prevents a replaced bridge from being destroyed here.
-      try {
-        link_->SetForwarding(forwarding);
-      } catch (...) {
-        // Preserve the old action's state on a publish exception, but never
-        // update a newer bridge that replaced the pinned process.
-        const std::lock_guard lock(mutex_);
-        if (process_ == process) forwarding_ = forwarding;
-        throw;
-      }
+      link_->SetForwarding(forwarding);
       {
         const std::lock_guard lock(mutex_);
         if (process_ != process) {

@@ -29,7 +29,6 @@ def _source(owner: str, *, generation: int = 1) -> dict[str, Any]:
         "freshness": "fresh",
         "known_gaps": [],
         "source_generation": generation,
-        "source_owner_epoch": f"{owner}.epoch.1",
         "source_owner_id": owner,
     }
 
@@ -40,7 +39,7 @@ def _facts() -> dict[str, Any]:
     offer = "sha256:" + "3" * 64
     runtime = {
         "complete": True,
-        "projection_owner_epoch": "headless.epoch.1",
+        "application_start_id": "3f9a00000000ffff",
         "projection_generation": 9,
         "sections": {
             "manager": {
@@ -88,7 +87,6 @@ def _facts() -> dict[str, Any]:
     }
     alarms = {
         "owner_id": "alarms",
-        "owner_epoch": "alarms.epoch.1",
         "generation": 3,
         "state_revision": 5,
         "active_count": 0,
@@ -102,7 +100,6 @@ def _facts() -> dict[str, Any]:
         "scenario_id": "cell-pick",
         "source": {
             "source_owner_id": "program-owner",
-            "source_owner_epoch": "program-owner.epoch.1",
             "source_generation": 6,
         },
     }
@@ -117,14 +114,14 @@ def _facts() -> dict[str, Any]:
             "cell_id": "cell-a",
             "graph_revision": graph,
             "retained_bundle_id": bundle,
-            "owner_epoch": "execution.epoch.1",
+            "application_start_id": "3f9a00000000ffff",
             "active_publication_generation": 8,
         },
     }
     targets = {
         "ok": True,
         "targets": {
-            "schema_version": "manyforge.execution_targets.v4",
+            "schema_version": "manyforge.execution_targets.v5",
             "components": [{
                 "controllable_component_id": "robot-a",
                 "availability": {"command_eligible": True, "reason": None},
@@ -144,7 +141,9 @@ def _facts() -> dict[str, Any]:
         "control_state": {
             "cell_stop_action": {
                 "available": True,
-                "expected_stop_generation": 2,
+                "last_event_id": 2,
+                "last_completed": None,
+                "unavailable_reason": None,
             }
         },
     }
@@ -156,7 +155,6 @@ def _facts() -> dict[str, Any]:
             "admission_generation": 7,
         },
         "program_cycle": {
-            "program_runner_owner_epoch": "runner.epoch.1",
             "cycle_generation": 11,
             "state": "terminal_awaiting_reset",
         },
@@ -192,16 +190,15 @@ def test_ready_overview_keeps_normal_terminal_cycle_out_of_health() -> None:
 
     overview = build_component_overview(**facts)
 
-    assert overview["schema_version"] == "manyforge.component_overview.v2"
+    assert overview["schema_version"] == "manyforge.component_overview.v3"
     assert overview["readiness"] == "ready"
     assert overview["overview_revision"].startswith("sha256:")
     assert _by_id(overview)["program_runner"]["detail"] == (
         "cycle state terminal awaiting reset"
     )
     assert _by_id(overview)["execute_control"]["status"] == "healthy"
-    assert _by_id(overview)["execution_owner"]["owner_epoch"] == (
-        "execution.epoch.1"
-    )
+    assert "owner_epoch" not in _by_id(overview)["execution_owner"]
+    assert not any("owner_epoch" in key for key in overview["basis"])
     assert build_component_overview(**facts)["overview_revision"] == (
         overview["overview_revision"]
     )
@@ -238,6 +235,36 @@ def test_expected_manager_convergence_is_waiting_without_operator_retry() -> Non
     )
 
 
+def test_oversized_manager_section_keeps_its_typed_reason() -> None:
+    # OD-281: the earlier value is still held, freshness is unavailable.
+    facts = _facts()
+    facts["runtime"]["sections"]["manager"].update(
+        {"freshness": "unavailable", "known_gaps": ["manager_status_section_oversized"]}
+    )
+
+    manager = _by_id(build_component_overview(**facts))["manager"]
+
+    assert manager["status"] == "offline"
+    assert manager["reason_code"] == "manager_status_section_oversized"
+
+
+def test_manager_not_answering_is_offline_with_the_catalog_code() -> None:
+    # OD-284: every section is stale with the one code; only the Manager tile
+    # changes, the scene tiles keep their stale presentation.
+    facts = _facts()
+    for section in ("manager", "logical_scene", "scene_runtime"):
+        facts["runtime"]["sections"].setdefault(section, _source(section)).update(
+            {"freshness": "stale", "known_gaps": ["manager_status_unavailable"]}
+        )
+
+    tiles = _by_id(build_component_overview(**facts))
+
+    assert tiles["manager"]["status"] == "offline"
+    assert tiles["manager"]["reason_code"] == "manager_status_unavailable"
+    assert tiles["logical_scene"]["status"] == "waiting"
+    assert tiles["logical_scene"]["reason_code"] == "source_stale"
+
+
 def test_admitted_maintenance_exposes_one_stable_reason_without_hiding_faults() -> None:
     facts = _facts()
     manager = facts["runtime"]["sections"]["manager"]["payload"]
@@ -248,7 +275,7 @@ def test_admitted_maintenance_exposes_one_stable_reason_without_hiding_faults() 
     )
     manager["apply"] = {
         "records": [{
-            "apply_id": "apply-1",
+            "apply_id": 1,
             "apply_generation": 4,
             "phase": "runtime_convergence_pending",
             "incomplete": True,
@@ -263,7 +290,7 @@ def test_admitted_maintenance_exposes_one_stable_reason_without_hiding_faults() 
 
     assert overview["readiness"] == "waiting"
     assert overview["maintenance_operation"] == {
-        "apply_id": "apply-1",
+        "apply_id": 1,
         "apply_generation": 4,
         "phase": "runtime_convergence_pending",
         "affected_runtime_unit_ids": ["robot.native"],
@@ -286,7 +313,7 @@ def test_admitted_maintenance_exposes_one_stable_reason_without_hiding_faults() 
     assert outside_maintenance["maintenance_operation"] is None
 
     manager["apply"]["records"] = [{
-        "apply_id": "apply-2",
+        "apply_id": 2,
         "apply_generation": 1,
         "phase": "fence_acquire_pending",
         "incomplete": True,
@@ -442,15 +469,15 @@ def _warm_empty_facts(canonical_empty: bool = True) -> dict[str, Any]:
     facts["execution_identity_response"] = {"ok": True, "identity": identity}
     facts["execution_targets_response"] = {
         "ok": True, "identity": copy.deepcopy(identity),
-        "targets": {"schema_version": "manyforge.execution_targets.v4", "components": []},
+        "targets": {"schema_version": "manyforge.execution_targets.v5", "components": []},
     }
     facts["execution_control_response"] = {
         "ok": True, "identity": copy.deepcopy(identity),
         "control_state": {
-            "schema_version": "manyforge.execution_control_state.v7",
+            "schema_version": "manyforge.execution_control_state.v8",
             "observed_targets": [], "manual_operations": [], "runtime_scale_control": None,
-            "cell_stop_action": {"available": True, "expected_stop_generation": 0,
-                                 "latest_terminal": None,
+            "cell_stop_action": {"available": True, "last_event_id": None,
+                                 "last_completed": None,
                                  "unavailable_reason": None},
         },
     }
@@ -491,7 +518,7 @@ def test_verified_empty_publication_has_no_required_equipment_faults(canonical_e
     (("available",), False),
     (("freshness",), "stale"),
     (("known_gaps",), ["source_gap"]),
-    (("source_owner_epoch",), None),
+    (("source_owner_id",), None),
     (("source_generation",), True),
     (("payload", "manager_ready"), False),
     (("payload", "runtime", "converged"), False),
@@ -558,8 +585,8 @@ def test_empty_publication_does_not_hide_actual_source_or_owner_errors(fault, ca
     (("execution_identity_response", "identity", "graph_revision"), "foreign-graph"),
     (("execution_identity_response", "identity", "active_publication_generation"), 3),
     (("execution_identity_response", "identity", "active_publication_generation"), True),
-    (("execution_identity_response", "identity", "owner_epoch"), ""),
-    (("execution_targets_response", "identity", "owner_epoch"), "replaced-owner"),
+    (("execution_identity_response", "identity", "application_start_id"), ""),
+    (("execution_targets_response", "identity", "application_start_id"), "3f9a00000000fffe"),
     (("execution_control_response", "identity", "active_publication_generation"), 5),
     (("execution_control_response", "identity", "scene_revision", "revision_id"), 2),
     (("execution_targets_response", "targets", "components"), [{}]),
@@ -615,3 +642,39 @@ def test_empty_real_returned_alarm_remains_visible() -> None:
     overview = build_component_overview(**facts)
     assert _by_id(overview)["execute_control"]["status"] == "not_applicable"
     assert overview["basis"]["alarm_state_revision"] == facts["alarms"]["state_revision"]
+
+
+def test_stop_capability_row_generation_is_the_last_stop_event_id() -> None:
+    """H10: the row's generation follows ``cell_stop_action.last_event_id``,
+    which changes with every Stop and never with a release."""
+
+    facts = _facts()
+    tile = _by_id(build_component_overview(**facts))["stop_capability"]
+    assert tile["generation"] == 2
+    stop_action = facts["execution_control_response"]["control_state"]["cell_stop_action"]
+    stop_action["last_event_id"] = 7
+    tile = _by_id(build_component_overview(**facts))["stop_capability"]
+    assert tile["generation"] == 7
+
+
+def test_component_with_an_unconfirmed_stop_carries_the_reason() -> None:
+    """F2: a component whose last Stop ended uncontained is published with
+    activity unknown and reason ``stop_unconfirmed``; the view carries it."""
+
+    facts = _facts()
+    reason = {"code": "stop_unconfirmed", "message": "Last Stop not confirmed"}
+    facts["component_model"] = parse_component_model({
+        "component_states": [
+            _component("robot", activity="unknown", reason=reason),
+        ],
+        "cell_latch": {"latched": True, "causes": [
+            {"component_id": "robot", "kind": "activity_unknown", "reason": reason},
+        ]},
+        "signal_samples": [],
+        "rule_holds": [],
+    })
+    tile = _by_id(build_component_overview(**facts))["component:robot"]
+    assert tile["reason_code"] == "stop_unconfirmed"
+    assert tile["detail"] == "Last Stop not confirmed"
+    cause = facts["component_model"].cell_latch["causes"][0]
+    assert cause["reason"] == reason

@@ -35,12 +35,12 @@ function stubDom() {
   return node('div');
 }
 
-const completed = (applyId: string): WorkbenchNotice => ({
+const completed = (applyId: number): WorkbenchNotice => ({
   id: `activation.completed.${applyId}`,
   severity: 'info',
   domain: 'activation',
   title: 'Activation completed',
-  message: `Manager confirmed ${applyId}.`,
+  message: `Manager confirmed 3f9a/apply${applyId}.`,
 });
 
 it('presents an event-triggered notice for BRIEF_NOTICE_MS, never re-presents it, and presents a new one', async () => {
@@ -58,18 +58,18 @@ it('presents an event-triggered notice for BRIEF_NOTICE_MS, never re-presents it
     root.render(<Probe notice={notice} />);
   });
 
-  await render(completed('apply.1'));
+  await render(completed(1));
   expect(shown?.title).toBe('Activation completed');
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS - 1); });
-  expect(shown?.id).toBe('activation.completed.apply.1');
+  expect(shown?.id).toBe('activation.completed.1');
   await act(() => { vi.advanceTimersByTime(1); });
   expect(shown).toBeNull();
 
   // The same notice again is the same event: it does not re-present.
-  await render(completed('apply.1'));
+  await render(completed(1));
   expect(shown).toBeNull();
 
-  await render(completed('apply.2'));
-  expect(shown?.id).toBe('activation.completed.apply.2');
+  await render(completed(2));
+  expect(shown?.id).toBe('activation.completed.2');
   await act(() => root.unmount());
 });

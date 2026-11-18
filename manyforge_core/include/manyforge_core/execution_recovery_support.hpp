@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <manyforge_core/observed_robot_state_publication.hpp>
 #include <manyforge_core/types/recovery.hpp>
-#include <manyforge_core/types/stop_certificate.hpp>
+#include <manyforge_core/types/strong_id.hpp>
 #include <map>
 #include <optional>
 #include <string>
@@ -75,13 +75,12 @@ class StopOwnerIdentityTracker {
   std::uint64_t selected_execution_id_ = 0;
 };
 
-/// Participant-local recovery evidence for one aggregate addressed Stop.
-/// Unlike KernelStopCertificateDTO this is only a reference to the addressed
-/// owner's certificate identity and is never published as another certificate.
+/// Participant-local recovery evidence for one addressed Stop: the Kernel's
+/// Stop event whose attempt settled this execution (K20). Only a reference to
+/// that event; never published as a certificate.
 struct AddressedMotionStopRecoveryEvidenceDTO final {
   std::uint64_t execution_id{};
-  std::uint64_t stop_owner_generation{};
-  StopCertificateRefDTO aggregate_stop_certificate;
+  StopEventId stop_event_id{0U};
   bool backend_stop_confirmed{};
 
   friend bool operator==(const AddressedMotionStopRecoveryEvidenceDTO&,
@@ -100,8 +99,6 @@ struct RecoveryAuthorityCapture {
   bool operator_stop_active = false;
   bool motion_trip_stop_active = false;
   bool stronger_authority_active = false;
-  std::uint64_t operator_stop_owner_generation = 0;
-  std::optional<KernelStopCertificateDTO> operator_stop_certificate;
   std::optional<AddressedMotionStopRecoveryEvidenceDTO> addressed_motion_stop_evidence;
   /// Classified retryable pre-dispatch validation failure, or a Failed
   /// prepared execution proven never dispatched (no physical effect).
@@ -179,10 +176,15 @@ MotionRetryEligibilityDTO planning_retry_eligibility(const RecoveryAuthorityCapt
 KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCapture& capture,
                                                       std::uint64_t previous_revision);
 
-/// A certified ordinary Stop whose execute worker's terminal cleanup is still
-/// pending: settled under its certificate, but neither retry nor close is
+/// A settled ordinary Stop whose execute worker's terminal cleanup is still
+/// pending: settled under its Stop event, but neither retry nor close is
 /// decided yet (status waiting, `terminal_cleanup_pending`).
 [[nodiscard]] bool stopped_awaiting_terminal_cleanup(
+    const KernelRecoveryAssessmentDTO& assessment) noexcept;
+
+/// A failed execution not admitted to retry, now or once its terminal
+/// cleanup ends: a retryable failure still awaiting its cleanup is not one.
+[[nodiscard]] bool failed_not_retry_admissible(
     const KernelRecoveryAssessmentDTO& assessment) noexcept;
 
 /// True when two assessments differ in identity, authority, actionability,

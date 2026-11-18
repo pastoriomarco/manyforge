@@ -19,6 +19,7 @@
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <fcntl.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -155,28 +156,26 @@ ManagedExecutionSurfaceControl::ManagedExecutionSurfaceControl(
       ExecutionCompositionAccess *selected_composition_access,
       component_manager::detail::ManagerLivenessCommandAdmission
           *selected_manager_liveness_admission,
-      core::RequestOwnerEpoch selected_owner_epoch)
+      core::ApplicationStartId selected_application_start_id)
       : run_root(std::move(selected_run_root)),
         composition_access(selected_composition_access),
         manager_liveness_admission(selected_manager_liveness_admission),
-        owner_epoch(std::move(selected_owner_epoch)) {}
+        application_start_id(selected_application_start_id) {}
 
 ExecutionCommandSurface::ExecutionCommandSurface(
       std::filesystem::path run_root,
       ExecutionCompositionAccess &composition_access,
       component_manager::detail::ManagerLivenessCommandAdmission
           &manager_liveness_admission,
-      core::RequestOwnerEpoch owner_epoch)
-      : owner_epoch_(std::move(owner_epoch)),
-        direct_control_program_run_id_("direct-control-" +
-                                       owner_epoch_.value()),
-        direct_control_gripper_program_run_id_("direct-control-gripper-" +
-                                               owner_epoch_.value()),
+      core::ApplicationStartId application_start_id)
+      : application_start_id_(application_start_id),
+        start_id_text_(core::FormatApplicationStartId(application_start_id).data(), 16U),
         composition_access_(composition_access),
         manager_liveness_admission_(manager_liveness_admission),
         host_lock_(run_root), command_socket_(run_root, kSocketFileName),
         control_socket_(run_root, kControlSocketFileName),
         observation_socket_(run_root, kObservationSocketFileName),
+        component_socket_(run_root, kComponentSocketFileName),
         event_stream_socket_(run_root, kEventStreamSocketFileName) {
     if (!lane_wake_) {
       FailErrno("create execution lane wake");
@@ -187,8 +186,15 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     const std::stop_callback wake_on_stop(stop_token, [this] { WakeLanes(); });
     std::jthread control_thread(
         [this](std::stop_token stop_token) { RunControlLane(stop_token); });
+    // Speed changes from both sockets; never behind planning, Submit or disk.
+    std::jthread runtime_scale_thread([this](std::stop_token stop_token) {
+      ::pthread_setname_np(::pthread_self(), "mf_scale_lane");
+      RunDeferredLane(runtime_scale_lane_, stop_token);
+    });
     std::jthread observation_thread(
         [this](std::stop_token stop_token) { RunObservationLane(stop_token); });
+    std::jthread component_thread(
+        [this](std::stop_token stop_token) { RunComponentLane(stop_token); });
     std::jthread reconciliation_thread([this](std::stop_token stop_token) {
       RunReconciliationLane(stop_token);
     });
@@ -199,17 +205,22 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     std::jthread scene_read_thread([this](std::stop_token stop_token) {
       RunDeferredLane(scene_read_lane_, stop_token);
     });
+    // Output writes wait for the device; never on the ordinary accept thread.
+    std::jthread io_output_thread([this](std::stop_token stop_token) {
+      ::pthread_setname_np(::pthread_self(), "mf_io_out_lane");
+      RunDeferredLane(io_output_lane_, stop_token);
+    });
     // Subscriber writers never take a command lane or its locks while they
     // send; a slow subscriber only lags in the journal.
     std::jthread event_stream_thread([this](std::stop_token stop_token) {
       event_stream_.Run(event_stream_socket_.get(), stop_token);
     });
+    LaneConnections connections;
     while (g_stop_requested == 0 && !stop_token.stop_requested() &&
            !reconciliation_lane_failed_.load(std::memory_order_acquire)) {
-      short revents = 0;
       int ready = -1;
       do {
-        ready = WaitForSocket(command_socket_.get(), revents);
+        ready = WaitForLane(command_socket_.get(), connections);
       } while (ready < 0 && errno == EINTR && g_stop_requested == 0 &&
                !stop_token.stop_requested() &&
                !reconciliation_lane_failed_.load(std::memory_order_acquire));
@@ -220,28 +231,37 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
       if (ready < 0) {
         FailErrno("poll execution command socket");
       }
-      if ((revents & POLLIN) != 0) {
-        HandleOneClient(command_socket_, CommandLane::kOrdinary, stop_token);
-      }
+      const short revents = connections.descriptors[0].revents;
+      ServeLaneTurn(command_socket_, CommandLane::kOrdinary, connections,
+                    stop_token);
       if ((revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
         Fail("execution command socket became unavailable");
       }
       if (control_socket_failed_.load(std::memory_order_acquire)) {
         Fail("execution Stop control socket became unavailable");
       }
+      if (component_socket_failed_.load(std::memory_order_acquire)) {
+        Fail("execution component socket became unavailable");
+      }
     }
     reconciliation_thread.request_stop();
     control_thread.request_stop();
     observation_thread.request_stop();
+    component_thread.request_stop();
     submission_ordered_thread.request_stop();
     scene_read_thread.request_stop();
+    io_output_thread.request_stop();
+    runtime_scale_thread.request_stop();
     event_stream_thread.request_stop();
     event_stream_thread.join();
     submission_ordered_thread.join();
     scene_read_thread.join();
+    io_output_thread.join();
+    runtime_scale_thread.join();
     reconciliation_thread.join();
     control_thread.join();
     observation_thread.join();
+    component_thread.join();
     if (reconciliation_lane_failed_.load(std::memory_order_acquire)) {
       std::exception_ptr failure;
       {
@@ -254,6 +274,8 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     }
     Require(!control_socket_failed_.load(std::memory_order_acquire),
             "execution Stop control socket became unavailable");
+    Require(!component_socket_failed_.load(std::memory_order_acquire),
+            "execution component socket became unavailable");
     return 0;
   }
 
@@ -389,8 +411,6 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
          CanonicalValue(binding.program_binding_id.value())},
         {"program_id", CanonicalValue(binding.program_id.value())},
         {"program_revision", CanonicalValue(binding.program_revision.value())},
-        {"program_run_id",
-         CanonicalValue(direct_control_program_run_id_.value())},
         {"target", CanonicalValue(CanonicalValue::Object{
             {"component_id", CanonicalValue(binding.controllable_component_id.value())},
             {"command_target_id", CanonicalValue(binding.command_target_id.value())}})},
@@ -473,7 +493,10 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
           refuse("current_route_unqualified", route.ok() ? nullptr : &route.error());
           return;
         }
-        representatives.push_back(physical);
+        // A gripper running as its own component: its current registrations
+        // are the command binding and its feedback alias.
+        for (const auto &registration : candidate.gripper_runtime->registrations())
+          representatives.push_back(registration.binding);
       }
       const auto resolved =
           composition.target_resolver->ResolveObservationTarget(
@@ -600,7 +623,6 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
               content_identity::nonnegative_int64_value(
                   resolved.value().evaluated_at_ns)},
              {"kind", CanonicalValue("frame_transform")},
-             {"owner_epoch", CanonicalValue(owner_epoch_.value())},
              {"pose", transform.pose_value},
              {"program_binding_id",
               CanonicalValue(query.program_binding_id.value())},
@@ -610,7 +632,7 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
                                      .projection_binding.projection_revision
                                      .scene_revision)},
              {"schema_version",
-              CanonicalValue("manyforge.target_observation.v2")},
+              CanonicalValue("manyforge.target_observation.v3")},
              {"source_frame", transform.source_frame_value},
              {"target_frame", transform.target_frame_value},
              {"value", PoseValue(resolved.value().pose_in_target_frame)},
@@ -630,8 +652,6 @@ CanonicalValue ExecutionCommandSurface::IoSignalQueryResponse(
 core::Result<core::IoSignalObservationDTO> ExecutionCommandSurface::ReadBoundIoSignal(
     const TargetObservationQuery &query, Composition &composition) const {
   using Reply = core::Result<core::IoSignalObservationDTO>;
-  if (query.owner_epoch != owner_epoch_)
-    return Reply::Err({"execution_target_owner_stale", "target query names a replaced owner", {}});
   if (!composition.io_signal_service)
     return Reply::Err({"io_signal_service_unavailable",
                       "current activation has no installed I/O service", {}});
@@ -683,8 +703,7 @@ core::Result<core::IoSignalObservationDTO> ExecutionCommandSurface::ReadBoundIoS
       {signal->reference.component_id, signal->reference.signal_name});
   if (!observed.ok())
     return Reply::Err(observed.error());
-  if (observed.value().cursor.owner_epoch != owner_epoch_ ||
-      observed.value().cursor.catalog_generation !=
+  if (observed.value().cursor.catalog_generation !=
           composition.publication_generation.value())
     return Reply::Err({"io_signal_catalog_stale", "I/O service differs from current activation", {}});
   const auto digest =
@@ -695,7 +714,7 @@ core::Result<core::IoSignalObservationDTO> ExecutionCommandSurface::ReadBoundIoS
     return Reply::Err({"io_signal_catalog_stale", "I/O descriptor differs from sealed binding", {}});
   if (changed_outside) {
     return host_detail::ReadBoundChangedOutside(*composition.io_signal_service,
-        observed.value(), owner_epoch_, composition.publication_generation.value());
+        observed.value(), composition.publication_generation.value());
   }
   return observed;
 }
@@ -747,8 +766,7 @@ CanonicalValue ExecutionCommandSurface::IoSignalResponse(
       {"target_observation",
        CanonicalValue(CanonicalValue::Object{
            {"schema_version",
-            CanonicalValue("manyforge.target_observation.v2")},
-           {"owner_epoch", CanonicalValue(owner_epoch_.value())},
+            CanonicalValue("manyforge.target_observation.v3")},
            {"program_binding_id",
             CanonicalValue(query.program_binding_id.value())},
            {"signal", CanonicalValue(CanonicalValue::Object{
@@ -808,16 +826,13 @@ CanonicalValue ExecutionCommandSurface::ProgramBlackboardResponse(
       {"command", CanonicalValue("publish_program_bbkeys")},
       {"ok", CanonicalValue(true)},
       {"status", CanonicalValue(accepted ? "accepted" : "superseded")},
-      {"owner_epoch", CanonicalValue(ack.owner_epoch.value())},
       {"program_binding_id", CanonicalValue(ack.program_binding_id.value())},
       {"active_publication_generation",
        CanonicalValue(
            static_cast<double>(ack.active_publication_generation.value()))},
       {"cycle_generation",
        CanonicalValue(static_cast<double>(ack.cycle_generation))},
-      {"program_run_id", ack.program_run_id
-                             ? CanonicalValue(ack.program_run_id->value())
-                             : CanonicalValue(nullptr)},
+      {"program_run_id", RunValue(ack.program_run_id)},
       {"source_epoch", CanonicalValue(ack.source_epoch.value())},
       {"accepted_sequence",
        ack.accepted_sequence
@@ -838,11 +853,9 @@ CanonicalValue ExecutionCommandSurface::MockRunPauseResponse(
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
       {"command", CanonicalValue("set_mock_io_run_paused")}, {"ok", CanonicalValue(true)},
-      {"owner_epoch", CanonicalValue(scope.request_owner_epoch.value())},
       {"program_binding_id", CanonicalValue(scope.program_binding_id.value())},
-      {"program_runner_owner_epoch", CanonicalValue(scope.program_runner_owner_epoch.value())},
       {"claim_generation", CanonicalValue(static_cast<double>(scope.claim_generation.value()))},
-      {"program_run_id", CanonicalValue(scope.program_run_id.value())},
+      {"program_run_id", CanonicalValue(static_cast<double>(scope.program_run_id.value()))},
       {"run_revision", CanonicalValue(std::to_string(request.run_revision))},
       {"paused", CanonicalValue(request.paused)},
       {"held_node_instance_ids", CanonicalValue(std::move(held_nodes))}});
@@ -922,13 +935,11 @@ CanonicalValue ExecutionCommandSurface::MockNodeSimulationResponse(
     return CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("end_mock_io_node_simulation")}, {"ok", CanonicalValue(true)},
-        {"owner_epoch", CanonicalValue(scope.request_owner_epoch.value())},
         {"program_binding_id", CanonicalValue(scope.program_binding_id.value())},
-        {"program_runner_owner_epoch", CanonicalValue(scope.program_runner_owner_epoch.value())},
         {"claim_generation", CanonicalValue(static_cast<double>(scope.claim_generation.value()))},
-        {"program_run_id", CanonicalValue(scope.program_run_id.value())},
+        {"program_run_id", CanonicalValue(static_cast<double>(scope.program_run_id.value()))},
         {"node_instance_id", CanonicalValue(scope.node.node_instance_id.value())},
-        {"node_attempt_id", CanonicalValue(scope.node.node_attempt_id)},
+        {"node_attempt_id", CanonicalValue(static_cast<double>(scope.node.node_attempt_id.value()))},
         {"node_start_index", CanonicalValue(std::to_string(scope.node_start_index))}});
   }
   const auto started = owner.StartProgramNodeMockSimulation(request);
@@ -956,13 +967,11 @@ CanonicalValue ExecutionCommandSurface::MockNodeSimulationResponse(
       {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
       {"command", CanonicalValue("start_mock_io_node_simulation")},
       {"ok", CanonicalValue(true)}, {"status", CanonicalValue("accepted")},
-      {"owner_epoch", CanonicalValue(scope.request_owner_epoch.value())},
       {"program_binding_id", CanonicalValue(scope.program_binding_id.value())},
-      {"program_runner_owner_epoch", CanonicalValue(scope.program_runner_owner_epoch.value())},
       {"claim_generation", CanonicalValue(static_cast<double>(scope.claim_generation.value()))},
-      {"program_run_id", CanonicalValue(scope.program_run_id.value())},
+      {"program_run_id", CanonicalValue(static_cast<double>(scope.program_run_id.value()))},
       {"node_instance_id", CanonicalValue(scope.node.node_instance_id.value())},
-      {"node_attempt_id", CanonicalValue(scope.node.node_attempt_id)},
+      {"node_attempt_id", CanonicalValue(static_cast<double>(scope.node.node_attempt_id.value()))},
       {"node_start_index", CanonicalValue(std::to_string(scope.node_start_index))},
       {"started_at_ns", CanonicalValue(std::to_string(receipt.started_at_ns))},
       {"signals", CanonicalValue(std::move(signals))}});
@@ -1020,9 +1029,6 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
 [[nodiscard]] CanonicalValue
   ExecutionCommandSurface::QueryTargetResponse(const TargetObservationQuery &query,
                       Composition &composition) const {
-    if (query.owner_epoch != owner_epoch_)
-      return ErrorResponse("execution_target_owner_stale",
-                           "target query names a replaced owner");
     if (query.signal.has_value())
       return IoSignalQueryResponse(query, composition);
     if (query.frame_transform.has_value())
@@ -1047,10 +1053,16 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     const auto &binding = observed_binding.value();
     const auto* gripper_backend =
         selected.gripper_runtime ? selected.gripper_runtime->backend() : nullptr;
-    if (gripper_backend && gripper_backend->gripper_actuation_kind(binding.command_target_id.value()) ==
-            core::GripperActuationKind::kPneumatic)
-      return ErrorResponse("gripper_state_unavailable",
-          "Pneumatic finger coordinates are display-only, not qualified gripper state");
+    // A pneumatic gripper reports its command state, never a finger position:
+    // its coordinates are display-only. A logical-only command (display-only,
+    // or valves written as mapped I/O) has no command state to report.
+    const bool pneumatic = gripper_backend &&
+        gripper_backend->gripper_actuation_kind(binding.command_target_id.value()) ==
+            core::GripperActuationKind::kPneumatic;
+    if (pneumatic && gripper_backend->gripper_output_mode(binding.command_target_id.value()) ==
+                         core::GripperOutputMode::kNone)
+      return ErrorResponse("gripper_status_unavailable",
+          "The pneumatic gripper's owner has no command state");
     const auto observed = channel->current_state(
         selected.cell_runtime != nullptr ? selected.cell_runtime->clock()->now()
                                          : selected.runtime->clock->now());
@@ -1168,7 +1180,8 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
                ? CanonicalValue(status.grasp_evidence->observation.confirmed)
                : CanonicalValue(nullptr)},
           {"observed_position",
-           CoordinatePositionValue(state.positions.front())},
+           pneumatic ? CanonicalValue(nullptr)
+                     : CoordinatePositionValue(state.positions.front())},
           {"revision", CanonicalValue(static_cast<double>(status.revision))},
           {"state",
            CanonicalValue(core::gripper_command_state_name(status.state))},
@@ -1176,10 +1189,9 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     }
     CanonicalValue::Object result{
         {"kind", CanonicalValue(frame_query ? "frame_pose" : "gripper_status")},
-        {"owner_epoch", CanonicalValue(owner_epoch_.value())},
         {"program_binding_id",
          CanonicalValue(query.program_binding_id.value())},
-        {"schema_version", CanonicalValue("manyforge.target_observation.v2")},
+        {"schema_version", CanonicalValue("manyforge.target_observation.v3")},
         {"source_epoch", CanonicalValue(state.source_epoch.value())},
         {"source_sequence",
          CanonicalValue(static_cast<double>(state.sequence))},
@@ -1208,17 +1220,17 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
 [[nodiscard]] CanonicalValue
   ExecutionCommandSurface::QueryOperationResponse(const ProgramOperationQuery &query,
                          Composition &composition) const {
-    if (query.owner_epoch != owner_epoch_)
-      return ErrorResponse("stale_request_owner_epoch",
-                           "operation query names another native owner");
+    // OD-234: a query of the held run resolves from that run's capture.
     const auto target = composition.target_resolver->ResolveOperationTarget(
-        query.program_binding_id, query.target);
+        query.program_binding_id, query.target,
+        composition.active_addressed_kernel()->program_run_resolution_context(
+            query.program_run_id));
     if (!target.ok())
       return ErrorResponse(target.error().code, target.error().message);
     // This is one bounded immutable owner capture, not a new operation index.
     const auto operations =
         composition.active_addressed_kernel()->get_resident_operations(
-            {query.program_run_id});
+            query.program_run_id);
     const core::OperationStateDTO *selected = nullptr;
     for (const auto &operation : operations) {
       if (operation.program_binding_id != query.program_binding_id)
@@ -1270,7 +1282,6 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
         {"ok", CanonicalValue(true)},
         {"operation", OperationStateValue(*selected)},
         {"runtime_scale", std::move(scale_value)},
-        {"owner_epoch", CanonicalValue(owner_epoch_.value())},
         {"target", CanonicalValue(CanonicalValue::Object{
             {"component_id", CanonicalValue(query.target.component_id.value())},
             {"command_target_id", CanonicalValue(query.target.command_target_id.value())}})},
@@ -1446,8 +1457,6 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
          CanonicalValue(binding.program_binding_id.value())},
         {"program_id", CanonicalValue(binding.program_id.value())},
         {"program_revision", CanonicalValue(binding.program_revision.value())},
-        {"program_run_id",
-         CanonicalValue(direct_control_gripper_program_run_id_.value())},
         {"resource",
          CanonicalValue(CanonicalValue::Object{
              {"coordinate_kind", CanonicalValue(coordinate_kind)},
@@ -1586,11 +1595,11 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
         {"active_publication_generation",
          CanonicalValue(
              static_cast<double>(composition.publication_generation.value()))},
+        {"application_start_id", CanonicalValue(start_id_text_)},
         {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
         {"control_management_mode", CanonicalValue("component_lifecycle")},
         {"graph_revision",
          CanonicalValue(projection.graph_revision.value())},
-        {"owner_epoch", CanonicalValue(owner_epoch_.value())},
         {"retained_bundle_id",
          CanonicalValue(projection.retained_bundle_id.value())},
     };
@@ -1601,7 +1610,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
                 const core::ProjectionRevisionDTO &projection) const {
     auto fields = IdentityFields(composition, projection);
     fields.emplace_back("schema_version",
-                        CanonicalValue("manyforge.execution_identity.v2"));
+                        CanonicalValue("manyforge.execution_identity.v3"));
     return CanonicalValue(std::move(fields));
   }
 
@@ -1612,16 +1621,39 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     // not another status contract with primary motion/gripper aliases.
     const auto targets = TargetsResponse(composition, projection);
     const auto control_state = ControlStateResponse(composition, projection);
+    // OD-217: one row per robot engine, ordered by component id. Each row
+    // copies that engine's check-monitor atomics (relaxed loads): no lock,
+    // nothing asked of a check thread or a motion worker.
+    std::map<std::string, CanonicalValue> check_rows;
+    const auto add_check_row = [&check_rows](const Composition &view) {
+      if (view.runtime == nullptr || view.runtime->participant_engine == nullptr)
+        return;
+      const auto &engine = *view.runtime->participant_engine;
+      const auto &component_id = view.controllable_component_id.value();
+      check_rows.emplace(component_id,
+                         RuntimeCollisionChecksRowValue(
+                             component_id, engine.runtime_collision_check_timing(),
+                             engine.runtime_collision_check_period_ns()));
+    };
+    add_check_row(composition);
+    for (const auto &participant : composition.participant_compositions)
+      add_check_row(*participant);
+    CanonicalValue::Array runtime_collision_checks;
+    runtime_collision_checks.reserve(check_rows.size());
+    for (auto &entry : check_rows)
+      runtime_collision_checks.push_back(std::move(entry.second));
     return CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("status")},
         {"ok", CanonicalValue(true)},
         {"status", CanonicalValue(CanonicalValue::Object{
                        {"schema_version",
-                        CanonicalValue("manyforge.execution_status.v3")},
+                        CanonicalValue("manyforge.execution_status.v4")},
                        {"identity", IdentityValue(composition, projection)},
                        {"targets", Member(targets, "targets")},
                        {"control_state", Member(control_state, "control_state")},
+                       {"runtime_collision_checks",
+                        CanonicalValue(std::move(runtime_collision_checks))},
                    })},
     });
   }
@@ -1728,7 +1760,6 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
           {"program_binding_id", field("program_binding_id")},
           {"program_id", field("program_id")},
           {"program_revision", field("program_revision")},
-          {"program_run_id", field("program_run_id")},
       };
       CanonicalValue::Object command;
       if (presentation == "motion") {
@@ -1950,7 +1981,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     });
     CanonicalValue::Object target_fields{
         {"components", CanonicalValue(std::move(components))},
-        {"schema_version", CanonicalValue("manyforge.execution_targets.v4")}};
+        {"schema_version", CanonicalValue("manyforge.execution_targets.v5")}};
     if (!io_bindings.empty())
       target_fields.emplace_back("io_signal_bindings",
                                  CanonicalValue(std::move(io_bindings)));
@@ -2009,9 +2040,9 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     runtime_scale_control_value =
         RuntimeScaleControlStatusValue(runtime_scale_control.value());
   }
-  const auto manual_operations = CurrentDirectControlManualOperations(
-      composition, *composition.active_addressed_kernel(),
-      direct_control_program_run_id_, direct_control_gripper_program_run_id_);
+  const auto manual_operations =
+      CurrentDirectControlManualOperations<core::ProgramTargetReferenceDTO>(
+          composition, *composition.active_addressed_kernel());
   CanonicalValue::Array manual_operation_values;
   manual_operation_values.reserve(manual_operations.size());
   for (const auto &projection : manual_operations) {
@@ -2107,7 +2138,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
             CanonicalValue(std::move(observed_target_states))},
            {"runtime_scale_control", std::move(runtime_scale_control_value)},
            {"schema_version",
-            CanonicalValue("manyforge.execution_control_state.v7")},
+            CanonicalValue("manyforge.execution_control_state.v8")},
        })},
       {"identity", IdentityValue(composition, projection)},
       {"ok", CanonicalValue(true)},
@@ -2505,16 +2536,16 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
         {"command", CanonicalValue("observation")},
         {"observation",
          CanonicalValue(CanonicalValue::Object{
+             {"application_start_id", CanonicalValue(start_id_text_)},
              {"cell_id",
               CanonicalValue(bundle.value().cell_graph.cell_id.value())},
              {"graph_revision",
               CanonicalValue(bundle.value().cell_graph.graph_revision.value())},
              {"measured_targets", CanonicalValue(std::move(measured_targets))},
-             {"owner_epoch", CanonicalValue(owner_epoch_.value())},
              {"retained_bundle_id",
               CanonicalValue(bundle.retained_bundle_id().value())},
              {"schema_version",
-              CanonicalValue("manyforge.execution_observation.v4")},
+              CanonicalValue("manyforge.execution_observation.v5")},
              {"source_epoch", CanonicalValue(stream_epoch)},
              {"source_sequence",
               CanonicalValue(static_cast<double>(change_generation))},
@@ -2545,15 +2576,14 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
           return ErrorResponse(
               "execution_owner_not_ready",
               "the managed execution owner has no active physical product",
-              {{"owner_epoch", owner_epoch_.value()}});
+              {{"application_start_id", start_id_text_}});
         }
         projection.emplace(
             BuildObservationProjection(*composition_access_.current));
       }
       auto current = std::move(*projection);
-      if (!command.observation_after_owner_epoch.has_value() ||
-          command.observation_after_owner_epoch->value() !=
-              owner_epoch_.value() ||
+      if (!command.observation_after_application_start_id.has_value() ||
+          *command.observation_after_application_start_id != application_start_id_ ||
           *command.observation_after_source_epoch != current.source_epoch ||
           *command.observation_after_source_sequence <
               current.source_sequence) {
@@ -2598,69 +2628,69 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
 [[nodiscard]] CanonicalValue
   ExecutionCommandSurface::ExecuteStop(const Command &command,
               core::ResourceAddressedExecutionKernel &addressed_kernel) {
+    // A Stop is never refused (stop state model §3.1 G2): every form returns
+    // its accepted event; an invalid request is widened and says so.
     if (command.kind == CommandKind::kStopProgramSelection) {
-      const auto result =
+      Require(command.program_selection.has_value(),
+              "execution Stop control lane accepts one complete Stop command");
+      const auto accepted =
           addressed_kernel.stop_program_selection(*command.program_selection);
-      if (!result.ok())
-        return ErrorResponse(result.error().code, result.error().message,
-                             result.error().details);
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("stop_program_selection")},
           {"ok", CanonicalValue(true)},
           {"accepted",
            ProgramSelectionAcceptedValue(
-               result.value(), command.program_selection->group_ids)}});
+               accepted, command.program_selection->group_ids)}});
     }
-    const bool ordinary = (command.kind == CommandKind::kStop ||
-                           command.kind == CommandKind::kStopProgramRun) &&
-                          command.stop.has_value();
-    const bool full =
-        command.kind == CommandKind::kFullStop && command.full_stop.has_value();
-    const bool malformed = command.kind == CommandKind::kMalformedStop &&
-                           command.malformed_stop.has_value();
-    Require(static_cast<unsigned>(ordinary) + static_cast<unsigned>(full) +
-                    static_cast<unsigned>(malformed) ==
-                1U,
-            "execution Stop control lane accepts one complete Stop command");
-    const auto result = [&] {
-      if (ordinary) {
-        return addressed_kernel.stop(*command.stop);
-      }
-      if (full) {
-        return addressed_kernel.full_stop(*command.full_stop);
-      }
-      return addressed_kernel.recognized_malformed_stop(
-          core::MalformedStopIngressDTO{
-              command.malformed_stop->request_id, owner_epoch_,
-              command.malformed_stop->attribution,
-              command.malformed_stop->recognized_route,
-              command.malformed_stop->reason});
-    }();
-    if (!result.ok()) {
+    const auto accepted_response = [](const std::string_view name,
+                                      const core::StopAcceptedDTO &accepted) {
       return CanonicalValue(CanonicalValue::Object{
+          {"accepted", StopAcceptedValue(accepted)},
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"error", ErrorValue(result.error())},
-          {"ok", CanonicalValue(false)},
+          {"command", CanonicalValue(std::string(name))},
+          {"ok", CanonicalValue(true)},
       });
+    };
+    switch (command.kind) {
+    case CommandKind::kStop:
+      Require(command.stop.has_value(),
+              "execution Stop control lane accepts one complete Stop command");
+      return accepted_response("stop", addressed_kernel.stop(*command.stop));
+    case CommandKind::kStopProgramRun:
+      Require(command.program_run_end.has_value(),
+              "execution Stop control lane accepts one complete Stop command");
+      return accepted_response("stop_program_run",
+                               addressed_kernel.end_program_run(*command.program_run_end));
+    case CommandKind::kStopAll:
+    case CommandKind::kHalt:
+    case CommandKind::kCellStop: {
+      Require(command.cell_wide_stop.has_value(),
+              "execution Stop control lane accepts one complete Stop command");
+      if (command.kind == CommandKind::kStopAll)
+        return accepted_response("stop_all", addressed_kernel.stop_all(*command.cell_wide_stop));
+      if (command.kind == CommandKind::kHalt)
+        return accepted_response("halt", addressed_kernel.halt(*command.cell_wide_stop));
+      return accepted_response("cell_stop", addressed_kernel.cell_stop(*command.cell_wide_stop));
     }
-    return CanonicalValue(CanonicalValue::Object{
-        {"accepted", StopAcceptedValue(result.value())},
-        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-        {"owner_epoch", CanonicalValue(owner_epoch_.value())},
-        {"command",
-         CanonicalValue(full ? "full_stop"
-                        : command.kind == CommandKind::kStopProgramRun
-                            ? "stop_program_run"
-                            : "stop")},
-        {"ok", CanonicalValue(true)},
-    });
+    case CommandKind::kRecognizedStop:
+      Require(command.recognized_stop.has_value(),
+              "execution Stop control lane accepts one complete Stop command");
+      return accepted_response(
+          "recognized_stop",
+          addressed_kernel.recognized_stop(core::RecognizedStopIngressDTO{
+              command.recognized_stop->request_key, command.recognized_stop->attribution,
+              command.recognized_stop->recognized_route, command.recognized_stop->reason,
+              command.recognized_stop->source_label}));
+    default:
+      Fail("execution Stop control lane accepts one complete Stop command");
+    }
   }
 
 [[nodiscard]] CanonicalValue
   ExecutionCommandSurface::ReadStop(const Command &command,
            core::ResourceAddressedExecutionKernel &addressed_kernel) const {
-    const auto status = addressed_kernel.get_stop_status(*command.stop_id);
+    const auto status = addressed_kernel.read_stop(*command.stop_event_id);
     if (!status.ok()) {
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -2672,7 +2702,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("read_stop")},
         {"ok", CanonicalValue(true)},
-        {"stop_status", StopStatusSummaryValue(status.value())},
+        {"stop_status", StopEventStatusValue(status.value())},
     });
   }
 
@@ -2680,11 +2710,26 @@ CanonicalValue::Object ExecutionCommandSurface::ComponentModelFields(
     core::ResourceAddressedExecutionKernel &addressed_kernel, const ComponentModelRead read) const {
   const bool control = read == ComponentModelRead::kControl;
   CanonicalValue::Array components;
-  if (composition_access_.component_runtime)
-    for (const auto &state : composition_access_.component_runtime->Read().states)
+  if (composition_access_.component_runtime) {
+    // F2: a component whose last Stop ended uncontained is published with
+    // activity unknown and the `stop_unconfirmed` reason until its controller
+    // reports idle (the Kernel clears the mark; the latch already counts it).
+    const auto unconfirmed = addressed_kernel.stop_unconfirmed_components();
+    for (auto state : composition_access_.component_runtime->Read().states) {
+      if (std::any_of(unconfirmed.begin(), unconfirmed.end(), [&](const auto &id) {
+            return id.value() == state.component_id;
+          })) {
+        state.activity = core::ComponentActivity::kUnknown;
+        state.reason = core::ComponentStateReason{
+            std::string(core::kStopUnconfirmedReason),
+            "Its last Stop ended uncontained; activity is unknown until its "
+            "controller reports idle."};
+      }
       components.emplace_back(ComponentStateValue(state));
+    }
+  }
   // Signals need the selected product. The control read is served on the
-  // Stop control socket, so it never waits for an Apply holding the
+  // component socket, so it never waits for an Apply holding the
   // composition: while one does, no sample is reported (an Apply refuses a
   // running cell). The state read waits, as its callers already do.
   CanonicalValue::Array samples;
@@ -2754,7 +2799,7 @@ CanonicalValue ExecutionCommandSurface::ReadComponentModelResponse(
 
 namespace {
 std::string RecoverySnapshotId(const ExecutionProduct &product,
-                               const core::RequestOwnerEpoch &owner_epoch,
+                               const std::string &start_id_text,
                                const std::string &component_id,
                                const Composition *composition) {
   CanonicalValue::Array processes;
@@ -2772,7 +2817,7 @@ std::string RecoverySnapshotId(const ExecutionProduct &product,
       if (peer) add(*peer);
   }
   const CanonicalValue identity(CanonicalValue::Object{
-      {"owner_epoch", CanonicalValue(owner_epoch.value())},
+      {"application_start_id", CanonicalValue(start_id_text)},
       {"component_id", CanonicalValue(component_id)},
       {"publication_generation", CanonicalValue(std::to_string(product.publication_generation.value()))},
       {"retained_bundle_id", CanonicalValue(product.bundle->retained_bundle_id().value())},
@@ -2823,7 +2868,7 @@ CanonicalValue ExecutionCommandSurface::ComponentRecoveryPreflightResponse(const
   CanonicalValue::Array components;
   if (raw.value().owner) components.push_back(component(*raw.value().owner));
   components.push_back(component(raw.value().member));
-  const auto snapshot_id = RecoverySnapshotId(*product, owner_epoch_, *command.component_id,
+  const auto snapshot_id = RecoverySnapshotId(*product, start_id_text_, *command.component_id,
                                                composition_access_.current);
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -2842,7 +2887,7 @@ CanonicalValue ExecutionCommandSurface::ComponentActionResponse(const Command &c
   const auto accepted = [&]() -> core::Result<core::ComponentActionInProgress> {
     if (command.recovery_preflight) {
       const auto component_id = *command.component_id;
-      const auto epoch = owner_epoch_;
+      const auto epoch = start_id_text_;
       auto *const access = &composition_access_;
       struct ConfirmedSnapshot {
         std::string expected;
@@ -3015,16 +3060,16 @@ ExecutionCommandSurface::EventsResponse(const Command &command) const {
   auto &owner = StableKernel();
   // Copy owner facts before any journal I/O. The stable owner and journal
   // outlive product composition; a failed page cannot erase these facts.
-  const auto actual_owner_epoch = owner.request_owner_epoch();
   CanonicalValue::Object metadata{
       {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
       {"command", CanonicalValue("events")},
       {"execution_owner_ready", CanonicalValue(execution_owner_ready)},
       {"carried_object_last_losses", CarriedObjectLastLossesValue()},
       {"carried_object_lost_signals", CarriedObjectLostSignalsValue()},
-      {"owner_epoch", CanonicalValue(actual_owner_epoch.value())},
       {"runtime_faults", RuntimeFaultsValue(owner)},
   };
+  // Kernel memory Stop facts (K18), the same members as the stream state.
+  AppendStopStreamFacts(metadata, owner.get_stop_stream_facts());
   for (auto &field : ComponentModelFields(owner, ComponentModelRead::kState))
     metadata.push_back(std::move(field));
   const auto failure = [&](const core::ErrorDTO &error) {
@@ -3049,16 +3094,16 @@ ExecutionCommandSurface::EventsResponse(const Command &command) const {
   try {
     // One same-lock owner read supplies catalog identity AND pending/ready
     // baseline. Keep both independent of page I/O and projection progress.
-    auto global_fields = InterruptRuleEventMetadataFields(
-        owner.ReadInterruptRuleStateBaseline(), actual_owner_epoch);
+    auto global_fields =
+        InterruptRuleEventMetadataFields(owner.ReadInterruptRuleStateBaseline());
     for (auto &field : global_fields) metadata.push_back(std::move(field));
     // Active TCP: read before the page, so no row of it is newer.
     metadata.emplace_back("active_tcp_baseline", ActiveTcpBaselineValue());
     auto *const journal = composition_access_.operation_journal.load();
     Require(journal != nullptr,
             "operational events have no stable cell journal owner");
-    const auto page = journal->ReadOperationalEvents(
-        *command.event_owner_epoch, command.after_sequence, command.event_limit);
+    const auto page =
+        journal->ReadOperationalEvents(command.after_sequence, command.event_limit);
     if (!page.ok()) return failure(page.error());
     const auto admission = owner.GetAuthoringAdmission();
     // Progress remains presentation-only on this same existing read.
@@ -3066,7 +3111,7 @@ ExecutionCommandSurface::EventsResponse(const Command &command) const {
         static_cast<double>(admission.admission_generation.value())));
     metadata.emplace_back("event_page", OperationEventPageValue(page.value()));
     metadata.emplace_back("operation_progress",
-                          OperationProgressValue(owner, actual_owner_epoch));
+                          OperationProgressValue(owner));
     metadata.emplace_back("ok", CanonicalValue(true));
     return CanonicalValue(std::move(metadata));
   } catch (const std::exception &error) {
@@ -3078,8 +3123,7 @@ ExecutionCommandSurface::EventsResponse(const Command &command) const {
   }
 }
 
-CanonicalValue ExecutionCommandSurface::ActiveTcpBaselineValue(
-    Composition &composition, const core::RequestOwnerEpoch &owner_epoch) {
+CanonicalValue ExecutionCommandSurface::ActiveTcpBaselineValue(Composition &composition) {
   CanonicalValue::Array robots;
   const auto add = [&](const Composition &view) {
     if (!view.ros2_control_runtime_handle) return;
@@ -3089,7 +3133,6 @@ CanonicalValue ExecutionCommandSurface::ActiveTcpBaselineValue(
         {"component_id", CanonicalValue(reading.robot->value())},
         {"entry", reading.reference ? core::EncodeTcpEntryReference(*reading.reference)
                                 : CanonicalValue(nullptr)},
-        {"owner_epoch", CanonicalValue(owner_epoch.value())},
         {"registration_generation",
          CanonicalValue(static_cast<double>(reading.registration_generation))},
         {"sequence", CanonicalValue(static_cast<double>(reading.sequence))}});
@@ -3104,8 +3147,7 @@ CanonicalValue ExecutionCommandSurface::ActiveTcpBaselineValue() const {
   std::shared_lock composition_lock(composition_access_.mutex);
   if (composition_access_.current == nullptr)
     return CanonicalValue(CanonicalValue::Array{});
-  return ActiveTcpBaselineValue(*composition_access_.current,
-                                StableKernel().request_owner_epoch());
+  return ActiveTcpBaselineValue(*composition_access_.current);
 }
 
 CanonicalValue ExecutionCommandSurface::ActiveTcpResponse(Composition *composition,
@@ -3121,18 +3163,14 @@ CanonicalValue ExecutionCommandSurface::ActiveTcpResponse(Composition *compositi
       {"ok", CanonicalValue(true)},
       {"robots", composition == nullptr
                      ? CanonicalValue(CanonicalValue::Array{})
-                     : ActiveTcpBaselineValue(
-                           *composition,
-                           composition->active_addressed_kernel()->request_owner_epoch())}});
+                     : ActiveTcpBaselineValue(*composition)}});
 }
 
 CanonicalValue ExecutionCommandSurface::ActiveTcpStatusValue(Composition &composition) const {
   if (!composition.ros2_control_runtime_handle) return CanonicalValue(nullptr);
-  const auto &owner_epoch = StableKernel().request_owner_epoch();
   const auto reading = composition.ros2_control_runtime_handle->ReadActiveTcp();
   if (!reading.value) return CanonicalValue(CanonicalValue::Object{
       {"display", CanonicalValue(nullptr)}, {"entry", CanonicalValue(nullptr)},
-      {"owner_epoch", CanonicalValue(owner_epoch.value())},
       {"registration_generation", CanonicalValue(static_cast<double>(reading.registration_generation))},
       {"sequence", CanonicalValue(static_cast<double>(reading.sequence))}});
   Require(reading.reference.has_value(), "Active TCP row has no direct reference");
@@ -3154,23 +3192,26 @@ CanonicalValue ExecutionCommandSurface::ActiveTcpStatusValue(Composition &compos
   }
   return CanonicalValue(CanonicalValue::Object{{"display", CanonicalValue(std::move(display))},
                                                {"entry", std::move(entry)},
-                                               {"owner_epoch", CanonicalValue(owner_epoch.value())},
                                                {"registration_generation", CanonicalValue(static_cast<double>(reading.registration_generation))},
                                                {"sequence", CanonicalValue(static_cast<double>(reading.sequence))}});
 }
 
-std::pair<std::string, CanonicalValue>
-ExecutionCommandSurface::EventStreamState() const {
+CanonicalValue ExecutionCommandSurface::EventStreamState() const {
   bool execution_owner_ready;
   {
     std::shared_lock composition_lock(composition_access_.mutex);
     execution_owner_ready = composition_access_.product() != nullptr;
   }
   auto &owner = StableKernel();
-  const auto owner_epoch = owner.request_owner_epoch();
+  // OD-205 (b), OD-213: the operations alarms, panel wake-ups and the
+  // runner's nodes read, from memory (one bounded Kernel section, encoded
+  // after its unlock). Read before the Active TCP baseline, as a `read`
+  // reply reads its operation before its `active_tcp`: a TCP a move commits
+  // before its goal is sent is in the baseline once the table shows the move
+  // running or ended.
+  auto operations = OperationTableValue(owner.get_operation_table());
   // The same owner facts as the `events` reply, read the same way.
-  auto state = InterruptRuleEventMetadataFields(
-      owner.ReadInterruptRuleStateBaseline(), owner_epoch);
+  auto state = InterruptRuleEventMetadataFields(owner.ReadInterruptRuleStateBaseline());
   state.emplace_back("active_tcp_baseline", ActiveTcpBaselineValue());
   state.emplace_back("admission_generation",
                      CanonicalValue(static_cast<double>(
@@ -3182,24 +3223,30 @@ ExecutionCommandSurface::EventStreamState() const {
                      CarriedObjectLostSignalsValue());
   state.emplace_back("execution_owner_ready",
                      CanonicalValue(execution_owner_ready));
+  // Kernel memory only, raised on the change signal after every change of
+  // these facts (K18); the runner reconciles its run from them (§6.3.2).
+  AppendStopStreamFacts(state, owner.get_stop_stream_facts());
+  state.emplace_back("operations", std::move(operations));
+  // OD-213 (1): the planning jobs' states (never their results), so a
+  // RUNNING planning node reads its job from the stream, not every tick.
+  state.emplace_back("planning_jobs",
+                     PlanningJobsStreamValue(planning_jobs_.StreamRows()));
   state.emplace_back("runtime_faults", RuntimeFaultsValue(owner));
   for (auto &field : ComponentModelFields(owner, ComponentModelRead::kState))
     state.push_back(std::move(field));
-  return {owner_epoch.value(), CanonicalValue(std::move(state))};
+  return CanonicalValue(std::move(state));
 }
 
 CanonicalValue ExecutionCommandSurface::OperationProgressValue(
-    core::ResourceAddressedExecutionKernel &owner,
-    const core::RequestOwnerEpoch &owner_epoch) const {
+    core::ResourceAddressedExecutionKernel &owner) const {
   CanonicalValue::Array operation_progress;
-  for (const auto &operation : owner.get_resident_operations(
-           {direct_control_program_run_id_, direct_control_gripper_program_run_id_})) {
+  // Resident manual operations (no run).
+  for (const auto &operation : owner.get_resident_operations(std::nullopt)) {
     if (operation.state != core::OperationStateKind::kExecuting ||
         operation.participants.size() != 1U)
       continue;
     operation_progress.emplace_back(CanonicalValue::Object{
-        {"owner_epoch", CanonicalValue(owner_epoch.value())},
-        {"operation_id", CanonicalValue(operation.operation_id.value())},
+        {"operation_id", CanonicalValue(static_cast<double>(operation.operation_id.value()))},
         {"operation_revision", CanonicalValue(static_cast<double>(
                                    operation.operation_revision.value()))},
         {"progress", CanonicalValue(operation.participants.front().progress)},
@@ -3210,17 +3257,15 @@ CanonicalValue ExecutionCommandSurface::OperationProgressValue(
 
 CanonicalValue ExecutionCommandSurface::EventStreamProgress() const {
   auto &owner = StableKernel();
-  return OperationProgressValue(owner, owner.request_owner_epoch());
+  return OperationProgressValue(owner);
 }
 
 CanonicalValue
-ExecutionCommandSurface::EventStreamPage(const std::string &owner_epoch,
-                                         const std::uint64_t after) const {
+ExecutionCommandSurface::EventStreamPage(const std::uint64_t after) const {
   auto *const journal = composition_access_.operation_journal.load();
   Require(journal != nullptr,
           "operational events have no stable cell journal owner");
-  const auto page = journal->ReadOperationalEvents(
-      core::RequestOwnerEpoch(owner_epoch), after, kMaximumEventPage);
+  const auto page = journal->ReadOperationalEvents(after, kMaximumEventPage);
   if (!page.ok())
     Fail(page.error().code + ": " + page.error().message);
   return OperationEventPageValue(page.value());
@@ -3278,7 +3323,7 @@ std::optional<CanonicalValue> ExecutionCommandSurface::ExecuteProgramCommand(
           {"command", CanonicalValue("register_program_run_capture")},
           {"ok", CanonicalValue(true)},
           {"program_run_id",
-           CanonicalValue(capture.value().program_run_id.value())},
+           CanonicalValue(static_cast<double>(capture.value().program_run_id.value()))},
           {"claim_generation", CanonicalValue(static_cast<double>(
                                    capture.value().claim_generation.value()))},
       });
@@ -3289,10 +3334,10 @@ std::optional<CanonicalValue> ExecutionCommandSurface::ExecuteProgramCommand(
           command.kind == CommandKind::kStartProgramSelection
               ? owner
                     ->start_program_selection(
-                    *command.program_selection, command.expected_selection_revision)
+                    *command.program_selection, command.expected_hold_revision)
               : owner
                     ->release_program_selection(
-                    *command.program_selection, command.expected_selection_revision);
+                    *command.program_selection, command.expected_hold_revision);
       if (!result.ok())
         return ErrorResponse(result.error().code, result.error().message,
                              result.error().details);
@@ -3319,12 +3364,9 @@ std::optional<CanonicalValue> ExecutionCommandSurface::ExecuteProgramCommand(
            CanonicalValue("check_program_node_motion_attention")},
           {"ok", CanonicalValue(true)}});
     }
-    if (command.kind == CommandKind::kReleaseProgramRunStopFence) {
+    if (command.kind == CommandKind::kReleaseHalt) {
       const auto result =
-          owner
-              ->release_program_run_stop_fence(
-              *command.program_run_id, *command.stop_id,
-              *command.stop_generation);
+          owner->release_halt(*command.program_run_id, command.expected_hold_revision);
       if (!result.ok()) {
         return CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -3334,8 +3376,11 @@ std::optional<CanonicalValue> ExecutionCommandSurface::ExecuteProgramCommand(
       }
       return CanonicalValue(CanonicalValue::Object{
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue("release_program_run_stop_fence")},
+          {"command", CanonicalValue("release_halt")},
           {"ok", CanonicalValue(true)},
+          // null: the run is not the current claim (no effect).
+          {"scope", result.value() ? ProgramExecutionScopeValue(*result.value())
+                                   : CanonicalValue(nullptr)},
       });
     }
     return std::nullopt;
@@ -3358,15 +3403,15 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
   const auto identity = IdentityValue(product, projection);
   const auto targets = CanonicalValue(CanonicalValue::Object{
       {"components", CanonicalValue(CanonicalValue::Array{})},
-      {"schema_version", CanonicalValue("manyforge.execution_targets.v4")}});
+      {"schema_version", CanonicalValue("manyforge.execution_targets.v5")}});
   // No direct-control target exists here, so no manual operation is this
-  // cell's: a run retained from the previous physical cell is not published.
+  // cell's: a result retained from the previous physical cell is not published.
   const auto control = CanonicalValue(CanonicalValue::Object{
       {"cell_stop_action", CellStopActionValue(StableKernel().cell_stop_action_projection())},
       {"manual_operations", CanonicalValue(CanonicalValue::Array{})},
       {"observed_targets", CanonicalValue(CanonicalValue::Array{})},
       {"runtime_scale_control", CanonicalValue(nullptr)},
-      {"schema_version", CanonicalValue("manyforge.execution_control_state.v7")}});
+      {"schema_version", CanonicalValue("manyforge.execution_control_state.v8")}});
   if (command.kind == CommandKind::kTargets)
     return CanonicalValue(CanonicalValue::Object{
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
@@ -3382,8 +3427,10 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
         {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
         {"command", CanonicalValue("status")}, {"ok", CanonicalValue(true)},
         {"status", CanonicalValue(CanonicalValue::Object{
-            {"schema_version", CanonicalValue("manyforge.execution_status.v3")},
-            {"identity", identity}, {"targets", targets}, {"control_state", control}})}});
+            {"schema_version", CanonicalValue("manyforge.execution_status.v4")},
+            {"identity", identity}, {"targets", targets}, {"control_state", control},
+            // No physical component, so no robot engine and no check rows.
+            {"runtime_collision_checks", CanonicalValue(CanonicalValue::Array{})}})}});
   // Effect dispatch continues to require an actual physical Composition.
   return OwnerNotReadyResponse(command);
 }
@@ -3444,8 +3491,10 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
     if (command.kind == CommandKind::kStop ||
         command.kind == CommandKind::kStopProgramRun ||
         command.kind == CommandKind::kStopProgramSelection ||
-        command.kind == CommandKind::kFullStop ||
-        command.kind == CommandKind::kMalformedStop) {
+        command.kind == CommandKind::kStopAll ||
+        command.kind == CommandKind::kHalt ||
+        command.kind == CommandKind::kCellStop ||
+        command.kind == CommandKind::kRecognizedStop) {
       return ExecuteStop(command,
                          *composition.active_addressed_kernel());
     }
@@ -3494,13 +3543,10 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
       // sent, so once it runs or ends this carries it (a failed move included).
       return CanonicalValue(CanonicalValue::Object{
           {"active_tcp",
-           ActiveTcpBaselineValue(
-               composition, composition.active_addressed_kernel()->request_owner_epoch())},
+           ActiveTcpBaselineValue(composition)},
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("read")},
           {"ok", CanonicalValue(true)},
-          {"owner_epoch",
-           CanonicalValue(projection.value().request_owner_epoch.value())},
           {"operation", OperationStateValue(projection.value().operation)},
           {"resident", CanonicalValue(projection.value().resident)},
           {"last_control",
@@ -3529,14 +3575,7 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
           {"operation_revision",
            CanonicalValue(static_cast<double>(
                assessment.value().operation_revision.value()))},
-          {"stop_generation",
-           assessment.value().stop_generation.has_value()
-               ? CanonicalValue(static_cast<double>(
-                     assessment.value().stop_generation->value()))
-               : CanonicalValue(nullptr)},
-          {"stop_id", assessment.value().stop_id.has_value()
-                          ? CanonicalValue(assessment.value().stop_id->value())
-                          : CanonicalValue(nullptr)},
+          {"stop_event_id", StopEventIdValue(assessment.value().stop_event_id)},
           {"participants",
            RecoveryParticipantsValue(assessment.value().participants)},
           {"recovery_assessment",
@@ -3579,8 +3618,7 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
                preview.value(), *command.operation, *command.operation_digest,
                target_composition->gripper_runtime
                    ? target_composition->gripper_runtime->position_limits()
-                   : std::optional<RetainedGripperPositionLimits>{},
-               owner_epoch_)},
+                   : std::optional<RetainedGripperPositionLimits>{})},
       });
     }
     if (command.kind == CommandKind::kReadManualHandover) {
@@ -3607,11 +3645,9 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
                  {"claim_generation", CanonicalValue(static_cast<double>(
                                           capture.claim_generation.value()))},
                  {"program_run_id",
-                  CanonicalValue(capture.program_run_id.value())},
-                 {"program_runner_owner_epoch",
-                  CanonicalValue(capture.program_runner_owner_epoch.value())},
-                 {"selection_revision", CanonicalValue(static_cast<double>(
-                                            held.selection_revision))}})},
+                  CanonicalValue(static_cast<double>(capture.program_run_id.value()))},
+                 {"hold_revision", CanonicalValue(static_cast<double>(
+                                       held.hold_revision))}})},
             {"producer_node_indices", CanonicalValue(std::move(indices))}});
       }
       return CanonicalValue(CanonicalValue::Object{
@@ -3629,10 +3665,9 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
           {"handover", std::move(handover)},
           {"intent_digest", CanonicalValue(command.operation_digest->value())},
           {"ok", CanonicalValue(true)},
-          {"request_id",
+          {"request_key",
            CanonicalValue(
-               command.operation->request_context.request_id.value())},
-          {"request_owner_epoch", CanonicalValue(owner_epoch_.value())}});
+               core::RequestKeyText(command.operation->request_context.request_key))}});
     }
     if (command.kind == CommandKind::kPreviewMotion) {
       if (composition.runtime == nullptr) {
@@ -3657,7 +3692,7 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
       }
       const auto preview_lease_id = core::ProjectionLeaseId{
           "motion-preview." +
-          preview_intent.request_context.request_id.value()};
+          core::RequestKeyText(preview_intent.request_context.request_key)};
       auto inventory =
           composition.runtime->collision_publisher
               ->retain_scene_snapshot_lease_inventory(preview_lease_id);
@@ -3764,7 +3799,7 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
           {"preview_receipt",
            MotionPreviewReceiptValue(preview.value(), *command.operation,
                                      *command.operation_digest,
-                                     preview_binding.value(), owner_epoch_, *path)},
+                                     preview_binding.value(), *path)},
       });
       if (content_identity::canonical_json(response).size() <= kPreviewEnvelopeLimit)
         return response;
@@ -3832,20 +3867,24 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
             step != result.error().details.end() && step->second == "admitted")
           failed.emplace_back(
               "active_tcp",
-              ActiveTcpBaselineValue(
-                  composition, composition.active_addressed_kernel()->request_owner_epoch()));
+              ActiveTcpBaselineValue(composition));
         return CanonicalValue(std::move(failed));
       }
       // Active TCP: the result carries every robot's confirmed Active
       // TCP and its sequence (a Set TCP's is committed when this returns).
+      // `operations_change` (OD-213 P4): the operations table's counter read
+      // after the acceptance; a pushed table with this counter or a later
+      // one includes the accepted operation (or its retirement).
       return CanonicalValue(CanonicalValue::Object{
           {"accepted", AcceptedValue(result.value())},
           {"active_tcp",
-           ActiveTcpBaselineValue(
-               composition, composition.active_addressed_kernel()->request_owner_epoch())},
+           ActiveTcpBaselineValue(composition)},
           {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
           {"command", CanonicalValue("submit")},
           {"ok", CanonicalValue(true)},
+          {"operations_change",
+           CanonicalValue(static_cast<double>(
+               composition.active_addressed_kernel()->get_operation_change()))},
       });
     }
     if (command.kind == CommandKind::kGetRuntimeScaleControl) {
@@ -3953,9 +3992,11 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
       case CommandKind::kStartProgramSelection:
       case CommandKind::kReleaseProgramSelection:
       case CommandKind::kCheckProgramNodeMotionAttention:
-      case CommandKind::kReleaseProgramRunStopFence:
-      case CommandKind::kFullStop:
-      case CommandKind::kMalformedStop:
+      case CommandKind::kReleaseHalt:
+      case CommandKind::kStopAll:
+      case CommandKind::kHalt:
+      case CommandKind::kCellStop:
+      case CommandKind::kRecognizedStop:
       case CommandKind::kReadComponentModel:
       case CommandKind::kComponentRecoveryPreflight:
       case CommandKind::kComponentAction:
@@ -3971,6 +4012,9 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
       case CommandKind::kReadActiveTcp:
       case CommandKind::kReadActiveTcpOrdered:
       case CommandKind::kResetActiveTcp:
+      case CommandKind::kReadPlanningJob:
+      case CommandKind::kCancelPlanningJob:
+      case CommandKind::kReleasePlanningJob:
         Fail("execution command dispatch is inconsistent");
       }
       Fail("execution command dispatch is unreachable");
@@ -3988,6 +4032,10 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
         {"command", CanonicalValue(std::string(
                         ControlName(control_result.value().control)))},
         {"ok", CanonicalValue(true)},
+        // OD-213 P4: as the `submit` reply's.
+        {"operations_change",
+         CanonicalValue(static_cast<double>(
+             composition.active_addressed_kernel()->get_operation_change()))},
     });
   }
 
@@ -4053,19 +4101,27 @@ void ExecutionCommandSurface::RunReconciliationLane(std::stop_token stop_token) 
     }
   }
 
+// Up to a full backlog of waiting connections is kept without allocating.
+ExecutionCommandSurface::LaneConnections::LaneConnections() {
+  waiting.reserve(static_cast<std::size_t>(kSocketBacklog));
+  descriptors.reserve(static_cast<std::size_t>(kSocketBacklog) + 3U);
+}
+
 /// Socket lanes only wait for clients; they need no periodic wakeup.
   /// Every reason to leave a lane (its stop request, a failed lane, a process
   /// stop signal) makes one of these descriptors readable.
-  [[nodiscard]] int ExecutionCommandSurface::WaitForSocket(const int socket, short &revents) const {
-    std::array<pollfd, 3U> descriptors{{
-        {socket, POLLIN, 0},
-        {lane_wake_.get(), POLLIN, 0},
-        // A negative descriptor is ignored by poll().
-        {g_stop_signal_wake_fd.load(std::memory_order_relaxed), POLLIN, 0},
-    }};
-    const int ready = ::poll(descriptors.data(), descriptors.size(), -1);
-    revents = descriptors[0].revents;
-    return ready;
+  [[nodiscard]] int ExecutionCommandSurface::WaitForLane(const int socket,
+                                                         LaneConnections &lane) const {
+    lane.descriptors.clear();
+    lane.descriptors.push_back({socket, POLLIN, 0});
+    lane.descriptors.push_back({lane_wake_.get(), POLLIN, 0});
+    // A negative descriptor is ignored by poll().
+    lane.descriptors.push_back(
+        {g_stop_signal_wake_fd.load(std::memory_order_relaxed), POLLIN, 0});
+    for (const auto &client : lane.waiting)
+      lane.descriptors.push_back({client.get(), POLLIN, 0});
+    return ::poll(lane.descriptors.data(),
+                  static_cast<nfds_t>(lane.descriptors.size()), -1);
   }
 
 /// Ends every socket-lane wait. The wake stays readable: it is raised only
@@ -4086,51 +4142,115 @@ void ExecutionCommandSurface::RunReconciliationLane(std::stop_token stop_token) 
 void ExecutionCommandSurface::RunControlLane(std::stop_token stop_token) noexcept {
     const std::stop_callback wake_on_stop(stop_token,
                                           [this] { WakeLanes(); });
+    LaneConnections connections;
     while (!stop_token.stop_requested() && g_stop_requested == 0 &&
            !LanesWoken()) {
-      short revents = 0;
       int ready = -1;
       do {
-        ready = WaitForSocket(control_socket_.get(), revents);
+        ready = WaitForLane(control_socket_.get(), connections);
       } while (ready < 0 && errno == EINTR && !stop_token.stop_requested());
       if (stop_token.stop_requested()) {
         return;
       }
+      const short revents = ready < 0 ? 0 : connections.descriptors[0].revents;
       if (ready < 0 || (revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
         control_socket_failed_.store(true, std::memory_order_release);
         WakeLanes();
         return;
       }
-      if ((revents & POLLIN) != 0) {
-        HandleOneClient(control_socket_, CommandLane::kStop);
-      }
+      ServeLaneTurn(control_socket_, CommandLane::kStop, connections);
     }
   }
 
 void ExecutionCommandSurface::RunObservationLane(std::stop_token stop_token) noexcept {
     const std::stop_callback wake_on_stop(stop_token,
                                           [this] { WakeLanes(); });
+    LaneConnections connections;
     while (!stop_token.stop_requested() && g_stop_requested == 0 &&
            !LanesWoken()) {
-      short revents = 0;
       int ready = -1;
       do {
-        ready = WaitForSocket(observation_socket_.get(), revents);
+        ready = WaitForLane(observation_socket_.get(), connections);
       } while (ready < 0 && errno == EINTR && !stop_token.stop_requested());
       if (stop_token.stop_requested() || ready < 0 ||
-          (revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+          (connections.descriptors[0].revents &
+           (POLLERR | POLLHUP | POLLNVAL)) != 0) {
         return;
       }
-      if ((revents & POLLIN) != 0) {
-        HandleOneClient(observation_socket_, CommandLane::kObservation,
-                        stop_token);
-      }
+      ServeLaneTurn(observation_socket_, CommandLane::kObservation,
+                    connections, stop_token);
     }
   }
 
-void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const CommandLane lane,
-                       const std::stop_token stop_token) noexcept {
-    const bool ordinary = lane == CommandLane::kOrdinary;
+// One request at a time, one request per connection; a failed socket
+// retires the host as the control socket's does.
+void ExecutionCommandSurface::RunComponentLane(std::stop_token stop_token) noexcept {
+    const std::stop_callback wake_on_stop(stop_token,
+                                          [this] { WakeLanes(); });
+    LaneConnections connections;
+    while (!stop_token.stop_requested() && g_stop_requested == 0 &&
+           !LanesWoken()) {
+      int ready = -1;
+      do {
+        ready = WaitForLane(component_socket_.get(), connections);
+      } while (ready < 0 && errno == EINTR && !stop_token.stop_requested());
+      if (stop_token.stop_requested()) {
+        return;
+      }
+      const short revents = ready < 0 ? 0 : connections.descriptors[0].revents;
+      if (ready < 0 || (revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        component_socket_failed_.store(true, std::memory_order_release);
+        WakeLanes();
+        return;
+      }
+      ServeLaneTurn(component_socket_, CommandLane::kComponent, connections,
+                    stop_token);
+    }
+  }
+
+// A connection waits for its request without a time limit and holds up no
+// other: the lane serves whichever connection has a request, one at a time,
+// the oldest first (accept order, which is connect order).
+void ExecutionCommandSurface::ServeLaneTurn(const CommandSocket &socket,
+                                            const CommandLane lane,
+                                            LaneConnections &connections,
+                                            const std::stop_token stop_token) noexcept {
+    auto &waiting = connections.waiting;
+    // descriptors[0..2]: listening socket and wakes; then one per waiting.
+    const auto &descriptors = connections.descriptors;
+    const short listening = descriptors[0].revents;
+    std::optional<std::size_t> ready;
+    std::size_t kept = 0U;
+    for (std::size_t index = 0U; index < waiting.size(); ++index) {
+      const short events = descriptors[3U + index].revents;
+      if ((events & POLLIN) != 0) {
+        if (!ready.has_value())
+          ready = kept;
+      } else if ((events & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        // Closed or failed without a request: dropped.
+        waiting[index] = FileDescriptor();
+        continue;
+      }
+      if (kept != index)
+        waiting[kept] = std::move(waiting[index]);
+      ++kept;
+    }
+    waiting.erase(waiting.begin() + static_cast<std::ptrdiff_t>(kept),
+                  waiting.end());
+    if (ready.has_value()) {
+      FileDescriptor client = std::move(waiting[*ready]);
+      waiting.erase(waiting.begin() + static_cast<std::ptrdiff_t>(*ready));
+      // An observation session waits for its next request behind the others.
+      if (ServeRequest(client, lane, stop_token))
+        waiting.push_back(std::move(client));
+    }
+    if ((listening & POLLIN) != 0)
+      AcceptClient(socket, lane, waiting);
+  }
+
+void ExecutionCommandSurface::AcceptClient(const CommandSocket &socket,
+                                           const CommandLane lane,
+                                           std::vector<FileDescriptor> &waiting) noexcept {
     try {
       FileDescriptor client(::accept4(socket.get(), nullptr, nullptr,
                                       SOCK_CLOEXEC | SOCK_NONBLOCK));
@@ -4143,8 +4263,9 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
         if (!accept_failure_logged_[index]) {
           accept_failure_logged_[index] = true;
           const char *name = ::strerrorname_np(error);
-          const char *lane_name = ordinary ? "ordinary" :
-              (lane == CommandLane::kStop ? "stop" : "observation");
+          const char *lane_name = lane == CommandLane::kOrdinary ? "ordinary" :
+              lane == CommandLane::kStop ? "stop" :
+              lane == CommandLane::kComponent ? "component" : "observation";
           std::ostringstream line;
           line << "accept execution command client lane=" << lane_name
                << " errno=" << error << " name=" << (name ? name : "unknown")
@@ -4160,24 +4281,18 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                            &peer_size) == 0 &&
                   peer_size == sizeof(peer) && peer.uid == ::geteuid(),
               "execution command client is not the same user");
-      bool first_packet = true;
-      while (!stop_token.stop_requested()) {
-        pollfd inbound{client.get(), POLLIN, 0};
-        int packet_ready = -1;
-        do {
-          packet_ready =
-              ::poll(&inbound, 1,
-                     first_packet ? (ordinary ? kOrdinaryFirstPacketDeadlineMilliseconds
-                                              : kClientPacketDeadlineMilliseconds)
-                                  : 1'000);
-        } while (packet_ready < 0 && errno == EINTR);
-        if (lane == CommandLane::kObservation && !first_packet &&
-            packet_ready == 0) {
-          continue;
-        }
-        Require(packet_ready > 0 && (inbound.revents & POLLIN) != 0,
-                "execution command client did not send a packet in time");
-        first_packet = false;
+      waiting.push_back(std::move(client));
+    } catch (...) {
+      // A foreign or disappearing private client cannot retire the sole owner.
+    }
+  }
+
+bool ExecutionCommandSurface::ServeRequest(FileDescriptor &client,
+                                           const CommandLane lane,
+                                           const std::stop_token stop_token) noexcept {
+    const bool ordinary = lane == CommandLane::kOrdinary;
+    try {
+      {
         std::array<char, kMaximumPacketBytes> buffer{};
         iovec vector{buffer.data(), buffer.size()};
         msghdr message{};
@@ -4202,7 +4317,6 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
             for (const auto candidate :
                  {"cell_admission_get", "cell_admission_update_readiness",
                   "cell_admission_acquire", "cell_admission_release",
-                  "cell_admission_reconcile",
                   "cell_admission_recovery_receipt",
                   "cell_admission_publish_operator_alarm_attention"}) {
               if (bytes.find(std::string("\"command\":\"") + candidate +
@@ -4226,13 +4340,25 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                         "the independent observation socket accepts only "
                         "observation",
                         {}});
-              } else if (lane == CommandLane::kStop && !attention) {
+              } else if (lane == CommandLane::kStop) {
                 response = detail::CellAdmissionResponseValue(
                     cell_admission->command,
                     core::ErrorDTO{
                         "execution_control_command_unsupported",
                         "the independent Stop control socket accepts only "
-                        "Stop, Stop status and operator-alarm attention",
+                        "Stop, Stop status, carried-object-lost and speed "
+                        "changes; component actions, the component model and "
+                        "operator-alarm attention go to the independent "
+                        "component socket",
+                        {}});
+              } else if (lane == CommandLane::kComponent && !attention) {
+                response = detail::CellAdmissionResponseValue(
+                    cell_admission->command,
+                    core::ErrorDTO{
+                        "execution_component_command_unsupported",
+                        "the independent component socket accepts only "
+                        "component actions, the component model and "
+                        "operator-alarm attention",
                         {}});
               } else if (lane == CommandLane::kOrdinary && attention) {
                 response = detail::CellAdmissionResponseValue(
@@ -4240,7 +4366,7 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                     core::ErrorDTO{
                         "execution_ordinary_command_unsupported",
                         "operator-alarm attention is published on the "
-                        "independent Stop control socket",
+                        "independent component socket",
                         {}});
               } else {
                 // Cell admission is owned by the stable cell Kernel and never
@@ -4248,6 +4374,7 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                 // exclusively does not delay it.
                 if (PreemptsPlanning(*cell_admission)) {
                   PreemptPlanning();
+                  PreemptPlanningJobs(*cell_admission);
                 }
                 auto result =
                     component_manager::detail::DispatchKernelCellAdmissionRpc(
@@ -4258,11 +4385,27 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
               }
             } else {
               const auto command = DecodeCommand(bytes);
-              if (lane != CommandLane::kObservation &&
+              if ((lane == CommandLane::kOrdinary ||
+                   lane == CommandLane::kStop) &&
                   PreemptsPlanning(command.kind)) {
                 PreemptPlanning();
+                // A Stop never reaches a planning job (OD-213 (1)).
+                if (command.kind == CommandKind::kResetRobotPosition)
+                  planning_jobs_.Preempt(std::nullopt);
               }
-              if (lane == CommandLane::kStop) {
+              if (lane == CommandLane::kStop &&
+                  command.kind == CommandKind::kSetRuntimeScaleControl) {
+                deferred.emplace(&runtime_scale_lane_, command);
+              } else if (lane == CommandLane::kStop &&
+                         IsComponentLaneCommand(command.kind)) {
+                response = ErrorResponse(
+                    "execution_control_command_unsupported",
+                    "the independent Stop control socket accepts only "
+                    "Stop, Stop status, carried-object-lost and speed "
+                    "changes; component actions, the component model and "
+                    "operator-alarm attention go to the independent "
+                    "component socket");
+              } else if (lane == CommandLane::kStop) {
                 // Stop and its in-memory progression reads reach the stable
                 // Kernel without the composition lock. It owns exact scope
                 // resolution, journal fences and unavailable evidence, also
@@ -4275,15 +4418,26 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                               *command.carried_object_lost_set)
                     : command.kind == CommandKind::kReadStop
                         ? ReadStop(command, owner)
-                    : command.kind == CommandKind::kReadComponentModel
+                    : IsPlanningJobControl(command.kind)
+                        ? PlanningJobResponse(command)
+                        : ExecuteStop(command, owner);
+              } else if (lane == CommandLane::kComponent &&
+                         !IsComponentLaneCommand(command.kind)) {
+                response = ErrorResponse(
+                    "execution_component_command_unsupported",
+                    "the independent component socket accepts only "
+                    "component actions, the component model and "
+                    "operator-alarm attention");
+              } else if (lane == CommandLane::kComponent) {
+                // Always available, during a latch and a run; never waits
+                // for planning or an Apply (the composition only by try_lock).
+                auto &owner = StableKernel();
+                response =
+                    command.kind == CommandKind::kReadComponentModel
                         ? ReadComponentModelResponse(owner)
                     : command.kind == CommandKind::kComponentRecoveryPreflight
                         ? ComponentRecoveryPreflightResponse(command)
-                    : command.kind == CommandKind::kComponentAction
-                        // Always available, during a latch and
-                        // a run; never waits for planning or an Apply.
-                        ? ComponentActionResponse(command)
-                        : ExecuteStop(command, owner);
+                        : ComponentActionResponse(command);
               } else if (lane == CommandLane::kObservation &&
                          command.kind != CommandKind::kObservation &&
                          command.kind != CommandKind::kReadVolatileMotionTrace) {
@@ -4296,11 +4450,23 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                     "execution_ordinary_command_unsupported",
                     "carried-object-lost signals are published on the "
                     "independent Stop control socket");
+              } else if (IsPlanningJobControl(command.kind)) {
+                // The ordinary thread can wait for a whole plan behind a
+                // value publication that takes the submission lock.
+                response = ErrorResponse(
+                    "execution_ordinary_command_unsupported",
+                    "a planning job is read, cancelled and released on the "
+                    "independent Stop control socket");
               } else if (IsStopLaneRead(command.kind)) {
                 response = ErrorResponse(
                     "execution_ordinary_command_unsupported",
-                    "Stop status, the component model and component actions "
-                    "are served by the independent Stop control socket");
+                    "Stop status is served by the independent Stop control "
+                    "socket");
+              } else if (IsComponentLaneCommand(command.kind)) {
+                response = ErrorResponse(
+                    "execution_ordinary_command_unsupported",
+                    "the component model and component actions are served "
+                    "by the independent component socket");
               } else if (command.kind == CommandKind::kReadVolatileMotionTrace) {
                 if (ordinary)
                   deferred.emplace(&scene_read_lane_, command);
@@ -4333,9 +4499,10 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                                               : "clear_outside_change"))},
                           {"ok", CanonicalValue(true)}});
               } else if (command.kind == CommandKind::kSetIoOutput) {
-                // Allowed when idle and during a pause; the
-                // Kernel refuses it during a latch or a rule's hold.
-                response = SetIoOutputResponse(command, StableKernel());
+                // Allowed when idle and during a pause; the Kernel refuses
+                // it during a latch or a rule's hold. Admitted and written
+                // on the output lane when it starts there, in arrival order.
+                deferred.emplace(&io_output_lane_, command);
               } else if (command.kind ==
                          CommandKind::kPublishProgramBlackboard) {
                 // ACK follows synchronous exact-Run source admission and the
@@ -4353,6 +4520,15 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                 std::shared_lock composition_lock(composition_access_.mutex);
                 if (composition_access_.product() == nullptr) {
                   response = OwnerNotReadyResponse(command);
+                } else if (ordinary && IsPlanningJobCommand(command.kind)) {
+                  // Answered now; planned on the submission-ordered lane.
+                  response = composition_access_.current == nullptr
+                                 ? OwnerNotReadyResponse(command)
+                                 : AcceptPlanningJob(
+                                       command, *composition_access_.current);
+                } else if (ordinary &&
+                           command.kind == CommandKind::kSetRuntimeScaleControl) {
+                  deferred.emplace(&runtime_scale_lane_, command);
                 } else if (composition_access_.current == nullptr) {
                   if (ordinary && IsSubmissionOrdered(command.kind))
                     deferred.emplace(&submission_ordered_lane_, command);
@@ -4379,6 +4555,7 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                     if (accepted != nullptr && accepted->is_bool() &&
                         accepted->as_bool()) {
                       PreemptPlanning();
+                      planning_jobs_.Preempt(std::nullopt);
                     }
                   }
                 }
@@ -4403,7 +4580,7 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
           auto &[deferred_lane, deferred_command] = *deferred;
           if (EnqueueDeferred(*deferred_lane, client,
                               std::move(deferred_command))) {
-            return;
+            return false;
           }
           response = ErrorResponse(
               std::string(deferred_lane->busy_code),
@@ -4411,13 +4588,12 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
               "pending requests on this lane");
         }
         SendResponse(client.get(), response, cell_admission_command);
-        if (lane != CommandLane::kObservation) {
-          return;
-        }
+        return lane == CommandLane::kObservation;
       }
     } catch (...) {
       // A malformed/disappearing private client cannot retire the sole owner.
     }
+    return false;
   }
 
 void ExecutionCommandSurface::SendResponse(
@@ -4438,7 +4614,7 @@ void ExecutionCommandSurface::SendResponse(
     pollfd outbound{client, POLLOUT, 0};
     int response_ready = -1;
     do {
-      response_ready = ::poll(&outbound, 1, kClientPacketDeadlineMilliseconds);
+      response_ready = ::poll(&outbound, 1, kResponseSendDeadlineMilliseconds);
     } while (response_ready < 0 && errno == EINTR);
     Require(response_ready > 0 && (outbound.revents & POLLOUT) != 0,
             "execution command client did not accept a response in time");
@@ -4452,34 +4628,49 @@ void ExecutionCommandSurface::SendResponse(
 
 /// Lane and ordering contract of the execution sockets.
   ///
-  /// Every ordinary and control connection carries one request and its
-  /// response, so a client that needs A before B already waits for A's
+  /// Every ordinary, control and component connection carries one request and
+  /// its response, so a client that needs A before B already waits for A's
   /// response; requests on different connections or sockets are ordered by
-  /// nothing but the owner fences below, never by arrival.
+  /// nothing but the owner fences below, never by arrival. Each socket's
+  /// thread handles one request at a time, from whichever connection has
+  /// sent one (oldest connection first); a connection that has not sent its
+  /// request yet waits without a time limit and holds up no other.
   ///
   /// - Control socket: Stop, Program Stop, Program-selection Stop, full and
-  ///   malformed Stop, plus the in-memory reads Stop progression needs
-  ///   (Stop status, Stop fault) and the operator-alarm attention heartbeat.
-  ///   It reaches only the stable Kernel, without the composition lock, so
-  ///   neither planning nor an Apply delays it. Each request is a bounded
-  ///   copy under the Kernel's state lock.
+  ///   malformed Stop, plus Stop status, the carried-object-lost level, the
+  ///   read, cancel and release of one planning job and the speed hand-off to
+  ///   the runtime-scale lane. It never takes the
+  ///   composition lock, so neither planning, an Apply nor a component
+  ///   request delays it. Each request is a bounded in-memory step.
+  /// - Component socket: component actions (plain and recover-enable), their
+  ///   recovery preflight, the component model and the operator-alarm
+  ///   attention heartbeat. Its own thread, one request at a time; it
+  ///   takes the composition only by try_lock, so an Apply never delays it.
   /// - Ordinary socket: operation controls (Reset,
   ///   acknowledgement), events, reads, Program selection and capture, cell
   ///   admission and recovery. It never waits for planning, submission
-  ///   ordering or a Manager round trip; those go to deferred lanes.
+  ///   ordering, a Manager round trip or an output write; those go to
+  ///   deferred lanes.
   /// - Submission-ordered lane: requests whose Kernel entry takes submission
-  ///   ordering (IsSubmissionOrdered). One worker, FIFO in host enqueue
-  ///   order, one in flight. A completed client send is not an enqueue receipt.
+  ///   ordering (IsSubmissionOrdered), pick/place planning jobs among them:
+  ///   their client is answered at accept, the outcome is read from the job
+  ///   table (PlanningJobTable) on the control socket. One worker,
+  ///   FIFO in host enqueue order, one in flight. A completed client send is
+  ///   not an enqueue receipt.
   /// - Scene-read lane: projections that first read the live Scene revision
   ///   from Manager (ReadsManagerScene). One worker, FIFO.
+  /// - Output lane: `set_io_output`, manual and Program alike. One worker,
+  ///   FIFO in host enqueue order, one in flight; the Kernel admits each
+  ///   write when it starts, and a started write completes.
   ///
-  /// Cross-lane fences: Reset, recovery and Stop-fence release name the
-  /// exact operation revision, Stop id and generation they act on, and their
-  /// clients issue them only after reading that state on the control socket. A stale name is refused (the Program owner also
+  /// Cross-lane fences: Reset and recovery name the exact operation
+  /// revision, Stop id and generation they act on, and their
+  /// clients issue them only after reading that state on the control or
+  /// component socket. A stale name is refused (the Program owner also
   /// refuses a cycle Reset while its Stop is not terminal); a Kernel Reset of
   /// a participant still stopping hard-stops it first, so no ordering of the
-  /// two sockets lets Reset restart motion or release a newer Stop. Alarm
-  /// attention is fenced by owner epoch, incarnation and monotonic generation
+  /// sockets lets Reset restart motion or release a newer Stop. Alarm
+  /// attention is fenced by host boot and monotonic generation
   /// and evaluated at admission only by age, so admission on another lane
   /// observes either the previous or the new publication, both valid. Event
   /// pages are journal-sequence ordered.
@@ -4493,19 +4684,16 @@ void ExecutionCommandSurface::SendResponse(
 [[nodiscard]] CanonicalValue
   ExecutionCommandSurface::OwnerNotReadyResponse(const Command &command) const {
     if (command.kind == CommandKind::kIdentity) {
-      return ExecutionOwnerNotReadyIdentityResponse(StableKernel(),
-                                                    owner_epoch_);
+      return ExecutionOwnerNotReadyIdentityResponse(StableKernel());
     }
     if (command.kind == CommandKind::kResetRobotPosition) {
       return ErrorResponse("execution_owner_not_ready",
                            "the managed execution owner has no active physical product",
-                           {{"owner_epoch", owner_epoch_.value()},
-                            {"effect_disposition", "known_no_effect"}});
+                           {{"effect_disposition", "known_no_effect"}});
     }
     return ErrorResponse("execution_owner_not_ready",
                          "the managed execution owner has no active physical "
-                         "product",
-                         {{"owner_epoch", owner_epoch_.value()}});
+                         "product");
   }
 
 [[nodiscard]] bool ExecutionCommandSurface::EnqueueDeferred(DeferredLane &lane, FileDescriptor &client,
@@ -4526,7 +4714,8 @@ void ExecutionCommandSurface::SendResponse(
 
 /// Cancels every advisory planning query already accepted, executing or
   /// queued; a queued one then reaches the Kernel already cancelled. Only
-  /// planning consults the token: a queued submit or read is unaffected.
+  /// planning consults the token: a queued submit or read is unaffected, and
+  /// a pick/place planning job plans with its own source (PreemptPlanningJobs).
   /// Called before a Stop or a component-lifecycle cell-admission claim is
   /// dispatched and after a Reset is accepted; none waits for the cancelled
   /// planning to return. (The Kernel's own
@@ -4542,6 +4731,112 @@ void ExecutionCommandSurface::SendResponse(
     }
   }
 
+void ExecutionCommandSurface::PreemptPlanningJobs(
+    const component_manager::detail::KernelCellAdmissionRpcPacket
+        &packet) noexcept {
+  // A Program Reset claim ends its run: that run's jobs are released.
+  const auto *reset = std::get_if<
+      component_manager::detail::ProgramResetClaimAcquireRequest>(&packet.request);
+  planning_jobs_.Preempt(reset != nullptr
+                             ? reset->program_cycle_status.program_run_id
+                             : std::optional<core::ProgramRunNumber>{});
+}
+
+CanonicalValue ExecutionCommandSurface::AcceptPlanningJob(
+    const Command &command, Composition &composition) {
+  if (!composition.pick_place_planning_owner) {
+    return ErrorResponse(
+        "pick_place_planning_owner_unavailable",
+        "the selected native process has no joined logical-scene "
+        "planning owner");
+  }
+  const bool pick = command.kind == CommandKind::kPlanPick;
+  const auto &approach = pick ? command.pick_planning->approach_operation
+                              : command.place_planning->approach_operation;
+  auto accepted = planning_jobs_.Accept(
+      pick ? command.pick_planning->sequence_id
+           : command.place_planning->sequence_id,
+      pick, approach.program_run_id);
+  if (!accepted.ok()) {
+    return ErrorResponse(accepted.error().code, accepted.error().message,
+                         accepted.error().details);
+  }
+  auto queued = command;
+  queued.planning_job_ticket = accepted.value().ticket;
+  FileDescriptor no_client;
+  if (!EnqueueDeferred(submission_ordered_lane_, no_client, std::move(queued))) {
+    planning_jobs_.Withdraw(accepted.value().ticket);
+    return ErrorResponse(
+        std::string(submission_ordered_lane_.busy_code),
+        "the execution owner already holds its bounded number of "
+        "pending requests on this lane");
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+      {"command", CanonicalValue(pick ? "plan_pick" : "plan_place")},
+      {"ok", CanonicalValue(true)},
+      {"planning_job", PlanningJobValue(accepted.value().job)},
+  });
+}
+
+CanonicalValue
+ExecutionCommandSurface::PlanningJobResponse(const Command &command) {
+  const auto &job_id = *command.planning_job_id;
+  const auto name = command.kind == CommandKind::kReadPlanningJob
+                        ? "read_planning_job"
+                    : command.kind == CommandKind::kCancelPlanningJob
+                        ? "cancel_planning_job"
+                        : "release_planning_job";
+  if (command.kind == CommandKind::kReleasePlanningJob) {
+    const auto released = planning_jobs_.Release(job_id);
+    if (!released.ok()) {
+      return ErrorResponse(released.error().code, released.error().message,
+                           released.error().details);
+    }
+    return CanonicalValue(CanonicalValue::Object{
+        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+        {"command", CanonicalValue(name)},
+        {"ok", CanonicalValue(true)},
+    });
+  }
+  const auto job = command.kind == CommandKind::kReadPlanningJob
+                       ? planning_jobs_.Read(job_id)
+                       : planning_jobs_.Cancel(job_id);
+  if (!job.ok()) {
+    return ErrorResponse(job.error().code, job.error().message,
+                         job.error().details);
+  }
+  return CanonicalValue(CanonicalValue::Object{
+      {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+      {"command", CanonicalValue(name)},
+      {"ok", CanonicalValue(true)},
+      {"planning_job", PlanningJobValue(job.value())},
+  });
+}
+
+void ExecutionCommandSurface::RunPlanningJob(
+    const Command &command, const std::stop_token lane_stop_token) noexcept {
+  auto source = planning_jobs_.Begin(command.planning_job_ticket);
+  if (!source.has_value()) return;  // cancelled or released while it waited
+  // The job's own source alone stops its planning: its cancel, a
+  // preemption, or the owner leaving. A Stop never reaches it.
+  const std::stop_callback cancel_on_shutdown(
+      lane_stop_token, [stop = *source]() mutable { stop.request_stop(); });
+  CanonicalValue response;
+  try {
+    response = DeferredResponse(command, source->get_token(), lane_stop_token);
+  } catch (const std::exception &error) {
+    const auto failure = ExecutionCommandExceptionError(error);
+    response = ErrorResponse(failure.code, failure.message, failure.details);
+  }
+  const auto *ok = response.find_object_member("ok");
+  const bool succeeded = ok != nullptr && ok->is_bool() && ok->as_bool();
+  const auto *outcome =
+      response.find_object_member(succeeded ? "planning_result" : "error");
+  planning_jobs_.Finish(command.planning_job_ticket, succeeded,
+                        outcome != nullptr ? *outcome : CanonicalValue(nullptr));
+}
+
 CanonicalValue ExecutionCommandSurface::ReadVolatileMotionTrace(
     const Command &command, const std::size_t response_capacity) const {
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
@@ -4552,8 +4847,8 @@ CanonicalValue ExecutionCommandSurface::ReadVolatileMotionTrace(
     const auto *directory = std::getenv("MANYFORGE_MOTION_TRACE_DIR");
     const bool disk = directory && *directory;
     auto snapshot = trace
-        ? disk ? trace->SnapshotFile(owner_epoch_, command.trace_allowance_bytes, directory)
-               : trace->Snapshot(owner_epoch_,
+        ? disk ? trace->SnapshotFile(application_start_id_, command.trace_allowance_bytes, directory)
+               : trace->Snapshot(application_start_id_,
                      std::min(command.trace_allowance_bytes,
                               response_capacity - kInlineTraceEnvelopeBytes))
         : core::Result<CanonicalValue>::Err({"volatile_motion_trace_unavailable",
@@ -4610,8 +4905,11 @@ void ExecutionCommandSurface::RunDeferredLane(DeferredLane &lane,
       std::optional<PendingDeferredCommand> pending;
       {
         std::unique_lock lock(lane.mutex);
+        // On a stop request the wait returns its predicate, so a non-empty
+        // queue must be told apart from "work to do".
         if (!lane.ready.wait(lock, stop_token,
-                             [&lane] { return !lane.queue.empty(); })) {
+                             [&lane] { return !lane.queue.empty(); }) ||
+            stop_token.stop_requested()) {
           // Closing the queued clients is their answer: the owner is leaving.
           lane.queue.clear();
           return;
@@ -4619,6 +4917,13 @@ void ExecutionCommandSurface::RunDeferredLane(DeferredLane &lane,
         pending.emplace(std::move(lane.queue.front()));
         lane.queue.pop_front();
         lane.in_flight = pending->cancellation;
+      }
+      if (IsPlanningJobCommand(pending->command.kind)) {
+        // Its client was answered at accept; the outcome goes to the job.
+        RunPlanningJob(pending->command, stop_token);
+        std::lock_guard lock(lane.mutex);
+        lane.in_flight.reset();
+        continue;
       }
       const std::stop_callback cancel_on_shutdown(
           stop_token, [source = pending->cancellation]() mutable {
@@ -4628,12 +4933,17 @@ void ExecutionCommandSurface::RunDeferredLane(DeferredLane &lane,
         CanonicalValue response;
         try {
           // Diagnostic encoding and disk I/O never retain a composition or
-          // command lock.
+          // command lock. An output write uses only the stable Kernel and
+          // the cell's component runtime, which outlive every composition,
+          // so an Apply never delays it; the Kernel admits it now, at its
+          // start, and a started write always completes (no stop token).
           response =
               pending->command.kind == CommandKind::kReadVolatileMotionTrace
                   ? ReadVolatileMotionTrace(
                         pending->command,
                         AtomicResponseCapacity(pending->client.get()))
+              : pending->command.kind == CommandKind::kSetIoOutput
+                  ? SetIoOutputResponse(pending->command, StableKernel())
                   : DeferredResponse(pending->command,
                                      pending->cancellation.get_token(),
                                      stop_token);
@@ -4661,11 +4971,11 @@ void RunManagedExecutionCommandSurface(
   try {
     Require(control.composition_access != nullptr &&
                 control.manager_liveness_admission != nullptr &&
-                !control.owner_epoch.empty(),
+                control.application_start_id.value != 0U,
             "managed execution command surface configuration is incomplete");
     ExecutionCommandSurface surface(
         control.run_root, *control.composition_access,
-        *control.manager_liveness_admission, control.owner_epoch);
+        *control.manager_liveness_admission, control.application_start_id);
     // Unpublish the surface before it is destroyed, also when Run throws.
     struct Unpublish final {
       ManagedExecutionSurfaceControl &control;
@@ -4691,10 +5001,13 @@ void RunManagedExecutionCommandSurface(
 }
 
 void PreemptManagedExecutionSurfacePlanning(
-    ManagedExecutionSurfaceControl &control) noexcept {
+    ManagedExecutionSurfaceControl &control,
+    const component_manager::detail::KernelCellAdmissionRpcPacket
+        &packet) noexcept {
   std::lock_guard lock(control.state_mutex);
   if (control.surface != nullptr) {
     control.surface->PreemptPlanning();
+    control.surface->PreemptPlanningJobs(packet);
   }
 }
 

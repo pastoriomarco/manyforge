@@ -75,7 +75,8 @@ beforeEach(() => {
 async function mount(documentUnavailableReason: string | null = null, motionActive = false,
   documentPath = '/projects/current.scenario', readOnly = false, hasChanges = true,
   cellComponents: readonly string[] | null = [], scenarioReplacementUnavailableReason: string | null = null,
-  busyOperation: BusyOperation | null = null, authoringAdmissionAllowed: boolean | null = null) {
+  busyOperation: BusyOperation | null = null, authoringAdmissionAllowed: boolean | null = null,
+  stopActive = false) {
   const dom = mountedHost();
   const controller = {
     busyOperation,
@@ -90,12 +91,19 @@ async function mount(documentUnavailableReason: string | null = null, motionActi
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(dom.host as unknown as Element);
   let admissionAllowed = authoringAdmissionAllowed;
+  let moving = motionActive;
+  let stopping = stopActive;
+  let componentAction = false;
   const render = async () => act(() => root.render(<ScenarioDocumentCommands controller={controller}
-    motionActive={motionActive} cellComponents={cellComponents}
+    motionActive={moving} newWaitReason={stopping ? 'A Stop is in progress.' : undefined}
+    componentActionActive={componentAction} cellComponents={cellComponents}
     authoringAdmissionAllowed={admissionAllowed} />));
   await render();
   unmount = async () => { await act(() => root.unmount()); };
   const rerenderAdmission = async (allowed: boolean | null) => { admissionAllowed = allowed; await render(); };
+  const rerenderMotion = async (motion: boolean, stop = false) => {
+    moving = motion; stopping = stop; await render();
+  };
   const click = async (props: Props) => { await act(async () => props.onClick?.({ currentTarget: { focus: () => undefined } })); };
   const open = async (label: string) => click(dom.find((p) => p['aria-label'] === label));
   const confirm = async () => { await act(() => dom.find((p) => p.type === 'checkbox').onChange?.({ target: { checked: true } })); };
@@ -105,7 +113,9 @@ async function mount(documentUnavailableReason: string | null = null, motionActi
     .onChange?.({ target: { value: `saved:/projects/${id}` } })); };
   // Confirmations use the danger look, the primary look elsewhere.
   const primary = (label: string) => dom.find((p) => (p.className === 'primary-action' || p.className === 'danger-button') && p.children === label);
-  return { ...dom, controller, click, open, confirm, choose, primary, ack, rerenderAdmission };
+  const rerenderComponentAction = async (running: boolean) => { componentAction = running; await render(); };
+  return { ...dom, controller, click, open, confirm, choose, primary, ack, rerenderAdmission, rerenderMotion,
+    rerenderComponentAction };
 }
 
 it('disables New, Save, Save As and Load while robots are moving', async () => {
@@ -113,6 +123,75 @@ it('disables New, Save, Save As and Load while robots are moving', async () => {
   for (const label of ['New', 'Save Scenario as', 'Load Scenario']) {
     expect(test.find((p) => p['aria-label'] === label).disabled).toBe(true);
   }
+});
+
+// New waits while motion executes or a Stop is in progress, and is available
+// again by itself when that ends (maintainer, 2026-11-13).
+it('New names a Stop in progress and moving robots, and is available again when they end', async () => {
+  const moving = 'Not available while robots are moving. Stop motion first.';
+  const test = await mount(null, true, '/projects/current.scenario', false, true, [], null, null, null, true);
+  const button = (label: string) => test.find((p) => p['aria-label'] === label);
+  expect(button('New').disabled).toBe(true);
+  expect(button('New')['data-tooltip']).toBe('New: A Stop is in progress.');
+  // Load keeps its own motion reason.
+  expect(button('Load Scenario')['data-tooltip']).toBe(`Load Scenario: ${moving}`);
+  await test.rerenderMotion(true);
+  expect(button('New').disabled).toBe(true);
+  expect(button('New')['data-tooltip']).toBe(`New: ${moving}`);
+  await test.rerenderMotion(false);
+  expect(button('New').disabled).toBe(false);
+  expect(button('New')['data-tooltip']).toBe('New');
+});
+
+// OD-194: New and Load wait while any component action runs, after moving
+// robots, and are available again when the action ends.
+it('New and Load name a running component action after moving robots, and are available again when it ends', async () => {
+  const action = 'Not available while a component action is running.';
+  const moving = 'Not available while robots are moving. Stop motion first.';
+  const test = await mount();
+  const button = (label: string) => test.find((p) => p['aria-label'] === label);
+  await test.rerenderComponentAction(true);
+  for (const label of ['New', 'Load Scenario']) {
+    expect(button(label).disabled).toBe(true);
+    expect(button(label)['data-tooltip']).toBe(`${label}: ${action}`);
+  }
+  // Save and Save as are not gated by it.
+  expect(button('Save Scenario as').disabled).toBe(false);
+  await test.rerenderMotion(true);
+  expect(button('New')['data-tooltip']).toBe(`New: ${moving}`);
+  expect(button('Load Scenario')['data-tooltip']).toBe(`Load Scenario: ${moving}`);
+  await test.rerenderMotion(false);
+  expect(button('New')['data-tooltip']).toBe(`New: ${action}`);
+  await test.rerenderComponentAction(false);
+  for (const label of ['New', 'Load Scenario']) {
+    expect(button(label).disabled).toBe(false);
+    expect(button(label)['data-tooltip']).toBe(label);
+  }
+});
+
+it('New names moving robots before a closed admission', async () => {
+  const test = await mount(null, true, '/projects/current.scenario', false, true, [], null, null, false);
+  expect(test.find((p) => p['aria-label'] === 'New')['data-tooltip'])
+    .toBe('New: Not available while robots are moving. Stop motion first.');
+  // Load is unchanged: the admission tooltip.
+  expect(test.find((p) => p['aria-label'] === 'Load Scenario')['data-tooltip'])
+    .toBe('The cell is finishing a background step; this is available again in a moment.');
+});
+
+it('disables a New confirmation if motion or a Stop starts while it is open', async () => {
+  const test = await mount(null, false, '/projects/current.scenario', false, true, [], null, null, true);
+  await test.open('New');
+  expect(test.find((p) => p.children === 'New Scenario?')).toBeDefined();
+  await test.rerenderMotion(true, true);
+  const acknowledge = () => test.find((p) => p.className === 'danger-button');
+  expect(acknowledge().disabled).toBe(true);
+  expect(acknowledge().title).toBe('A Stop is in progress.');
+  await test.rerenderMotion(true);
+  expect(acknowledge().title).toBe('Not available while robots are moving. Stop motion first.');
+  await test.rerenderMotion(false);
+  expect(acknowledge().disabled).toBe(false);
+  await test.ack();
+  expect(test.controller.newScenarioDocument).toHaveBeenCalledOnce();
 });
 
 it('Cancel on the discard confirmation sends no New or Load', async () => {

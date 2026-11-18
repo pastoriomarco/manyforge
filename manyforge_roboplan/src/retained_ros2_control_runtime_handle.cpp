@@ -273,7 +273,7 @@ struct BoundComponentStreams final {
   auto measured = host_component_stream_health()->Declare(
       owner.value().controllable_component_id,
       core::StreamDeclarationDTO{"measured_joints", lane->freshness_budget_ns,
-                                 lane->stream_severity, lane->stream_recovery,
+                                 lane->stream_severity,
                                  core::StreamTimestampSourceDTO::kMessageStamp});
   if (!measured.ok()) return Out::Err(measured.error());
   streams.measured = std::move(measured.value());
@@ -311,7 +311,7 @@ public:
   }
 
   core::ExecutionPortCommandResultDTO
-  Submit(const core::ExecutionGoalKey &key,
+  Submit(const core::ControllerGoalId &key,
          const core::TrajectoryDTO &trajectory,
          std::shared_ptr<core::ExecutionDispatchToken> token = {}) override {
     if (const auto refused = Refusal()) return *refused;
@@ -321,8 +321,8 @@ public:
   }
 
   core::ExecutionPortCommandResultDTO
-  Replace(const core::ExecutionGoalKey &active_key,
-          const core::ExecutionGoalKey &next_key,
+  Replace(const core::ControllerGoalId &active_key,
+          const core::ControllerGoalId &next_key,
           const core::TrajectoryDTO &trajectory,
           std::shared_ptr<core::ExecutionDispatchToken> token = {}) override {
     if (const auto refused = Refusal()) return *refused;
@@ -332,8 +332,8 @@ public:
   }
 
   core::ExecutionPortCommandResultDTO
-  ReplaceScheduled(const core::ExecutionGoalKey &active_key,
-                   const core::ExecutionGoalKey &next_key,
+  ReplaceScheduled(const core::ControllerGoalId &active_key,
+                   const core::ControllerGoalId &next_key,
                    const core::TrajectoryDTO &trajectory,
                    const core::ExecutionReplacementStartDTO &start,
                    std::shared_ptr<core::ExecutionDispatchToken> token = {}) override {
@@ -346,7 +346,7 @@ public:
   }
 
   core::ExecutionPortCommandResultDTO
-  Cancel(const core::ExecutionGoalKey &key, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
+  Cancel(const core::ControllerGoalId &key, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
     return adapter_->Cancel(key, deadline);
   }
 
@@ -359,7 +359,7 @@ public:
   }
 
   std::optional<core::ExecutionGoalObservationDTO>
-  ReadGoal(const core::ExecutionGoalKey &key) const override {
+  ReadGoal(const core::ControllerGoalId &key) const override {
     return adapter_->ReadGoal(key);
   }
 
@@ -1447,18 +1447,18 @@ RetainedRos2ControlRuntimeHandle::StopAndQuiesce(
     if (!handoff.ok())
       return {HostQuiesceOutcome::kUnresolved, "journal_handoff", handoff.error().code};
     if (!leaf_drained)
-      return {HostQuiesceOutcome::kUnresolved, "leaf", "component_owner_stalled"};
+      return {HostQuiesceOutcome::kUnresolved, "leaf", "component_quiesce_not_drained"};
     if (!adapter->loss_cancel_shutdown_settled() && !has_unresolved)
-      return {HostQuiesceOutcome::kUnresolved, "late_cancel_close", "component_owner_stalled"};
+      return {HostQuiesceOutcome::kUnresolved, "late_cancel_close", "component_quiesce_not_drained"};
   }
   if (epoch_resources && !epoch_resources->quiesce_until(effective_deadline))
-    return {HostQuiesceOutcome::kUnresolved, "join", "component_owner_stalled"};
+    return {HostQuiesceOutcome::kUnresolved, "join", "component_quiesce_not_drained"};
   if (gripper) {
     const auto gripper_deadline = std::min(deadline, started + std::chrono::nanoseconds(gripper_timeout.value()));
     machine_deadline = std::min(machine_deadline, gripper_deadline);
     const auto status = gripper->CloseGripperLateCancels(gripper_deadline);
     if (status == ros2_control_execution::Ros2GripperCommandBackend::LateCancelShutdownStatus::kStuck)
-      return {HostQuiesceOutcome::kUnresolved, "late_cancel_close", "component_owner_stalled"};
+      return {HostQuiesceOutcome::kUnresolved, "late_cancel_close", "component_quiesce_not_drained"};
     if (status == ros2_control_execution::Ros2GripperCommandBackend::LateCancelShutdownStatus::kPendingOrFailed)
       return {HostQuiesceOutcome::kUnresolved, "late_cancel_close", "internal_error"};
     // kDurableUnknown is already journaled; its recovery claim remains live.
@@ -1466,10 +1466,10 @@ RetainedRos2ControlRuntimeHandle::StopAndQuiesce(
     // are still live; the destructor's shutdown() is then a no-op.
     gripper->shutdown();
     if (!gripper->StopSceneProjectionUntil(gripper_deadline))
-      return {HostQuiesceOutcome::kUnresolved, "join", "component_owner_stalled"};
+      return {HostQuiesceOutcome::kUnresolved, "join", "component_quiesce_not_drained"};
   }
   if (machine_resources && !machine_resources->quiesce_until(machine_deadline))
-    return {HostQuiesceOutcome::kUnresolved, "join", "component_owner_stalled"};
+    return {HostQuiesceOutcome::kUnresolved, "join", "component_quiesce_not_drained"};
   {
     std::lock_guard lock(mutex_);
     if (resources_ != machine_resources || gripper_.get() != gripper || bool(arm_) != had_arm ||
@@ -1499,7 +1499,7 @@ RetainedRos2ControlRuntimeHandle::QuiesceForHostShutdown(
       if (!detached.ok()) {
         const auto reason = detached.error().details.find("reason");
         if (reason != detached.error().details.end() && reason->second == "scheduler_detach_timeout")
-          return {HostQuiesceOutcome::kUnresolved, stage, "component_owner_stalled"};
+          return {HostQuiesceOutcome::kUnresolved, stage, "component_quiesce_not_drained"};
         return {HostQuiesceOutcome::kUnresolved, stage, detached.error().code};
       }
     }
@@ -2114,13 +2114,20 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::RebindRetainedToolContext(
     }
   }
   if (reset) {
-    std::lock_guard lock(mutex_);
-    ++active_tcp_sequence_;
-    if (active_tcp_events_)
-      active_tcp_events_(core::ActiveTcpChangeDTO{
+    // The row is built under the lock and posted after it (OD-220); the
+    // arm step still held keeps this robot's posts in commit order.
+    ActiveTcpEventSink sink;
+    std::optional<core::ActiveTcpChangeDTO> change;
+    {
+      std::lock_guard lock(mutex_);
+      ++active_tcp_sequence_;
+      sink = active_tcp_events_;
+      change.emplace(core::ActiveTcpChangeDTO{
           *active_tcp_robot_, previous_reference, selected_reference,
           core::ActiveTcpChangeSource::kReset, offset_sent,
           active_tcp_registration_generation_, active_tcp_sequence_, 0});
+    }
+    if (sink) sink(*change);
   }
   return core::Result<void>::Ok();
 }
@@ -2242,16 +2249,24 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::ChangeActiveTcp(
       return core::Result<void>::Err(sent.error());
     }
   }
-  // The commit and its event, under the handle's lock.
-  std::lock_guard lock(mutex_);
-  const auto previous = active_tcp_.reference();
-  const bool changed = entry ? active_tcp_.commit(*entry) : active_tcp_.reset();
-  if (!changed) return core::Result<void>::Ok();
-  ++active_tcp_sequence_;
-  if (!active_tcp_events_ || !active_tcp_robot_) return core::Result<void>::Ok();
-  active_tcp_events_(core::ActiveTcpChangeDTO{
-      *active_tcp_robot_, previous, active_tcp_.reference(), source,
-      offset_sent, active_tcp_registration_generation_, active_tcp_sequence_, 0});
+  // The commit and its event, built under the handle's lock and posted
+  // after it (OD-220). Every caller holds this robot's arm step until it
+  // returns, so the robot's posts keep their commit order.
+  ActiveTcpEventSink sink;
+  std::optional<core::ActiveTcpChangeDTO> change;
+  {
+    std::lock_guard lock(mutex_);
+    const auto previous = active_tcp_.reference();
+    const bool changed = entry ? active_tcp_.commit(*entry) : active_tcp_.reset();
+    if (!changed) return core::Result<void>::Ok();
+    ++active_tcp_sequence_;
+    if (!active_tcp_events_ || !active_tcp_robot_) return core::Result<void>::Ok();
+    sink = active_tcp_events_;
+    change.emplace(core::ActiveTcpChangeDTO{
+        *active_tcp_robot_, previous, active_tcp_.reference(), source,
+        offset_sent, active_tcp_registration_generation_, active_tcp_sequence_, 0});
+  }
+  sink(*change);
   return core::Result<void>::Ok();
 }
 
@@ -2638,6 +2653,17 @@ bool RetainedRos2ControlRuntimeHandle::ControllerLaunchSettling() const {
     if (exited.ok() && exited.value().has_value()) return false;
   }
   return true;
+}
+
+bool RetainedRos2ControlRuntimeHandle::ControllerLaunchExited() const {
+  std::function<core::Result<std::optional<std::string>>()> health;
+  {
+    std::lock_guard lock(mutex_);
+    health = process_health_source_;
+  }
+  if (!health) return false;
+  const auto exited = health();
+  return exited.ok() && exited.value().has_value();
 }
 
 void RetainedRos2ControlRuntimeHandle::ReplaceControllerProcessFaultSource(
@@ -3290,7 +3316,7 @@ core::Result<void> RetainedRos2ControlRuntimeHandle::RotateEpochLocked(
       const auto handed_off = FlushLateCancelHandoff();
       lock.lock();
       if (!handed_off.ok()) return handed_off;
-      return reject<void>("component_owner_stalled",
+      return reject<void>("component_quiesce_not_drained",
                           "ROS controller action leaf did not drain before its lifecycle deadline");
     }
     const bool joined = old_epoch->quiesce_until(deadline);
@@ -3788,8 +3814,9 @@ RetainedRos2ControlRuntimeHandle::DeactivateArmController(
 }
 
 RetainedRos2ControlSwitchResult
-RetainedRos2ControlRuntimeHandle::SwitchArmHardware(const bool active,
-                                                    const std::stop_token cancellation) {
+RetainedRos2ControlRuntimeHandle::SwitchArmHardware(
+    const bool active, const std::optional<MockResetPositionStepDeadline> step_deadline,
+    const std::stop_token cancellation) {
   SerializedStep step(*this, SerializedStepKind::kArm);
   bool hardware_active = false;
   bool broadcaster_loaded = false;
@@ -3807,7 +3834,7 @@ RetainedRos2ControlRuntimeHandle::SwitchArmHardware(const bool active,
     broadcaster_off = broadcaster_loaded && !activity.broadcaster_active;
   }
   if (hardware_active != active) {
-    auto switched = SendHardwareState(active, cancellation, std::nullopt);
+    auto switched = SendHardwareState(active, cancellation, step_deadline);
     if (switched.outcome != RetainedRos2ControlSwitchOutcome::kSucceeded || !active)
       return switched;
     // The hardware's activation may or may not have deactivated the joint
@@ -3816,7 +3843,7 @@ RetainedRos2ControlRuntimeHandle::SwitchArmHardware(const bool active,
     // unless already active (best effort: an active one is left as is).
     if (broadcaster_loaded)
       return SendControllerSwitch({std::string(kJointStateBroadcasterControllerName)}, {},
-                                  cancellation, std::nullopt, std::nullopt, true);
+                                  cancellation, std::nullopt, step_deadline, true);
   }
   // Switched on: the joint state broadcaster too, when it is off (a vendor
   // driver that deactivated its controllers while its robot was not ready
@@ -3824,7 +3851,7 @@ RetainedRos2ControlRuntimeHandle::SwitchArmHardware(const bool active,
   // meanwhile is left as is.
   if (active && broadcaster_off)
     return SendControllerSwitch({std::string(kJointStateBroadcasterControllerName)}, {},
-                                cancellation, std::nullopt, std::nullopt, true);
+                                cancellation, std::nullopt, step_deadline, true);
   return {RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
 }
 
@@ -3916,6 +3943,11 @@ bool RetainedRos2ControlRuntimeHandle::mock_reset_writer_inactive() const {
   return publisher && publisher->get_subscription_count() == 1U;
 }
 
+bool RetainedRos2ControlRuntimeHandle::mock_reset_position_pending() const {
+  std::lock_guard lock(mutex_);
+  return arm_ && arm_->reset_position_pending;
+}
+
 bool RetainedRos2ControlRuntimeHandle::mock_reset_writer_active() const {
   std::lock_guard lock(mutex_);
   return arm_ && arm_->transport.mock_reset_position &&
@@ -3956,7 +3988,8 @@ bool RetainedRos2ControlRuntimeHandle::mock_reset_successor_ready() const {
   // deadline. Reset does not synthesize a separate lifecycle transport loss.
   activity->Refresh();
   adapter->RefreshEndpointFacts();
-  if (ReadObservation(clock_->now()).process_fault)
+  if (const auto observed = ReadObservation(clock_->now());
+      observed.process_fault || observed.transport_fault)
     return false;
   const bool discovered = adapter->ActionServerIsReady();
   std::lock_guard lock(mutex_);
@@ -3982,18 +4015,25 @@ RetainedRos2ControlRuntimeHandle::ResetMockPosition(
   std::optional<core::ExecutionBindingEpoch> successor;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr publisher;
   std::shared_ptr<ros2_control_execution::Ros2TransportResources> publisher_owner;
+  // An interrupted reset runs all its steps again from the controller state
+  // it left, while the arm's Enable still stands.
+  bool rerun = false;
+  bool rerun_possibly_active = false;
   {
     std::lock_guard lock(mutex_);
+    rerun = arm_ && arm_->reset_position_pending;
     if (!phase || !arm_ || !arm_->transport.mock_reset_position ||
-        !arm_->reset_publisher || !arm_->bound ||
-        arm_->reset_position_pending ||
+        !arm_->reset_publisher ||
         !arm_->activity.controller_manager_present ||
         !arm_->activity.observed || !arm_->activity.hardware_active ||
-        !arm_->activity.controller_active || !arm_->reset_writer_loaded ||
-        arm_->reset_writer_active || arm_->reset_writer_possibly_active)
+        !arm_->reset_writer_loaded ||
+        (rerun ? arm_->requested != core::ComponentLifecycleStateDTO::kActive
+               : !arm_->bound || !arm_->activity.controller_active ||
+                     arm_->reset_writer_active || arm_->reset_writer_possibly_active))
       return not_sent("mock_reset_position_unavailable",
                       "Mock position reset requires the active exact arm and "
                       "inactive writer");
+    rerun_possibly_active = arm_->reset_writer_possibly_active;
     target = *arm_->transport.mock_reset_position;
     controller = arm_->transport.controller.controller_name;
     predecessor = arm_->epoch;
@@ -4062,8 +4102,14 @@ RetainedRos2ControlRuntimeHandle::ResetMockPosition(
                        "Controller switch outcome is unknown")};
     }
   };
+  // A rerun's strict switch names only what is not yet in place: the writer
+  // may already be active, the trajectory controller already inactive.
+  std::vector<std::string> writer_on;
+  std::vector<std::string> controller_off;
   {
     std::lock_guard lock(mutex_);
+    if (!rerun || !arm_->reset_writer_active) writer_on.push_back(target.controller_name);
+    if (!rerun || arm_->activity.controller_active) controller_off.push_back(controller);
     arm_->reset_position_pending = true;
     arm_->reset_motion_admitted->store(false);
     arm_->reset_writer_possibly_active = true;
@@ -4096,18 +4142,21 @@ RetainedRos2ControlRuntimeHandle::ResetMockPosition(
       failed.outcome = RetainedRos2ControlSwitchOutcome::kFailed;
     if (failed.error)
       failed.error->message +=
-          " Robot position unknown after a failed position reset. Restart the "
-          "workbench to recover.";
+          " Robot position unknown after a failed position reset.";
     return failed;
   };
-  auto switched = send({target.controller_name}, {controller});
+  auto switched =
+      writer_on.empty() && controller_off.empty()
+          ? RetainedRos2ControlSwitchResult{RetainedRos2ControlSwitchOutcome::kSucceeded,
+                                            std::nullopt}
+          : send(std::move(writer_on), std::move(controller_off));
   if (switched.outcome == RetainedRos2ControlSwitchOutcome::kNotSent) {
     // The service was unavailable before dispatch: no physical transition
-    // occurred, so preserve the original active binding and existing retry.
+    // occurred, so the marks return to what they were before this attempt.
     std::lock_guard lock(mutex_);
-    arm_->reset_position_pending = false;
-    arm_->reset_motion_admitted->store(true);
-    arm_->reset_writer_possibly_active = false;
+    arm_->reset_position_pending = rerun;
+    arm_->reset_motion_admitted->store(!rerun);
+    arm_->reset_writer_possibly_active = rerun && rerun_possibly_active;
     PublishReadinessLocked();
     return switched;
   }
@@ -4329,7 +4378,7 @@ RetainedRos2ControlRuntimeHandle::PrepareGripperController(
     return component_enabled();
   if (gripper_activity_.controller_active)
     return not_sent("ros2_control_gripper_controller_active_unrequested",
-                    "the gripper controller is active without CCLC activation");
+                    "the gripper controller is already active although ManyForge did not switch it on");
   gripper_requested_ = core::ComponentLifecycleStateDTO::kPrepared;
   return {RetainedRos2ControlSwitchOutcome::kSucceeded, std::nullopt};
 }
@@ -4534,6 +4583,7 @@ core::ActionResult RetainedRos2ControlRuntimeHandle::RecoverFaultedOwner(
       bool participant_locked{};
       bool swapped{};
       bool needs_motion_proof{};
+      bool participant_stage_invalid{};
       bool (*swap_slots)(void *) noexcept{};
       bool (*commit_gripper)(void *) noexcept{};
     } commit{this, stage, expected, failed, std::move(pending_fault), &replacement};
@@ -4558,8 +4608,15 @@ core::ActionResult RetainedRos2ControlRuntimeHandle::RecoverFaultedOwner(
           const auto locked = s.participant->LockOwnerRebind(s.participant_stage);
           if (!locked.ok()) return false;
           c.participant_locked = true;
-          c.needs_motion_proof = s.participant->LockedOwnerRebindNeedsMotionProof(s.participant_stage);
-          s.participant->CommitLockedOwnerRebind(s.participant_stage);
+          // An invalid stage is a defect; nothing is swapped and the rebind is refused.
+          const auto needs_motion_proof =
+              s.participant->LockedOwnerRebindNeedsMotionProof(s.participant_stage);
+          if (!needs_motion_proof ||
+              !s.participant->CommitLockedOwnerRebind(s.participant_stage)) {
+            c.participant_stage_invalid = true;
+            return false;
+          }
+          c.needs_motion_proof = *needs_motion_proof;
         }
         self.resources_ = s.candidate;
         if (s.previous_arm) {
@@ -4647,6 +4704,11 @@ core::ActionResult RetainedRos2ControlRuntimeHandle::RecoverFaultedOwner(
       {
         stage->participant->UnlockOwnerRebind(stage->participant_stage);
         commit.participant_locked = false;
+      }
+      if (!commit.swapped && commit.participant_stage_invalid) {
+        auto refused = fail({});
+        refused.error->code = std::string(core::error_codes::kOwnerRebindStageInvalid);
+        return refused;
       }
       if (!commit.swapped) return fail("ROS owner identities changed before the joint commit");
       try {
@@ -4770,13 +4832,13 @@ RetainedRos2ControlRuntimeHandle::ReadObservation(const core::TimePoint now_ns) 
     retired_late_cancel_unknown = !pending_late_cancel_handoff_.empty();
     if (resources_) {
       if (const auto failed = resources_->executor_fault())
-        observation.process_fault = "ROS transport executor thread failed: " + *failed +
-                                    " (owner " + resources_->owner_name() + ")";
+        observation.transport_fault = "ROS transport executor thread failed: " + *failed +
+                                      " (owner " + resources_->owner_name() + ")";
     }
-    if (!observation.process_fault && arm_ && arm_->epoch_resources) {
+    if (!observation.transport_fault && arm_ && arm_->epoch_resources) {
       if (const auto failed = arm_->epoch_resources->executor_fault())
-        observation.process_fault = "ROS transport executor thread failed: " + *failed +
-                                    " (owner " + arm_->epoch_resources->owner_name() + ")";
+        observation.transport_fault = "ROS transport executor thread failed: " + *failed +
+                                      " (owner " + arm_->epoch_resources->owner_name() + ")";
     }
     if (guard_hooks_) guard_fault = guard_hooks_->fault;
     if (tool_context_fault_) observation.tool_context_fault = tool_context_fault_->message;
@@ -4806,15 +4868,15 @@ RetainedRos2ControlRuntimeHandle::ReadObservation(const core::TimePoint now_ns) 
           owner_recovery_pending_fault_ == pending_recovery_fault) {
         owner_recovery_marker_.reset();
         owner_recovery_pending_fault_.clear();
-      } else if (!owner_recovery_pending_fault_.empty() && !observation.process_fault) {
-        observation.process_fault = owner_recovery_pending_fault_;
+      } else if (!owner_recovery_pending_fault_.empty() && !observation.transport_fault) {
+        observation.transport_fault = owner_recovery_pending_fault_;
       }
-    } else if (!observation.process_fault) {
-      observation.process_fault = pending_recovery_fault;
+    } else if (!observation.transport_fault) {
+      observation.transport_fault = pending_recovery_fault;
     }
   }
   // The exact launch owner's cached exit, never its advancement source.
-  if (!observation.process_fault && process_health) {
+  if (process_health) {
     auto exited = process_health();
     if (!exited.ok())
       observation.process_fault = exited.error().message;

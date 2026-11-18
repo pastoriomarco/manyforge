@@ -40,6 +40,7 @@ from manyforge_behavior.program import Program, ProgramTreeNode
 
 
 _ROOT = Path(__file__).resolve().parents[2]
+_APPLICATION_START_ID = "3f9a00000000002a"
 _DIGEST_A = "sha256:" + "a" * 64
 _DIGEST_B = "sha256:" + "b" * 64
 _DIGEST_C = "sha256:" + "c" * 64
@@ -178,7 +179,7 @@ def _context(
     assistant_projection: Mapping[str, Any] | None = None,
 ) -> ProgramRunPortContext:
     return ProgramRunPortContext(
-        program_run_id="program-run-1",
+        program_run_id=1,
         applied_record_digest="sha256:" + "9" * 64,
         scenario_id="scenario-1",
         source_document_digest=_DIGEST_A,
@@ -263,7 +264,7 @@ class _SceneTransport:
 
     def scene(self) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.scene_projection.v1",
+            "schema_version": "manyforge.scene_projection.v2",
             "projection_generation": 7,
             "logical_scene": {
                 "available": True,
@@ -383,9 +384,8 @@ class _SnapshotSource:
             "source": {
                 "height": parameters["height"],
                 "image_sha256": "sha256:" + sha256(_JPEG).hexdigest(),
-                "schema_version": "manyforge.program_snapshot_source.v1",
+                "schema_version": "manyforge.program_snapshot_source.v2",
                 "viewer_generation": 19,
-                "viewer_owner_epoch": "headless.epoch.1",
                 "width": parameters["width"],
             },
             "transport": "inline_data_url",
@@ -406,8 +406,13 @@ class _AuditSink:
         self.records.append(deepcopy(dict(record)))
 
 
+_ATTEMPTS: dict[str, int] = {}
+
+
 def _identity(attempt: str = "attempt-1") -> NodeAttemptIdentity:
-    return NodeAttemptIdentity("program-run-1", "node-1", attempt)
+    # One stable attempt number per label.
+    number = _ATTEMPTS.setdefault(attempt, len(_ATTEMPTS) + 1)
+    return NodeAttemptIdentity(1, "node-1", number)
 
 
 def _wait_terminal(
@@ -615,7 +620,12 @@ def test_selection_validation_preserves_authored_failure_policy(
 def test_bind_requires_model_contract_only_for_programs_that_query_models() -> None:
     scene = HeadlessProgramSceneSource(_SceneTransport())
     transport = _ModelTransport()
-    port = ProgramAssistantPort(transport, scene, audit_sink=_AuditSink())
+    port = ProgramAssistantPort(
+        transport,
+        scene,
+        audit_sink=_AuditSink(),
+        application_start_id=_APPLICATION_START_ID,
+    )
     try:
         ordinary = _program("pick_and_place_minimal.program.yaml")
         port.bind(_context(ordinary))
@@ -661,6 +671,7 @@ def test_bind_matches_query_template_variables_to_the_template_types(
         _ModelTransport(),
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=_AuditSink(),
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         with pytest.raises(ProgramAssistantPortError, match=message):
@@ -673,6 +684,7 @@ def test_query_program_requires_a_durable_model_attempt_sink() -> None:
     port = ProgramAssistantPort(
         _ModelTransport(),
         HeadlessProgramSceneSource(_SceneTransport()),
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         with pytest.raises(ProgramAssistantPortError, match="durable"):
@@ -722,6 +734,7 @@ def test_snapshot_image_program_query_carries_owner_attributed_inline_image() ->
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=audit,
         snapshot_source=snapshot,
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(
@@ -744,9 +757,8 @@ def test_snapshot_image_program_query_carries_owner_attributed_inline_image() ->
         assert terminal.metadata["snapshot_source"] == {
             "height": 480,
             "image_sha256": "sha256:" + sha256(_JPEG).hexdigest(),
-            "schema_version": "manyforge.program_snapshot_source.v1",
+            "schema_version": "manyforge.program_snapshot_source.v2",
             "viewer_generation": 19,
-            "viewer_owner_epoch": "headless.epoch.1",
             "width": 640,
         }
         assert snapshot.requests[0]["transport"] == "inline_data_url"
@@ -769,6 +781,7 @@ def test_snapshot_image_program_query_fails_typed_without_a_snapshot_source() ->
         transport,
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=audit,
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(
@@ -811,6 +824,7 @@ def test_snapshot_source_failure_stays_typed_and_never_calls_the_model() -> None
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=audit,
         snapshot_source=source,
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(
@@ -872,6 +886,7 @@ def test_model_pose_output_rejects_a_non_unit_quaternion_before_blackboard() -> 
         transport,
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=audit,
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(
@@ -993,6 +1008,7 @@ def test_selection_and_model_query_use_exact_captured_contracts() -> None:
         model_transport,
         HeadlessProgramSceneSource(scene_transport),
         audit_sink=audit,
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(
@@ -1034,7 +1050,8 @@ def test_selection_and_model_query_use_exact_captured_contracts() -> None:
         assert request.timeout_s <= 20.0
         assert len(audit.records) == 1
         assert audit.records[0]["outcome"] == "success"
-        assert audit.records[0]["program_run_id"] == "program-run-1"
+        assert audit.records[0]["application_start_id"] == _APPLICATION_START_ID
+        assert audit.records[0]["program_run_id"] == 1
         assert audit.records[0]["external_attempt_index"] == 1
         assert audit.records[0]["validated_output_digest"].startswith("sha256:")
         port.acknowledge(started.task_id, _identity("query-1"))
@@ -1056,6 +1073,7 @@ def test_opt_in_model_audit_content_is_committed_with_the_terminal_attempt() -> 
         _ModelTransport([_selected_response()]),
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=audit,
+        application_start_id=_APPLICATION_START_ID,
     )
     selection_context = build_scene_selection_context(
         selection_request_text="Select the sphere object.",
@@ -1124,6 +1142,7 @@ def test_query_model_performs_at_most_one_parse_repair_retry() -> None:
         transport,
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=audit,
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(
@@ -1236,6 +1255,7 @@ def test_query_model_rejects_untrusted_identity_or_low_confidence(
         transport,
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=_AuditSink(),
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(
@@ -1288,6 +1308,7 @@ def test_settled_selection_failures_can_reuse_one_task_slot() -> None:
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=_AuditSink(),
         maximum_tasks=1,
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(_context(_program(), assistant_projection=_assistant_projection()))
@@ -1312,6 +1333,7 @@ def test_unbind_cancels_and_releases_unacknowledged_run_tasks() -> None:
         _ModelTransport(),
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=_AuditSink(),
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(
@@ -1330,7 +1352,7 @@ def test_unbind_cancels_and_releases_unacknowledged_run_tasks() -> None:
         )
         assert terminal.state is OwnerTaskState.FAILED
 
-        port.unbind("program-run-1")
+        port.unbind(1)
 
         with pytest.raises(ProgramAssistantPortError, match="unknown"):
             port.observe(terminal.task_id)
@@ -1347,6 +1369,7 @@ def test_unbind_retries_durable_cancellation_before_releasing_a_model_task() -> 
         transport,
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=audit,
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(
@@ -1379,10 +1402,10 @@ def test_unbind_retries_durable_cancellation_before_releasing_a_model_task() -> 
         assert transport.started.wait(timeout=1.0)
 
         with pytest.raises(ProgramAssistantPortError, match="not durable"):
-            port.unbind("program-run-1")
+            port.unbind(1)
         assert port.observe(started.task_id).state is OwnerTaskState.ACTIVE
 
-        port.unbind("program-run-1")
+        port.unbind(1)
         assert [record["outcome"] for record in audit.records] == ["cancelled"]
         with pytest.raises(ProgramAssistantPortError, match="unknown"):
             port.observe(started.task_id)
@@ -1402,6 +1425,7 @@ def test_unbind_retries_the_exact_completed_outcome_after_audit_failure(timestam
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=audit,
         clock_ns=lambda: timestamp_ns,
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(
@@ -1435,7 +1459,7 @@ def test_unbind_retries_the_exact_completed_outcome_after_audit_failure(timestam
         assert failed.reason_code == "model_audit_commit_failed"
         assert failed.settlement_proven is False
 
-        port.unbind("program-run-1")
+        port.unbind(1)
 
         assert [record["outcome"] for record in audit.records] == ["success"]
         assert audit.attempted_records[0] == audit.records[0]
@@ -1490,6 +1514,7 @@ def test_query_model_ai_model_failures_are_typed(
         transport,
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=audit,
+        application_start_id=_APPLICATION_START_ID,
     )
     selection_context = build_scene_selection_context(
         selection_request_text="Select the sphere object.",
@@ -1535,6 +1560,7 @@ def test_timed_out_task_suppresses_a_transport_that_returns_late() -> None:
         transport,
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=audit,
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(
@@ -1587,6 +1613,7 @@ def test_cancelled_task_suppresses_a_transport_that_returns_late() -> None:
         transport,
         HeadlessProgramSceneSource(_SceneTransport()),
         audit_sink=audit,
+        application_start_id=_APPLICATION_START_ID,
     )
     try:
         port.bind(

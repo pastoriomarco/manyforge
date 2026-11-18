@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <manyforge_core/component_coordinator.hpp>
+#include <manyforge_core/stop_state.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
@@ -22,8 +23,8 @@ namespace manyforge::roboplan_backend::host_detail {
 /// the core component coordinator for the whole cell, installed once with the
 /// stable Kernel and kept across Apply. Every component state change goes to
 /// the Kernel's cell latch and to the host's publication (event stream state
-/// and the `components` read); a successful `enable` opens the component's
-/// command routes in the Kernel before the action reports success.
+/// and the `components` read); an `enable` opens the component's command
+/// routes in the Kernel before its adapter enables it.
 class HostComponentRuntime final {
  public:
   struct Hooks final {
@@ -32,10 +33,10 @@ class HostComponentRuntime final {
     /// and starts a newly `prepared` component's `changed_outside` signals
     /// false.
     std::function<void(std::vector<core::ComponentState>)> observe_states;
-    /// Runs inside a component's `enable` after its adapter succeeded:
+    /// Runs inside a component's `enable` before its adapter runs:
     /// publishes the component's routes to the Kernel
     /// (`publish_runtime_route_configuration`). Its failure fails the action
-    /// with its error.
+    /// with its error and the adapter is not run.
     std::function<core::Result<void>(const std::string &component_id)> open_routes;
     /// The publication changed (wakes the event stream writers).
     std::function<void()> published;
@@ -95,8 +96,10 @@ class HostComponentRuntime final {
       const std::string &component_id, std::vector<core::ComponentRecoveryFact> confirmed,
       std::function<bool()> current, std::function<bool()> owner_recovered = {});
 
-  /// A Stop was accepted: every component action in progress is interrupted.
-  void InterruptActions();
+  /// A Stop was accepted: the component actions it names are interrupted
+  /// (every action for Stop all, Halt, the cell Stop and the Kernel's own
+  /// cell-wide Stops; PD-2). Called after the Kernel's locks are released.
+  void InterruptActions(const core::StopComponentInterrupts &interrupts);
 
   /// The host tick: reads every adapter and publishes on change.
   void Refresh();

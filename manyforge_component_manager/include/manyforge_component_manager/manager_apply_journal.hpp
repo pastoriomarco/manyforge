@@ -8,9 +8,11 @@
 #include <manyforge_component_manager/selected_bundle_transition.hpp>
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
+#include <manyforge_core/types/application_identity.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/projection_common.hpp>
+#include <manyforge_core/types/request_key.hpp>
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
@@ -22,11 +24,17 @@
 #include <string_view>
 #include <vector>
 
+namespace manyforge::persistence {
+class SqliteRecordWriter;
+} // namespace manyforge::persistence
+
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.h1a.v22";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 22;
+    "manyforge.internal.component-manager.apply-journal.h1a.v24";
+/// v24: metadata `records_lost`, set by the record writer when records of this
+/// start were not written.
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 24;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
@@ -50,11 +58,15 @@ inline constexpr std::size_t kMaximumManagerApplyFenceBindings = 128U;
 inline constexpr std::size_t kMaximumManagerApplyFenceResources = 384U;
 inline constexpr std::size_t kMaximumManagerApplyJournalIdentifierBytes = 256U;
 inline constexpr std::size_t kMaximumManagerApplySourceLabelBytes = 256U;
-inline constexpr std::size_t kMaximumManagerApplyCorrelationIdBytes = 1024U;
 inline constexpr std::size_t kMaximumManagerApplyPreparedReceiptBytes = 65536U;
 inline constexpr std::size_t kMaximumManagerApplyFenceReasonBytes = 1024U;
 inline constexpr std::int64_t
     kMaximumManagerApplyJournalDatabasePageImageBytes = 64LL * 1024LL * 1024LL;
+/// The part of the page image the Apply records may not take (od212): the
+/// schema (about 40 pages), a partly filled root page for each of the 29
+/// b-trees and at most 17 free-list trunk pages, with room to spare.
+inline constexpr std::int64_t kManagerApplyJournalReservedFileBytes =
+    1024LL * 1024LL;
 
 class ManagerApplyJournalError : public std::runtime_error {
 public:
@@ -186,7 +198,7 @@ struct ManagerApplyAffectedScopeDTO final {
   manyforge::deployment::ApplyComponentDeltaDTO component_delta;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero() && scope.valid() &&
+    return apply_id.nonzero() && apply_generation.nonzero() && scope.valid() &&
            manyforge::core::IsKnownApplyFenceBusyDisposition(busy_disposition) &&
            component_delta.valid() &&
            manyforge::deployment::apply_component_delta_is_fenced(component_delta,
@@ -336,14 +348,15 @@ struct ManagerApplyTerminalOutcomeWriteResult final {
   bool inserted;
 };
 
-/// The operator's acknowledgement and its single fence-release attempt.
+/// The operator's acknowledgement and its single fence-release attempt, or
+/// New's latest release attempt. No request: the Kernel held no fence for it.
 /// A missing receipt means the release outcome is not established.
 struct PersistedFailedApplyRelease final {
   manyforge::core::ContentDigest terminal_outcome_digest;
-  manyforge::core::ContentDigest fence_acceptance_digest;
-  manyforge::core::RequestId acknowledgement_request_id;
+  std::optional<manyforge::core::ContentDigest> fence_acceptance_digest;
+  manyforge::core::RequestKey acknowledgement_request_key;
   std::string acknowledgement_source_label;
-  manyforge::core::ConfigurationFenceReleaseDTO request;
+  std::optional<manyforge::core::ConfigurationFenceReleaseDTO> request;
   std::optional<manyforge::core::ConfigurationFenceReleasedDTO> released;
   bool acknowledged{};
 };
@@ -374,9 +387,8 @@ struct PersistedManagerApplyStatus final {
 [[nodiscard]] bool FailedApplyAcknowledgementEligible(
     const PersistedManagerApplyStatus &status) noexcept;
 
-/// Whether New may release this failed Apply's held fence and claim: any
-/// failure (before effect or not) that still holds its accepted fence and
-/// published nothing. The owner rechecks the Kernel.
+/// Whether New may release this Apply's held fence and claim: any ended
+/// failure. The owner asks the Kernel what it still holds.
 [[nodiscard]] bool FailedApplyNewReleaseEligible(
     const PersistedManagerApplyStatus &status) noexcept;
 
@@ -423,8 +435,10 @@ struct ManagerApplyJournalIntegrityReport final {
 /// Apply is still needed does the insert fail with a limit error.
 ///
 /// Exact duplicate writes replay the original record. One public
-/// `(request_owner_epoch, request_id)` identifies exactly one immutable Apply
-/// intent. Reusing an Apply ID requires the next contiguous generation.
+/// `request_key` (16 bytes, contract 1.4) identifies exactly one immutable
+/// Apply intent. Reusing an Apply number requires the next contiguous
+/// generation. The journal is per start (schema 23; older files are never
+/// converted).
 /// Each Apply generation may append only the exact parent-linked records for
 /// affected scope, fence admission, runtime staged readiness, selected-bundle
 /// publication, fence release, and terminal success. Scene maintenance is
@@ -432,26 +446,20 @@ struct ManagerApplyJournalIntegrityReport final {
 /// records or their required provenance, foreign-cell databases, and
 /// resource-limit exhaustion fail before another journal write.
 ///
-/// Construction/open performs a full integrity verification, including when
-/// startup reopens the journal after a crash. `VerifyIntegrity()` explicitly
-/// performs the same full verification. Ordinary reads and writes validate
-/// the records they request or touch and the identity, generation, and
-/// provenance chain needed for that operation. Full-history decoding does not
-/// occur per write, though numeric SQL `COUNT` ceiling checks may count
-/// historical rows. For generation continuity, a write checks the touched
-/// generation and its immediate predecessor; older generations are checked by
-/// full verification. Corruption outside the records and provenance checked
-/// by an operation may remain undetected until the next open or explicit full
-/// verification. Existing record-count and database page-image limits remain
-/// in force.
+/// The records live in memory; every read and decision is answered from
+/// memory, and each accepted write is posted to a record writer that writes
+/// the file afterwards. Open verifies the whole file and loads its records.
 ///
 /// This journal owns no mutable phase row and performs no external Kernel,
 /// process, scene, publication, or robot effect. Those semantic owners return
 /// the exact evidence recorded here.
 class SqliteManagerApplyJournal final {
 public:
-  SqliteManagerApplyJournal(std::filesystem::path database_path,
-                            manyforge::core::CellId cell_id);
+  /// Without a `record_writer` the journal owns one and drains it at Close;
+  /// a handed-in writer is drained by its owner before Close.
+  SqliteManagerApplyJournal(
+      std::filesystem::path database_path, manyforge::core::CellId cell_id,
+      manyforge::persistence::SqliteRecordWriter *record_writer = nullptr);
   ~SqliteManagerApplyJournal();
 
   SqliteManagerApplyJournal(SqliteManagerApplyJournal &&) noexcept;
@@ -468,29 +476,22 @@ public:
   [[nodiscard]] std::optional<PersistedManagerApplyIntent>
   ReadIntent(const manyforge::core::ApplyId &apply_id,
              manyforge::core::ApplyGeneration apply_generation) const;
-  /// Every durable Apply status in the requested inventory, each record
-  /// digest-verified as it is read.
-  ///
-  /// All Read* operations reuse records they already decoded and verified
-  /// only while the database is provably unchanged: the same SQLite
-  /// `data_version` (no commit through any other connection) and the same
-  /// total change count of this connection (no own write). Any commit, or a
-  /// failed read, discards every reused record, so a changed or corrupted
-  /// record is re-read and re-verified by the very next read. VerifyIntegrity
-  /// always verifies the complete database.
+  /// Every Apply status the journal holds, in (Apply number, generation)
+  /// order.
   [[nodiscard]] std::vector<PersistedManagerApplyStatus>
   ReadStatusInventory() const;
-  /// Number of uncached verified-record lookups, including misses, and
-  /// selected manual predecessor decodes.
+  /// Number of records decoded and verified from the file at open.
   [[nodiscard]] std::uint64_t record_verification_count() const;
+  /// The file bytes the held records can take, an over-count; deletion keeps
+  /// it within the page image less the reserve while any Apply qualifies.
+  [[nodiscard]] std::uint64_t record_file_bytes() const;
   /// One transactionally consistent immutable view of every durable record for
   /// exactly one Apply generation, or nullopt when that identity is unknown.
   [[nodiscard]] std::optional<PersistedManagerApplyStatus>
   ReadStatus(const manyforge::core::ApplyId &apply_id,
              manyforge::core::ApplyGeneration apply_generation) const;
   [[nodiscard]] std::optional<PersistedManagerApplyIntent>
-  ReadRequest(const manyforge::core::RequestOwnerEpoch &request_owner_epoch,
-              const manyforge::core::RequestId &request_id) const;
+  ReadRequest(const manyforge::core::RequestKey &request_key) const;
   [[nodiscard]] std::optional<manyforge::core::ApplyGeneration>
   ReadApplyGenerationHighWater(const manyforge::core::ApplyId &apply_id) const;
   [[nodiscard]] ManagerApplyAffectedScopeWriteResult
@@ -562,136 +563,36 @@ public:
                       manyforge::core::ApplyGeneration apply_generation) const;
 
   /// Store the acknowledged release request before contacting the Kernel.
-  /// One row permits one attempt and one completion; it never alters the
-  /// original failed terminal outcome.
+  /// One row permits one attempt and one completion; `for_new` may begin an
+  /// incomplete attempt again, with no request when no fence is held. It
+  /// never alters the original failed terminal outcome.
   void BeginFailedApplyRelease(
       const manyforge::core::ApplyId &apply_id,
       manyforge::core::ApplyGeneration apply_generation,
-      const manyforge::core::RequestId &acknowledgement_request_id,
+      const manyforge::core::RequestKey &acknowledgement_request_key,
       const std::string &acknowledgement_source_label,
-      const manyforge::core::ConfigurationFenceReleaseDTO &request);
+      const std::optional<manyforge::core::ConfigurationFenceReleaseDTO> &request,
+      bool for_new = false);
   void CompleteFailedApplyRelease(
       const manyforge::core::ApplyId &apply_id,
       manyforge::core::ApplyGeneration apply_generation,
       const manyforge::core::ConfigurationFenceReleasedDTO &released);
-  /// Record that the already-released fence's admission claim also settled.
+  /// Record that the admission claim also settled, after the fence release
+  /// or when the attempt held no fence.
   void CompleteFailedApplyAcknowledgement(
       const manyforge::core::ApplyId &apply_id,
       manyforge::core::ApplyGeneration apply_generation);
   [[nodiscard]] std::optional<PersistedFailedApplyRelease> ReadFailedApplyRelease(
       const manyforge::core::ApplyId &apply_id,
       manyforge::core::ApplyGeneration apply_generation) const;
-  /// Perform full integrity verification over the Apply journal.
+  /// The record counts of the journal; the file is verified at open.
   [[nodiscard]] ManagerApplyJournalIntegrityReport VerifyIntegrity() const;
 
   void Close();
 
 private:
-  // Narrow test seam for the same independent read-only proof path.
-  friend manyforge::core::Result<PersistedManagerApplyStatus>
-  ReadManagerApplyStatusReadOnlyForTesting(
-      const std::filesystem::path &, const manyforge::core::CellId &,
-      const manyforge::core::NamedApplyPublicationTransactionDTO &,
-      std::uint64_t *);
-  friend manyforge::core::Result<PersistedManagerApplyStatus>
-  ReadManagerApplyStatusReadOnly(
-      const std::filesystem::path &, const manyforge::core::CellId &,
-      const manyforge::core::NamedApplyPublicationTransactionDTO &);
-  friend manyforge::core::Result<PersistedManagerApplyStatus>
-  ReadManagerApplyStatusByClaimIntentReadOnly(
-      const std::filesystem::path &, const manyforge::core::CellId &,
-      const manyforge::core::CellAdmissionClaimIntentDTO &);
-  friend manyforge::core::Result<PersistedManagerApplyStatus>
-  ReadManagerApplyConfigurationStatusReadOnly(
-      const std::filesystem::path &, const manyforge::core::CellId &,
-      const manyforge::core::NamedApplyPublicationTransactionDTO &,
-      const manyforge::core::CellAdmissionClaimDTO &);
-  friend manyforge::core::Result<void>
-  ValidateManagerApplyCellAdmissionSettlementReadOnly(
-      const std::filesystem::path &, const manyforge::core::CellId &,
-      const manyforge::core::CellAdmissionClaimDTO &,
-      const manyforge::core::CellAdmissionClaimReleaseDTO &);
-  friend manyforge::core::Result<void>
-  ValidateTerminalManagerApplyClaimsReadOnly(
-      const std::filesystem::path &, const manyforge::core::CellId &,
-      std::span<const manyforge::core::CellAdmissionClaimDTO>);
-  friend manyforge::core::Result<void> ValidateFreshManagerApplySuccessReadOnly(
-      const std::filesystem::path &, const manyforge::core::CellId &,
-      const manyforge::core::CellAdmissionClaimDTO &,
-      const manyforge::core::CellAdmissionClaimReleaseDTO &);
   class Impl;
   std::unique_ptr<Impl> impl_;
 };
-
-/// Read-only native-Kernel settlement check for one exact Manager-owned cell
-/// claim. It opens the owner journal without initialization, locks, mutation,
-/// checkpointing, or durability side effects.
-[[nodiscard]] manyforge::core::Result<void>
-ValidateManagerApplyCellAdmissionSettlementReadOnly(
-    const std::filesystem::path &database_path,
-    const manyforge::core::CellId &cell_id,
-    const manyforge::core::CellAdmissionClaimDTO &claim,
-    const manyforge::core::CellAdmissionClaimReleaseDTO &release);
-
-/// Prove immutable failed/unknown terminals for the exact old claims. A missing
-/// terminal stays LIVE; this read neither terminalizes nor settles anything.
-[[nodiscard]] manyforge::core::Result<void>
-ValidateTerminalManagerApplyClaimsReadOnly(
-    const std::filesystem::path &database_path,
-    const manyforge::core::CellId &cell_id,
-    std::span<const manyforge::core::CellAdmissionClaimDTO> old_claims);
-/// Fresh immutable success only. The Kernel separately proves that every old
-/// fence was released before its admission owner settles the old claim rows.
-[[nodiscard]] manyforge::core::Result<void>
-ValidateFreshManagerApplySuccessReadOnly(
-    const std::filesystem::path &database_path,
-    const manyforge::core::CellId &cell_id,
-    const manyforge::core::CellAdmissionClaimDTO &fresh_claim,
-    const manyforge::core::CellAdmissionClaimReleaseDTO &release);
-
-/// Observation-only exact record from an existing journal, including terminal
-/// records with no live claim. It grants no Apply/effect/currentness
-/// permission.
-[[nodiscard]] manyforge::core::Result<PersistedManagerApplyStatus>
-ReadManagerApplyStatusReadOnly(
-    const std::filesystem::path &database_path,
-    const manyforge::core::CellId &cell_id,
-    const manyforge::core::NamedApplyPublicationTransactionDTO &apply);
-
-/// Resolve retained parent data from the exact original direct Manager acquire
-/// intent; its intent digest must match. Unavailable, corrupt or conflicting
-/// reads are errors. No acquired claim identity or current effect authority is
-/// inferred.
-[[nodiscard]] manyforge::core::Result<PersistedManagerApplyStatus>
-ReadManagerApplyStatusByClaimIntentReadOnly(
-    const std::filesystem::path &database_path,
-    const manyforge::core::CellId &cell_id,
-    const manyforge::core::CellAdmissionClaimIntentDTO &parent_claim_intent);
-
-/// Observe one ordinary configuration Apply through its exact original full
-/// Kernel parent. Direct Manager and stored authoring parents keep their own
-/// grammars; an authoring claim is never equated to the Manager intent digest.
-/// No acquired/current authority is inferred from this read-only owner snapshot.
-[[nodiscard]] manyforge::core::Result<PersistedManagerApplyStatus>
-ReadManagerApplyConfigurationStatusReadOnly(
-    const std::filesystem::path &database_path,
-    const manyforge::core::CellId &cell_id,
-    const manyforge::core::NamedApplyPublicationTransactionDTO &apply,
-    const manyforge::core::CellAdmissionClaimDTO &actual_parent_claim);
-
-/// Authorize one Composer owner-epoch rotation without a Composer journal.
-/// A short local claim absent from the Manager journal is proven to have no
-/// surviving external effect. A claim transferred to Manager is eligible only
-/// after that exact operation has a known terminal outcome; pending and
-/// unknown-effect operations remain held and keep authoring closed.
-[[nodiscard]] manyforge::core::Result<
-    manyforge::core::CellAdmissionReconcileValidationDTO>
-ValidateManagerAuthoringOwnerReconciliationReadOnly(
-    const std::filesystem::path &database_path,
-    const manyforge::core::CellId &cell_id,
-    const std::vector<manyforge::core::CellAdmissionClaimDTO> &held_claims,
-    const std::vector<manyforge::core::CellAdmissionCurrentOwnerEpochDTO>
-        &current_owner_epochs,
-    const manyforge::core::CellAdmissionReconcileDTO &reconcile);
 
 } // namespace manyforge::component_manager

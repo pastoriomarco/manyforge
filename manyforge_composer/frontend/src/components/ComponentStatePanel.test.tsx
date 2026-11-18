@@ -102,15 +102,15 @@ describe('ComponentStatePanel', () => {
 describe('ComponentStatePanel in a machine', () => {
   const owner = state({
     component_id: 'lite6', lifecycle: 'fault', capabilities: ['power_off', 'reboot'],
-    fault: { code: 'fault_estop', message: 'C2', clearable: true, operator_action: 'recover',
+    fault: { code: 'fault_protective_stop', message: 'C31', clearable: true, operator_action: 'recover',
       concerns: ['lite6_robot_controller_io'], since_ns: 1 },
   });
   const io = state({
     component_id: 'lite6_robot_controller_io', owner_id: 'lite6', role: 'controller_io', lifecycle: 'offline',
-    reason: { code: 'owner_unavailable', message: 'through lite6: C2' },
+    reason: { code: 'owner_unavailable', message: 'through lite6: C31' },
   });
   const arm = state({ component_id: 'lite6_robot', owner_id: 'lite6', role: 'arm', lifecycle: 'offline',
-    reason: { code: 'owner_unavailable', message: 'through lite6: C2' } });
+    reason: { code: 'owner_unavailable', message: 'through lite6: C31' } });
 
   it('offers an owner Prepare, Recover and its power actions only', () => {
     const html = renderToStaticMarkup(<ComponentStatePanel enabled state={owner} states={[owner, io]} />);
@@ -130,13 +130,13 @@ describe('ComponentStatePanel in a machine', () => {
 
   it('shows the owner fault as a banner on a concerned member, with the owner\'s reason', () => {
     const html = renderToStaticMarkup(<ComponentStatePanel enabled state={io} states={[owner, io, arm]} />);
-    expect(html).toContain('lite6: Emergency stop active');
+    expect(html).toContain('lite6: Robot stopped itself');
     expect(html).toContain('Operator action: Recover on lite6');
-    expect(html).toContain('<dt>Reason</dt><dd>through lite6: Emergency stop active</dd>');
+    expect(html).toContain('<dt>Reason</dt><dd>through lite6: Robot stopped itself</dd>');
     // A member it doesn't concern: no banner, still offline through the owner.
     const other = renderToStaticMarkup(<ComponentStatePanel enabled state={arm} states={[owner, io, arm]} />);
     expect(other).not.toContain('role="alert"');
-    expect(other).toContain('through lite6: Emergency stop active');
+    expect(other).toContain('through lite6: Robot stopped itself');
   });
 });
 
@@ -338,7 +338,8 @@ describe('Recover and enable (OD-54)', () => {
     const { createRoot } = await import('react-dom/client');
     const root = createRoot(host as unknown as Element);
     try {
-      await act(() => root.render(<ComponentStatePanel enabled state={arm} states={[machine, arm]} />));
+      await act(() => root.render(<ComponentStatePanel enabled state={arm} states={[machine, arm]}
+        applicationStartId="3f9a000000000001" />));
       await act(() => find((props) => props.type === 'button' && props.children === 'Recover and enable').onClick?.());
       await act(async () => { await new Promise((resolve) => { setTimeout(resolve, 0); }); });
       expect(api.action).not.toHaveBeenCalled();
@@ -347,7 +348,8 @@ describe('Recover and enable (OD-54)', () => {
       expect(all((props) => props.children === 'lite6: E-stop pressed or not yet cleared (C2)')).toHaveLength(1);
       await act(() => find((props) => props.type === 'button' && props.className === 'transport-run'
         && props.children === 'Recover and enable').onClick?.());
-      expect(api.recoverEnable).toHaveBeenCalledExactlyOnceWith('lite6_robot', expect.objectContaining({ snapshot_id: 's1' }));
+      expect(api.recoverEnable).toHaveBeenCalledExactlyOnceWith('lite6_robot', expect.objectContaining({ snapshot_id: 's1' }),
+        '3f9a000000000001');
       expect(api.action).not.toHaveBeenCalled();
     } finally { await act(() => root.unmount()); }
   });

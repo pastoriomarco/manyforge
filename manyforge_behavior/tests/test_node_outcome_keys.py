@@ -137,7 +137,7 @@ def test_only_the_system_writer_sets_an_outcome_and_reset_clears_it() -> None:
 
     assert NODE_OUTCOME_VALUES[-1] == "none"
     for outcome in NODE_ENDED_OUTCOMES:
-        store.write_node_outcome("move_to_pick", outcome, metadata={"node_attempt_id": "a"})
+        store.write_node_outcome("move_to_pick", outcome, metadata={"node_attempt_id": 1})
         assert store.read(_KEY) == outcome
     # A new run's store starts at `none` again.
     assert ProgramValueStore(program).read(_KEY) == "none"

@@ -96,12 +96,33 @@ it('keeps an unlisted typed preparation cause visible when no catalog row exists
   );
 });
 
+const PREVIEW_START = '3f9a000000000001';
+const PREVIEW_KEY = '00112233445566778899aabbccddeeff';
+
+it('matches a preview receipt to the sent key on the bytes Headless keeps', async () => {
+  const intent = buildJointMotionIntent(statusFixture(), [0.2, 0.1], PREVIEW_KEY);
+  const formed = motionPreviewResponse(intent);
+  // Headless sets byte 0 (class 3, part 0) of an HTTP client key.
+  (formed.preview_receipt as Record<string, unknown>).request_key = `c0${PREVIEW_KEY.slice(2)}`;
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(formed)));
+  await expect(api.execution.previewMotion(intent, PREVIEW_START)).resolves.toMatchObject({
+    requestKey: `c0${PREVIEW_KEY.slice(2)}`,
+  });
+  const foreign = motionPreviewResponse(intent);
+  (foreign.preview_receipt as Record<string, unknown>).request_key = `c0${'f'.repeat(30)}`;
+  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(foreign)));
+  await expect(api.execution.previewMotion(intent, PREVIEW_START)).rejects.toThrow('does not match');
+});
+
 it('accepts a joint-flange fallback only for a joint-goal motion preview', async () => {
-  const intent = buildJointMotionIntent(statusFixture(), [0.2, 0.1], 'preview-1');
-  vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(motionPreviewResponse(intent))));
-  await expect(api.execution.previewMotion(intent)).resolves.toMatchObject({
+  const intent = buildJointMotionIntent(statusFixture(), [0.2, 0.1], PREVIEW_KEY);
+  const fetcher = vi.fn().mockResolvedValue(response(motionPreviewResponse(intent)));
+  vi.stubGlobal('fetch', fetcher);
+  await expect(api.execution.previewMotion(intent, PREVIEW_START)).resolves.toMatchObject({
     resolvedTcp: { source: 'joint_flange_fallback', entry: { frame: { frameId: 'flange' } } },
   });
+  // The body is the intent plus the application-start id (contract 1.6).
+  expect(JSON.parse(fetcher.mock.calls[0][1].body)).toEqual({ ...intent, application_start_id: PREVIEW_START });
 
   const poseIntent = structuredClone(intent);
   const payload = poseIntent.participants[0].payload;
@@ -114,7 +135,7 @@ it('accepts a joint-flange fallback only for a joint-goal motion preview', async
     },
   };
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(motionPreviewResponse(poseIntent))));
-  await expect(api.execution.previewMotion(poseIntent)).rejects.toThrow(
+  await expect(api.execution.previewMotion(poseIntent, PREVIEW_START)).rejects.toThrow(
     /joint flange fallback is only valid for a joint-goal preview/,
   );
 });
@@ -227,7 +248,7 @@ it('retains the exact sent authoring envelope after a lost reply without retryin
   const fence = localFence();
   await expect(api.programWorkspace.discard(fence)).rejects.toBe(lost);
   expect(failedAuthoringRequest(lost)).toEqual({
-    requestOwnerEpoch: fence.requestOwnerEpoch, requestId: fence.requestId,
+    applicationStartId: fence.applicationStartId, requestKey: fence.requestKey,
     expectedAdmissionGeneration: fence.expectedAdmissionGeneration,
     path: '/api/program/discard',
   });
@@ -235,17 +256,26 @@ it('retains the exact sent authoring envelope after a lost reply without retryin
 });
 
 it('reads only exact submission evidence and rejects mismatched or malformed records', async () => {
-  const identity = { requestOwnerEpoch: 'browser.1', requestId: 'request.1', expectedAdmissionGeneration: 7 };
+  const identity = {
+    applicationStartId: '3f9a0000000000a1', requestKey: '7'.repeat(32), expectedAdmissionGeneration: 7,
+  };
   const record = {
-    schema_version: 'manyforge.authoring_submission_outcome.v1',
-    request_owner_epoch: 'browser.1', request_id: 'request.1', expected_admission_generation: 7,
-    owner_epoch: 'composer.1', outcome: { kind: 'settled', operation_kind: 'save', apply: null },
+    schema_version: 'manyforge.authoring_submission_outcome.v2',
+    application_start_id: '3f9a0000000000a1', request_key: '7'.repeat(32), expected_admission_generation: 7,
+    outcome: { kind: 'settled', operation_kind: 'save', apply: null },
   };
   const fetcher = vi.fn().mockResolvedValue(response(record));
   vi.stubGlobal('fetch', fetcher);
   await expect(api.authoringWorkspace.submissionOutcome(identity)).resolves.toEqual({ kind: 'settled', apply: null });
   expect(fetcher.mock.calls[0][1].method).toBe('GET');
-  for (const patch of [{ request_id: 'other' }, { expected_admission_generation: 8 },
+  expect(fetcher.mock.calls[0][0]).toBe(
+    `/api/authoring/submission-outcome?application_start_id=3f9a0000000000a1&request_key=${'7'.repeat(32)}`
+      + '&expected_admission_generation=7',
+  );
+  for (const patch of [{ request_key: '8'.repeat(32) }, { application_start_id: '3f9a0000000000a2' },
+    { expected_admission_generation: 8 },
+    { schema_version: 'manyforge.authoring_submission_outcome.v1' },
+    { owner_epoch: 'composer.1' },
     { outcome: { kind: 'settled', operation_kind: 'save', apply: {} } },
     { outcome: { kind: 'manager_accepted', operation_kind: 'apply', apply: null } },
     { unexpected: true }]) {
@@ -259,12 +289,40 @@ it('reads only exact submission evidence and rejects mismatched or malformed rec
 it('downloads filtered diagnostics directly without fetching or parsing into UI state', () => {
   const fetcher = vi.fn();
   vi.stubGlobal('fetch', fetcher);
-  const query = { programRunId: 'run.one / two', channel: 'manyforge.composer', recentSeconds: 60 };
+  const query = { programRunId: 3, applicationStartId: '3f9a000000000001',
+    channel: 'manyforge.composer', recentSeconds: 60 };
   expect(api.history.exportUrl(query)).toContain('/api/debug/export?');
   expect(api.history.exportUrl(query, true)).toContain('/api/debug/export/ros2-medkit?');
   expect(api.history.exportUrl(query)).toContain('channel=manyforge.composer');
-  expect(api.history.exportUrl(query)).toContain('program_run_id=run.one+%2F+two');
+  expect(api.history.exportUrl(query)).toContain('program_run_id=3');
+  expect(api.history.exportUrl(query)).toContain('application_start_id=3f9a000000000001');
   expect(fetcher).not.toHaveBeenCalled();
+});
+
+it('sends the application-start id with History queries whenever a start is named', () => {
+  const start = '3f9a000000000001';
+  expect(historianListPath({ operationId: 7, applicationStartId: start }))
+    .toBe(`/api/execution/history?limit=32&operation_id=7&application_start_id=${start}`);
+  expect(historianListPath({ programRunId: 3, applicationStartId: start }))
+    .toContain(`program_run_id=3&application_start_id=${start}`);
+  // A start is a filter of its own: with a time or channel filter, or as a whole.
+  expect(historianListPath({ recentSeconds: 60, channel: 'manyforge.composer', applicationStartId: start }))
+    .toBe(`/api/execution/history?limit=32&recent_seconds=60&channel=manyforge.composer&application_start_id=${start}`);
+  expect(historianListPath({ applicationStartId: start, limit: 1 }))
+    .toBe(`/api/execution/history?limit=1&application_start_id=${start}`);
+  // Without a named start, no start is sent.
+  expect(historianListPath({ recentSeconds: 60 })).not.toContain('application_start_id');
+  expect(api.history.captureExportUrl(4)).not.toContain('application_start_id');
+});
+
+it('reads admitted speeds of a run by its number and the application-start id', async () => {
+  const fetcher = vi.fn().mockResolvedValue(response({
+    schema_version: 'manyforge.program_run_admitted_speeds.v2', program_run_id: 3, targets: [],
+  }));
+  vi.stubGlobal('fetch', fetcher);
+  await api.execution.admittedSpeeds(3, '3f9a000000000001').catch(() => undefined);
+  expect(fetcher.mock.calls[0][0])
+    .toBe('/api/execution/program-runs/3/admitted-speeds?application_start_id=3f9a000000000001');
 });
 
 it('rejects a discovery page for a different requested index', async () => {
@@ -273,6 +331,30 @@ it('rejects a discovery page for a different requested index', async () => {
     values: ['manyforge.composer'], truncated: false, next_after: null,
   })));
   await expect(api.history.discovery('program_run_id')).rejects.toThrow('different kind');
+});
+
+it('lists the starts that have History rows', async () => {
+  const fetcher = vi.fn().mockResolvedValue(response({
+    schema_version: 'manyforge.historian_discovery.v1', kind: 'application_start_id',
+    values: ['0bad0000000000b2', '1b2c000000000002'], truncated: false, next_after: null,
+  }));
+  vi.stubGlobal('fetch', fetcher);
+  await expect(api.history.discovery('application_start_id'))
+    .resolves.toMatchObject({ values: ['0bad0000000000b2', '1b2c000000000002'] });
+  expect(fetcher.mock.calls[0][0]).toBe('/api/execution/history/discovery?kind=application_start_id&after=&limit=32');
+});
+
+it('lists the Program runs of the named start', async () => {
+  const fetcher = vi.fn().mockResolvedValue(response({
+    schema_version: 'manyforge.historian_discovery.v1', kind: 'program_run_id',
+    values: ['2', '10'], truncated: false, next_after: null,
+  }));
+  vi.stubGlobal('fetch', fetcher);
+  await expect(api.history.discovery('program_run_id', '', undefined, '0bad0000000000b2'))
+    .resolves.toMatchObject({ values: ['2', '10'] });
+  expect(fetcher.mock.calls[0][0]).toBe(
+    '/api/execution/history/discovery?kind=program_run_id&after=&limit=32&application_start_id=0bad0000000000b2',
+  );
 });
 
 describe('runtime-scale control reads', () => {
@@ -398,15 +480,14 @@ function motionPreviewResponse(intent: DirectControlOperationIntent): Record<str
     ok: true,
     command: 'preview_motion',
     preview_receipt: {
-      schema_version: 'manyforge.direct_control_motion_preview.v4',
+      schema_version: 'manyforge.direct_control_motion_preview.v5',
       receipt_digest: 'sha256:receipt',
       intent_digest: 'sha256:intent',
-      request_id: intent.request_context.request_id,
-      request_owner_epoch: intent.request_context.request_owner_epoch,
+      request_key: intent.request_context.request_key,
       program_id: intent.program_id,
       program_revision: intent.program_revision,
       program_binding_id: intent.program_binding_id,
-      program_run_id: intent.program_run_id,
+      program_run_id: null,
       graph_revision: intent.expected_graph_revision,
       retained_bundle_id: intent.expected_retained_bundle_id,
       scene_revision: { scene_id: 'scene.1', revision_id: 1, content_hash: 'sha256:scene' },
@@ -417,7 +498,6 @@ function motionPreviewResponse(intent: DirectControlOperationIntent): Record<str
           frame: { component_id: participant.target.component_id, frame_id: 'flange' },
         },
         source: 'joint_flange_fallback',
-        owner_epoch: intent.request_context.request_owner_epoch,
         registration_generation: 1,
         sequence: 0,
       },
@@ -484,7 +564,7 @@ function runtimeScaleResponse(selector: RuntimeScaleControlSelector): Record<str
       : {}),
   };
   return {
-    api_version: 'manyforge.execution_command_response.v4',
+    api_version: 'manyforge.execution_command_response.v6',
     command: 'get_runtime_scale_control',
     ok: true,
     runtime_scale_control: status,
@@ -496,8 +576,8 @@ function draftFence(revision = 1): DraftFenceRequest {
     draftId: 'draft-1',
     expectedDraftRevision: revision,
     expectedAdmissionGeneration: 4,
-    requestOwnerEpoch: 'composer-authoring-owner.fixture',
-    requestId: 'composer-authoring.fixture',
+    applicationStartId: '3f9a0000000000a1',
+    requestKey: 'f'.repeat(32),
   };
 }
 
@@ -614,41 +694,11 @@ function authoringWorkspaceFixture(): Record<string, unknown> {
   };
 }
 
-function appliedResultFixture(): Record<string, unknown> {
-  const digestA = `sha256:${'a'.repeat(64)}`;
-  const digestB = `sha256:${'b'.repeat(64)}`;
-  const digestC = `sha256:${'c'.repeat(64)}`;
-  return {
-    status: 'applied',
-    confirmation_token: null,
-    prepared_activation: {
-      schema_version: 'manyforge.prepared_activation_input.v7',
-      prepared_activation_id: digestC,
-      origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA, project_path: '/projects/fixture.scenario' },
-      captured_input_digest: digestB,
-      deployment_artifact_id: 'cell-a',
-      deployment_revision: digestB,
-      retained_bundle_id: digestB,
-      graph_revision: digestC,
-      program_id: 'fixture',
-      program_revision: digestA,
-      program_outcome: { kind: 'bound', program_binding_id: digestC },
-      node_environment_digest: digestA,
-      assistant_mode: 'forbidden',
-    },
-    candidate_preview: null,
-    manager_apply: null,
-    preparation: null,
-    phases_ms: {},
-    apply_id: null,
-  };
-}
-
 describe('structural API client', () => {
   it('uses the owner mode index and bridge-owned request status routes', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response({
-        schema_version: 'manyforge.assistant_mode_index.v2',
+        schema_version: 'manyforge.assistant_mode_index.v3',
         retained_bundle_id: 'bundle.1',
         graph_revision: 'graph.1',
         assistant_projection_digest: `sha256:${'1'.repeat(64)}`,
@@ -667,16 +717,13 @@ describe('structural API client', () => {
           freshness: 'fresh',
           known_gaps: [],
           projection_generation: 1,
-          projection_owner_epoch: 'headless.1',
           receiver_age_ns: 1,
           selection_projection_generation: 1,
           selection_source_content_digest: `sha256:${'3'.repeat(64)}`,
           selection_source_generation: 1,
-          selection_source_owner_epoch: 'manager.1',
           selection_source_owner_id: 'manager',
           source_content_digest: `sha256:${'4'.repeat(64)}`,
           source_generation: 1,
-          source_owner_epoch: 'headless.1',
           source_owner_id: 'headless.assistant-mode-index',
           source_owner_kind: 'assistant_mode_index',
         },
@@ -850,13 +897,17 @@ describe('structural API client', () => {
 
   it('forwards Apply without client-owned state', async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(response({
-      status: 'applied',
-      headless: appliedResultFixture(),
-      workspace: workspaceFixture(),
+      schema_version: 'manyforge.apply_command_reply.v1',
+      command: {
+        kind: 'program_apply', request_key: draftFence().requestKey, step: 'previewing',
+        step_source: null, accepted_at_ns: '1', end: null,
+      },
     }));
     vi.stubGlobal('fetch', fetchMock);
 
-    await api.programWorkspace.apply(draftFence());
+    // Answered at acceptance with its row (OD-214); the body carries its key.
+    await expect(api.programWorkspace.apply(draftFence())).resolves
+      .toMatchObject({ kind: 'program_apply', requestKey: draftFence().requestKey, end: null });
 
     const [applyUrl, applyOptions] = fetchMock.mock.calls[0] as [
       string,
@@ -873,9 +924,11 @@ describe('structural API client', () => {
       .mockResolvedValueOnce(response(workspaceFixture()))
       .mockResolvedValueOnce(response(workspaceFixture()))
       .mockResolvedValueOnce(response({
-        status: 'reverted',
-        headless: null,
-        workspace: workspaceFixture(),
+        schema_version: 'manyforge.apply_command_reply.v1',
+        command: {
+          kind: 'program_revert', request_key: draftFence(7).requestKey, step: 'previewing',
+          step_source: null, accepted_at_ns: '1', end: null,
+        },
       }));
     vi.stubGlobal('fetch', fetchMock);
     const currentFence = localFence(7);
@@ -975,7 +1028,7 @@ describe('resolveStructuralAssetUrl', () => {
 describe('headless intent client', () => {
   it('submits one exact current-revision scene transaction', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
-      api_version: 'manyforge.manager_command_response.v2',
+      api_version: 'manyforge.manager_command_response.v3',
       committed_projection_revision: {
         retained_bundle_id: 'bundle-1',
         graph_revision: 'graph-1',
@@ -989,18 +1042,16 @@ describe('headless intent client', () => {
       ok: true,
       projection_status: 'committed',
       replay_status: 'accepted_new',
-      request_id: 'request-scene-1',
-      request_owner_epoch: 'scene-owner-epoch-7',
+      request_key: `c0${'5'.repeat(30)}`,
       transaction_sequence: 3,
       update_status: 'pose_changed',
     }));
     vi.stubGlobal('fetch', fetchMock);
     const transaction = {
+      application_start_id: '3f9a0000000000a1',
       request_context: {
-        request_id: 'request-scene-1',
-        request_owner_epoch: 'scene-owner-epoch-7',
+        request_key: `0f${'5'.repeat(30)}`,
         source_label: 'composer_ui' as const,
-        correlation_id: null,
       },
       expected_projection_revision: {
         retained_bundle_id: 'bundle-1',
@@ -1038,9 +1089,9 @@ describe('headless intent client', () => {
 
   it('observes one exact Manager Apply without replaying the effect', async () => {
     const payload = {
-      api_version: 'manyforge.manager_command_response.v2',
+      api_version: 'manyforge.manager_command_response.v3',
       apply_generation: 3,
-      apply_id: 'apply-3',
+      apply_id: 3,
       candidate_projection_revision: null,
       failure_acknowledgement: 'unavailable',
       error: null,
@@ -1059,8 +1110,7 @@ describe('headless intent client', () => {
         program_binding_id: `sha256:${'4'.repeat(64)}`,
         prepared_activation_id: `sha256:${'5'.repeat(64)}`,
       },
-      request_id: 'request-3',
-      request_owner_epoch: 'owner-3',
+      request_key: '3'.repeat(32),
       state: 'pending',
     };
     const acknowledgedPayload = {
@@ -1083,35 +1133,59 @@ describe('headless intent client', () => {
       .mockResolvedValueOnce(response(acknowledgedPayload));
     vi.stubGlobal('fetch', fetchMock);
 
-    const observed = await api.manager.applyStatus('apply-3', 3);
+    const observed = await api.manager.applyStatus(3, 3, '3f9a0000000000a1');
 
     expect(fetchMock).toHaveBeenCalledTimes(1);
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
-      '/api/manager/apply/status?apply_id=apply-3&apply_generation=3',
+      '/api/manager/apply/status?apply_id=3&apply_generation=3&application_start_id=3f9a0000000000a1',
     );
     expect(observed.phase).toBe('fence_accepted');
 
     const requestContext = {
-      request_id: 'composer-manager-apply-ack.request-1',
+      request_key: '9'.repeat(32),
       source_label: 'manyforge_composer',
     };
-    const acknowledged = await api.manager.acknowledgeApply('apply-3', 3, requestContext);
+    const acknowledged = await api.manager.acknowledgeApply(
+      3, 3, '3f9a0000000000a1', requestContext,
+    );
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(fetchMock.mock.calls[1]?.[0]).toBe(
-      '/api/manager/apply/acknowledge?apply_id=apply-3&apply_generation=3',
+      '/api/manager/apply/acknowledge?apply_id=3&apply_generation=3',
     );
     expect(fetchMock.mock.calls[1]?.[1]).toMatchObject({ method: 'POST' });
     expect(fetchMock.mock.calls[1]?.[1]?.body).toBe(JSON.stringify({
+      application_start_id: '3f9a0000000000a1',
       request_context: requestContext,
     }));
     expect(acknowledged.failureAcknowledgement).toBe('acknowledged');
   });
 
+  it('sends the application start with Recover and Enable (single and group)', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(response({}));
+    vi.stubGlobal('fetch', fetchMock);
+    const confirmation = { recovery_snapshot_id: 'snapshot-1' } as never;
+    await api.components.recoverEnable('arm', confirmation, '3f9a0000000000a1').catch(() => undefined);
+    await api.components.recoverEnableGroup(
+      [{ component_id: 'arm', recovery_preflight: confirmation }], '3f9a0000000000a1',
+    ).catch(() => undefined);
+    const [singleUrl, single] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(singleUrl).toBe('/api/components/arm/recover-enable');
+    expect(JSON.parse(String(single.body))).toEqual({
+      recovery_snapshot_id: 'snapshot-1', application_start_id: '3f9a0000000000a1',
+    });
+    const [groupUrl, group] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(groupUrl).toBe('/api/components/recover-enable');
+    expect(JSON.parse(String(group.body))).toEqual({
+      targets: [{ component_id: 'arm', recovery_preflight: { recovery_snapshot_id: 'snapshot-1' } }],
+      application_start_id: '3f9a0000000000a1',
+    });
+  });
+
   it('rejects an Apply status for a different durable identity', async () => {
     const payload = {
-      api_version: 'manyforge.manager_command_response.v2',
+      api_version: 'manyforge.manager_command_response.v3',
       apply_generation: 4,
-      apply_id: 'different-apply',
+      apply_id: 99,
       candidate_projection_revision: null,
       failure_acknowledgement: 'unavailable',
       error: null,
@@ -1130,13 +1204,12 @@ describe('headless intent client', () => {
         program_binding_id: `sha256:${'4'.repeat(64)}`,
         prepared_activation_id: `sha256:${'5'.repeat(64)}`,
       },
-      request_id: 'request-4',
-      request_owner_epoch: 'owner-4',
+      request_key: '4'.repeat(32),
       state: 'pending',
     };
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(payload)));
 
-    await expect(api.manager.applyStatus('apply-4', 4)).rejects.toThrow(
+    await expect(api.manager.applyStatus(4, 4, '3f9a0000000000a1')).rejects.toThrow(
       'Manager Apply status identity does not match the request',
     );
   });
@@ -1166,20 +1239,17 @@ describe('headless intent client', () => {
       details: {},
     };
 
-    await api.alarms.acknowledge(
-      alarm,
-      'owner-epoch-3',
-      'request-4',
-    );
+    await api.alarms.acknowledge(alarm, '3f9a000000000001');
 
     const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toContain('/api/execution/alarms/condition%2Fone/acknowledge');
     expect(options.method).toBe('POST');
-    expect(JSON.parse(String(options.body))).toEqual({
-      request_id: 'request-4',
-      request_owner_epoch: 'owner-epoch-3',
+    const body = JSON.parse(String(options.body));
+    expect(body.request_key).toMatch(/^[0-9a-f]{32}$/);
+    expect(body).toEqual({
+      request_key: body.request_key,
+      application_start_id: '3f9a000000000001',
       source_label: 'composer_ui',
-      correlation_id: null,
       activation_id: 'activation-2',
       expected_record_revision: 7,
       reason: null,
@@ -1193,15 +1263,15 @@ describe('headless intent client', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await api.alarms.acknowledgeAll(
-      'owner-epoch-5',
+      '3f9a000000000001',
       9,
       [{ conditionId: 'condition-a', activationId: 'activation-a', recordRevision: 3 }],
-      'request-6',
     );
 
     const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(options.body))).not.toHaveProperty('request_owner_epoch');
     expect(JSON.parse(String(options.body))).toMatchObject({
-      request_owner_epoch: 'owner-epoch-5',
+      application_start_id: '3f9a000000000001',
       expected_generation: 9,
       members: [{
         condition_id: 'condition-a',
@@ -1214,10 +1284,10 @@ describe('headless intent client', () => {
 
   it('reads one exact typed historian detail by safe sequence', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
-      schema_version: 'manyforge.historian_detail.v2',
+      schema_version: 'manyforge.historian_detail.v3',
       sequence: 7,
       event: {
-        schema_version: 'manyforge.historian_event.v2',
+        schema_version: 'manyforge.historian_event.v3',
         event_id: 'event-1',
         component: 'manyforge.execution',
         event_type: 'operation_updated',
@@ -1246,7 +1316,7 @@ describe('headless intent client', () => {
 
   it('carries bounded historian time, component, type, and page filters', async () => {
     const fetchMock = vi.fn().mockResolvedValue(response({
-      schema_version: 'manyforge.historian_summary_page.v2',
+      schema_version: 'manyforge.historian_summary_page.v3',
       time_window: { start_utc_ns: '10', end_utc_ns: '20' },
       retention: null,
       events: [],
@@ -1267,6 +1337,13 @@ describe('headless intent client', () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       '/api/execution/history?limit=32&start_utc_ns=10&end_utc_ns=20&before_sequence=7&components=manyforge.runtime&event_types=operation_completed',
     );
+    // The start is a filter of its own: with a number, and as a whole start.
+    expect(historianListPath({ operationId: 7, applicationStartId: '0bad0000000000b2' })).toBe(
+      '/api/execution/history?limit=32&operation_id=7&application_start_id=0bad0000000000b2',
+    );
+    expect(historianListPath({ applicationStartId: '0bad0000000000b2' })).toBe(
+      '/api/execution/history?limit=32&application_start_id=0bad0000000000b2',
+    );
     expect(() => historianListPath({ limit: HISTORIAN_PAGE_LIMIT + 1 })).toThrow(
       'History page limit must be an integer from 1 to 32',
     );
@@ -1277,8 +1354,18 @@ describe('headless intent client', () => {
 });
 
 describe('server-side Apply, Load and New', () => {
-  const applied = { outcome: 'succeeded', components: [
-    { component_id: 'arm', disposition: 'replace', lifecycle_after: 'prepared' }] };
+  // Answered at acceptance with the command's row (OD-214).
+  const acceptedReply = (body: unknown) => ({
+    schema_version: 'manyforge.apply_command_reply.v1',
+    command: {
+      kind: 'deployment_apply',
+      request_key: (body as { request_key: string }).request_key,
+      step: 'resetting_cycle', step_source: null, accepted_at_ns: 7, end: null,
+    },
+  });
+  const replyEchoingKey = () => vi.fn(async (_url: string, init: RequestInit) => (
+    response(acceptedReply(JSON.parse(String(init.body))))
+  ));
   it.each([
     ['new', () => api.cellApply.newScenario(), '/api/scenario/new', { discard_unsaved: true }],
     ['load', () => api.cellApply.load('/projects/cell'), '/api/scenario/load',
@@ -1287,15 +1374,40 @@ describe('server-side Apply, Load and New', () => {
       { scope: { draft_revision: 3 } }],
     ['revert', () => api.cellApply.revert({ saved: 'x' }), '/api/deployment/revert',
       { scope: { saved: 'x' } }],
-  ] as const)('%s calls its endpoint once and returns the ApplyResult', async (_name, call, url, body) => {
-    const fetchMock = vi.fn().mockResolvedValue(response(applied));
+  ] as const)('%s calls its endpoint once with a request key and returns the accepted row', async (_name, call, url, body) => {
+    const fetchMock = replyEchoingKey();
     vi.stubGlobal('fetch', fetchMock);
-    await expect(call()).resolves.toEqual(applied);
+    const row = await call();
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [calledUrl, options] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(calledUrl).toBe(url);
     expect(options.method).toBe('POST');
-    expect(JSON.parse(String(options.body))).toEqual(body);
+    const sent = JSON.parse(String(options.body));
+    expect(sent).toEqual({ ...body, request_key: expect.stringMatching(/^[0-9a-f]{32}$/) });
+    expect(row).toMatchObject({ requestKey: sent.request_key, step: 'resetting_cycle', end: null });
+  });
+  it('resends the same request after a lost reply with the same key, and a new one after a reply', async () => {
+    const lost = vi.fn().mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    vi.stubGlobal('fetch', lost);
+    await expect(api.cellApply.load('/projects/cell')).rejects.toThrow(TypeError);
+    const firstKey = JSON.parse(String((lost.mock.calls[0] as [string, RequestInit])[1].body)).request_key;
+    const answered = replyEchoingKey();
+    vi.stubGlobal('fetch', answered);
+    await expect(api.cellApply.load('/projects/cell')).resolves.toMatchObject({ requestKey: firstKey });
+    await api.cellApply.load('/projects/cell');
+    const keys = answered.mock.calls.map(([, init]) => JSON.parse(String(init.body)).request_key);
+    expect(keys[0]).toBe(firstKey);
+    expect(keys[1]).not.toBe(firstKey);
+  });
+  it('gives a different request its own key after a lost reply', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValueOnce(new TypeError('Failed to fetch')));
+    await expect(api.cellApply.load('/projects/a')).rejects.toThrow(TypeError);
+    const answered = replyEchoingKey();
+    vi.stubGlobal('fetch', answered);
+    await api.cellApply.newScenario();
+    await api.cellApply.load('/projects/a');
+    const keys = answered.mock.calls.map(([, init]) => JSON.parse(String(init.body)).request_key);
+    expect(new Set(keys).size).toBe(2);
   });
   const preview = { components: [
     { component_id: 'arm', disposition: 'replace', reasons: ['description'], restarts: true },
@@ -1315,15 +1427,8 @@ describe('server-side Apply, Load and New', () => {
     await expect(call()).resolves.toEqual(preview);
     expect(fetchMock.mock.calls[0]![0]).toBe(url);
   });
-  it('parses removed components without lifecycle_after', async () => {
-    const result = { outcome: 'succeeded', components: [
-      { component_id: 'old_arm', disposition: 'remove' },
-      { component_id: 'arm', disposition: 'add', lifecycle_after: 'prepared' }] };
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(result)));
-    await expect(api.cellApply.apply({})).resolves.toEqual(result);
-  });
-  it('rejects a malformed ApplyResult', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response({ outcome: 'done', components: [] })));
+  it('rejects a reply that is not the accepted row', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response({ outcome: 'succeeded', components: [] })));
     await expect(api.cellApply.apply({})).rejects.toThrow('/api/deployment/apply');
   });
 });

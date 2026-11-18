@@ -180,16 +180,10 @@ STRONG_STRING_TYPES = (
     "ProgramId",
     "ProgramRevision",
     "ProgramBindingId",
-    "ProgramRunId",
     "MoveId",
-    "RequestOwnerEpoch",
-    "RequestId",
     "LifecycleTransactionId",
     "LifecycleFactId",
     "ConfigurationFenceId",
-    "OperationId",
-    "StopId",
-    "StopCertificateId",
 )
 
 
@@ -790,7 +784,7 @@ def test_every_core_strong_string_has_distinct_immutable_python_type():
         with pytest.raises(TypeError):
             cls()
 
-    assert len(STRONG_STRING_TYPES) == 100
+    assert len(set(STRONG_STRING_TYPES)) == len(STRONG_STRING_TYPES) == 94
     assert len({type(value) for value in values}) == len(STRONG_STRING_TYPES)
     assert len(set(values)) == len(STRONG_STRING_TYPES)
     for index, left in enumerate(values):
@@ -803,6 +797,37 @@ def test_every_core_strong_string_has_distinct_immutable_python_type():
 
         class InvalidSubclass(core.CellId):
             pass
+
+    # Six former text identifiers are gone. Operation, Stop and run ids are
+    # numbers; the request id is the 16-byte request key; the request-owner
+    # epoch and the Stop certificate id have no Python type.
+    for removed in (
+        "ProgramRunId",
+        "OperationId",
+        "StopId",
+        "RequestId",
+        "RequestOwnerEpoch",
+        "StopCertificateId",
+    ):
+        assert not hasattr(core, removed), removed
+    for type_name in ("ProgramRunNumber", "OperationNumber", "StopEventId"):
+        cls = getattr(core, type_name)
+        number = cls(7)
+        assert number.value == 7
+        assert number.nonzero
+        assert number == cls(7)
+        assert hash(number) == hash(cls(7))
+        assert type_name in repr(number)
+        with pytest.raises(AttributeError):
+            number.value = 8
+        with pytest.raises(TypeError):
+            cls("7")
+    assert core.ProgramRunNumber(7) != core.OperationNumber(7)
+    key = core.RequestKey(bytes(range(16)))
+    assert key.value == bytes(range(16))
+    assert key == core.RequestKey.from_hex(key.hex())
+    with pytest.raises(ValueError):
+        core.RequestKey(b"shared")
 
 
 @pytest.mark.parametrize("case", CATALOG_REF_CASES)

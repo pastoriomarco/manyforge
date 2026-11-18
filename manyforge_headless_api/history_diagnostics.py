@@ -25,12 +25,10 @@ _REFERENCE_FIELDS = frozenset(
         "owner_id",
         "recovery_context_id",
         "stop_decision_id",
-        "stop_certificate_id",
         "control_binding_id",
         "control_domain_id",
         "parent_program_run_id",
         "intervention_program_run_id",
-        "program_runner_owner_epoch",
         "scene_source_owner_id",
         "scene_source_owner_epoch",
         "scene_content_hash",
@@ -38,16 +36,9 @@ _REFERENCE_FIELDS = frozenset(
 )
 
 
-# Retained Program diagnostic versions. Originals recorded before a schema
-# cutover keep their recorded version and this producer-only attribution.
-_PROGRAM_DIAGNOSTIC_SCHEMAS = frozenset(
-    (
-        "manyforge.program_diagnostic.v1",
-        "manyforge.program_diagnostic.v2",
-        "manyforge.program_diagnostic.v3",
-        "manyforge.program_diagnostic.v4",
-    )
-)
+# The Program diagnostic version this History file holds: History opens only
+# its own format version, so no earlier diagnostic is ever read here.
+_PROGRAM_DIAGNOSTIC_SCHEMAS = frozenset(("manyforge.program_diagnostic.v5",))
 
 
 def causal_references(payload: Any) -> tuple[dict[str, list[str]], bool]:
@@ -84,6 +75,9 @@ def causal_references(payload: Any) -> tuple[dict[str, list[str]], bool]:
         if visited > 8192:
             truncated = True
             break
+        if name in _REFERENCE_FIELDS and type(value) is int:
+            # Minted ids are integers (contract 1.5); references stay text.
+            value = str(value)
         if name in _REFERENCE_FIELDS and isinstance(value, str) and value:
             values = found.setdefault(name, set())
             if len(values) < 128 and len(value.encode("utf-8")) <= 1024:
@@ -130,7 +124,7 @@ def forensic_bundle(
     # pages. Each operation sample is keyed by owner clock AND operation.
     if len(events) > 256:
         raise ValueError("forensic event budget exceeded")
-    operations: dict[tuple[str, str], dict[str, Any]] = {}
+    operations: dict[tuple[str, int], dict[str, Any]] = {}
     records, incidents, blackboards = [], [], []
     stop_latencies: list[int] = []
     reference_truncated = False
@@ -191,7 +185,7 @@ def forensic_bundle(
         schema = payload.get("schema_version")
         journal = (
             payload.get("journal_payload", {})
-            if schema == "manyforge.operation_history_event.v1"
+            if schema == "manyforge.operation_history_event.v2"
             else {}
         )
         if not isinstance(journal, dict):
@@ -212,7 +206,7 @@ def forensic_bundle(
                 )
         operation_id, clock = payload.get("operation_id"), stored["clock_owner"]
         state = journal.get("operation_state")
-        if isinstance(operation_id, str) and isinstance(clock, str) and isinstance(state, dict):
+        if type(operation_id) is int and isinstance(clock, str) and isinstance(state, dict):
             operation = operations.setdefault(
                 (clock, operation_id),
                 {
@@ -271,10 +265,17 @@ def forensic_bundle(
                 "intervention_required",
             }:
                 stage("terminal_ns")
-        if payload.get("record_kind") == "stop_terminal_projected":
-            duration = _ns(journal.get("acceptance_to_terminal_latency_ns"))
-            if duration is not None:
-                stop_latencies.append(duration)
+        if payload.get("record_kind") == "stop_event_completed":
+            # One completion row per Stop event (H4): its own acceptance and
+            # completion times, on the Kernel's clock.
+            accepted_at = _ns(journal.get("accepted_at_ns"))
+            completed_at = _ns(journal.get("completed_at_ns"))
+            if (
+                accepted_at is not None
+                and completed_at is not None
+                and completed_at >= accepted_at
+            ):
+                stop_latencies.append(completed_at - accepted_at)
     admission, completion = [], []
     incomplete_operations = 0
     for operation in operations.values():

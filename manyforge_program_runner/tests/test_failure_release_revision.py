@@ -7,6 +7,8 @@ advance the revision once for it; the adapter never infers a release.
 
 from __future__ import annotations
 
+import hashlib
+
 from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any
@@ -32,16 +34,27 @@ from .test_runtime import (
     _start_request,
 )
 
-_RUN = "program-cycle.1"
+
+def _kb(*parts) -> bytes:
+    """A deterministic 16-byte request key named by text, for readable tests."""
+
+    return hashlib.md5("/".join(map(str, parts)).encode()).digest()
 
 
-def _row(node: str, attempt: str, operation: str) -> dict[str, Any]:
+def _key(*parts) -> str:
+    """The wire form (32 lowercase hex) of ``_kb``."""
+
+    return _kb(*parts).hex()
+
+_RUN = 1
+
+
+def _row(node: str, attempt: int, operation: int) -> dict[str, Any]:
     return {
         "node_instance_id": node,
         "node_attempt_id": attempt,
         "operator_facing_run_revision": 2,
         "operation": {
-            "source_owner_epoch": "kernel.1",
             "operation_id": operation,
             "operation_revision": 1,
         },
@@ -60,7 +73,6 @@ def _publish(owner: _Owner, rows: list[dict[str, Any]], state: str) -> _Snapshot
     snapshot = _Snapshot(
         _RUN,
         owner_id=value["owner_id"],
-        owner_epoch=value["owner_epoch"],
         state=state,
         revision=current.run_revision + 1,
     )
@@ -81,12 +93,10 @@ class _Harness:
         _bypass_scene_preparation(monkeypatch)
         runtime, journal, _admission = _reconcile_runtime(
             tmp_path,
-            journal_owner_epoch="runner.1",
-            runtime_owner_epoch="runner.1",
             inventory={},
         )
         owner = _Owner()
-        host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
+        host = _Host(owner, owner_id=runtime.owner_id)
         runtime._owner, runtime._host = owner, host  # noqa: SLF001
         runtime.start()
         runtime.start_run(_start_request())
@@ -98,8 +108,8 @@ class _Harness:
             for node in ("move.1", "move.2")
         }
         self.rows = [
-            _row("move.1", "attempt.1", "operation.1"),
-            _row("move.2", "attempt.2", "operation.2"),
+            _row("move.1", 1, 11),
+            _row("move.2", 2, 12),
         ]
         self.holds = {
             row["node_attempt_id"]: SimpleNamespace(
@@ -116,13 +126,13 @@ class _Harness:
         }
         _publish(owner, self.rows, "intervention_required")
         owner.intervention = lambda _run, *, node_attempt_id=None: self.holds.get(
-            node_attempt_id or "attempt.1"
+            node_attempt_id or 1
         )
         owner.operator_stop_scope = lambda _run: OperatorMotionStopSnapshot()
         self.offer = {
             "offer_id": _DIGEST_A,
             "offer_revision": 1,
-            "node_attempt_id": "attempt.1",
+            "node_attempt_id": 1,
             "actions": [],
         }
         runtime._recovery_offer = lambda *_a, **_k: deepcopy(self.offer)  # noqa: SLF001
@@ -159,25 +169,24 @@ class _Harness:
             return hold
 
         owner.refresh_failure_assessment = refresh
-        owner.continue_failure_pause = lambda run, **_k: owner.read(run)
-        owner.retry_failure_pause = lambda run, **_k: owner.read(run)
+        # Retry and Continue are applied by the run's tick (OD-146).
+        host.continue_failure_pause = lambda run, **_k: owner.read(run)
+        host.retry_failure_pause = lambda run, **_k: owner.read(run)
         owner.apply_owner_recovery = lambda *_a, **_k: {"accepted": True}
         # Acknowledge closes no hold: the run view advances, its rows stay.
         owner.note_runtime_control_change = lambda _run: _publish(
             owner, self.rows, "intervention_required"
         )
         host.resume_recovery = resolve
-        host.resume_motion = lambda run, **_k: resolve(run, node_attempt_id="attempt.1")
+        host.resume_motion = lambda run, **_k: resolve(run, node_attempt_id=1)
 
     def apply(self, action_id: str, request_id: str) -> dict[str, Any]:
         self.offer["actions"] = [{"action_id": action_id, "enabled": True}]
         return self.runtime.apply_recovery_action(
             CycleRecoveryActionRequest.model_validate(
                 {
-                    "request_id": request_id,
-                    "request_owner_epoch": "client.1",
+                    "request_key": _key(request_id),
                     "source_label": "test",
-                    "expected_owner_epoch": self.runtime.owner_epoch,
                     "offer_id": self.offer["offer_id"],
                     "offer_revision": self.offer["offer_revision"],
                     "action_id": action_id,
@@ -227,11 +236,10 @@ class _Observer:
 @pytest.fixture
 def adapter():
     ingress = ExecutionControlIngress(
-        projection=lambda: ("runner.1", 4),
+        projection=lambda: 4,
         dispatch=lambda _request, _stamp: None,
-        authority=ControlFreshnessAuthority(
-            receiver_incarnation="receiver.1", secret=b"x" * 32
-        ),
+        application_start_id="3f9a0000000000a1",
+        authority=ControlFreshnessAuthority(secret=b"x" * 32),
     )
     observer = _Observer()
     source = HeadlessControlStateSource(
@@ -271,14 +279,14 @@ def test_each_release_advances_the_revision_once_and_the_cycle_stays_running(
     run = harness(policy)
     before = run.revision()
     result = run.apply(action_id, "release.1")
-    assert result["accepted"] is True and run.effects == ["attempt.1"]
+    assert result["accepted"] is True and run.effects == [1]
     assert run.revision() == before + 1
     assert run.journal.read().state == "running"
     assert not run.journal.read().reconciliation_required
     # The second hold's release advances it once more.
-    run.offer["node_attempt_id"] = "attempt.2"
+    run.offer["node_attempt_id"] = 2
     run.owner.intervention = lambda _run, *, node_attempt_id=None: run.holds.get(
-        "attempt.2"
+        2
     )
     run.apply(action_id, "release.2")
     assert run.revision() == before + 2
@@ -290,9 +298,9 @@ def test_continue_then_retry_each_advance_once(harness) -> None:
     before = run.revision()
     run.apply("continue_with_failure", "continue.1")
     assert run.revision() == before + 1
-    run.offer["node_attempt_id"] = "attempt.2"
+    run.offer["node_attempt_id"] = 2
     run.owner.intervention = lambda _run, *, node_attempt_id=None: run.holds.get(
-        "attempt.2"
+        2
     )
     run.apply("retry_runtime_step", "retry.1")
     assert run.revision() == before + 2
@@ -308,15 +316,15 @@ def test_real_runner_release_clears_the_exact_occurrence_and_keeps_the_sibling(
     held = _observe(source, run)
     activation = held["execution_control_revision"]
     assert observer.states() == [
-        ("active", "attempt.1", activation),
-        ("active", "attempt.2", activation),
+        ("active", 1, activation),
+        ("active", 2, activation),
     ]
     run.apply(action_id, "release.1")
     _observe(source, run)
     # Only the released occurrence clears; the sibling hold stays active.
-    assert observer.states()[2:] == [("clear", "attempt.1", activation + 1)]
+    assert observer.states()[2:] == [("clear", 1, activation + 1)]
     cleared = observer.calls[-1]
-    assert cleared["operation"]["operation_id"] == "operation.1"
+    assert cleared["operation"]["operation_id"] == 11
     assert cleared["program_run_id"] == _RUN
     _observe(source, run)
     assert len(observer.calls) == 3
@@ -347,10 +355,8 @@ def test_refused_release_neither_advances_nor_clears(harness, adapter) -> None:
         run.runtime.apply_recovery_action(
             CycleRecoveryActionRequest.model_validate(
                 {
-                    "request_id": "stale.1",
-                    "request_owner_epoch": "client.1",
+                    "request_key": _key("stale.1"),
                     "source_label": "test",
-                    "expected_owner_epoch": run.runtime.owner_epoch,
                     "offer_id": run.offer["offer_id"],
                     "offer_revision": 2,
                     "action_id": "continue_with_failure",
@@ -427,9 +433,9 @@ def test_replayed_or_duplicate_release_does_not_advance_again(
     # The same command (or a new one) for the already released hold.
     with pytest.raises(ProgramRunnerError):
         run.apply("continue_with_failure", request_id)
-    assert run.revision() == released and run.effects == ["attempt.1"]
+    assert run.revision() == released and run.effects == [1]
     _observe(source, run)
-    assert observer.states()[2:] == [("clear", "attempt.1", released)]
+    assert observer.states()[2:] == [("clear", 1, released)]
 
 
 @pytest.mark.parametrize(
@@ -444,7 +450,7 @@ def test_real_runner_manual_result_advances_once_and_clears_only_its_occurrence(
     run = harness()
     source, observer = adapter
     # The held operation's owner confirmed the non-moving state.
-    run.holds["attempt.1"].owner_assessment = {"acknowledged_non_moving": True}
+    run.holds[1].owner_assessment = {"acknowledged_non_moving": True}
     actions: list[str] = []
     results: list[Any] = []
     release = run.host.resume_recovery
@@ -460,14 +466,12 @@ def test_real_runner_manual_result_advances_once_and_clears_only_its_occurrence(
         _RUN,
         ManualResultStageRequest.model_validate(
             {
-                "request_id": "manual.1",
-                "request_owner_epoch": "client.1",
+                "request_key": _key("manual.1"),
                 "source_label": "test",
                 "program_run_id": _RUN,
-                "expected_owner_epoch": run.runtime.owner_epoch,
                 "expected_run_revision": run.owner.read(_RUN).run_revision,
                 "node_instance_id": "move.1",
-                "node_attempt_id": "attempt.1",
+                "node_attempt_id": 1,
                 "outcome": outcome,
                 # A failed result never carries Continue's marker,
                 # even when a caller sends it as output.
@@ -482,7 +486,7 @@ def test_real_runner_manual_result_advances_once_and_clears_only_its_occurrence(
     assert run.journal.read().state == "running"
     assert not run.journal.read().reconciliation_required
     _observe(source, run)
-    assert observer.states()[2:] == [("clear", "attempt.1", activation + 1)]
+    assert observer.states()[2:] == [("clear", 1, activation + 1)]
     _observe(source, run)
     assert len(observer.calls) == 3
 
@@ -494,14 +498,12 @@ def _stage_manual_success(run, request_id: str):
         _RUN,
         ManualResultStageRequest.model_validate(
             {
-                "request_id": request_id,
-                "request_owner_epoch": "client.1",
+                "request_key": _key(request_id),
                 "source_label": "test",
                 "program_run_id": _RUN,
-                "expected_owner_epoch": run.runtime.owner_epoch,
                 "expected_run_revision": run.owner.read(_RUN).run_revision,
                 "node_instance_id": "move.1",
-                "node_attempt_id": "attempt.1",
+                "node_attempt_id": 1,
                 "outcome": "succeeded",
             }
         ),
@@ -534,7 +536,7 @@ def test_manual_result_rechecks_the_owner_at_the_press(
 
     run = harness()
     source, observer = adapter
-    run.holds["attempt.1"].owner_assessment = {
+    run.holds[1].owner_assessment = {
         "acknowledged_non_moving": True,
         "observed_state_available": True,
         "observed_state_valid_until_ns": 0,
@@ -557,7 +559,7 @@ def test_manual_result_with_an_unreadable_owner_deadline_refuses_cleanly(harness
 
     run = harness()
     source, _observer = adapter
-    run.holds["attempt.1"].owner_assessment = {
+    run.holds[1].owner_assessment = {
         "acknowledged_non_moving": True,
         "observed_state_available": True,
     }
@@ -575,7 +577,7 @@ def test_manual_result_with_an_unreadable_owner_deadline_refuses_cleanly(harness
 def test_manual_result_with_a_fresh_at_rest_owner_releases_the_hold(harness, adapter) -> None:
     run = harness()
     source, _observer = adapter
-    run.holds["attempt.1"].owner_assessment = {
+    run.holds[1].owner_assessment = {
         "acknowledged_non_moving": True,
         "observed_state_available": True,
         "observed_state_valid_until_ns": 0,
@@ -583,4 +585,4 @@ def test_manual_result_with_a_fresh_at_rest_owner_releases_the_hold(harness, ada
     run.fresh = dict(_AT_REST)
     _observe(source, run)
     result = _stage_manual_success(run, "manual.fresh")
-    assert result["accepted"] is True and run.effects == ["attempt.1"]
+    assert result["accepted"] is True and run.effects == [1]

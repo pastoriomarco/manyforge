@@ -4,6 +4,7 @@
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/types/operation_member_id_json.hpp>
 #include <manyforge_core/types/participant_stop_stage.hpp>
 #include <set>
 #include <stdexcept>
@@ -42,6 +43,14 @@ template <typename StrongId>
 template <typename Counter>
 [[nodiscard]] bool counter(const Counter& value) noexcept {
   return value.nonzero() && value.value() <= kMaximumIJsonInteger;
+}
+
+[[nodiscard]] bool identity(const OperationParticipantId& value) noexcept {
+  return value.nonzero() && value.operation_id.value() <= kMaximumIJsonInteger;
+}
+
+[[nodiscard]] bool identity(const ControllerGoalId& value) noexcept {
+  return value.nonzero() && value.operation_id.value() <= kMaximumIJsonInteger;
 }
 
 [[nodiscard]] bool safe_sequence(std::uint64_t value) noexcept {
@@ -191,9 +200,9 @@ template <typename ProviderPath>
   }
   CanonicalValue::Object fields{
       {"api_version", CanonicalValue(std::string(kResolvedParticipantStopScopePolicyApiVersion))},
-      {"operation_id", CanonicalValue(stage.operation_id.value())},
+      {"operation_id", safe_unsigned(stage.operation_id.value())},
       {"operation_revision", safe_unsigned(stage.operation_revision.value())},
-      {"participant_id", CanonicalValue(stage.participant_id.value())},
+      {"participant_id", OperationParticipantIdValue(stage.participant_id)},
       {"controllable_component_id", CanonicalValue(stage.controllable_component_id.value())},
       {"command_target_id", CanonicalValue(stage.command_target_id.value())},
       {"capability_id", CanonicalValue(stage.capability_id.value())},
@@ -208,8 +217,7 @@ template <typename ProviderPath>
       {"controller_topology_id", CanonicalValue(stage.controller_topology_id.value())},
       {"topology_revision", CanonicalValue(stage.topology_revision.value())},
       {"control_route_id", CanonicalValue(stage.control_route_id.value())},
-      {"controller_goal_id", CanonicalValue(stage.controller_goal_id.value())},
-      {"controller_goal_generation", safe_unsigned(stage.controller_goal_generation.value())},
+      {"controller_goal_id", ControllerGoalIdValue(stage.controller_goal_id)},
       {"provider_runtime_epoch", CanonicalValue(stage.provider_runtime_epoch.value())},
       {"resources", CanonicalValue(std::move(resources))},
       {"containment_granularity",
@@ -319,10 +327,9 @@ template <typename ProviderPath>
 }
 
 [[nodiscard]] Result<void> validate_stage_shape(const ResolvedParticipantStopStageDTO& stage) {
-  if (!identity(stage.stop_id) || !counter(stage.stop_generation) ||
-      !identity(stage.operation_id) || !counter(stage.operation_revision) ||
+  if (!counter(stage.stop_event_id) || !counter(stage.operation_id) || !counter(stage.operation_revision) ||
       !identity(stage.participant_id) || !identity(stage.controller_goal_id) ||
-      !counter(stage.controller_goal_generation) || !identity(stage.controllable_component_id) ||
+      !identity(stage.controllable_component_id) ||
       !identity(stage.command_target_id) || !identity(stage.capability_id) ||
       !identity(stage.control_domain_id) || !identity(stage.control_domain_revision) ||
       !identity(stage.control_binding_id) || !identity(stage.control_binding_revision) ||
@@ -533,8 +540,8 @@ template <typename ProviderPath>
   // for a controlled-Stop command (hard stages are bounded by the lane;
   // gripper cancels are fire-and-forget).
   const auto* command = selected_command(stage);
-  if (command == nullptr || budget.stop_id != stage.stop_id ||
-      budget.stop_generation != stage.stop_generation || budget.elapsed_since_stop_ns < 0 ||
+  if (command == nullptr || budget.stop_event_id != stage.stop_event_id ||
+      budget.elapsed_since_stop_ns < 0 ||
       budget.elapsed_since_stop_ns > kMaximumStopDurationNs ||
       (budget.stop_ingress_age_ns &&
        (*budget.stop_ingress_age_ns < 0 ||

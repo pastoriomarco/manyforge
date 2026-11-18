@@ -310,7 +310,7 @@ TEST(ResolvedStopBasePlanResolverTest,
             std::optional<core::Duration>(3'000'000'000));
   const auto readiness = seal_runtime_participant_stop_readiness(
       *retained.bundle, plan, core::ComponentLifecycleGeneration(11U), expected,
-      runtime.binding);
+      runtime.binding, 1'500'000'000);
   ASSERT_TRUE(readiness.ok()) << readiness.error().message;
 
   const auto different_time =
@@ -322,7 +322,7 @@ TEST(ResolvedStopBasePlanResolverTest,
   EXPECT_FALSE(seal_runtime_participant_stop_readiness(
                    *different_time.bundle, plan,
                    core::ComponentLifecycleGeneration(11U), expected,
-                   runtime.binding)
+                   runtime.binding, 1'500'000'000)
                    .ok());
   // Shorter than the 1.0 s deceleration: not refused in advance.
   EXPECT_NO_THROW(
@@ -382,9 +382,11 @@ TEST(ResolvedStopBasePlanResolverTest,
 
   auto readiness = seal_runtime_participant_stop_readiness(
       *retained.bundle, plan, core::ComponentLifecycleGeneration(11U), expected,
-      runtime.binding);
+      runtime.binding, 1'500'000'000);
   ASSERT_TRUE(readiness.ok()) << readiness.error().message;
   EXPECT_EQ(readiness.value().value().resolved_stop_base_plan, plan);
+  // F4: the lane's hard-stop completion timeout reaches the readiness.
+  EXPECT_EQ(readiness.value().value().hard_stop_completion_timeout_ns, 1'500'000'000);
 }
 
 TEST(ResolvedStopBasePlanResolverTest,
@@ -464,7 +466,7 @@ TEST(ResolvedStopBasePlanResolverTest, RosGripperLogicalEvidenceSurvivesDurableR
     }
     const auto readiness = seal_runtime_participant_stop_readiness(
         *retained.bundle, plan, core::ComponentLifecycleGeneration(11U), expected,
-        runtime.binding);
+        runtime.binding, 1'500'000'000);
     ASSERT_TRUE(readiness.ok()) << readiness.error().message;
   }
 }
@@ -625,7 +627,7 @@ TEST(ResolvedStopBasePlanResolverTest, NoOutputGripperSealsOnlyItsExactLocalOwne
     EXPECT_EQ(plan.escalation_stages.front().stage_kind, core::StopEscalationStageKind::kNominal);
     const auto readiness = seal_runtime_participant_stop_readiness(
         *retained.bundle, plan, core::ComponentLifecycleGeneration(11U), expected,
-        runtime.binding);
+        runtime.binding, 1'500'000'000);
     ASSERT_TRUE(readiness.ok()) << readiness.error().message;
   }
 }

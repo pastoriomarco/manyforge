@@ -14,13 +14,12 @@ class CheckedIoCondition;
 /// identity shape; Kernel must revalidate membership before releasing dispatch
 /// and before accepting an eventual response. This is not physical authority.
 struct IoOperationRuleScopeDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ControllableComponentId controllable_component_id;
   CommandTargetId command_target_id;
   ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation;
   std::uint64_t preparation_id;
   ContentDigest prepared_contract_digest;
   MotionInterruptScopeId motion_interrupt_scope_id;
@@ -38,7 +37,6 @@ struct IoActivationRuleScopeDTO final {
 using IoRuleScopeDTO = std::variant<IoOperationRuleScopeDTO, IoActivationRuleScopeDTO>;
 
 struct IoRuleRegistrationDTO final {
-  RequestOwnerEpoch owner_epoch;
   std::uint64_t catalog_generation;
   std::uint64_t registration_id;
   InterruptPolicyId policy_id;

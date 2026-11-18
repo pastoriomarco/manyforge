@@ -18,14 +18,17 @@ void append_field(std::string& encoded, const std::string_view value) {
 TrajectoryCache::TrajectoryCache(CacheConfig config) : config_(config) {}
 
 std::string TrajectoryCache::encoded_key(const TrajectoryCacheKey& key) {
+  // Manual work has no run: an empty field, distinct from every run number.
+  const auto run =
+      key.program_run_id ? std::to_string(key.program_run_id->value()) : std::string{};
   std::string encoded;
   encoded.reserve(key.program_revision.value().size() + key.program_binding_id.value().size() +
-                  key.program_run_id.value().size() + key.move_id.value().size() +
+                  run.size() + key.move_id.value().size() +
                   key.controllable_component_id.value().size() +
                   key.command_target_id.value().size() + key.capability_id.value().size() + 64U);
   append_field(encoded, key.program_revision.value());
   append_field(encoded, key.program_binding_id.value());
-  append_field(encoded, key.program_run_id.value());
+  append_field(encoded, run);
   append_field(encoded, key.move_id.value());
   append_field(encoded, key.controllable_component_id.value());
   append_field(encoded, key.command_target_id.value());

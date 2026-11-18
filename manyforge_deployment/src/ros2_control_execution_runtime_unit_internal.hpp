@@ -21,7 +21,7 @@ namespace detail {
 
 inline constexpr std::string_view
     kRos2ControlExecutionRuntimeManifestApiVersion =
-        "manyforge.ros2_control_execution_runtime_manifest.v1";
+        "manyforge.ros2_control_execution_runtime_manifest.v3";
 inline constexpr std::string_view
     kRos2ControlExecutionRuntimeProductContractId =
         ros2_control_execution_runtime_contract::kProductContractId;

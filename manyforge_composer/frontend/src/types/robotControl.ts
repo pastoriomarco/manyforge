@@ -1,4 +1,5 @@
 import type { IoSignalBinding, SystemSignalProjection } from '../api/parsers/ioSignals';
+import type { Nanoseconds } from './nanoseconds';
 
 export interface SceneRevisionValue {
   scene_id: string;
@@ -194,7 +195,7 @@ export interface TargetStopResponse {
 }
 
 export interface DirectControlMotionStatus {
-  activeTcp: { entry: TcpEntryIdentity | null; display: string | null; ownerEpoch: string;
+  activeTcp: { entry: TcpEntryIdentity | null; display: string | null; applicationStartId: string;
     registrationGeneration: number; sequence: number } | null;
   controllableComponentId: string;
   commandTargetId: string;
@@ -211,7 +212,6 @@ export interface DirectControlMotionStatus {
   programId: string;
   programRevision: string;
   programBindingId: string;
-  programRunId: string;
   joints: DirectControlJoint[];
   targetDescriptor: ManualControlMotionDescriptor;
   /** Present only when the owner publishes the target's qualified Stop chain. */
@@ -228,7 +228,6 @@ export interface DirectControlGripperStatus {
   programId: string;
   programRevision: string;
   programBindingId: string;
-  programRunId: string;
   commandSchemaId: string;
   commandSchemaRevision: string;
   sourceCoordinateName: string;
@@ -265,34 +264,21 @@ export interface ObservedGripperTarget {
   complete: boolean;
 }
 
-export interface StopCertificateReference {
-  stopCertificateId: string;
-  stopCertificateRevision: number;
-  stopId: string;
-  stopGeneration: number;
-}
+/** A Stop event's outcome (`manyforge.execution_control_state.v8`). */
+export type StopEventResult = 'pending' | 'no_effect' | 'stopped' | 'stopped_escalated' | 'some_failed';
 
-export interface CellStopStageSummary {
-  operationId: string;
-  participantId: string;
-  stageId: string;
-  stageIndex: number;
-  actionClass: 'controlled' | 'software_hard' | 'safety_system_request';
-  outcome: 'succeeded' | 'partial' | 'failed' | 'superseded_no_effect';
-  executedMode: 'soft_on_path' | 'spring_back_hold' | 'spring_back_fast' | 'hard_deceleration' | null;
-  substitutionReason: string | null;
-}
-
+/** The cell's Stop facts: the last accepted Stop event and the last one that completed. */
 export interface CellStopActionStatus {
   available: boolean;
   unavailableReason: string | null;
-  expectedStopGeneration: number;
-  latestTerminal: {
-    certificate: StopCertificateReference;
-    result: 'succeeded_nominal' | 'succeeded_escalated' | 'partial' | 'failed_uncontained';
+  /** Changes with every accepted Stop; null before the first one. */
+  lastEventId: number | null;
+  lastCompleted: {
+    eventId: number;
+    applied: string;
+    result: StopEventResult;
     escalated: boolean;
-    hardStopFloorUsed: boolean;
-    executedStages: CellStopStageSummary[];
+    completedAtNs: Nanoseconds;
   } | null;
 }
 
@@ -308,7 +294,7 @@ export interface ExecutionComponentStatus {
 }
 
 export interface ExecutionOwnerStatus {
-  ownerEpoch: string;
+  applicationStartId: string;
   cellId: string;
   activePublicationGeneration: number;
   graphRevision: string;
@@ -325,7 +311,7 @@ export interface ExecutionOwnerStatus {
   observedGripper: ObservedGripperTarget | null;
   observedMotions: ObservedMotionTarget[];
   observedGrippers: ObservedGripperTarget[];
-  manualOperations: (OperationObservation & { programRunId: string })[];
+  manualOperations: OperationObservation[];
   cellStopAction: CellStopActionStatus;
   runtimeScaleControl: RuntimeScaleControlStatus | null;
   /** `targets.io_signal_bindings` when the owner publishes it (static per activation). */
@@ -335,7 +321,7 @@ export interface ExecutionOwnerStatus {
 }
 
 export interface ExecutionIdentity {
-  ownerEpoch: string;
+  applicationStartId: string;
   cellId: string;
   activePublicationGeneration: number;
   controlManagementMode: 'pending' | 'direct' | 'component_lifecycle';
@@ -420,15 +406,14 @@ export interface CapabilityCommandParticipantPayload {
 
 /** Opaque Kernel coordinates; copied into the intent, never minted by the UI. */
 export interface ManualProgramHandoverContext {
-  program_runner_owner_epoch: string;
-  program_run_id: string;
+  program_run_id: number;
   claim_generation: number;
-  selection_revision: number;
+  hold_revision: number;
 }
 
 export interface ManualControlAvailability {
-  requestId: string;
-  requestOwnerEpoch: string;
+  /** The request key as Headless formed it from the sent key (contract 1.4). */
+  requestKey: string;
   intentDigest: string;
   available: boolean;
   unavailableReason: string | null;
@@ -438,15 +423,12 @@ export interface ManualControlAvailability {
 
 export interface DirectControlOperationIntent {
   request_context: {
-    request_id: string;
-    request_owner_epoch: string;
+    request_key: string;
     source_label: 'composer_ui';
-    correlation_id: string | null;
   };
   program_id: string;
   program_revision: string;
   program_binding_id: string;
-  program_run_id: string;
   expected_graph_revision: string;
   expected_retained_bundle_id: string;
   /** The latest Scene is used; callers name no Scene revision. */
@@ -490,16 +472,17 @@ export interface MotionPreviewPath {
 }
 
 export interface MotionPreviewReceipt {
-  schemaVersion: 'manyforge.direct_control_motion_preview.v4';
+  schemaVersion: 'manyforge.direct_control_motion_preview.v5';
   pathPreview: MotionPreviewPath;
   receiptDigest: string;
   intentDigest: string;
-  requestId: string;
-  requestOwnerEpoch: string;
+  /** The request key as Headless formed it from the sent key (contract 1.4). */
+  requestKey: string;
   programId: string;
   programRevision: string;
   programBindingId: string;
-  programRunId: string;
+  /** Null for manual work; the Program run for Program work. */
+  programRunId: number | null;
   graphRevision: string;
   retainedBundleId: string;
   sceneRevision: SceneRevisionValue;
@@ -510,7 +493,6 @@ export interface MotionPreviewReceipt {
       frame: { componentId: string; frameId: string };
     };
     source: 'active_tcp' | 'joint_flange_fallback' | 'explicit_entry';
-    ownerEpoch: string;
     registrationGeneration: number;
     sequence: number;
   };
@@ -527,15 +509,16 @@ export interface MotionPreviewReceipt {
 }
 
 export interface CapabilityCommandPreviewReceipt {
-  schemaVersion: 'manyforge.direct_control_capability_command_preview.v2';
+  schemaVersion: 'manyforge.direct_control_capability_command_preview.v3';
   receiptDigest: string;
   intentDigest: string;
-  requestId: string;
-  requestOwnerEpoch: string;
+  /** The request key as Headless formed it from the sent key (contract 1.4). */
+  requestKey: string;
   programId: string;
   programRevision: string;
   programBindingId: string;
-  programRunId: string;
+  /** Null for manual work; the Program run for Program work. */
+  programRunId: number | null;
   graphRevision: string;
   retainedBundleId: string;
   target: { componentId: string; commandTargetId: string };
@@ -572,14 +555,16 @@ export type OperationStateName =
   | 'cancelled_pre_dispatch';
 
 export interface OperationObservation {
-  operationId: string;
+  operationId: number;
   operationRevision: number;
   resident: boolean;
   state: OperationStateName;
   progress: number;
-  activeStopId: string | null;
-  activeStopGeneration: number | null;
+  /** The latest Stop event that covered this operation; null when none. */
+  stopEventId: number | null;
   terminalError: string | null;
+  /** The participant's payload: a motion, or a capability command (gripper). */
+  payloadKind: 'motion' | 'capability_command';
   /** Exact target identity when the owner exposes operation participants. */
   controllableComponentId?: string;
   commandTargetId?: string;
@@ -627,7 +612,7 @@ export interface RuntimeScaleControlStatus {
   scalingDomainId: string | null;
   activeControlConfigurationId: string | null;
   activeControlConfigurationGeneration: number | null;
-  activeOperationId: string | null;
+  activeOperationId: number | null;
   activeOperationRevision: number | null;
   activeOperationScaleGeneration: number | null;
   effectiveScale: number | null;
@@ -647,11 +632,10 @@ export interface RuntimeScaleControlMember extends RuntimeScaleControlTarget {
 }
 
 export interface RuntimeScaleControlAccepted {
-  requestId: string;
   selector: RuntimeScaleControlSelector;
   requestedScale: number;
   controlGeneration: number;
-  activeOperationId: string | null;
+  activeOperationId: number | null;
   activeOperationRevision: number | null;
   activeOperationScaleGeneration: number | null;
 }
@@ -664,7 +648,7 @@ export interface RuntimeScaleControlAccepted {
 export interface AdmittedTcpSpeed {
   controllableComponentId: string;
   commandTargetId: string;
-  operationId: string;
+  operationId: number;
   occurredAtWall: string;
   requestedTcpLinearSpeedMps: number | null;
   deploymentMaximumTcpLinearSpeedMps: number;
@@ -672,6 +656,6 @@ export interface AdmittedTcpSpeed {
 }
 
 export interface ProgramRunAdmittedSpeeds {
-  programRunId: string;
+  programRunId: number;
   targets: AdmittedTcpSpeed[];
 }

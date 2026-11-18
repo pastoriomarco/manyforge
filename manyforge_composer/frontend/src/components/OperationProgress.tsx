@@ -6,9 +6,8 @@ import { EMPTY_OPERATION_PROGRESS, operationProgressValue } from '../utils/opera
 const subscribeNothing = () => () => undefined;
 const emptySnapshot = () => EMPTY_OPERATION_PROGRESS;
 
-export function OperationProgress({ operation, ownerEpoch, source }: {
+export function OperationProgress({ operation, source }: {
   operation: OperationObservation;
-  ownerEpoch: string | undefined;
   source?: HeadlessStateSource | null;
 }) {
   const samples = useSyncExternalStore(
@@ -16,7 +15,7 @@ export function OperationProgress({ operation, ownerEpoch, source }: {
     source?.getOperationProgress ?? emptySnapshot,
     emptySnapshot,
   );
-  const progress = operationProgressValue(operation, ownerEpoch, samples);
+  const progress = operationProgressValue(operation, samples);
   return <>
     <progress aria-label="Operation progress" max={1} value={progress} />
     <span>

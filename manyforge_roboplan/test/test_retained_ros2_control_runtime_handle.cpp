@@ -255,7 +255,7 @@ struct ArmWorld final {
         prefix + "/joint_states", measured_freshness_ns,
         core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
         std::string(kMeasuredJointStateProfileId),
-        core::StreamSeverityDTO::kFault, core::StreamRecoveryDTO::kAck, std::nullopt};
+        core::StreamSeverityDTO::kFault, std::nullopt};
     const auto bound = handle->Bind(
         ros2_control_execution::Ros2TransportResources::create(
             "manyforge_handle_test_" + fake::unique_suffix(), "/", executor_threads,
@@ -345,9 +345,10 @@ TEST(RetainedRos2ControlRuntimeHandleTest, OwnerStallIsPublishedWhileOwnerTaskSt
   if (!latched) {
     release.set_value();
     slow.wait();
-    FAIL() << "owner stall did not latch";
+    FAIL() << "owner stall was not raised";
     return;
   }
+  const auto stalled = owner->owner_stall();
   // Refresh must not wait for the still-running owner task.
   auto refresh = std::async(std::launch::async, [&] {
     coordinator.Refresh();
@@ -363,8 +364,18 @@ TEST(RetainedRos2ControlRuntimeHandleTest, OwnerStallIsPublishedWhileOwnerTaskSt
   ASSERT_TRUE(states.front().fault);
   EXPECT_EQ(states.front().fault->code, core::FaultCode::kOwnerStalled);
   EXPECT_EQ(states.front().capabilities, expected_capabilities);
-  EXPECT_NE(states.front().fault->message.find(owner->owner_stall()->owner), std::string::npos);
-  EXPECT_NE(states.front().fault->message.find(owner->owner_stall()->task), std::string::npos);
+  EXPECT_NE(states.front().fault->message.find(stalled->owner), std::string::npos);
+  EXPECT_NE(states.front().fault->message.find(stalled->task), std::string::npos);
+  // OD-245: no recovery is offered while it lasts.
+  EXPECT_EQ(states.front().fault->operator_action, core::FaultOperatorAction::kNone);
+  EXPECT_FALSE(states.front().fault->clearable);
+  // The owner's task finished: the stall has ended and the fault is gone.
+  EXPECT_FALSE(owner->owner_stall());
+  coordinator.Refresh();
+  const auto after = coordinator.States();
+  ASSERT_EQ(after.size(), 1U);
+  EXPECT_FALSE(after.front().fault &&
+               after.front().fault->code == core::FaultCode::kOwnerStalled);
 }
 
 using Outcome = RetainedRos2ControlSwitchOutcome;
@@ -584,8 +595,7 @@ struct GripperWorld final {
         prefix + "/joint_states", 100,
         core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
         std::string(kMeasuredJointStateProfileId),
-        core::StreamSeverityDTO::kFault, core::StreamRecoveryDTO::kAck,
-        std::move(gripper_feedback_stream)};
+        core::StreamSeverityDTO::kFault, std::move(gripper_feedback_stream)};
     arm.controller = {prefix + "/controller_manager", "arm_controller",
                       "TestSystem"};
     if (controller_manager_gripper) {
@@ -731,15 +741,13 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
           // consumption before this callback permits writer deactivation.
           core::TrajectoryDTO hold;
           hold.joint_names = {"joint_1"};
-          const core::ExecutionGoalKey key{
-              core::ControllerGoalId("goal.reset-gated"),
-              core::ControllerGoalGeneration(1U)};
+          const core::ControllerGoalId key{
+              core::ControllerGoalId{core::OperationNumber(901U), 1U, 1U}};
           EXPECT_EQ(predecessor->Submit(key, hold).refusal,
                     core::ExecutionPortRefusal::kNotReady);
           EXPECT_EQ(predecessor
                         ->Replace(key,
-                                  {core::ControllerGoalId("goal.reset-gated"),
-                                   core::ControllerGoalGeneration(2U)},
+                                  (core::ControllerGoalId{core::OperationNumber(901U), 1U, 2U}),
                                   hold)
                         .refusal,
                     core::ExecutionPortRefusal::kNotReady);
@@ -998,8 +1006,11 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   EXPECT_TRUE(world.manager.reset_commands().empty());
   EXPECT_FALSE(world.handle->current_port()->ReadReadiness().controller_bound);
   ASSERT_TRUE(reset.error);
-  EXPECT_NE(reset.error->message.find("Restart the workbench"),
+  EXPECT_NE(reset.error->message.find("Robot position unknown"),
             std::string::npos);
+  // The way out is the next position reset, not a restart.
+  EXPECT_EQ(reset.error->message.find("Restart ManyForge"), std::string::npos);
+  EXPECT_TRUE(world.handle->mock_reset_position_pending());
 }
 
 TEST(
@@ -1071,6 +1082,202 @@ TEST(RetainedRos2ControlRuntimeHandleTest,
   EXPECT_TRUE(world.handle->current_port()->ReadReadiness().controller_bound);
   EXPECT_EQ(world.manager.switch_requests(), 1U);
   EXPECT_TRUE(world.manager.reset_commands().empty());
+}
+
+/// A step of a position reset: its phase and, for kSettingState,
+/// `target_published`, else `switch_acknowledged`.
+struct ResetStep final {
+  MockResetPositionPhase phase;
+  bool second;
+};
+
+/// The host's part of a position reset here: each acknowledged switch waits
+/// for its observation, as the host's does; the step `fail_at` fails.
+[[nodiscard]] MockResetPositionPhaseCallback ResetSteps(
+    ArmWorld &world, std::optional<ResetStep> fail_at = std::nullopt,
+    std::function<void(const MockResetPositionTransition &)> on_step = {}) {
+  return [&world, fail_at, on_step](const MockResetPositionTransition &transition,
+                                    const MockResetPositionStepDeadline &) -> core::Result<void> {
+    if (transition.phase == MockResetPositionPhase::kContaining)
+      return core::Result<void>::Ok();
+    if (on_step) on_step(transition);
+    const bool second = transition.phase == MockResetPositionPhase::kSettingState
+                            ? transition.target_published
+                            : transition.switch_acknowledged;
+    if (fail_at && fail_at->phase == transition.phase && fail_at->second == second)
+      return core::Result<void>::Err({"execution_rejected", "interrupted", {}});
+    if (transition.switch_acknowledged &&
+        !fake::WaitUntil([&] {
+          return transition.phase == MockResetPositionPhase::kSwitchingToWriter
+                     ? world.handle->mock_reset_writer_active()
+                     : world.handle->mock_reset_successor_ready();
+        }, 900ms))
+      return core::Result<void>::Err({"execution_rejected", "not observed", {}});
+    return core::Result<void>::Ok();
+  };
+}
+
+/// The arm's port refuses motion because a position reset is pending (an
+/// empty trajectory is never dispatched either way).
+[[nodiscard]] bool MotionRefusedForPendingReset(ArmWorld &world) {
+  core::TrajectoryDTO empty;
+  empty.joint_names = {"joint_1"};
+  const auto submitted = world.handle->current_port()->Submit(
+      core::ControllerGoalId{core::OperationNumber(902U), 1U, 1U}, empty);
+  if (!submitted.error) return false;
+  const auto reason = submitted.error->details.find("reason");
+  return reason != submitted.error->details.end() &&
+         reason->second == "mock_reset_position_pending";
+}
+
+/// The state one clean position reset leaves: trajectory controller active
+/// and bound, writer inactive, no reset pending, motion admitted.
+void ExpectCleanResetEnd(ArmWorld &world) {
+  EXPECT_FALSE(world.handle->mock_reset_position_pending());
+  EXPECT_FALSE(world.manager.writer_active());
+  EXPECT_TRUE(fake::WaitUntil([&] {
+    return world.handle->arm_activity().controller_active &&
+           world.handle->mock_reset_writer_inactive();
+  }));
+  EXPECT_TRUE(world.handle->current_port()->ReadReadiness().controller_bound);
+  EXPECT_FALSE(MotionRefusedForPendingReset(world));
+  ASSERT_FALSE(world.manager.reset_commands().empty());
+  EXPECT_EQ(world.manager.reset_commands().back(), (std::vector<double>{0.125}));
+}
+
+using Names = std::vector<std::string>;
+using Switch = std::pair<Names, Names>;
+
+struct InterruptedReset final {
+  const char *name;
+  ResetStep at;
+  /// Whether the interrupted run left the reset pending.
+  bool pending;
+  /// Whether the interrupted run published the target.
+  bool published;
+  /// The rerun's first switch: only what the interrupted run left otherwise.
+  Switch rerun_switch;
+};
+
+class InterruptedResetTest
+    : public ::testing::TestWithParam<std::tuple<InterruptedReset, bool>> {};
+
+// A reset interrupted at any step leaves it pending; the next reset runs all
+// its steps from the controller state left and ends as one clean reset does.
+TEST_P(InterruptedResetTest, TheNextResetRunsAllStepsAndEndsClean) {
+  const auto &[point, isaac] = GetParam();
+  ArmWorld world("arm_controller", nullptr, ArmBinding(), {}, true, {}, {}, 3U, 100, isaac);
+  EnableResetArm(world);
+  const auto interrupted = world.handle->ResetMockPosition({}, ResetSteps(world, point.at));
+  ASSERT_NE(interrupted.outcome, Outcome::kSucceeded);
+  EXPECT_EQ(world.handle->mock_reset_position_pending(), point.pending);
+  EXPECT_EQ(MotionRefusedForPendingReset(world), point.pending);
+  EXPECT_FALSE(world.manager.writer_active());
+  const auto sent = world.manager.switch_history().size();
+  const std::size_t published = point.published ? 1U : 0U;
+
+  const auto rerun = world.handle->ResetMockPosition({}, ResetSteps(world));
+  ASSERT_EQ(rerun.outcome, Outcome::kSucceeded) << SwitchFailureText(rerun);
+  const auto switches = world.manager.switch_history();
+  ASSERT_EQ(switches.size(), sent + 2U);
+  EXPECT_EQ(switches[sent], point.rerun_switch);
+  EXPECT_EQ(switches[sent + 1U], (Switch{{"arm_controller"}, {"reset_writer"}}));
+  EXPECT_TRUE(fake::WaitUntil(
+      [&] { return world.manager.reset_commands().size() == published + 1U; }));
+  ExpectCleanResetEnd(world);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    EveryStep, InterruptedResetTest,
+    ::testing::Combine(
+        ::testing::Values(
+            // Before the first switch: nothing changed, nothing pending.
+            InterruptedReset{"BeforeWriterSwitch", {MockResetPositionPhase::kSwitchingToWriter, false},
+                             false, false, {{"reset_writer"}, {"arm_controller"}}},
+            // Writer on, trajectory controller off; containment switches the writer off.
+            InterruptedReset{"AfterWriterSwitch", {MockResetPositionPhase::kSwitchingToWriter, true},
+                             true, false, {{"reset_writer"}, {}}},
+            InterruptedReset{"BeforePublish", {MockResetPositionPhase::kSettingState, false},
+                             true, false, {{"reset_writer"}, {}}},
+            InterruptedReset{"AfterPublishBeforeSample", {MockResetPositionPhase::kSettingState, true},
+                             true, true, {{"reset_writer"}, {}}},
+            InterruptedReset{"BeforeSwitchBack", {MockResetPositionPhase::kSwitchingToJtc, false},
+                             true, true, {{"reset_writer"}, {}}},
+            // Switched back: trajectory controller on, writer off, unbound.
+            InterruptedReset{"AfterSwitchBack", {MockResetPositionPhase::kSwitchingToJtc, true},
+                             true, true, {{"reset_writer"}, {"arm_controller"}}}),
+        ::testing::Bool()),
+    [](const auto &info) {
+      return std::string(std::get<0>(info.param).name) +
+             (std::get<1>(info.param) ? "Isaac" : "Mock");
+    });
+
+// A writer the interrupted run left active (its containment never took
+// effect) is not switched again: the rerun starts at its observation.
+TEST(RetainedRos2ControlRuntimeHandleTest, ResetRerunKeepsAWriterLeftActive) {
+  ArmWorld world("arm_controller", nullptr, ArmBinding(), {}, true);
+  EnableResetArm(world);
+  ASSERT_NE(world.handle
+                ->ResetMockPosition({}, ResetSteps(world, ResetStep{
+                                                     MockResetPositionPhase::kSettingState, false}))
+                .outcome,
+            Outcome::kSucceeded);
+  world.manager.SetControllerActivity(false, true);
+  ASSERT_TRUE(fake::WaitUntil([&] { return world.handle->mock_reset_writer_active(); }));
+  const auto sent = world.manager.switch_history().size();
+  const auto rerun = world.handle->ResetMockPosition({}, ResetSteps(world));
+  ASSERT_EQ(rerun.outcome, Outcome::kSucceeded) << SwitchFailureText(rerun);
+  const auto switches = world.manager.switch_history();
+  ASSERT_EQ(switches.size(), sent + 1U);
+  EXPECT_EQ(switches[sent], (Switch{{"arm_controller"}, {"reset_writer"}}));
+  ExpectCleanResetEnd(world);
+}
+
+// A Stop during the rerun interrupts it again, at once, and leaves the same
+// retriable state; the next reset completes.
+TEST(RetainedRos2ControlRuntimeHandleTest, StopDuringResetRerunLeavesItRetriable) {
+  ArmWorld world("arm_controller", nullptr, ArmBinding(), {}, true);
+  EnableResetArm(world);
+  ASSERT_NE(world.handle
+                ->ResetMockPosition({}, ResetSteps(world, ResetStep{
+                                                     MockResetPositionPhase::kSwitchingToJtc, true}))
+                .outcome,
+            Outcome::kSucceeded);
+  // Stopped before the publication.
+  std::stop_source stop;
+  const auto stopped = world.handle->ResetMockPosition(
+      stop.get_token(), ResetSteps(world, std::nullopt, [&](const auto &transition) {
+        if (transition.phase == MockResetPositionPhase::kSettingState) stop.request_stop();
+      }));
+  ASSERT_NE(stopped.outcome, Outcome::kSucceeded);
+  ASSERT_TRUE(stopped.error);
+  EXPECT_EQ(stopped.error->details.at("reason"), "mock_reset_position_cancelled");
+  EXPECT_TRUE(world.handle->mock_reset_position_pending());
+  EXPECT_TRUE(MotionRefusedForPendingReset(world));
+  // The Stop also ends the containment's wait; its switch still lands.
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    return !world.manager.writer_active() && !world.handle->mock_reset_writer_active();
+  }));
+  // Stopped while the controller manager holds the rerun's switch answer.
+  world.manager.SetSwitchRepliesPaused(true);
+  std::stop_source held;
+  auto pending = std::async(std::launch::async, [&] {
+    return world.handle->ResetMockPosition(held.get_token(), ResetSteps(world));
+  });
+  const bool dispatched = fake::WaitUntil([&] { return world.manager.reply_waiting(); });
+  held.request_stop();
+  const bool ended = pending.wait_for(2s) == std::future_status::ready;
+  world.manager.SetSwitchRepliesPaused(false);
+  EXPECT_TRUE(dispatched);
+  EXPECT_TRUE(ended);
+  EXPECT_EQ(pending.get().outcome, Outcome::kUncertain);
+  EXPECT_TRUE(world.handle->mock_reset_position_pending());
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    return !world.manager.writer_active() && !world.handle->mock_reset_writer_active();
+  }));
+  const auto last = world.handle->ResetMockPosition({}, ResetSteps(world));
+  ASSERT_EQ(last.outcome, Outcome::kSucceeded) << SwitchFailureText(last);
+  ExpectCleanResetEnd(world);
 }
 
 TEST(RetainedRos2ControlRuntimeHandleTest,
@@ -1304,7 +1511,7 @@ MeasuredSourceDescriptor(const core::RuntimeParticipantBinding &binding,
           prefix + "/joint_states", budget_ns,
           core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
           std::string(kMeasuredJointStateProfileId),
-          core::StreamSeverityDTO::kFault, core::StreamRecoveryDTO::kAck, std::nullopt});
+          core::StreamSeverityDTO::kFault, std::nullopt});
   if (!descriptor.ok())
     throw std::logic_error(descriptor.error().message);
   return descriptor.value();
@@ -1502,8 +1709,7 @@ TEST(RetainedRos2ControlRuntimeHandle,
   GripperWorld world(true, clock, true,
                      core::StreamDeclarationDTO{
                          "gripper_feedback", 1'500'000'000,
-                         core::StreamSeverityDTO::kBlocking,
-                         core::StreamRecoveryDTO::kAuto,
+                         core::StreamSeverityDTO::kWarning,
                          core::StreamTimestampSourceDTO::kMessageStamp});
   const auto motion = MeasuredSourceDescriptor(world.motion, world.prefix);
   const auto tool = MeasuredSourceDescriptor(world.tool, world.prefix);
@@ -1522,8 +1728,7 @@ TEST(RetainedRos2ControlRuntimeHandle,
   const auto declared = gripper_stream();
   ASSERT_TRUE(declared.has_value());
   EXPECT_EQ(declared->budget_ns, 1'500'000'000);
-  EXPECT_EQ(declared->severity, core::StreamSeverityDTO::kBlocking);
-  EXPECT_EQ(declared->recovery, core::StreamRecoveryDTO::kAuto);
+  EXPECT_EQ(declared->severity, core::StreamSeverityDTO::kWarning);
   EXPECT_EQ(declared->timestamp_source,
             core::StreamTimestampSourceDTO::kMessageStamp);
   EXPECT_FALSE(declared->age_ns.has_value());
@@ -1587,10 +1792,8 @@ TEST(RetainedRos2ControlRuntimeHandle,
           prefix + "/joint_states", 250'000'000,
           core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
           std::string(kMeasuredJointStateProfileId),
-          core::StreamSeverityDTO::kFault, core::StreamRecoveryDTO::kAck,
-          core::StreamDeclarationDTO{
+          core::StreamSeverityDTO::kFault, core::StreamDeclarationDTO{
               "gripper_feedback", 1'000'000'000, core::StreamSeverityDTO::kFault,
-              core::StreamRecoveryDTO::kAck,
               core::StreamTimestampSourceDTO::kMessageStamp}}).ok());
   // The descriptor carries the bound lane's own 250 ms budget (the stage
   // refuses a source whose freshness differs from the bound lane).
@@ -1675,7 +1878,7 @@ TEST(RetainedRos2ControlRuntimeHandle,
             made.prefix + "/joint_states", 100'000'000,
             core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
             std::string(kMeasuredJointStateProfileId), core::StreamSeverityDTO::kFault,
-            core::StreamRecoveryDTO::kAck, std::nullopt});
+            std::nullopt});
     if (!bound.ok()) throw std::logic_error(bound.error().message);
     return made;
   };
@@ -1785,6 +1988,159 @@ TEST(RetainedRos2ControlRuntimeHandle, AProcessOnlyOwnersLaunchIsSettlingUntilIt
   EXPECT_FALSE(handle->ControllerLaunchSettling());
 }
 
+// The adapter's question before a driver restart: the installed launch
+// exited by itself (its health source), never while it runs.
+TEST(RetainedRos2ControlRuntimeHandle, ControllerLaunchExitedReadsTheInstalledExit) {
+  auto clock = std::make_shared<core::FakeClock>();
+  clock->set(1000);
+  const auto prefix = "/manyforge_owner_exited_" + fake::unique_suffix();
+  auto handle = RetainedRos2ControlRuntimeHandle::Create();
+  ASSERT_TRUE(handle->SetOwnerShutdownTimeout(1'000'000'000).ok());
+  ASSERT_TRUE(handle
+                  ->BindProcessOnly(ros2_control_execution::Ros2TransportResources::create(
+                                        "manyforge_owner_exited_" + fake::unique_suffix(), "/", 1U),
+                                    *clock, {prefix + "/controller_manager", "", "TestSystem"},
+                                    clock)
+                  .ok());
+  EXPECT_FALSE(handle->ControllerLaunchExited());  // no launch installed
+  const auto exited = std::make_shared<std::optional<std::string>>();
+  handle->InstallControllerProcessFaultSource(
+      [exited] { return *exited; },
+      [exited] { return core::Result<std::optional<std::string>>::Ok(*exited); });
+  EXPECT_FALSE(handle->ControllerLaunchExited());
+  *exited = "controller_launch_exited: pid=7";
+  EXPECT_TRUE(handle->ControllerLaunchExited());
+  // The restart re-points it to the restarted launch, which runs.
+  handle->ReplaceControllerProcessFaultSource(
+      [] { return std::optional<std::string>{}; },
+      [] { return core::Result<std::optional<std::string>>::Ok(std::nullopt); });
+  EXPECT_FALSE(handle->ControllerLaunchExited());
+}
+
+/// A lane adapter that records the actions it runs and reports success
+/// (or a scripted failure of Prepare).
+class RecordingLaneAdapter final : public core::IComponentAdapter {
+public:
+  [[nodiscard]] core::ComponentState State(std::int64_t now_ns) const override {
+    core::ComponentState state;
+    state.observed_at_ns = now_ns;
+    return state;
+  }
+  [[nodiscard]] core::ActionResult Run(core::ComponentAction action, std::stop_token) override {
+    actions.push_back(action);
+    core::ActionResult result;
+    result.action = action;
+    result.outcome = action == core::ComponentAction::kPrepare && prepare_fails
+                         ? core::ActionOutcome::kFailed
+                         : core::ActionOutcome::kSucceeded;
+    if (result.outcome == core::ActionOutcome::kFailed)
+      result.error = core::ActionError{"ros2_control_controller_not_loaded",
+                                       "the trajectory controller is not loaded", std::nullopt,
+                                       std::nullopt};
+    return result;
+  }
+  [[nodiscard]] std::vector<core::Capability> capabilities() const override {
+    return {core::Capability::kResetPosition};
+  }
+  std::vector<core::ComponentAction> actions;
+  bool prepare_fails = false;
+};
+
+struct DriverRestartWorld final {
+  DriverRestartWorld()
+      : lane(std::make_shared<RecordingLaneAdapter>()),
+        adapter(lane, [this] { return exited; },
+                [this](std::stop_token) {
+                  ++restarts;
+                  if (refusal) return core::Result<void>::Err(*refusal);
+                  exited = false;
+                  return core::Result<void>::Ok();
+                }) {}
+  std::shared_ptr<RecordingLaneAdapter> lane;
+  bool exited = false;
+  int restarts = 0;
+  std::optional<core::ErrorDTO> refusal;
+  Ros2ControlDriverRestartAdapter adapter;
+};
+
+using LaneActions = std::vector<core::ComponentAction>;
+
+// Decided (OD-211 a), as an xArm machine's driver: Prepare with an exited
+// launch restarts it, then runs Prepare on the new launch.
+TEST(Ros2ControlDriverRestartAdapterTest, PrepareRestartsAnExitedLaunchThenPrepares) {
+  DriverRestartWorld world;
+  world.exited = true;
+  const auto prepared = world.adapter.Run(core::ComponentAction::kPrepare, {});
+  EXPECT_EQ(prepared.outcome, core::ActionOutcome::kSucceeded);
+  EXPECT_EQ(prepared.action, core::ComponentAction::kPrepare);
+  EXPECT_EQ(world.restarts, 1);
+  EXPECT_EQ(world.lane->actions, (LaneActions{core::ComponentAction::kPrepare}));
+}
+
+// Recover restarts it, waits for the new launch as Prepare does, then runs
+// Recover's own step; nothing is enabled.
+TEST(Ros2ControlDriverRestartAdapterTest, RecoverRestartsThenPreparesThenRecovers) {
+  DriverRestartWorld world;
+  world.exited = true;
+  const auto recovered = world.adapter.Run(core::ComponentAction::kRecover, {});
+  EXPECT_EQ(recovered.outcome, core::ActionOutcome::kSucceeded);
+  EXPECT_EQ(recovered.action, core::ComponentAction::kRecover);
+  EXPECT_EQ(world.restarts, 1);
+  EXPECT_EQ(world.lane->actions, (LaneActions{core::ComponentAction::kPrepare,
+                                              core::ComponentAction::kRecover}));
+}
+
+// A running launch is never restarted; Enable and Disable never restart.
+TEST(Ros2ControlDriverRestartAdapterTest, OnlyAnExitedLaunchIsRestartedAndOnlyByPrepareOrRecover) {
+  DriverRestartWorld world;
+  static_cast<void>(world.adapter.Run(core::ComponentAction::kPrepare, {}));
+  static_cast<void>(world.adapter.Run(core::ComponentAction::kRecover, {}));
+  world.exited = true;
+  static_cast<void>(world.adapter.Run(core::ComponentAction::kEnable, {}));
+  static_cast<void>(world.adapter.Run(core::ComponentAction::kDisable, {}));
+  EXPECT_EQ(world.restarts, 0);
+  EXPECT_EQ(world.lane->actions,
+            (LaneActions{core::ComponentAction::kPrepare, core::ComponentAction::kRecover,
+                         core::ComponentAction::kEnable, core::ComponentAction::kDisable}));
+  EXPECT_EQ(world.adapter.capabilities(),
+            (std::vector<core::Capability>{core::Capability::kResetPosition}));
+}
+
+// A failed restart is the action's failure with its typed code, nothing runs
+// on the lane, and the next attempt can succeed.
+TEST(Ros2ControlDriverRestartAdapterTest, AFailedRestartFailsTheActionAndCanBeTriedAgain) {
+  DriverRestartWorld world;
+  world.exited = true;
+  world.refusal = core::ErrorDTO{"component_driver_restart_failed",
+                                 "The driver could not be restarted: spawn failed", {}};
+  const auto failed = world.adapter.Run(core::ComponentAction::kRecover, {});
+  EXPECT_EQ(failed.outcome, core::ActionOutcome::kFailed);
+  EXPECT_EQ(failed.action, core::ComponentAction::kRecover);
+  ASSERT_TRUE(failed.error.has_value());
+  EXPECT_EQ(failed.error->code, "component_driver_restart_failed");
+  EXPECT_TRUE(world.lane->actions.empty());
+  EXPECT_TRUE(world.exited);
+
+  world.refusal.reset();
+  EXPECT_EQ(world.adapter.Run(core::ComponentAction::kRecover, {}).outcome,
+            core::ActionOutcome::kSucceeded);
+  EXPECT_EQ(world.restarts, 2);
+}
+
+// Recover whose new launch doesn't prepare ends with Prepare's failure and
+// doesn't run Recover's step.
+TEST(Ros2ControlDriverRestartAdapterTest, RecoverStopsAtAFailedPrepareOnTheNewLaunch) {
+  DriverRestartWorld world;
+  world.exited = true;
+  world.lane->prepare_fails = true;
+  const auto failed = world.adapter.Run(core::ComponentAction::kRecover, {});
+  EXPECT_EQ(failed.outcome, core::ActionOutcome::kFailed);
+  EXPECT_EQ(failed.action, core::ComponentAction::kRecover);
+  ASSERT_TRUE(failed.error.has_value());
+  EXPECT_EQ(failed.error->code, "ros2_control_controller_not_loaded");
+  EXPECT_EQ(world.lane->actions, (LaneActions{core::ComponentAction::kPrepare}));
+}
+
 TEST(RetainedRos2ControlRuntimeHandle, AProcessOnlyBindingObservesTheProcessWithoutAnArm) {
   // A machine's process with its arm deactivated. The owner's
   // lifecycle comes from the process: the controller manager present (not
@@ -1844,13 +2200,14 @@ TEST(RetainedRos2ControlRuntimeHandle, MachineExecutorFaultNamesItsOwner) {
   ASSERT_TRUE(owner->notify_owner());
   ASSERT_TRUE(fake::WaitUntil([&] { return owner->executor_fault().has_value(); }));
   const auto observation = handle->ReadObservation(clock->now());
-  ASSERT_TRUE(observation.process_fault.has_value());
-  EXPECT_NE(observation.process_fault->find("injected fault"), std::string::npos);
-  EXPECT_NE(observation.process_fault->find(owner_name), std::string::npos);
+  ASSERT_TRUE(observation.transport_fault.has_value());
+  EXPECT_FALSE(observation.process_fault.has_value());
+  EXPECT_NE(observation.transport_fault->find("injected fault"), std::string::npos);
+  EXPECT_NE(observation.transport_fault->find(owner_name), std::string::npos);
   const auto state = ros2_control_component_state(observation, clock->now());
   EXPECT_EQ(state.lifecycle, core::ComponentLifecycle::kFault);
   ASSERT_TRUE(state.fault.has_value());
-  EXPECT_EQ(state.fault->code, core::FaultCode::kProcessExited);
+  EXPECT_EQ(state.fault->code, core::FaultCode::kRosTransportFailed);
 }
 
 namespace {
@@ -1899,7 +2256,7 @@ void exercise_fault_owner_rebuild(bool fail_epoch, bool use_epoch,
   }
   inject.store(true);
   ASSERT_TRUE(fake::WaitUntil([&] { return failed->executor_fault().has_value(); }));
-  ASSERT_TRUE(world.handle->ReadObservation(world.clock.now()).process_fault.has_value());
+  ASSERT_TRUE(world.handle->ReadObservation(world.clock.now()).transport_fault.has_value());
   RetainedRos2ControlRuntimeHandle::TransportOwners replacement;
   const auto recovered = world.handle->RecoverFaultedOwner(previous, {}, replacement);
   ASSERT_EQ(recovered.outcome, core::ActionOutcome::kSucceeded)
@@ -1914,7 +2271,7 @@ void exercise_fault_owner_rebuild(bool fail_epoch, bool use_epoch,
     return RetainedRos2ControlRuntimeHandleTestAccess::EndpointsSettled(*world.handle);
   }));
   ASSERT_TRUE(fake::WaitUntil([&] { return world.handle->ReadObservation(world.clock.now()).observed; }));
-  EXPECT_FALSE(world.handle->ReadObservation(world.clock.now()).process_fault.has_value());
+  EXPECT_FALSE(world.handle->ReadObservation(world.clock.now()).transport_fault.has_value());
   ASSERT_EQ(world.handle->RecoverArmController({}, Soon()).outcome, Outcome::kSucceeded);
   EXPECT_EQ(world.handle->PrepareArmController({}, Soon()).outcome, Outcome::kSucceeded);
   EXPECT_EQ(world.Observe().lifecycle, core::ComponentLifecycle::kPrepared);
@@ -1975,7 +2332,7 @@ TEST(RetainedRos2ControlRuntimeHandle, GripperOwnerFaultRebuildPreservesBackend)
   handle->StartBackend();
   inject.store(true);
   ASSERT_TRUE(fake::WaitUntil([&] { return owner->executor_fault().has_value(); }));
-  ASSERT_TRUE(handle->ReadObservation(clock->now()).process_fault.has_value());
+  ASSERT_TRUE(handle->ReadObservation(clock->now()).transport_fault.has_value());
   RetainedRos2ControlRuntimeHandle::TransportOwners replacement;
   const auto result = handle->RecoverFaultedOwner({owner, {}}, {}, replacement);
   ASSERT_EQ(result.outcome, core::ActionOutcome::kSucceeded)
@@ -1983,7 +2340,7 @@ TEST(RetainedRos2ControlRuntimeHandle, GripperOwnerFaultRebuildPreservesBackend)
   EXPECT_TRUE(owner->joined());
   EXPECT_NE(replacement.machine, owner);
   EXPECT_EQ(RetainedRos2ControlRuntimeHandleTestAccess::GripperBackend(*handle), original_backend);
-  EXPECT_FALSE(handle->ReadObservation(clock->now()).process_fault.has_value());
+  EXPECT_FALSE(handle->ReadObservation(clock->now()).transport_fault.has_value());
   EXPECT_EQ(handle->PrepareGripperController({}, Soon()).outcome, Outcome::kSucceeded);
 }
 
@@ -2030,7 +2387,6 @@ TEST(RetainedRos2ControlRuntimeHandle, InactiveJointStateSamplesAreMeasuredAndRe
   ASSERT_EQ(streams.size(), 1U);
   EXPECT_EQ(streams.front().stream_id, "measured_joints");
   EXPECT_EQ(streams.front().severity, core::StreamSeverityDTO::kFault);
-  EXPECT_EQ(streams.front().recovery, core::StreamRecoveryDTO::kAck);
   EXPECT_TRUE(streams.front().age_ns.has_value());
   clock->set(9'000'000);
   EXPECT_EQ(reader->current_state(query, 1050).value(), sampled.value());
@@ -2742,6 +3098,94 @@ TEST(RetainedRos2ControlRuntimeHandleTest, AMoveRecordsRobotControlUnderItsDirec
   EXPECT_EQ(events[1].source, core::ActiveTcpChangeSource::kProgram);
 }
 
+// OD-220: every Active TCP change (Set TCP, a move's TCP step, Reset, and the
+// reset of an Apply rebind) is built under the handle's lock and handed to
+// the sink after it: the sink reads the handle (it would deadlock under the
+// lock) and sees exactly the committed value, generation and sequence.
+TEST(RetainedRos2ControlRuntimeHandleTest, ActiveTcpEventIsPostedAfterTheHandleLock) {
+  ArmWorld world;
+  const auto rows = TcpRows({"tcp", "tool"});
+  world.handle->InstallActiveTcp(kRobot, rows, TcpAssociations(rows), true);
+  auto *handle = world.handle.get();
+  std::vector<core::ActiveTcpChangeDTO> events;
+  std::vector<ActiveTcpReading> readings;
+  handle->BindActiveTcpEvents([&](const core::ActiveTcpChangeDTO &change) {
+    events.push_back(change);
+    readings.push_back(handle->ReadActiveTcp());
+  });
+  world.handle->StartBackend();
+  ASSERT_TRUE(handle->SetActiveTcp(TcpEntry("tool"), core::ActiveTcpChangeSource::kProgram).ok());
+  ASSERT_TRUE(handle->ApplyMotionToolContext(TcpEntry("tcp")).ok());
+  ASSERT_TRUE(handle->SetActiveTcp(TcpEntry("tool"), core::ActiveTcpChangeSource::kProgram).ok());
+  ASSERT_TRUE(handle->ResetActiveTcp().ok());
+  ASSERT_TRUE(handle->SetActiveTcp(TcpEntry("tool"), core::ActiveTcpChangeSource::kProgram).ok());
+  // The rebind drops the selected TCP's association: a reset on a new
+  // registration generation.
+  ASSERT_TRUE(handle->RebindRetainedToolContext(
+      rows, {{TcpEntry("tcp"), {}}}, std::nullopt, {}, {}, {}, {}, {}).ok());
+  ASSERT_EQ(events.size(), 6U);
+  ASSERT_EQ(readings.size(), 6U);
+  EXPECT_EQ(events[1].source, core::ActiveTcpChangeSource::kProgram);
+  EXPECT_EQ(events[3].source, core::ActiveTcpChangeSource::kReset);
+  EXPECT_EQ(events[5].source, core::ActiveTcpChangeSource::kReset);
+  EXPECT_GT(events[5].registration_generation, events[4].registration_generation);
+  for (std::size_t index = 0U; index < events.size(); ++index) {
+    SCOPED_TRACE(index);
+    EXPECT_EQ(readings[index].registration_generation, events[index].registration_generation);
+    EXPECT_EQ(readings[index].sequence, events[index].sequence);
+    EXPECT_EQ(readings[index].reference, events[index].entry);
+  }
+}
+
+// OD-220: the post runs inside the robot's arm step, so a later change of the
+// same robot waits for an earlier change's post and the posts keep the
+// commit order.
+TEST(RetainedRos2ControlRuntimeHandleTest, ActiveTcpPostsOfOneRobotKeepTheCommitOrder) {
+  ArmWorld world;
+  const auto rows = TcpRows({"tcp", "tool"});
+  world.handle->InstallActiveTcp(kRobot, rows, TcpAssociations(rows), true);
+  auto *handle = world.handle.get();
+  std::mutex events_mutex;
+  std::vector<core::ActiveTcpChangeDTO> events;
+  std::promise<void> first_entered;
+  std::promise<void> release_first;
+  const auto released = release_first.get_future().share();
+  handle->BindActiveTcpEvents([&](const core::ActiveTcpChangeDTO &change) {
+    {
+      std::lock_guard lock(events_mutex);
+      events.push_back(change);
+    }
+    if (change.entry == std::optional(TcpEntry("tool"))) {
+      first_entered.set_value();
+      released.wait();
+    }
+  });
+  world.handle->StartBackend();
+  auto first = std::async(std::launch::async, [&] {
+    return handle->SetActiveTcp(TcpEntry("tool"), core::ActiveTcpChangeSource::kProgram);
+  });
+  ASSERT_EQ(first_entered.get_future().wait_for(std::chrono::seconds(10)),
+            std::future_status::ready);
+  // The first change is committed and readable while its post runs.
+  EXPECT_EQ(handle->ReadActiveTcp().reference, std::optional(TcpEntry("tool")));
+  auto second = std::async(std::launch::async, [&] {
+    return handle->SetActiveTcp(TcpEntry("tcp"), core::ActiveTcpChangeSource::kRobotControl);
+  });
+  EXPECT_EQ(second.wait_for(std::chrono::milliseconds(100)), std::future_status::timeout);
+  {
+    std::lock_guard lock(events_mutex);
+    EXPECT_EQ(events.size(), 1U);
+  }
+  release_first.set_value();
+  ASSERT_TRUE(first.get().ok());
+  ASSERT_TRUE(second.get().ok());
+  std::lock_guard lock(events_mutex);
+  ASSERT_EQ(events.size(), 2U);
+  EXPECT_EQ(events[0].entry, std::optional(TcpEntry("tool")));
+  EXPECT_EQ(events[1].entry, std::optional(TcpEntry("tcp")));
+  EXPECT_EQ(events[1].sequence, events[0].sequence + 1U);
+}
+
 // Mock and Isaac have no tool-context hook: nothing to apply.
 // Active TCP: a TCP change commits at once.
 TEST(RetainedRos2ControlRuntimeHandleTest, WithoutAToolContextHookATcpChangeCommitsAlone) {
@@ -3435,7 +3879,7 @@ TEST(Ros2ControlComponentAdapterTest, PrepareWaitsForTheRestartedLaunchAfterADri
     const auto activity = world.handle->arm_activity();
     return activity.observed && !activity.hardware_active && activity.broadcaster_active;
   }));
-  EXPECT_EQ(world.handle->SwitchArmHardware(true, {}).outcome,
+  EXPECT_EQ(world.handle->SwitchArmHardware(true, std::nullopt, {}).outcome,
             RetainedRos2ControlSwitchOutcome::kSucceeded);
   EXPECT_EQ(world.handle->ActivateArmController({}, Soon()).outcome,
             RetainedRos2ControlSwitchOutcome::kSucceeded);
@@ -3448,7 +3892,7 @@ TEST(Ros2ControlComponentAdapterTest, PrepareWaitsForTheRestartedLaunchAfterADri
     const auto activity = world.handle->arm_activity();
     return activity.observed && !activity.hardware_active && !activity.controller_active;
   }));
-  EXPECT_EQ(world.handle->SwitchArmHardware(true, {}).outcome,
+  EXPECT_EQ(world.handle->SwitchArmHardware(true, std::nullopt, {}).outcome,
             RetainedRos2ControlSwitchOutcome::kSucceeded);
   EXPECT_TRUE(fake::WaitUntil([&] { return world.handle->arm_activity().broadcaster_active; }));
   // Live 2026-11-02 (Real Lite 6): the driver switched every controller off
@@ -3459,13 +3903,63 @@ TEST(Ros2ControlComponentAdapterTest, PrepareWaitsForTheRestartedLaunchAfterADri
     const auto activity = world.handle->arm_activity();
     return activity.observed && activity.hardware_active && !activity.broadcaster_active;
   }));
-  EXPECT_EQ(world.handle->SwitchArmHardware(true, {}).outcome,
+  EXPECT_EQ(world.handle->SwitchArmHardware(true, std::nullopt, {}).outcome,
             RetainedRos2ControlSwitchOutcome::kSucceeded);
   EXPECT_TRUE(fake::WaitUntil([&] { return world.handle->arm_activity().broadcaster_active; }));
   EXPECT_TRUE(world.handle->arm_activity().hardware_active);
   EXPECT_EQ(world.handle->ActivateArmController({}, Soon()).outcome,
             RetainedRos2ControlSwitchOutcome::kSucceeded);
   EXPECT_TRUE(world.handle->arm_activity().broadcaster_active);
+}
+
+// OD-214: xArm Enable's hardware switch carries the Enable's step deadline;
+// a broadcaster switch the controller manager accepts but never answers ends
+// at that deadline as an unknown effect, instead of waiting until a Stop.
+TEST(Ros2ControlComponentAdapterTest, ArmHardwareSwitchEndsAtTheStepDeadlineWithoutAnAnswer) {
+  ArmWorld world;
+  world.handle->StartBackend();
+  world.manager.SetHardwareActive(false);
+  world.manager.SetBroadcasterActive(false);
+  ASSERT_TRUE(fake::WaitUntil([&] {
+    const auto activity = world.handle->arm_activity();
+    return activity.observed && !activity.hardware_active && !activity.controller_active &&
+           activity.broadcaster_loaded && !activity.broadcaster_active &&
+           RetainedRos2ControlRuntimeHandleTestAccess::EndpointsSettled(*world.handle);
+  }));
+  ASSERT_TRUE(world.handle->node()
+                  ->create_client<controller_manager_msgs::srv::SwitchController>(
+                      world.prefix + "/controller_manager/switch_controller")
+                  ->wait_for_service(10s));
+  ASSERT_TRUE(world.handle->node()
+                  ->create_client<controller_manager_msgs::srv::SetHardwareComponentState>(
+                      world.prefix + "/controller_manager/set_hardware_component_state")
+                  ->wait_for_service(10s));
+  world.manager.SetSwitchRepliesPaused(true);
+  const auto started = std::chrono::steady_clock::now();
+  auto pending = std::async(std::launch::async, [&] {
+    return world.handle->SwitchArmHardware(true, started + 2s, {});
+  });
+  EXPECT_TRUE(fake::WaitUntil([&] { return world.manager.reply_waiting(); }));
+  const bool ended = pending.wait_for(10s) == std::future_status::ready;
+  const auto elapsed = std::chrono::steady_clock::now() - started;
+  // Release the fake before any fatal assertion, including failure teardown.
+  world.manager.SetSwitchRepliesPaused(false);
+  ASSERT_TRUE(ended);
+  const auto result = pending.get();
+  EXPECT_GE(elapsed, 1900ms);
+  EXPECT_LT(elapsed, 8s);
+  EXPECT_EQ(result.outcome, RetainedRos2ControlSwitchOutcome::kUncertain);
+  ASSERT_TRUE(result.error.has_value());
+  EXPECT_EQ(result.error->details.at("reason"), "ros2_control_switch_timeout");
+  // The hardware request answered; one broadcaster request, never resent.
+  EXPECT_EQ(world.manager.hardware_history(), std::vector<bool>{true});
+  EXPECT_EQ(world.manager.switch_requests(), 1U);
+  // As the arm adapter sees it: Enable ends unknown with the lane's code.
+  const auto reported =
+      ros2_control_action_result(core::ComponentAction::kEnable, result);
+  EXPECT_EQ(reported.outcome, core::ActionOutcome::kUnknown);
+  ASSERT_TRUE(reported.error.has_value());
+  EXPECT_EQ(reported.error->code, "component_action_refused");
 }
 
 TEST(Ros2ControlComponentAdapterTest, MockResetPositionIsDeclaredWithTheHostPhase) {

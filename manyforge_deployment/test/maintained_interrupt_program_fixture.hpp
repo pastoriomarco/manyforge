@@ -10,6 +10,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace manyforge::deployment::test {
@@ -27,10 +28,21 @@ struct MaintainedInterruptProgramFixture final {
   std::shared_ptr<const deployment::ProgramBinding> binding;
 };
 
+inline constexpr std::string_view kMaintainedInterruptProgramTree = R"({
+    "node_id":"motion.move_until_signal","instance_id":"move","children":[],
+    "parameters":{"target":{"component_id":"lite6_robot","command_target_id":"arm"},"base_frame":{"component_id":"lite6_robot","frame_id":"base"},"tcp_endpoint":{"kind":"current"},"stop_mode":"soft_on_path","priority":0,
+      "activation_mode":"require_inactive_at_arm","on_signal":"success","on_no_signal":"failure",
+      "goal":{"frame_ref":{"kind":"target_frame","frame":{"component_id":"lite6_robot","frame_id":"base"}},
+        "position_m":[0.1,0.1,0.1],"orientation":{"xyzw":[0,0,0,1]}},
+      "interrupt_condition":{"compare":{"operand":{"key":"ready"},"op":"==","value":true}}}})";
+
+/// `tree` replaces the default single interrupt move with another authored
+/// tree on the same maintained Lite6 + lite_gripper Deployment.
 [[nodiscard]] inline MaintainedInterruptProgramFixture
 LoadMaintainedInterruptProgram(
     const std::filesystem::path &package_root,
-    const std::filesystem::path &program_artifact_root) {
+    const std::filesystem::path &program_artifact_root,
+    const std::string_view tree = kMaintainedInterruptProgramTree) {
   namespace d = deployment;
   namespace c = core;
   using V = d::CanonicalValue;
@@ -84,14 +96,7 @@ LoadMaintainedInterruptProgram(
     "namespaces":[],"keys":[{"key":"ready","type":"bool",
       "access":"read_write","persistence":"run","initial":false}]})")
                             .root());
-  replace("tree", d::parse_strict_json_model_yaml(R"({
-    "node_id":"motion.move_until_signal","instance_id":"move","children":[],
-    "parameters":{"target":{"component_id":"lite6_robot","command_target_id":"arm"},"base_frame":{"component_id":"lite6_robot","frame_id":"base"},"tcp_endpoint":{"kind":"current"},"stop_mode":"soft_on_path","priority":0,
-      "activation_mode":"require_inactive_at_arm","on_signal":"success","on_no_signal":"failure",
-      "goal":{"frame_ref":{"kind":"target_frame","frame":{"component_id":"lite6_robot","frame_id":"base"}},
-        "position_m":[0.1,0.1,0.1],"orientation":{"xyzw":[0,0,0,1]}},
-      "interrupt_condition":{"compare":{"operand":{"key":"ready"},"op":"==","value":true}}}})")
-                      .root());
+  replace("tree", d::parse_strict_json_model_yaml(std::string(tree)).root());
   const auto authored = d::test::with_program_revision(
       d::normalize_program_authoring(V(std::move(fields))));
   d::FilesystemCatalogArtifactStore artifacts(package_root);

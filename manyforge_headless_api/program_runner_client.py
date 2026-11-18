@@ -5,11 +5,14 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from typing import Any, Protocol
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import urlsplit, urlunsplit
 
 import httpx
+from pydantic import ValidationError
 
+from .internal_http import INTERNAL_HTTP_CLIENT_LIMITS
 from .native import strict_json_object
+from .program_cycle import ProgramCommandReplyDTO
 
 
 MAX_PROGRAM_RUNNER_RESPONSE_BYTES = 32 * 1024 * 1024
@@ -64,64 +67,40 @@ class ProgramRunnerPort(Protocol):
 
     def prepare_applied_scene(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def read_run(self, program_run_id: str) -> dict[str, Any]: ...
+    def read_run(self, program_run_id: int) -> dict[str, Any]: ...
 
     def preview_node_correction(
-        self, program_run_id: str, body: Mapping[str, Any]
-    ) -> dict[str, Any]: ...
-
-    def stop_run(
-        self,
-        program_run_id: str,
-        body: Mapping[str, Any],
-    ) -> dict[str, Any]: ...
-
-    def stop_motion(
-        self,
-        program_run_id: str,
-        body: Mapping[str, Any],
+        self, program_run_id: int, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
 
     def start_motion(
         self,
-        program_run_id: str,
+        program_run_id: int,
         body: Mapping[str, Any],
     ) -> dict[str, Any]: ...
 
-    def full_stop(
+    def resume_halt(
         self,
-        program_run_id: str,
-        body: Mapping[str, Any],
-    ) -> dict[str, Any]: ...
-
-    def resume_full_stop(
-        self,
-        program_run_id: str,
+        program_run_id: int,
         body: Mapping[str, Any],
     ) -> dict[str, Any]: ...
 
     def resume_motion(
-        self, program_run_id: str, body: Mapping[str, Any]
+        self, program_run_id: int, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
 
     def prepare_manual_handover(
-        self, program_run_id: str, body: Mapping[str, Any]
+        self, program_run_id: int, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
 
-    def discard_full_stop(
-        self,
-        program_run_id: str,
-        body: Mapping[str, Any],
-    ) -> dict[str, Any]: ...
-
-    def cycle_status(self) -> dict[str, Any]: ...
+    def cycle_status(self, *, before_command: bool = False) -> dict[str, Any]: ...
 
     def reset_cycle(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def runtime_controls(self, program_run_id: str) -> dict[str, Any]: ...
+    def runtime_controls(self, program_run_id: int) -> dict[str, Any]: ...
 
     def runtime_control_action(
-        self, program_run_id: str, suffix: str, body: Mapping[str, Any]
+        self, program_run_id: int, suffix: str, body: Mapping[str, Any]
     ) -> dict[str, Any]: ...
 
     def apply_recovery_action(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
@@ -164,9 +143,16 @@ class ProgramRunnerHttpClient:
             )
         self._owns_client = client is None
         self._base_url = base_url.rstrip("/")
+        # A runner command answers at its acceptance and publishes its end
+        # in its row (OD-214): only the connection is limited, never the
+        # wait for the answer (the Manager's 250 ms liveness probe detects a
+        # lost runner). So is the cycle status read before a command is
+        # forwarded; other status reads keep the whole limit.
+        self._command_timeout = httpx.Timeout(None, connect=timeout_seconds)
         self._client = client or httpx.Client(
             base_url=self._base_url,
             timeout=httpx.Timeout(timeout_seconds),
+            limits=INTERNAL_HTTP_CLIENT_LIMITS,
         )
 
     @property
@@ -217,6 +203,8 @@ class ProgramRunnerHttpClient:
         *,
         params: Sequence[tuple[str, str | int]] = (),
         body: Mapping[str, Any] | None = None,
+        command: bool = False,
+        wait_for_answer: bool = False,
     ) -> dict[str, Any]:
         if (
             not (
@@ -236,6 +224,11 @@ class ProgramRunnerHttpClient:
                 path,
                 params=params,
                 json=dict(body) if body is not None else None,
+                **(
+                    {"timeout": self._command_timeout}
+                    if command or wait_for_answer
+                    else {}
+                ),
             ) as response:
                 chunks: list[bytes] = []
                 size = 0
@@ -251,9 +244,12 @@ class ProgramRunnerHttpClient:
         except ProgramRunnerClientError:
             raise
         except httpx.HTTPError as exc:
+            # The transport failure's class (for example `ConnectError`,
+            # `RemoteProtocolError`, `ReadTimeout`) names the real cause.
             raise ProgramRunnerClientError(
                 "program_runner_unavailable",
                 "independent Program runner is unavailable",
+                details={"transport_error": type(exc).__name__},
             ) from exc
         raw = b"".join(chunks)
         try:
@@ -269,19 +265,27 @@ class ProgramRunnerHttpClient:
             ) from exc
         if response.status_code >= 400:
             raise self._error(payload, response.status_code)
+        if command:
+            try:
+                ProgramCommandReplyDTO.model_validate(payload)
+            except ValidationError as exc:
+                raise ProgramRunnerClientError(
+                    "program_runner_response_invalid",
+                    "Program runner returned an invalid command reply",
+                    response.status_code,
+                ) from exc
         return payload
 
+    def _command(self, path: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """One runner command: its ``program_command_reply.v1`` at acceptance."""
+
+        return self._request("POST", path, body=body, command=True)
+
     @staticmethod
-    def _run_path(program_run_id: str) -> str:
-        if (
-            not isinstance(program_run_id, str)
-            or not program_run_id
-            or len(program_run_id.encode("utf-8")) > 256
-            or "/" in program_run_id
-            or ".." in program_run_id
-        ):
+    def _run_path(program_run_id: int) -> str:
+        if type(program_run_id) is not int or not 1 <= program_run_id <= 9_007_199_254_740_991:
             raise ValueError("program_run_id is invalid")
-        return f"/api/program/runs/{quote(program_run_id, safe='')}"
+        return f"/api/program/runs/{program_run_id}"
 
     def runs(
         self,
@@ -309,16 +313,16 @@ class ProgramRunnerHttpClient:
         return self._request("GET", "/api/program/diagnostics/health")
 
     def start_run(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self._request("POST", "/api/program/runs", body=body)
+        return self._command("/api/program/runs", body)
 
     def prepare_applied_scene(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/program/scene-preparations", body=body)
 
-    def read_run(self, program_run_id: str) -> dict[str, Any]:
+    def read_run(self, program_run_id: int) -> dict[str, Any]:
         return self._request("GET", self._run_path(program_run_id))
 
     def preview_node_correction(
-        self, program_run_id: str, body: Mapping[str, Any]
+        self, program_run_id: int, body: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self._request(
             "POST",
@@ -326,102 +330,49 @@ class ProgramRunnerHttpClient:
             body=body,
         )
 
-    def stop_run(
-        self,
-        program_run_id: str,
-        body: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"{self._run_path(program_run_id)}/stop",
-            body=body,
-        )
-
-    def stop_motion(
-        self,
-        program_run_id: str,
-        body: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"{self._run_path(program_run_id)}/motion-stop",
-            body=body,
-        )
-
     def start_motion(
         self,
-        program_run_id: str,
+        program_run_id: int,
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"{self._run_path(program_run_id)}/motion-start",
-            body=body,
-        )
+        return self._command(f"{self._run_path(program_run_id)}/motion-start", body)
 
     def resume_motion(
-        self, program_run_id: str, body: Mapping[str, Any]
+        self, program_run_id: int, body: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"{self._run_path(program_run_id)}/motion-resume",
-            body=body,
-        )
+        return self._command(f"{self._run_path(program_run_id)}/motion-resume", body)
 
     def prepare_manual_handover(
-        self, program_run_id: str, body: Mapping[str, Any]
+        self, program_run_id: int, body: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return self._request(
-            "POST", f"{self._run_path(program_run_id)}/manual-handover", body=body
-        )
+        return self._command(f"{self._run_path(program_run_id)}/manual-handover", body)
 
-    def full_stop(
+    def resume_halt(
         self,
-        program_run_id: str,
+        program_run_id: int,
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"{self._run_path(program_run_id)}/full-stop",
-            body=body,
-        )
+        return self._command(f"{self._run_path(program_run_id)}/resume-halt", body)
 
-    def resume_full_stop(
-        self,
-        program_run_id: str,
-        body: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        return self._request(
-            "POST",
-            f"{self._run_path(program_run_id)}/resume-full-stop",
-            body=body,
-        )
+    def cycle_status(self, *, before_command: bool = False) -> dict[str, Any]:
+        """The cycle status; ``before_command``: the read that decides whether
+        a command is forwarded, which waits for the runner's answer."""
 
-    def discard_full_stop(
-        self,
-        program_run_id: str,
-        body: Mapping[str, Any],
-    ) -> dict[str, Any]:
         return self._request(
-            "POST",
-            f"{self._run_path(program_run_id)}/discard-full-stop",
-            body=body,
+            "GET", "/api/cycle/status", wait_for_answer=before_command
         )
-
-    def cycle_status(self) -> dict[str, Any]:
-        return self._request("GET", "/api/cycle/status")
 
     def reset_cycle(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self._request("POST", "/api/program/cycle/reset", body=body)
+        return self._command("/api/program/cycle/reset", body)
 
-    def runtime_controls(self, program_run_id: str) -> dict[str, Any]:
+    def runtime_controls(self, program_run_id: int) -> dict[str, Any]:
         return self._request(
             "GET", f"{self._run_path(program_run_id)}/runtime-controls"
         )
 
     def runtime_control_action(
         self,
-        program_run_id: str,
+        program_run_id: int,
         suffix: str,
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -431,14 +382,10 @@ class ProgramRunnerHttpClient:
         }
         if suffix not in allowed:
             raise ValueError("runtime-control action is unsupported")
-        return self._request(
-            "POST",
-            f"{self._run_path(program_run_id)}/{suffix}",
-            body=body,
-        )
+        return self._command(f"{self._run_path(program_run_id)}/{suffix}", body)
 
     def apply_recovery_action(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self._request("POST", "/api/cycle/recovery-actions", body=body)
+        return self._command("/api/cycle/recovery-actions", body)
 
     def persistent_values(self) -> dict[str, Any]:
         return self._request("GET", persistent_values_path())
@@ -446,7 +393,7 @@ class ProgramRunnerHttpClient:
     def persistent_value_action(
         self, action: str, body: Mapping[str, Any]
     ) -> dict[str, Any]:
-        return self._request("POST", persistent_values_path(action), body=body)
+        return self._command(persistent_values_path(action), body)
 
     def reconcile_persistent_values(self) -> dict[str, Any]:
         return self._request("POST", "/api/program/persistent-values/reconcile")

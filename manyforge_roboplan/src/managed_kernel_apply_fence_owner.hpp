@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <filesystem>
 #include <functional>
 #include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
 #include <manyforge_core/resource_slot_table.hpp>
@@ -31,7 +30,7 @@ struct ManagedKernelAdmissionObservation final {
 };
 
 /// Process-local atomic admission gate shared by the managed execution owner
-/// and its durable Apply-fence owner.
+/// and its Apply-fence owner.
 ///
 /// It is used while the managed command surface remains closed. Operation
 /// admission joins this same gate; it must not create a second
@@ -86,16 +85,8 @@ public:
       const std::function<void(const manyforge::core::ConfigurationFenceId &,
                                const manyforge::core::ConfigurationFenceScopeDTO
                                    &)> &validate_terminal_overlap = {});
-  void RestoreFence(const manyforge::core::ConfigurationFenceId &fence_id,
-                    const manyforge::core::ConfigurationFenceScopeDTO &scope);
   void ReleaseFence(const manyforge::core::ConfigurationFenceId &fence_id,
                     const manyforge::core::ConfigurationFenceScopeDTO &scope);
-
-  /// Selected release checks the effect pin before committing its ledger row.
-  void
-  ReleaseFenceDurably(const manyforge::core::ConfigurationFenceId &fence_id,
-                      const manyforge::core::ConfigurationFenceScopeDTO &scope,
-                      const std::function<void()> &commit_durable_release);
 
   /// Execute one bounded in-process installation step only while the exact
   /// durable fence remains held. This is an Apply interlock, not caller
@@ -123,17 +114,18 @@ private:
 };
 
 struct ManagedKernelApplyFenceOwnerConfig final {
-  std::filesystem::path ledger_path;
-  std::filesystem::path manager_state_root;
+  /// The current publication as the Manager last stated it to the host; read
+  /// from memory, never from a Manager store.
+  std::function<manyforge::core::ActiveBundlePublicationReceiptDTO()>
+      active_publication;
   manyforge::core::CellId cell_id;
   manyforge::core::RuntimeUnitId runtime_unit_id;
   manyforge::core::RuntimeEpoch runtime_epoch;
-  manyforge::core::RequestOwnerEpoch request_owner_epoch;
   std::function<std::int64_t()> now_ns;
 };
 
-/// Durable Kernel-owned Manager Apply fence: one generation,
-/// request ledger and admission gate.
+/// Kernel-owned Manager Apply fence: one generation, an in-memory request
+/// ledger of at most 256 fences, and the admission gate.
 class ManagedKernelApplyFenceOwner final
     : public manyforge::core::IManagerKernelApplyFencePort {
 public:
@@ -154,53 +146,28 @@ public:
   ReconcileAcquireAttempt(
       const manyforge::core::ApplyFenceAcquireAttemptQueryDTO &query)
       const override;
-  [[nodiscard]] manyforge::core::ApplyFenceReconcileResultDTO
-  Rehydrate(const manyforge::core::ApplyFenceRehydrateDTO &request) override;
   [[nodiscard]] manyforge::core::ConfigurationFenceStatusDTO
   QueryStatus(const manyforge::core::ConfigurationFenceStatusQueryDTO &query)
       const override;
 
   /// Run one selected-runtime installation effect only while the exact
-  /// durable Apply fence is held and the active publication is still the
-  /// predecessor named by Component Manager. Candidate active-control
-  /// configurations are deliberately not required until after the effect:
-  /// they are facts produced by installing the candidate participants.
+  /// durable Apply fence is held. Candidate active-control configurations are
+  /// deliberately not required until after the effect: they are facts
+  /// produced by installing the candidate participants.
   /// This is an internal Apply interlock, not command authorization.
   void RunWithExactHeldPredecessor(
       const manyforge::core::ConfigurationFenceStatusQueryDTO &query,
-      const manyforge::core::ActiveBundlePublicationGeneration
-          &expected_predecessor_publication_generation,
-      const manyforge::core::ContentDigest
-          &expected_predecessor_public_pointer_digest,
       const std::function<void()> &effect) const;
 
   /// The exact query of the Apply fence currently held for
-  /// `apply` (HostApplyRequest carries no fence fields), stamped with the
-  /// Manager runtime epoch the caller knows; nullopt when none is held.
+  /// `apply` (HostApplyRequest carries no fence fields); nullopt when none is
+  /// held.
   [[nodiscard]] std::optional<manyforge::core::ConfigurationFenceStatusQueryDTO>
-  HeldApplyFence(const manyforge::core::NamedApplyPublicationTransactionDTO &apply,
-                 const manyforge::core::RuntimeEpoch &manager_runtime_epoch) const;
+  HeldApplyFence(const manyforge::core::NamedApplyPublicationTransactionDTO &apply) const;
 
-  void RunWithExactHeldSuccessor(
-      const manyforge::core::ConfigurationFenceStatusQueryDTO &query,
-      const manyforge::core::ActiveBundlePublicationReceiptDTO &successor,
-      const std::function<void()> &effect) const;
-
-  /// Callback-local positive readback for private cross-owner operations.
-  /// Keeps the same actual interlock as the existing operations and avoids
-  /// recursively querying this owner's nonrecursive mutex.
-  /// Candidate control configurations must already be installed. Use the
-  /// no-readback predecessor overload for preparation/installation itself;
-  /// this readback is for Scene adoption after child Holding, before publish.
-  void RunWithExactHeldPredecessorReadback(
-      const manyforge::core::ConfigurationFenceStatusQueryDTO &query,
-      const manyforge::core::ActiveBundlePublicationGeneration &expected_predecessor_publication_generation,
-      const manyforge::core::ContentDigest &expected_predecessor_public_pointer_digest,
-      const std::function<void(const HeldStatusView&)> &effect) const;
-  void RunWithExactHeldSuccessorReadback(
-      const manyforge::core::ConfigurationFenceStatusQueryDTO &query,
-      const manyforge::core::ActiveBundlePublicationReceiptDTO &successor,
-      const std::function<void(const HeldStatusView&)> &effect) const;
+  /// The exact queries of every held Apply fence in this owner's ledger.
+  [[nodiscard]] std::vector<manyforge::core::ConfigurationFenceStatusQueryDTO>
+  HeldApplyFences() const;
 
   [[nodiscard]] manyforge::core::ConfigurationFenceReleasedDTO Release(
       const manyforge::core::ConfigurationFenceReleaseDTO &request) override;

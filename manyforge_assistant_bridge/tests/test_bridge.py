@@ -88,7 +88,7 @@ def _projection() -> dict[str, Any]:
         "nodes": [],
         "retained_bundle_id": "bundle.1",
         "runs_in": ["no_program_active"],
-        "schema_version": "manyforge.assistant_mode_projection.v2",
+        "schema_version": "manyforge.assistant_mode_projection.v3",
         "skills": [],
         "compact_history": False,
         "constrained_regeneration": False,
@@ -101,20 +101,17 @@ def _projection() -> dict[str, Any]:
         "freshness": "fresh",
         "known_gaps": [],
         "projection_generation": 1,
-        "projection_owner_epoch": "headless.epoch.1",
         "receiver_age_ns": 10,
         "selection_projection_generation": 1,
         "selection_source_content_digest": "sha256:" + "5" * 64,
         "selection_source_generation": 1,
-        "selection_source_owner_epoch": "manager.epoch.1",
         "selection_source_owner_id": "manager",
         "source_content_digest": framed_digest(
             "manyforge-assistant-mode-projection-semantic",
-            "manyforge.assistant_mode_projection.v2",
+            "manyforge.assistant_mode_projection.v3",
             semantic,
         ),
         "source_generation": 1,
-        "source_owner_epoch": "headless.epoch.1",
         "source_owner_id": "headless.assistant-mode.composer-assistant",
         "source_owner_kind": "assistant_mode_projection",
     }
@@ -151,7 +148,7 @@ def _scene_projection() -> dict[str, Any]:
         simulation_source("/World/probe", 5),
     ]
     return {
-        "schema_version": "manyforge.scene_projection.v1",
+        "schema_version": "manyforge.scene_projection.v2",
         "projection_generation": 7,
         "logical_scene": {
             "available": True,
@@ -184,7 +181,7 @@ class _Headless(HeadlessHttpClient):
     def node_environment(self) -> dict[str, Any]:
         mode = self.projection
         return {
-            "schema_version": "manyforge.node_environment_projection.v2",
+            "schema_version": "manyforge.node_environment_projection.v3",
             "retained_bundle_id": mode["retained_bundle_id"],
             "graph_revision": mode["graph_revision"],
             **mode["node_environment"],
@@ -199,7 +196,7 @@ class _Headless(HeadlessHttpClient):
 
     def source_model(self) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.source_model_projection.v3",
+            "schema_version": "manyforge.source_model_projection.v4",
             "components": [{"component_id": "robot", "mounted_on": None}],
             "targets": [{"component_id": "robot", "target_id": "arm",
                          "frames": [{"frame_role_id": "tcp"}]}],
@@ -299,7 +296,7 @@ def _rehash(projection: dict[str, Any]) -> dict[str, Any]:
     )
     projection["source"]["source_content_digest"] = framed_digest(
         "manyforge-assistant-mode-projection-semantic",
-        "manyforge.assistant_mode_projection.v2",
+        "manyforge.assistant_mode_projection.v3",
         {key: value for key, value in projection.items() if key != "source"},
     )
     return projection
@@ -324,7 +321,7 @@ def _append_projection_tool(
     )
     projection["source"]["source_content_digest"] = framed_digest(
         "manyforge-assistant-mode-projection-semantic",
-        "manyforge.assistant_mode_projection.v2",
+        "manyforge.assistant_mode_projection.v3",
         {key: value for key, value in projection.items() if key != "source"},
     )
 
@@ -778,7 +775,7 @@ def test_bridge_rejects_a_self_consistent_but_nonactive_projection_before_model(
     forwarded["description"] = "forged but self-consistent"
     forwarded["source"]["source_content_digest"] = framed_digest(
         "manyforge-assistant-mode-projection-semantic",
-        "manyforge.assistant_mode_projection.v2",
+        "manyforge.assistant_mode_projection.v3",
         {key: value for key, value in forwarded.items() if key != "source"},
     )
     body = _request(forwarded)
@@ -1204,7 +1201,7 @@ def test_conversation_history_is_partitioned_by_exact_narrowed_catalog(
     )
     projection["source"]["source_content_digest"] = framed_digest(
         "manyforge-assistant-mode-projection-semantic",
-        "manyforge.assistant_mode_projection.v2",
+        "manyforge.assistant_mode_projection.v3",
         {key: value for key, value in projection.items() if key != "source"},
     )
     upstream_bodies: list[dict[str, Any]] = []
@@ -1327,7 +1324,7 @@ def _with_token_env(projection: dict[str, Any], name: str) -> dict[str, Any]:
     projection["model_endpoint"]["api_key_env"] = name
     projection["source"]["source_content_digest"] = framed_digest(
         "manyforge-assistant-mode-projection-semantic",
-        "manyforge.assistant_mode_projection.v2",
+        "manyforge.assistant_mode_projection.v3",
         {key: value for key, value in projection.items() if key != "source"},
     )
     return projection
@@ -1685,7 +1682,7 @@ def test_a_refused_draft_edit_keeps_its_typed_code_for_the_model_and_recovery() 
     assert recovery["repeats"] == 2
 
 
-def test_experimental_reasoning_switch_maps_to_the_chat_template_kwarg(tmp_path: Path) -> None:
+def test_reasoning_switch_maps_to_the_chat_template_kwarg(tmp_path: Path) -> None:
     for reasoning, expected in ((None, None), ("off", False), ("on", True)):
         projection = _projection()
         if reasoning is not None:
@@ -2876,10 +2873,8 @@ def test_headless_restart_with_the_same_content_keeps_the_verification(
     request = _provider_request(projection)
     asyncio.run(service._verify_request(request))
 
-    # A fresh Headless: new owner epoch and generations, same content digest.
+    # A fresh Headless: new generations, same content digest.
     restarted = deepcopy(projection)
-    restarted["source"]["projection_owner_epoch"] = "headless.epoch.2"
-    restarted["source"]["source_owner_epoch"] = "headless.epoch.2"
     restarted["source"]["projection_generation"] = 1
     restarted["source"]["receiver_age_ns"] = 99
     service._headless = _Headless(restarted)

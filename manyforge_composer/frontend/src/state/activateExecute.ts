@@ -66,31 +66,33 @@ export function inactiveComponentIds(states: readonly ComponentState[]): string[
 
 /**
  * One group action of the activation, with each target's last action and
- * the cell's Stop generation before it was sent.
+ * the cell's last Stop event before it was sent.
  */
 export interface ActivationStep {
   action: 'prepare' | 'enable';
   targets: string[];
   before: Record<string, number | null>;
-  stopGeneration: number | null;
+  lastStopEventId: number | null;
 }
 
 export interface ActivationFailure {
   /** Null for a refused request or a reason not tied to one component. */
   componentId: string | null;
   text: string;
+  /** The action's error code, when a failed action result carried one. */
+  code?: string;
 }
 
 export function activationStep(
   action: ActivationStep['action'],
   targets: readonly string[],
   states: readonly ComponentState[],
-  stopGeneration: number | null = null,
+  lastStopEventId: number | null = null,
 ): ActivationStep {
   return {
     action,
     targets: [...targets],
-    stopGeneration,
+    lastStopEventId,
     before: Object.fromEntries(targets.map((id) => [
       id, states.find((state) => state.component_id === id)?.last_action?.started_at_ns ?? null,
     ])),
@@ -108,14 +110,14 @@ export function activationStep(
  * runs (e.g. an xArm Enable's arming briefly stops the joint states, a
  * stale-stream fault that clears within the Enable, and may show on a
  * gripper or I/O member still waiting its turn). A Stop ends the group
- * (the cell's Stop generation changed since the step was sent): once nothing
+ * (the cell's last Stop event changed since the step was sent): once nothing
  * runs, a faulted target is judged and a target that never got its action
  * is a failure too.
  */
 export function stepProgress(
   step: ActivationStep,
   states: readonly ComponentState[],
-  stopGeneration: number | null = null,
+  lastStopEventId: number | null = null,
 ): { done: boolean; failures: ActivationFailure[] } {
   const failures: ActivationFailure[] = [];
   const reached = (state: ComponentState) => state.lifecycle === 'enabled'
@@ -125,8 +127,8 @@ export function stepProgress(
   const targets = step.targets.map((componentId) => ({
     componentId, state: states.find((candidate) => candidate.component_id === componentId),
   }));
-  const stopped = step.stopGeneration !== null && stopGeneration !== null
-    && stopGeneration !== step.stopGeneration;
+  const stopped = step.lastStopEventId !== null && lastStopEventId !== null
+    && lastStopEventId !== step.lastStopEventId;
   const idle = targets.every(({ state }) => state?.action === undefined);
   // Finished: nothing runs and every target ran its action or is already
   // there, or a Stop ended the group.
@@ -140,10 +142,14 @@ export function stepProgress(
     } else if (state.action !== undefined) {
       done = false;
     } else if (state.fault !== undefined) {
-      if (ran(state) || groupFinished) failures.push({ componentId, text: codedErrorText(state.fault) });
-      else done = false;
+      // A fault after this step's own failed action keeps that action's code.
+      const failedCode = last !== undefined && last.action === step.action && last.outcome !== 'succeeded'
+        && ran(state) ? last.error?.code : undefined;
+      if (ran(state) || groupFinished) {
+        failures.push({ componentId, text: codedErrorText(state.fault), ...(failedCode ? { code: failedCode } : {}) });
+      } else done = false;
     } else if (last !== undefined && last.action === step.action && last.outcome !== 'succeeded' && ran(state)) {
-      failures.push({ componentId, text: actionResultText(last) });
+      failures.push({ componentId, text: actionResultText(last), ...(last.error ? { code: last.error.code } : {}) });
     } else if (!reached(state)) {
       if (stopped && groupFinished && !ran(state)) {
         failures.push({ componentId, text: codedErrorText({ code: 'component_action_interrupted_by_stop', message: '' }) });

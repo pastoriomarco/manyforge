@@ -34,6 +34,22 @@ from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 
+# The browser's application-start id and request keys on the new wire.
+_A = "3f9a0000000000a1"
+
+
+def _command_reply(kind: str) -> dict:
+    """A runner command's reply at acceptance (OD-214)."""
+
+    return {"schema_version": "manyforge.program_command_reply.v1", "command": {
+        "kind": kind, "request_key": "f" * 32, "step": None,
+        "accepted_at_ns": "1", "end": None}}
+
+
+def _key(number: int) -> str:
+    return f"{number:032x}"
+
+
 _BINDING_FIXTURE = (
     Path(__file__).resolve().parents[2]
     / "manyforge_deployment/resources/program_binding_lite6_native.fixture.json"
@@ -68,14 +84,13 @@ def _runtime() -> dict[str, Any]:
             "known_gaps": [],
             "payload": {},
             "source_generation": generation,
-            "source_owner_epoch": f"{owner}.epoch.1",
             "source_owner_id": owner,
         }
 
     return {
-        "schema_version": "manyforge.headless_runtime_snapshot.v1",
+        "schema_version": "manyforge.headless_runtime_snapshot.v3",
         "complete": True,
-        "projection_owner_epoch": "projection.epoch.1",
+        "application_start_id": "3f9a0000000000a1",
         "projection_owner_id": "headless.owner",
         "projection_generation": 4,
         "reasons": [],
@@ -90,8 +105,7 @@ def _runtime() -> dict[str, Any]:
 
 def _alarms() -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.operator_alarm_snapshot.v2",
-        "owner_epoch": "alarm.epoch.1",
+        "schema_version": "manyforge.operator_alarm_snapshot.v3",
         "generation": 3,
         "state_revision": 5,
         "alarms": [],
@@ -101,12 +115,12 @@ def _alarms() -> dict[str, Any]:
 
 def _execution_observation() -> dict[str, Any]:
     return {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "command": "observation",
         "ok": True,
         "observation": {
-            "schema_version": "manyforge.execution_observation.v4",
-            "owner_epoch": "execution.epoch.1",
+            "schema_version": "manyforge.execution_observation.v5",
+            "application_start_id": "execution.epoch.1",
             "cell_id": "cell-a",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
@@ -132,17 +146,16 @@ def _execution_observation() -> dict[str, Any]:
 
 def _scene_body(
     *,
-    request_id: str = "request.scene.1",
+    request_key: str = _key(0x5C1),
     scene_resource_id: str = "part.1",
 ) -> dict[str, Any]:
     scene_id = "sha256:" + "d" * 64
     return {
         "request_context": {
-            "request_id": request_id,
-            "request_owner_epoch": "scene-owner.epoch.7",
+            "request_key": request_key,
             "source_label": "composer_ui",
-            "correlation_id": None,
         },
+        "application_start_id": _A,
         "expected_projection_revision": {
             "retained_bundle_id": "sha256:" + "b" * 64,
             "graph_revision": "sha256:" + "c" * 64,
@@ -165,14 +178,13 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
     digest_b = "sha256:" + "b" * 64
     digest_c = "sha256:" + "c" * 64
     return {
-        "schema_version": "manyforge.program_run_status.v4",
+        "schema_version": "manyforge.program_run_status.v5",
         "owner_id": "program-runner.cell-a",
-        "owner_epoch": "program-runner.epoch.1",
         "run_revision": 1,
         "state": state,
         "capture": {
-            "schema_version": "manyforge.program_run_capture.v2",
-            "program_run_id": "program-run.1",
+            "schema_version": "manyforge.program_run_capture.v3",
+            "program_run_id": 1,
             "applied_record_digest": digest_c,
             "scenario_id": "cell-pick",
             "source_document_digest": digest_a,
@@ -186,9 +198,8 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
             "node_policy_digest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
             "owner_identities": [
                 {
-                    "owner_role": "program_runner",
-                    "owner_id": "program-runner.cell-a",
-                    "owner_epoch": "program-runner.epoch.1",
+                    "role": "program_runner",
+                    "application_start_id": "3f9a0000000000a1",
                 }
             ],
         },
@@ -200,6 +211,7 @@ def _program_run_status(*, state: str = "running") -> dict[str, Any]:
         "message": "",
         "details": None,
         "origin": None,
+        "halt": None,
     }
 
 
@@ -215,7 +227,7 @@ def headless_client() -> (
         for item in build_executable_node_resolver(environment).dispositions
     }
     node_environment = {
-        "schema_version": "manyforge.node_environment_projection.v2",
+        "schema_version": "manyforge.node_environment_projection.v3",
         "retained_bundle_id": "bundle.1",
         "graph_revision": "graph.1",
         "catalog_id": manifest.catalog_id,
@@ -281,24 +293,21 @@ def headless_client() -> (
         },
         "source": {
             "projection_generation": 4,
-            "projection_owner_epoch": "projection.epoch.1",
             "available": True,
             "freshness": "fresh",
             "known_gaps": [],
             "receiver_age_ns": 10,
             "source_generation": 2,
-            "source_owner_epoch": "manager.epoch.1",
             "source_owner_id": "component-manager.cell-a",
             "source_content_digest": "sha256:" + "a" * 64,
             "selection_projection_generation": 4,
             "selection_source_content_digest": "sha256:" + "a" * 64,
             "selection_source_generation": 2,
-            "selection_source_owner_epoch": "manager.epoch.1",
             "selection_source_owner_id": "component-manager.cell-a",
         },
     }
     source_model = {
-        "schema_version": "manyforge.source_model_projection.v3",
+        "schema_version": "manyforge.source_model_projection.v4",
         "cell_id": "cell-a",
         "retained_bundle_id": "bundle.1",
         "graph_revision": "graph.1",
@@ -312,16 +321,13 @@ def headless_client() -> (
             "freshness": "fresh",
             "known_gaps": [],
             "projection_generation": 1,
-            "projection_owner_epoch": "source-model-projection.epoch.1",
             "receiver_age_ns": 10,
             "selection_projection_generation": 4,
             "selection_source_content_digest": "sha256:" + "a" * 64,
             "selection_source_generation": 2,
-            "selection_source_owner_epoch": "manager.epoch.1",
             "selection_source_owner_id": "component-manager.cell-a",
             "source_content_digest": "",
             "source_generation": 1,
-            "source_owner_epoch": "source-model.epoch.1",
             "source_owner_id": "headless-api.source-model",
             "source_owner_kind": "source_model_projection",
         },
@@ -331,7 +337,7 @@ def headless_client() -> (
             (
                 CONTENT_IDENTITY_PREFIX,
                 b"manyforge-source-model-projection-semantic",
-                b"manyforge.source_model_projection.v3",
+                b"manyforge.source_model_projection.v4",
                 canonical_json_bytes(
                     {
                         key: value
@@ -374,30 +380,15 @@ def headless_client() -> (
                 "authoring_allowed": True,
                 "admission_generation": 7,
             }
-        elif path == "/api/program/authoring-transactions/recovery-receipt":
-            payload = {
-                "recovery_receipt": {
-                    "status": "unknown",
-                    "kernel_owner_epoch": "kernel.1",
-                    "held_claims": [],
-                    "current_owner_epochs": [],
-                }
-            }
-        elif path == "/api/program/authoring-transactions/reconcile-owner":
-            payload = {
-                "admission": {
-                    "authoring_allowed": True,
-                    "admission_generation": 7,
-                }
-            }
         elif path == "/api/program/authoring-transactions":
             intent = {
                 "claim_kind": "authoring_mutation",
-                "owner_role": "authoring_owner",
-                "owner_epoch": body["request_owner_epoch"],
-                "owner_transaction_id": body["owner_transaction_id"],
-                "request_id": body["request_id"],
-                "request_payload_digest": body["request_payload_digest"],
+                "owner": {
+                    "role": "authoring_owner",
+                    "application_start_id": body["application_start_id"],
+                },
+                "owner_transaction_id": None,
+                "request_key": body["request_key"],
                 "expected_admission_generation": body["expected_admission_generation"],
                 "scope": {"resources": [], "configurations": []},
                 "program_cycle_evidence": None,
@@ -425,15 +416,14 @@ def headless_client() -> (
             }
         elif path == "/api/control/state":
             payload = {
-                "schema_version": "manyforge.execution_control_projection.v1",
-                "semantic_owner_epoch": "program-runner.epoch.1",
+                "schema_version": "manyforge.execution_control_projection.v2",
                 "execution_control_revision": 4,
             }
         elif path == "/api/control/commands":
             payload = {
                 "receipt": {
-                    "schema_version": "manyforge.execution_command_receipt.v1",
-                    "correlation_id": body["command_envelope"]["correlation_id"],
+                    "schema_version": "manyforge.execution_command_receipt.v3",
+                    "client_sequence": body["command_envelope"].get("client_sequence"),
                     "disposition": "received",
                 },
                 "result": {"accepted": True},
@@ -442,12 +432,11 @@ def headless_client() -> (
             payload = _runtime()
         elif path == "/api/manager/status":
             payload = {
-                "schema_version": "manyforge.manager_status_projection.v1",
+                "schema_version": "manyforge.manager_status_projection.v2",
                 "source": {
                     "available": True,
                     "freshness": "fresh",
                     "known_gaps": [],
-                    "source_owner_epoch": "manager.epoch.1",
                 },
                 "status": {
                     "manager_ready": True,
@@ -459,10 +448,10 @@ def headless_client() -> (
                 },
             }
         elif path == "/api/manager/graph":
-            payload = {"schema_version": "manyforge.manager_graph_projection.v1"}
+            payload = {"schema_version": "manyforge.manager_graph_projection.v2"}
         elif path == "/api/manager/diff":
             payload = {
-                "schema_version": "manyforge.manager_diff_projection.v1",
+                "schema_version": "manyforge.manager_diff_projection.v2",
                 "source": {
                     "available": True,
                     "freshness": "fresh",
@@ -479,37 +468,25 @@ def headless_client() -> (
         elif path == "/api/program/runs" and request.method == "GET":
             active_only = request.url.params.get("active_only") == "true"
             payload = {
-                "schema_version": "manyforge.program_run_index.v2",
+                "schema_version": "manyforge.program_run_index.v3",
                 "owner_id": "program-runner.cell-a",
-                "owner_epoch": "program-runner.epoch.1",
+                "application_start_id": "3f9a0000000000a1",
                 "active_only": active_only,
                 "truncated": False,
                 "runs": [],
             }
         elif path == "/api/program/runs" and request.method == "POST":
+            payload = _command_reply("start")
+        elif path == "/api/program/runs/1":
             payload = _program_run_status()
-        elif path == "/api/program/runs/program-run.1":
-            payload = _program_run_status()
-        elif path == "/api/program/runs/program-run.1/stop":
-            payload = _program_run_status(state="stopping")
-        elif path == "/api/program/runs/program-run.1/motion-stop":
+        elif path == "/api/program/runs/1/motion-stop":
             payload = _program_run_status(state="running")
-        elif path == "/api/program/runs/program-run.1/motion-start":
-            payload = _program_run_status(state="running")
-        elif path == "/api/program/runs/program-run.1/full-stop":
-            payload = _program_run_status(state="full_stopping")
-        elif path == "/api/program/runs/program-run.1/resume-full-stop":
-            payload = _program_run_status(state="running")
-        elif path == "/api/program/runs/program-run.1/reset":
-            payload = {
-                "schema_version": "manyforge.program_cycle_reset_result.v1",
-                "program_run_id": "program-run.1",
-                "reset_cycle_generation": 4,
-                "idle_cycle_generation": 5,
-                "settlement_reference": "sha256:" + "d" * 64,
-                "admission": {},
-                "runtime_controls": None,
-            }
+        elif path == "/api/program/runs/1/motion-start":
+            payload = _command_reply("start_motion")
+        elif path == "/api/program/runs/1/resume-halt":
+            payload = _command_reply("resume_halt")
+        elif path == "/api/program/runs/1/reset":
+            payload = _command_reply("reset")
         elif path == "/api/program/applied":
             return httpx.Response(
                 404,
@@ -523,13 +500,13 @@ def headless_client() -> (
             )
         elif path == "/api/assistant/modes":
             payload = {
-                "schema_version": "manyforge.assistant_mode_index.v2",
+                "schema_version": "manyforge.assistant_mode_index.v3",
                 "assistant_component_id": "assistant",
                 "modes": [{"mode": "composer-assistant", "runs_in": ["no_program_active"]}],
             }
         elif path == "/api/assistant/modes/composer-assistant":
             payload = {
-                "schema_version": "manyforge.assistant_mode_projection.v2",
+                "schema_version": "manyforge.assistant_mode_projection.v3",
                 "mode": "composer-assistant",
             }
         elif path == "/api/manager/apply":
@@ -546,30 +523,30 @@ def headless_client() -> (
             )
         elif path == "/api/manager/apply/acknowledge":
             payload = {
-                "api_version": "manyforge.manager_command_response.v2",
+                "api_version": "manyforge.manager_command_response.v3",
                 "apply_generation": int(request.url.params["apply_generation"]),
-                "apply_id": request.url.params["apply_id"],
+                "apply_id": int(request.url.params["apply_id"]),
                 "failure_acknowledgement": "acknowledged",
                 "ok": True,
                 "state": "failed",
             }
         elif path in {
             "/api/execution/stops",
-            "/api/execution/full-stop",
+            "/api/execution/stop-all",
+            "/api/execution/halt",
             "/api/execution/runtime-scale-control",
         } or path.startswith("/api/execution/operations/"):
             payload = {
-                "api_version": "manyforge.execution_command_response.v4",
+                "api_version": "manyforge.execution_command_response.v6",
                 "ok": True,
-                "operation": {"operation_id": "operation-1"},
+                "operation": {"operation_id": 1},
             }
         elif path == "/api/execution/manual-handover":
             payload = {
-                "api_version": "manyforge.execution_command_response.v4",
+                "api_version": "manyforge.execution_command_response.v6",
                 "command": "read_manual_handover",
                 "ok": True,
-                "request_id": body["request_context"]["request_id"],
-                "request_owner_epoch": body["request_context"]["request_owner_epoch"],
+                "request_key": body["request_context"]["request_key"],
                 "manual_handover": None,
                 "availability": {
                     "available": False,
@@ -582,7 +559,7 @@ def headless_client() -> (
             "/api/execution/capability-command-previews",
         }:
             payload = {
-                "api_version": "manyforge.execution_command_response.v4",
+                "api_version": "manyforge.execution_command_response.v6",
                 "command": (
                     "preview_motion"
                     if path.endswith("motion-previews")
@@ -596,7 +573,7 @@ def headless_client() -> (
                 return httpx.Response(
                     404,
                     json={
-                        "api_version": "manyforge.manager_command_response.v2",
+                        "api_version": "manyforge.manager_command_response.v3",
                         "committed_projection_revision": None,
                         "error": {
                             "code": "object_not_found",
@@ -606,17 +583,14 @@ def headless_client() -> (
                         "ok": False,
                         "projection_status": "not_attempted",
                         "replay_status": "accepted_new",
-                        "request_id": "request.scene.missing",
-                        "request_owner_epoch": body["request_context"][
-                            "request_owner_epoch"
-                        ],
+                        "request_key": _key(0x5C2),
                         "transaction_sequence": None,
                         "update_status": None,
                     },
                     request=request,
                 )
             payload = {
-                "api_version": "manyforge.manager_command_response.v2",
+                "api_version": "manyforge.manager_command_response.v3",
                 "committed_projection_revision": {
                     "retained_bundle_id": "sha256:" + "b" * 64,
                     "graph_revision": "sha256:" + "c" * 64,
@@ -630,22 +604,21 @@ def headless_client() -> (
                 "ok": True,
                 "projection_status": "committed",
                 "replay_status": "accepted_new",
-                "request_id": "request.scene.1",
-                "request_owner_epoch": body["request_context"]["request_owner_epoch"],
+                "request_key": _key(0x5C1),
                 "transaction_sequence": 1,
                 "update_status": "geometry_changed",
             }
         elif path == "/api/scene":
-            payload = {"schema_version": "manyforge.scene_projection.v1"}
+            payload = {"schema_version": "manyforge.scene_projection.v2"}
         elif path == "/api/execution/alarms":
             payload = _alarms()
         elif path == "/api/execution/alarms/metrics":
-            payload = {"schema_version": "manyforge.operator_alarm_metrics.v1"}
+            payload = {"schema_version": "manyforge.operator_alarm_metrics.v2"}
         elif path.endswith("/acknowledge") or path.endswith("/acknowledge-all"):
             payload = {"schema_version": "manyforge.headless_api_mutation_response.v1"}
         elif path == "/api/execution/history":
             payload = {
-                "schema_version": "manyforge.historian_summary_page.v2",
+                "schema_version": "manyforge.historian_summary_page.v3",
                 "events": [],
             }
         elif path == "/api/execution/history/captures":
@@ -654,10 +627,10 @@ def headless_client() -> (
                 "captures": [],
                 "query": dict(request.url.params),
             }
-        elif path == "/api/execution/program-runs/run-1/admitted-speeds":
+        elif path == "/api/execution/program-runs/1/admitted-speeds":
             payload = {
-                "schema_version": "manyforge.program_run_admitted_speeds.v1",
-                "program_run_id": "run-1",
+                "schema_version": "manyforge.program_run_admitted_speeds.v2",
+                "program_run_id": 1,
                 "targets": [],
             }
         elif path == "/api/execution/history/health":
@@ -665,15 +638,36 @@ def headless_client() -> (
                 "schema_version": "manyforge.historian_health.v1",
                 "available": True,
             }
-        elif path == "/api/execution/history/reconcile":
-            payload = {
-                "schema_version": "manyforge.historian_reconciliation.v1",
-                "reconciled": True,
-            }
         elif path.startswith("/api/program/persistent-values"):
+            payload = (
+                {"forwarded": path}
+                if request.method == "GET"
+                else _command_reply({"/clear": "persistent_values_clear",
+                                     "/reset": "persistent_value_reset"}.get(
+                                         path[len("/api/program/persistent-values"):],
+                                         "persistent_value_set"))
+            )
+        elif path == "/api/program/runs/7/node-correction-previews":
             payload = {"forwarded": path}
-        elif path == "/api/program/runs/program-run.7/node-correction-previews":
-            payload = {"forwarded": path}
+        elif path.startswith("/api/execution/pick-place/plans/job-1"):
+            payload = (
+                {
+                    "api_version": "manyforge.execution_command_response.v6",
+                    "command": "release_planning_job",
+                    "ok": True,
+                }
+                if path.endswith("/release")
+                else {
+                    "api_version": "manyforge.execution_command_response.v6",
+                    "command": (
+                        "cancel_planning_job"
+                        if path.endswith("/cancel")
+                        else "read_planning_job"
+                    ),
+                    "ok": True,
+                    "planning_job": {"job_id": "job-1", "state": "planning"},
+                }
+            )
         else:
             return httpx.Response(404, json={"detail": "unknown"}, request=request)
         return httpx.Response(200, json=payload, request=request)
@@ -732,8 +726,8 @@ class _ComposerTestClient(TestClient):
             json = {
                 **json,
                 "expectedAdmissionGeneration": 7,
-                "requestOwnerEpoch": "test-browser.epoch.1",
-                "requestId": f"test-browser.request.{self._authoring_sequence}",
+                "applicationStartId": _A,
+                "requestKey": _key(self._authoring_sequence),
             }
             json.setdefault("expectedWorkspaceEpoch", workspace.workspace_epoch)
             json.setdefault(
@@ -745,12 +739,12 @@ class _ComposerTestClient(TestClient):
 def _composer(client: HeadlessHttpClient) -> TestClient:
     state_root = tempfile.mkdtemp(prefix="manyforge-composer-journal-")
     return _ComposerTestClient(
-        ComposerState(headless_client=client)
+        ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=client)
     )
 
 
 def _composer_with_program(client: HeadlessHttpClient) -> TestClient:
-    state = ComposerState.from_paths(
+    state = ComposerState.from_paths(application_start_id=0x3F9A0000000000A1,
         program_path=str(_PROGRAM_PATH),
         allowed_fs_roots=[str(_ROOT / "examples")],
         headless_client=client,
@@ -781,42 +775,50 @@ def test_public_control_rest_contract_is_a_strict_transparent_adapter(
     headless_client,
 ) -> None:
     client, requests, _node_environment = headless_client
-    command = {
-        "command_envelope": {
-            "schema_version": "manyforge.execution_command.v1",
-            "command_kind": "program_stop",
-            "correlation_id": "request.external.stop.1",
-            "source_label": "external_supervisor",
-            "control_session_id": None,
-            "client_sequence": None,
-            "freshness": {
-                "context_id": "freshness.1",
-                "receiver_incarnation": "headless.receiver.1",
-                "semantic_owner_epoch": "program-runner.epoch.1",
-                "execution_control_revision": 4,
-                "issued_server_sequence": "1",
-                "valid_for_ns": 750_000_000,
-            },
-            "expected_semantic_owner_epoch": "program-runner.epoch.1",
-            "expected_execution_control_revision": 4,
+    envelope = {
+        "schema_version": "manyforge.execution_command.v2",
+        "command_kind": "operation_stop",
+        "request_key": _key(0xE1),
+        "application_start_id": _A,
+        "source_label": "external_supervisor",
+        "control_session_number": None,
+        "client_sequence": None,
+        "freshness": {
+            "context_id": "freshness.1",
+            "execution_control_revision": 4,
+            "issued_server_sequence": "1",
+            "valid_for_ns": 750_000_000,
         },
+        "expected_execution_control_revision": 4,
+    }
+    stop = {"command_envelope": envelope, "payload": {}}
+    ordinary = {
+        "command_envelope": {**envelope, "command_kind": "operation_reset"},
         "payload": {},
     }
     with _composer(client) as composer:
         projection = composer.get("/api/control/state")
-        accepted = composer.post("/api/control/commands", json=command)
+        accepted = composer.post("/api/control/commands", json=stop)
+        # A Stop kind is forwarded unchanged even when it is malformed.
+        malformed_stop = composer.post(
+            "/api/control/commands", json={**stop, "unexpected": True}
+        )
         malformed = composer.post(
-            "/api/control/commands",
-            json={**command, "unexpected": True},
+            "/api/control/commands", json={**ordinary, "unexpected": True}
         )
 
     assert projection.json()["execution_control_revision"] == 4
-    assert accepted.json()["receipt"]["correlation_id"] == ("request.external.stop.1")
+    assert accepted.status_code == 200, accepted.text
+    assert malformed_stop.status_code == 200, malformed_stop.text
+    assert malformed.status_code == 422
     forwarded = [item for item in requests if item["path"].startswith("/api/control/")]
     assert [(item["method"], item["path"]) for item in forwarded] == [
         ("GET", "/api/control/state"),
         ("POST", "/api/control/commands"),
+        ("POST", "/api/control/commands"),
     ]
+    assert forwarded[1]["body"] == stop
+    assert forwarded[2]["body"] == {**stop, "unexpected": True}
 
 
 def _without_authoring_owner_calls(
@@ -890,7 +892,9 @@ def test_composer_passes_a_run_failure_record_through_unchanged() -> None:
     }
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/api/program/runs/program-run.1"
+        assert request.url.path == "/api/program/runs/1"
+        # The browser's `A` is forwarded unchanged as the read's query parameter.
+        assert request.url.params["application_start_id"] == _A
         return httpx.Response(200, json=failed, request=request)
 
     raw = httpx.Client(
@@ -899,9 +903,11 @@ def test_composer_passes_a_run_failure_record_through_unchanged() -> None:
     )
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
-        state = ComposerState(headless_client=client)
+        state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=client)
         state.authoring_admission = None
-        response = TestClient(create_app(state)).get("/api/program/runs/program-run.1")
+        response = TestClient(create_app(state)).get(
+            "/api/program/runs/1", params={"application_start_id": _A}
+        )
     finally:
         raw.close()
     assert response.status_code == 200
@@ -910,10 +916,9 @@ def test_composer_passes_a_run_failure_record_through_unchanged() -> None:
 
 def _caller() -> dict[str, Any]:
     return {
-        "request_id": "request.1",
-        "request_owner_epoch": "alarm.epoch.1",
+        "request_key": _key(1),
+        "application_start_id": _A,
         "source_label": "composer_ui",
-        "correlation_id": None,
     }
 
 
@@ -922,19 +927,19 @@ def test_composer_proxies_direct_scene_clear_without_repeating_it():
         calls = []
         def program_scene_prepare(self, body):
             self.calls.append(body)
-            return {"scene_clear": {"request_id": body["request_id"], "state": "succeeded",
+            return {"scene_clear": {"request_key": body["request_key"], "state": "succeeded",
                                     "remaining": [], "reason": None}}
 
     client = Client()
     app = FastAPI()
-    app.include_router(create_headless_router(client, ComposerState()))
-    body = {"request_id": "clear.1", "request_owner_epoch": "runner.1", "source_label": "composer_ui",
+    app.include_router(create_headless_router(client, ComposerState(application_start_id=0x3F9A0000000000A1)))
+    body = {"request_key": _key(0xC1), "application_start_id": _A, "source_label": "composer_ui",
             "expected_applied_record_digest": None, "expected_admission_generation": 1,
             "clear_empty_scene": True, "expected_publication_generation": 1}
     with TestClient(app) as composer:
         response = composer.post("/api/program/scene-preparations", json=body)
     assert response.status_code == 200
-    assert response.json()["scene_clear"]["request_id"] == "clear.1"
+    assert response.json()["scene_clear"]["request_key"] == _key(0xC1)
     assert len(client.calls) == 1 and client.calls[0]["expected_publication_generation"] == 1
 
 
@@ -965,7 +970,7 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
             {"mode": "composer-assistant", "runs_in": ["no_program_active"]}
         ]
         assert composer.get("/api/source-model").json()["schema_version"] == (
-            "manyforge.source_model_projection.v3"
+            "manyforge.source_model_projection.v4"
         )
         catalog = composer.get("/api/catalog").json()
         assert catalog["environmentDigest"] == node_environment["environment_digest"]
@@ -986,9 +991,12 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
         captures = composer.get("/api/execution/history/captures?limit=4")
         assert captures.status_code == 200, captures.text
         assert captures.json()["query"] == {"limit": "4"}
-        admitted = composer.get("/api/execution/program-runs/run-1/admitted-speeds")
+        admitted = composer.get(
+            "/api/execution/program-runs/1/admitted-speeds",
+            params={"application_start_id": _A},
+        )
         assert admitted.status_code == 200, admitted.text
-        assert admitted.json()["program_run_id"] == "run-1"
+        assert admitted.json()["program_run_id"] == 1
 
     assert all(
         item["method"] == "GET" for item in _without_authoring_owner_calls(requests)
@@ -1009,7 +1017,7 @@ def test_composer_source_model_uses_one_coherent_context_request(
         response = composer.get("/api/source-model")
 
     assert response.status_code == 200
-    assert response.json()["schema_version"] == ("manyforge.source_model_projection.v3")
+    assert response.json()["schema_version"] == ("manyforge.source_model_projection.v4")
     assert [
         item["path"]
         for item in requests
@@ -1030,26 +1038,29 @@ def test_composer_proxies_apply_acknowledgement_as_post_with_query_identity(
     with _composer(client) as composer:
         response = composer.post(
             "/api/manager/apply/acknowledge",
-            params={"apply_id": "apply-7", "apply_generation": 7},
-            json={"request_context": {
-                "request_id": "composer-ack.request.7",
-                "source_label": "manyforge_composer",
-            }},
+            params={"apply_id": 7, "apply_generation": 7},
+            json={
+                "request_context": {
+                    "request_key": _key(7),
+                    "source_label": "manyforge_composer",
+                },
+                "application_start_id": _A,
+            },
         )
 
     assert response.status_code == 200
     assert response.json()["failure_acknowledgement"] == "acknowledged"
-    # Composer startup recovers its authoring owner; isolate the forwarding
-    # assertion while still checking for any other non-startup request.
+    # The validated body (request context and `A`) is forwarded unchanged.
     assert _without_authoring_owner_calls(requests) == [{
         "method": "POST",
         "path": "/api/manager/apply/acknowledge",
-        "query": "apply_id=apply-7&apply_generation=7",
+        "query": "apply_id=7&apply_generation=7",
         "body": {
             "request_context": {
-                "request_id": "composer-ack.request.7",
+                "request_key": _key(7),
                 "source_label": "manyforge_composer",
-            }
+            },
+            "application_start_id": _A,
         },
     }]
 
@@ -1060,23 +1071,19 @@ def test_composer_program_routes_forward_when_draft_matches_applied(
     client, requests, _node_environment = headless_client
     digest_a = "sha256:" + "a" * 64
     start = {
-        "request_id": "request.program.1",
-        "request_owner_epoch": "composer.epoch.1",
+        "request_key": _key(0x101),
+        "application_start_id": _A,
         "source_label": "operator_ui",
-        "correlation_id": None,
         "scenario_id": "cell-pick",
         "source_document_digest": digest_a,
         "expected_applied_record_digest": "sha256:" + "b" * 64,
         # Run carries no admission generation; the server uses its current one.
     }
-    stop = {
-        "request_id": "request.program.2",
-        "request_owner_epoch": "composer.epoch.1",
+    selection = {
+        "application_start_id": _A,
         "source_label": "operator_ui",
-        "correlation_id": None,
-        "program_run_id": "program-run.1",
-        "expected_owner_epoch": "program-runner.epoch.1",
-        "reason": "operator stop",
+        "program_run_id": 1,
+        "reason": "operator motion",
     }
 
     with _composer_with_program(client) as composer:
@@ -1093,74 +1100,80 @@ def test_composer_program_routes_forward_when_draft_matches_applied(
             == []
         )
         started = composer.post("/api/program/runs", json=start)
-        read = composer.get("/api/program/runs/program-run.1")
+        read = composer.get("/api/program/runs/1", params={"application_start_id": _A})
         motion_stopped = composer.post(
-            "/api/program/runs/program-run.1/motion-stop",
+            "/api/program/runs/1/motion-stop",
             json={
-                **stop,
-                "request_id": "request.program.motion-stop.1",
+                **selection,
+                "request_key": _key(0x102),
+                "group_ids": ["all"],
                 "reason": "ordinary operator motion Stop",
             },
         )
         motion_started = composer.post(
-            "/api/program/runs/program-run.1/motion-start",
+            "/api/program/runs/1/motion-start",
             json={
-                **stop,
-                "request_id": "request.program.motion-start.1",
-                "expected_selection_revision": 0,
+                **selection,
+                "request_key": _key(0x103),
+                "expected_hold_revision": 0,
                 "reason": "initial operator motion Run",
             },
         )
-        full_stopped = composer.post(
-            "/api/program/runs/program-run.1/full-stop",
-            json={
-                **stop,
-                "request_id": "request.program.full-stop.1",
-                "reason": "ordinary operator Full Stop",
-            },
+        # The Program's own Halt route is gone: Halt names no run.
+        removed_halt = composer.post(
+            "/api/program/runs/1/full-stop",
+            json={**selection, "request_key": _key(0x104)},
         )
         resumed = composer.post(
-            "/api/program/runs/program-run.1/resume-full-stop",
+            "/api/program/runs/1/resume-halt",
             json={
                 **_caller(),
-                "request_id": "request.program.resume-full-stop.1",
-                "program_run_id": "program-run.1",
-                "expected_owner_epoch": "program-runner.epoch.1",
+                "request_key": _key(0x105),
+                "program_run_id": 1,
                 "expected_run_revision": 1,
-                "reason": "operator Run after Full Stop",
+                "reason": "operator Execute after Halt",
             },
         )
         reset = composer.post(
-            "/api/program/runs/program-run.1/reset",
+            "/api/program/runs/1/reset",
             json={
                 **_caller(),
-                "request_id": "request.program.reset-full-stop.1",
-                "program_run_id": "program-run.1",
-                "expected_owner_epoch": "program-runner.epoch.1",
+                "request_key": _key(0x106),
+                "program_run_id": 1,
                 "expected_run_revision": 1,
                 "expected_cycle_generation": 4,
                 "expected_claim_generation": 7,
-                "reason": "operator Reset discarded Full Stop",
+                "reason": "operator Reset discarded Halt",
             },
         )
-        stopped = composer.post(
-            "/api/program/runs/program-run.1/stop",
-            json=stop,
-        )
         mismatch = composer.post(
-            "/api/program/runs/another-run/stop",
-            json=stop,
+            "/api/program/runs/2/resume-halt",
+            json={
+                **_caller(),
+                "request_key": _key(0x107),
+                "program_run_id": 1,
+                "expected_run_revision": 1,
+                "reason": "operator Execute after Halt",
+            },
+        )
+        # The public Program Stop proxy is gone.
+        removed = composer.post(
+            "/api/program/runs/1/stop",
+            json={**selection, "request_key": _key(0x108)},
         )
 
     assert started.status_code == 200
-    assert read.json()["capture"]["program_run_id"] == "program-run.1"
+    # Runner commands answer at acceptance; the Composer forwards the reply
+    # unchanged (OD-214).
+    assert started.json() == _command_reply("start")
+    assert read.json()["capture"]["program_run_id"] == 1
     assert motion_stopped.json()["state"] == "running"
-    assert motion_started.json()["state"] == "running"
-    assert full_stopped.json()["state"] == "full_stopping"
-    assert resumed.json()["state"] == "running"
-    assert reset.json()["idle_cycle_generation"] == 5
-    assert stopped.json()["state"] == "stopping"
+    assert motion_started.json() == _command_reply("start_motion")
+    assert removed_halt.status_code == 503
+    assert resumed.json() == _command_reply("resume_halt")
+    assert reset.json() == _command_reply("reset")
     assert mismatch.status_code == 400
+    assert removed.status_code == 503
     forwarded = [
         request
         for request in requests
@@ -1174,9 +1187,12 @@ def test_composer_program_routes_forward_when_draft_matches_applied(
         "POST",
         "POST",
         "POST",
-        "POST",
-        "POST",
     ]
+    assert forwarded[2]["query"] == f"application_start_id={_A}"
+    # Every effectful request carries the browser's key and `A` unchanged.
+    for request in forwarded[3:]:
+        assert request["body"]["application_start_id"] == _A
+        assert len(request["body"]["request_key"]) == 32
 
 
 def test_composer_forwards_only_strict_attributed_alarm_intent(
@@ -1212,30 +1228,30 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
 ) -> None:
     client, requests, _node_environment = headless_client
     context = {
-        "request_id": "request.control.1",
-        "request_owner_epoch": "execution.epoch.1",
+        "request_key": _key(0xC0),
         "source_label": "composer_ui",
-        "correlation_id": None,
     }
     control = {
         "request_context": context,
-        "operation_id": "operation-1",
+        "application_start_id": _A,
+        "operation_id": 1,
         "expected_operation_revision": 3,
         "reason": None,
     }
     stop = {
         "request_context": context,
+        "application_start_id": _A,
         "operations": [
             {
-                "operation_id": "operation-1",
+                "operation_id": 1,
                 "expected_operation_revision": 3,
-                "expected_stop_generation": 0,
             }
         ],
         "reason": "operator Stop",
     }
     scale_control = {
         "request_context": context,
+        "application_start_id": _A,
         "selector": {
             "program_binding_id": "binding-1",
             "component_id": "robot",
@@ -1244,24 +1260,30 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         "expected_control_generation": 0,
         "scale": 0.5,
     }
-    full_stop = {
+    stop_all = {
         "request_context": {
             **context,
-            "request_id": "request.full-stop.1",
+            "request_key": _key(0xF5),
         },
-        "expected_stop_generation": 0,
+    }
+    halt = {
+        "request_context": {
+            **context,
+            "request_key": _key(0xF6),
+        },
     }
     with _composer(client) as composer:
         for endpoint in ("reset", "acknowledge-completed"):
             response = composer.post(
-                f"/api/execution/operations/operation-1/{endpoint}",
+                f"/api/execution/operations/1/{endpoint}",
                 json=control,
             )
             assert response.status_code == 200, response.text
         assert composer.post("/api/execution/stops", json=stop).status_code == 200
         assert (
-            composer.post("/api/execution/full-stop", json=full_stop).status_code == 200
+            composer.post("/api/execution/stop-all", json=stop_all).status_code == 200
         )
+        assert composer.post("/api/execution/halt", json=halt).status_code == 200
         assert (
             composer.post(
                 "/api/execution/runtime-scale-control", json=scale_control
@@ -1341,15 +1363,20 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
             == 422
         )
         mismatch = composer.post(
-            "/api/execution/operations/operation-2/reset", json=control
+            "/api/execution/operations/2/reset", json=control
+        )
+        not_a_number = composer.post(
+            "/api/execution/operations/operation-1/reset", json=control
         )
 
     assert mismatch.status_code == 400
+    assert not_a_number.status_code == 422
     forwarded = [
         item
         for item in requests
-        if item["path"] == "/api/execution/stops"
-        or item["path"] == "/api/execution/full-stop"
+        if item["path"] in {
+            "/api/execution/stops", "/api/execution/stop-all", "/api/execution/halt",
+        }
         or item["path"].startswith("/api/execution/operations/")
         or item["path"] == "/api/execution/runtime-scale-control"
     ]
@@ -1357,41 +1384,39 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         "reset",
         "acknowledge-completed",
         "stops",
-        "full-stop",
+        "stop-all",
+        "halt",
         "runtime-scale-control",
         "runtime-scale-control",
         "runtime-scale-control",
     ]
     assert forwarded[0]["body"] == control
     assert forwarded[2]["body"] == stop
-    assert forwarded[3]["body"] == full_stop
-    assert forwarded[4]["body"] == scale_control
-    assert forwarded[5]["method"] == "GET"
+    assert forwarded[3]["body"] == stop_all
+    assert forwarded[4]["body"] == halt
+    assert forwarded[5]["body"] == scale_control
     assert forwarded[6]["method"] == "GET"
+    assert forwarded[7]["method"] == "GET"
     assert json.loads(
-        dict(parse_qsl(forwarded[6]["query"]))["group_targets"]
+        dict(parse_qsl(forwarded[7]["query"]))["group_targets"]
     ) == [
         {"component_id": "robot-a", "command_target_id": "arm"},
         {"component_id": "robot-b", "command_target_id": "arm"},
     ]
 
 
-def test_composer_preserves_recognized_malformed_stop_semantics(
+def test_composer_forwards_every_stop_body_unchanged_without_refusal(
     headless_client,
 ) -> None:
     client, requests, _node_environment = headless_client
+    # Operations and resources together: Headless, not Composer, decides.
     mixed = {
-        "request_context": {
-            "request_id": "request.mixed-stop.1",
-            "request_owner_epoch": "execution.epoch.1",
-            "source_label": "composer_ui",
-            "correlation_id": None,
-        },
+        "request_context": {"request_key": _key(0x51), "source_label": "composer_ui"},
+        "application_start_id": _A,
         "operations": [
             {
-                "operation_id": "operation-1",
+                "operation_id": 1,
                 "expected_operation_revision": 3,
-                "expected_stop_generation": 0,
             }
         ],
         "resources": [
@@ -1399,10 +1424,10 @@ def test_composer_preserves_recognized_malformed_stop_semantics(
                 "resource_id": "joint.1",
                 "expected_graph_revision": "sha256:" + "1" * 64,
                 "expected_operation_resource_generation": 4,
-                "expected_stop_generation": 0,
             }
         ],
     }
+    invalid_selection = {"program_run_id": "not-a-number", "group_ids": "all"}
 
     with _composer(client) as composer:
         malformed = composer.post(
@@ -1412,26 +1437,123 @@ def test_composer_preserves_recognized_malformed_stop_semantics(
         )
         mixed_response = composer.post("/api/execution/stops", json=mixed)
         oversized = composer.post(
-            "/api/execution/full-stop",
+            "/api/execution/stop-all",
+            content=b"x" * (1024 * 1024 + 1),
+            headers={"content-type": "application/json"},
+        )
+        not_an_object = composer.post("/api/execution/stop-all", json=[1, 2])
+        oversized_halt = composer.post(
+            "/api/execution/halt",
+            content=b"x" * (1024 * 1024 + 1),
+            headers={"content-type": "application/json"},
+        )
+        halt_not_an_object = composer.post("/api/execution/halt", json=[1, 2])
+        motion_stop = composer.post(
+            "/api/program/runs/1/motion-stop", json=invalid_selection
+        )
+        # The path segment of a Stop is forwarded as it is, never refused.
+        run_motion_stop = composer.post(
+            "/api/program/runs/run-a/motion-stop", json=invalid_selection
+        )
+        oversized_motion_stop = composer.post(
+            "/api/program/runs/1/motion-stop",
             content=b"x" * (1024 * 1024 + 1),
             headers={"content-type": "application/json"},
         )
 
-    assert malformed.status_code == 200, malformed.text
-    assert mixed_response.status_code == 200, mixed_response.text
-    assert oversized.status_code == 200, oversized.text
+    for response in (
+        malformed, mixed_response, oversized, not_an_object, oversized_halt,
+        halt_not_an_object,
+    ):
+        assert response.status_code == 200, response.text
     assert oversized.headers["connection"] == "close"
+    assert oversized_halt.headers["connection"] == "close"
+    # The fake owner answers only run 1; the run Stops reached it unchanged.
+    assert motion_stop.status_code == 200, motion_stop.text
+    assert run_motion_stop.status_code == 404
+    assert oversized_motion_stop.status_code == 200, oversized_motion_stop.text
+    assert oversized_motion_stop.headers["connection"] == "close"
     forwarded = [
-        item
+        (item["path"], item["body"])
         for item in requests
-        if item["path"] in {"/api/execution/stops", "/api/execution/full-stop"}
+        if item["path"] in {
+            "/api/execution/stops", "/api/execution/stop-all", "/api/execution/halt",
+        }
+        or item["path"].endswith("-stop")
     ]
-    assert [item["path"] for item in forwarded] == [
-        "/api/execution/stops",
-        "/api/execution/stops",
-        "/api/execution/full-stop",
+    assert forwarded == [
+        ("/api/execution/stops", {}),
+        ("/api/execution/stops", mixed),
+        ("/api/execution/stop-all", {}),
+        ("/api/execution/stop-all", {}),
+        ("/api/execution/halt", {}),
+        ("/api/execution/halt", {}),
+        ("/api/program/runs/1/motion-stop", invalid_selection),
+        ("/api/program/runs/run-a/motion-stop", invalid_selection),
+        ("/api/program/runs/1/motion-stop", {}),
     ]
-    assert all(item["body"] == {} for item in forwarded)
+
+
+def test_composer_stop_routes_never_answer_busy(headless_client) -> None:
+    """A full ordinary lane refuses ordinary work; every Stop still goes through."""
+
+    from manyforge_headless_api.execution_control import (
+        ExecutionControlBusyError,
+        ExecutionControlLane,
+    )
+
+    client, requests, _node_environment = headless_client
+
+    class SaturatedOrdinaryLane:
+        async def stop(self, callback):
+            return callback()
+
+        async def ordinary(self, _callback):
+            raise ExecutionControlBusyError(ExecutionControlLane.ORDINARY, 1)
+
+        def close(self) -> None:
+            pass
+
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=client)
+    app = FastAPI()
+    app.include_router(create_headless_router(client, state, SaturatedOrdinaryLane()))
+    stop_command = {
+        "command_envelope": {"command_kind": "operation_stop"},
+        "payload": {},
+    }
+    with TestClient(app) as composer:
+        ordinary = composer.post(
+            "/api/execution/runtime-scale-control",
+            json={
+                "request_context": {"request_key": _key(1), "source_label": "composer_ui"},
+                "application_start_id": _A,
+                "selector": {
+                    "program_binding_id": "binding-1",
+                    "component_id": "robot",
+                    "command_target_id": "arm",
+                },
+                "expected_control_generation": 0,
+                "scale": 0.5,
+            },
+        )
+        stops = [
+            composer.post("/api/execution/stops", json={}),
+            composer.post("/api/execution/stop-all", json={}),
+            composer.post("/api/execution/halt", json={}),
+            composer.post("/api/program/runs/1/motion-stop", json={}),
+            composer.post("/api/control/commands", json=stop_command),
+        ]
+
+    assert ordinary.status_code == 503
+    assert ordinary.json()["detail"]["code"] == "execution_control_ingress_busy"
+    assert [response.status_code for response in stops] == [200] * 5
+    assert [item["path"] for item in requests if item["method"] == "POST"] == [
+        "/api/execution/stops",
+        "/api/execution/stop-all",
+        "/api/execution/halt",
+        "/api/program/runs/1/motion-stop",
+        "/api/control/commands",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1449,15 +1571,14 @@ def test_composer_preview_and_handover_routes_are_strict_stateless_forwarders(
     client, requests, _node_environment = headless_client
     body = {
         "request_context": {
-            "request_id": "request.preview.1",
-            "request_owner_epoch": "execution.epoch.1",
+            "request_key": _key(0x9E),
             "source_label": "composer_ui",
-            "correlation_id": None,
         },
+        "application_start_id": _A,
         "program_id": "manyforge.direct_control.gripper",
         "program_revision": "sha256:" + "a" * 64,
         "program_binding_id": "sha256:" + "b" * 64,
-        "program_run_id": "direct-control-gripper-run.1",
+        "program_run_id": None,
         "expected_graph_revision": "sha256:" + "c" * 64,
         "expected_retained_bundle_id": "sha256:" + "d" * 64,
         "expected_scene_revision": {
@@ -1503,11 +1624,10 @@ def test_composer_preview_and_handover_routes_are_strict_stateless_forwarders(
     assert response.json()["command"] == command
     if command == "read_manual_handover":
         assert response.json() == {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": command,
             "ok": True,
-            "request_id": body["request_context"]["request_id"],
-            "request_owner_epoch": body["request_context"]["request_owner_epoch"],
+            "request_key": body["request_context"]["request_key"],
             "manual_handover": None,
             "availability": {
                 "available": False,
@@ -1558,11 +1678,10 @@ def test_composer_runtime_scene_transaction_omits_authoring_fences(
     client, requests, _node_environment = headless_client
     body = {
         "request_context": {
-            "request_id": "request.scene.attach",
-            "request_owner_epoch": "scene-owner.epoch.7",
+            "request_key": _key(0x5CA),
             "source_label": "composer_ui",
-            "correlation_id": None,
         },
+        "application_start_id": _A,
         "expected_projection_revision": _scene_body()["expected_projection_revision"],
         "operation": {
             "kind": "attach_carried_object",
@@ -1675,9 +1794,9 @@ def test_composer_rejects_draft_and_save_during_an_active_run(
             assert active_only is True
             assert limit == 1
             return {
-                "schema_version": "manyforge.program_run_index.v2",
+                "schema_version": "manyforge.program_run_index.v3",
                 "owner_id": "program-runner.cell-a",
-                "owner_epoch": "program-runner.epoch.1",
+                "application_start_id": "3f9a0000000000a1",
                 "active_only": True,
                 "truncated": False,
                 "runs": [_program_run_status()],
@@ -1692,7 +1811,7 @@ def test_composer_rejects_draft_and_save_during_an_active_run(
 
     program_path = tmp_path / "active.program.yaml"
     program_path.write_bytes(_PROGRAM_PATH.read_bytes())
-    state = ComposerState.from_paths(
+    state = ComposerState.from_paths(application_start_id=0x3F9A0000000000A1,
         program_path=str(program_path),
         allowed_fs_roots=[str(tmp_path)],
         headless_client=ActiveRunnerClient(),  # type: ignore[arg-type]
@@ -1853,10 +1972,18 @@ def test_program_revert_without_scenario_activation_input_has_no_effect(
                 "expectedDraftRevision": before["draft"]["draftRevision"],
             },
         )
+        # OD-214: the check runs after acceptance (in the preparation): the
+        # row ends refused, with no effect.
+        assert response.status_code == 200, response.text
+        ended = composer._composer_state.apply_commands.ended_row(
+            response.json()["command"]["request_key"]
+        )
         after = composer.get("/api/program/workspace").json()
 
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == ("activation_input_incomplete")
+    assert ended["kind"] == "program_revert"
+    assert (ended["end"]["outcome"], ended["end"]["code"]) == (
+        "refused", "activation_input_incomplete")
+    assert ended["step"] == "previewing"
     assert after["draft"] == before["draft"]
     assert after["saved"] == before["saved"]
     assert not any(
@@ -1869,14 +1996,14 @@ def test_composer_preserves_complete_scene_rejection(
 ) -> None:
     client, _requests, _node_environment = headless_client
     body = _scene_body(
-        request_id="request.scene.missing",
+        request_key=_key(0x5C2),
         scene_resource_id="missing-part",
     )
     with _composer(client) as composer:
         response = composer.post("/api/scene/transactions", json=body)
     assert response.status_code == 404
     assert response.json() == {
-        "api_version": "manyforge.manager_command_response.v2",
+        "api_version": "manyforge.manager_command_response.v3",
         "committed_projection_revision": None,
         "error": {
             "code": "object_not_found",
@@ -1886,8 +2013,7 @@ def test_composer_preserves_complete_scene_rejection(
         "ok": False,
         "projection_status": "not_attempted",
         "replay_status": "accepted_new",
-        "request_id": "request.scene.missing",
-        "request_owner_epoch": "scene-owner.epoch.7",
+        "request_key": _key(0x5C2),
         "transaction_sequence": None,
         "update_status": None,
     }
@@ -2038,7 +2164,7 @@ def test_composer_does_not_fall_back_when_the_headless_environment_is_lost() -> 
     )
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
-        state = ComposerState(headless_client=client)
+        state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=client)
         # This test covers the read adapter. Authoring-owner startup has its own
         # focused contract and must not obscure this unavailable read.
         state.authoring_admission = None
@@ -2060,10 +2186,9 @@ def test_composer_forwards_persistent_value_edits_as_strict_requests(
     client, requests, _node_environment = headless_client
     base = "/api/program/persistent-values"
     caller = {
-        "request_id": "request.1",
-        "request_owner_epoch": "composer.epoch.1",
+        "request_key": _key(1),
+        "application_start_id": _A,
         "source_label": "operator_ui",
-        "correlation_id": None,
         "project_path": "/projects/cell-pick.scenario",
     }
     edit = {
@@ -2076,7 +2201,8 @@ def test_composer_forwards_persistent_value_edits_as_strict_requests(
 
     with _composer(client) as composer:
         assert composer.get(base).json() == {"forwarded": base}
-        assert composer.post(base, json={**edit, "value": 3}).status_code == 200
+        set_reply = composer.post(base, json={**edit, "value": 3})
+        assert set_reply.json() == _command_reply("persistent_value_set")
         assert composer.post(f"{base}/reset", json=edit).status_code == 200
         assert composer.post(f"{base}/clear", json=caller).status_code == 200
         assert composer.post(base, json=edit).status_code == 422
@@ -2103,24 +2229,24 @@ def test_composer_forwards_the_node_correction_preview_as_a_strict_query(
     headless_client,
 ) -> None:
     client, requests, _node_environment = headless_client
-    path = "/api/program/runs/program-run.7/node-correction-previews"
+    path = "/api/program/runs/7/node-correction-previews"
     body = {
-        "schema_version": "manyforge.program_node_correction_preview_request.v1",
-        "request_id": "node-preview.1",
-        "program_run_id": "program-run.7",
-        "expected_owner_epoch": "program-runner.epoch.1",
+        "schema_version": "manyforge.program_node_correction_preview_request.v2",
+        "request_key": _key(0x7),
+        "application_start_id": _A,
+        "program_run_id": 7,
         "program_id": "lite6_program",
         "program_revision": "sha256:" + "a" * 64,
         "program_binding_id": "sha256:" + "a" * 64,
         "node_instance_id": "move_to_pick",
-        "node_attempt_id": "attempt:1",
+        "node_attempt_id": 1,
         "proposed_inputs": [{"path": "goal.position_m[2]", "value": 0.25}],
     }
 
     with _composer(client) as composer:
         response = composer.post(path, json=body)
         mismatch = composer.post(
-            "/api/program/runs/program-run.8/node-correction-previews", json=body
+            "/api/program/runs/8/node-correction-previews", json=body
         )
         # The browser cannot name a binding, robot or capability.
         foreign = composer.post(
@@ -2140,10 +2266,10 @@ def test_composer_forwards_the_node_correction_preview_as_a_strict_query(
 def test_composer_does_not_serve_removed_runtime_override_routes(headless_client) -> None:
     client, requests, _node_environment = headless_client
     removed = [
-        "/api/program/runs/program-run.7/runtime-overrides",
-        "/api/program/runs/program-run.7/runtime-overrides/activate",
-        "/api/program/runs/program-run.7/runtime-overrides/clear",
-        "/api/program/runs/program-run.7/runtime-overrides/promote",
+        "/api/program/runs/7/runtime-overrides",
+        "/api/program/runs/7/runtime-overrides/activate",
+        "/api/program/runs/7/runtime-overrides/clear",
+        "/api/program/runs/7/runtime-overrides/promote",
         "/api/program/draft/runtime-override-promotions",
     ]
     with _composer(client) as composer:
@@ -2289,7 +2415,7 @@ def test_composer_motion_preview_preserves_only_valid_failure_diagnostic(diagnos
     class Client:
         def preview_motion(self, body):
             assert body["participants"][0]["payload"]["motion"]["joint_names"] == ["joint1"]
-            response = {"api_version": "manyforge.execution_command_response.v4", "ok": False,
+            response = {"api_version": "manyforge.execution_command_response.v6", "ok": False,
                         "error": {"code": "validation_collision", "message": "collision", "details": {"reason": "contact"}}}
             if diagnostic is not None:
                 response["diagnostic_preview"] = diagnostic
@@ -2395,3 +2521,30 @@ def test_composer_motion_preview_limits_final_utf8_envelope(character) -> None:
     assert response.status_code == 409
     assert response.json() == {"detail": {"code": "validation_collision", "details": details,
                                            "message": "collision", "producer": "headless_api"}}
+
+
+def test_composer_planning_job_routes_forward_read_cancel_and_release(
+    headless_client,
+) -> None:
+    """OD-213 (1): each route forwards at once; nothing waits for a plan."""
+
+    client, requests, _node_environment = headless_client
+    with _composer(client) as composer:
+        read = composer.get("/api/execution/pick-place/plans/job-1")
+        cancel = composer.post("/api/execution/pick-place/plans/job-1/cancel")
+        release = composer.post("/api/execution/pick-place/plans/job-1/release")
+
+    assert read.status_code == 200, read.text
+    assert read.json()["command"] == "read_planning_job"
+    assert read.json()["planning_job"]["state"] == "planning"
+    assert cancel.json()["command"] == "cancel_planning_job"
+    assert release.json()["command"] == "release_planning_job"
+    assert [
+        (item["method"], item["path"], item["body"])
+        for item in requests
+        if item["path"].startswith("/api/execution/pick-place/plans/")
+    ] == [
+        ("GET", "/api/execution/pick-place/plans/job-1", None),
+        ("POST", "/api/execution/pick-place/plans/job-1/cancel", None),
+        ("POST", "/api/execution/pick-place/plans/job-1/release", None),
+    ]

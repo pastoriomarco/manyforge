@@ -258,13 +258,12 @@ void log_moving_phase(const RoboPlanCandidateRequestDTO &input,
   char line[768];
   const int size = std::snprintf(
       line, sizeof(line),
-      "manyforge_moving_candidate_phase pid=%ld source_goal=%.256s "
-      "generation=%llu phase=%s elapsed_ns=%lld suffix_remaining_ns=%lld "
+      "manyforge_moving_candidate_phase pid=%ld source_goal=%llu/%u "
+      "generation=%u phase=%s elapsed_ns=%lld suffix_remaining_ns=%lld "
       "preparation_remaining_ns=%lld\n",
       static_cast<long>(::getpid()),
-      moving.source_goal.controller_goal_id.value().c_str(),
-      static_cast<unsigned long long>(
-          moving.source_goal.controller_goal_generation.value()),
+      static_cast<unsigned long long>(moving.source_goal.operation_id.value()),
+      moving.source_goal.ordinal, moving.source_goal.generation,
       phase, static_cast<long long>(elapsed),
       moving.remaining_planning_budget_s
           ? remaining(*moving.remaining_planning_budget_s)
@@ -1177,8 +1176,8 @@ struct MovingFinalizationMeasurements final {
     const auto &goal = input.moving_replacement->source_goal;
     const int size = std::snprintf(
         line, sizeof(line),
-        "manyforge_moving_connector_measure pid=%ld source_goal=%.256s "
-        "generation=%llu stage=%s elapsed_ns=%lld entries=%zu attempts=%zu "
+        "manyforge_moving_connector_measure pid=%ld source_goal=%llu/%u "
+        "generation=%u stage=%s elapsed_ns=%lld entries=%zu attempts=%zu "
         "entry_s=%.17g duration_s=%.17g ratio=%.17g source_points=%zu "
         "future_points=%zu future_points_total=%zu splice_ns=%lld "
         "source_joint_ns=%lld "
@@ -1187,9 +1186,9 @@ struct MovingFinalizationMeasurements final {
         "endpoint_lower_bound_s=%.17g "
         "future_v_ratio=%.17g future_a_ratio=%.17g future_j_ratio=%.17g "
         "future_tcp_ratio=%.17g next_duration_ratio=%.17g\n",
-        static_cast<long>(::getpid()), goal.controller_goal_id.value().c_str(),
-        static_cast<unsigned long long>(
-            goal.controller_goal_generation.value()),
+        static_cast<long>(::getpid()),
+        static_cast<unsigned long long>(goal.operation_id.value()), goal.ordinal,
+        goal.generation,
         stage, static_cast<long long>(elapsed), entries, attempts, entry_s,
         duration_s, ratio, source_points, future_points, future_points_total,
         splice_ns, source_ns[0], source_ns[1], source_ns[2], future_ns[0],
@@ -1933,8 +1932,7 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
   const auto &moving = *input.moving_replacement;
   const auto &prefix = moving.source_prefix_trajectory;
   const double divergence = moving.divergence_cursor_s - moving.source_cursor_s;
-  if (moving.source_goal.controller_goal_id.empty() ||
-      !moving.source_goal.controller_goal_generation.nonzero() ||
+  if (!moving.source_goal.nonzero() ||
       !moving.source_binding_epoch.nonzero() ||
       !finite_nonnegative(moving.source_cursor_s) ||
       !finite_positive(divergence) ||

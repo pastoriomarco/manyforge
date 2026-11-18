@@ -79,13 +79,13 @@ export const heldCatalog: CatalogEntry[] = [{
 
 export function heldOffer(patch: Partial<CycleRecoveryOffer> = {}): CycleRecoveryOffer {
   return {
-    schemaVersion: 'manyforge.cycle_recovery_offer.v5',
+    schemaVersion: 'manyforge.cycle_recovery_offer.v6',
     offerId: digest('e'),
     offerRevision: 1,
-    programRunId: 'run.1',
+    programRunId: 1,
     programBindingId: digest('c'),
     nodeInstanceId: 'move',
-    nodeAttemptId: 'move.attempt.1',
+    nodeAttemptId: 1,
     recoveryClass: 'node_failure_pause',
     actions: [],
     reason: {
@@ -102,11 +102,10 @@ export function heldOffer(patch: Partial<CycleRecoveryOffer> = {}): CycleRecover
 
 export function heldRun(): ProgramRunStatus {
   return {
-    ownerEpoch: 'runner.epoch.1',
     runRevision: 4,
     state: 'intervention_required',
     capture: {
-      programRunId: 'run.1',
+      programRunId: 1,
       programId: 'pick',
       programRevision: digest('a'),
       programBindingId: digest('c'),

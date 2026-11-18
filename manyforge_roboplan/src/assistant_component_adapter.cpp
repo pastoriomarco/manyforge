@@ -98,13 +98,12 @@ core::ComponentState AssistantComponentState(const bool process_started,
 AssistantComponentAdapter::AssistantComponentAdapter(
     AssistantSettings settings, std::string ros_namespace, ComponentProcessLauncher start_process,
     std::shared_ptr<IAssistantHostLink> link, std::shared_ptr<core::IClock> clock,
-    const std::chrono::nanoseconds lifecycle_command_timeout, std::function<void()> pause)
+    std::function<void()> pause)
     : settings_(std::move(settings)),
       ros_namespace_(std::move(ros_namespace)),
       start_process_(std::move(start_process)),
       link_(std::move(link)),
       clock_(std::move(clock)),
-      lifecycle_command_timeout_(lifecycle_command_timeout),
       pause_(std::move(pause)) {
   if (!start_process_ || !link_ || !clock_ || ros_namespace_.empty())
     throw std::invalid_argument(
@@ -172,8 +171,10 @@ core::ActionResult AssistantComponentAdapter::Run(const core::ComponentAction ac
         break;
       }
       link_->SetServing(serving);
-      // Wait for the host's report on this (the action's) thread; State keeps
-      // the last completed Enable or Disable meanwhile. Serving is reported by
+      // Wait for the host's report on this (the action's) thread, with no
+      // time limit (OD-214, OD-240): the action stays visible as running and
+      // ends on the report, the host's exit or a Stop. State keeps the last
+      // completed Enable or Disable meanwhile. Serving is reported by
       // an endpoint together with a `/health` answer that arrived during this
       // action: a latched endpoint of a host that Recover replaced has none.
       const auto reported = [&] {
@@ -182,7 +183,6 @@ core::ActionResult AssistantComponentAdapter::Run(const core::ComponentAction ac
         return !observed.endpoint.empty() && observed.last_health_ns &&
                *observed.last_health_ns >= started_at_ns;
       };
-      const auto deadline_ns = started_at_ns + lifecycle_command_timeout_.count();
       const auto what = serving ? std::string("serving") : std::string("stopped");
       for (;;) {
         if (reported()) break;
@@ -196,15 +196,14 @@ core::ActionResult AssistantComponentAdapter::Run(const core::ComponentAction ac
                "The assistant host exited before its bridge was " + what);
           break;
         }
-        if (clock_->now() >= deadline_ns) {
-          fail("component_action_result_not_observed",
-               "The assistant host didn't report its bridge " + what +
-                   " within the lifecycle command time");
-          break;
-        }
         pause_();
       }
-      if (result.outcome != core::ActionOutcome::kSucceeded) break;
+      if (result.outcome != core::ActionOutcome::kSucceeded) {
+        // An Enable that did not complete withdraws its serving request: the
+        // host serves only while a completed Enable stands.
+        if (serving) link_->SetServing(false);
+        break;
+      }
       const std::lock_guard lock(mutex_);
       if (process_ != process) {
         result.outcome = core::ActionOutcome::kUnknown;

@@ -70,7 +70,6 @@ struct Fixture {
       },
       link,
       clock,
-      std::chrono::seconds(2),
       [clock = clock, host = host] {
         clock->advance(kPollNs);
         ++host->pauses;
@@ -143,15 +142,21 @@ TEST(AssistantComponentAdapter, EnableWaitsForTheEndpointThenPublishesIt) {
   EXPECT_EQ(state.endpoints.front(), (core::ComponentEndpoint{"assistant_request", kUrl}));
 }
 
-TEST(AssistantComponentAdapter, EnableWithoutAReportIsNotObserved) {
+// No time limit: a slow bridge is waited for; only a Stop (or the host's
+// exit) ends the wait, and the unfinished Enable withdraws its request.
+TEST(AssistantComponentAdapter, EnableWaitsWithoutATimeLimitAndAStopWithdrawsIt) {
   Fixture f;
   f.Prepare();
-  const auto result = f.adapter.Run(core::ComponentAction::kEnable, {});
+  std::stop_source stop;
+  f.host->on_pause = [&](const int pauses) {
+    if (pauses == 10'000) stop.request_stop();
+  };
+  const auto result = f.adapter.Run(core::ComponentAction::kEnable, stop.get_token());
   EXPECT_EQ(result.outcome, core::ActionOutcome::kFailed);
   ASSERT_TRUE(result.error.has_value());
-  EXPECT_EQ(result.error->code, "component_action_result_not_observed");
-  EXPECT_GE(f.clock->now(), 2 * kSecond);
-  EXPECT_LT(f.clock->now(), 2 * kSecond + 2 * kPollNs);
+  EXPECT_EQ(result.error->code, "component_action_interrupted_by_stop");
+  EXPECT_EQ(f.host->pauses, 10'000);
+  EXPECT_EQ(f.link->serving.back(), false);
   EXPECT_EQ(f.adapter.State(f.clock->now()).lifecycle, core::ComponentLifecycle::kPrepared);
 }
 
@@ -226,10 +231,13 @@ TEST(AssistantComponentAdapter, DisableWaitsForTheBridgeToStop) {
   EXPECT_EQ(state.streams.front().freshness, core::StreamFreshness::kNone);
 
   f.link->observed.endpoint = kUrl;
-  f.host->on_pause = {};
-  const auto stuck = f.adapter.Run(core::ComponentAction::kDisable, {});
+  std::stop_source stop;
+  f.host->on_pause = [&](const int pauses) {
+    if (pauses == 1'000) stop.request_stop();
+  };
+  const auto stuck = f.adapter.Run(core::ComponentAction::kDisable, stop.get_token());
   EXPECT_EQ(stuck.outcome, core::ActionOutcome::kFailed);
-  EXPECT_EQ(stuck.error->code, "component_action_result_not_observed");
+  EXPECT_EQ(stuck.error->code, "component_action_interrupted_by_stop");
   const auto unsupported = f.adapter.Run(core::ComponentAction::kResetPosition, {});
   EXPECT_EQ(unsupported.outcome, core::ActionOutcome::kFailed);
   EXPECT_EQ(unsupported.error->code, "component_action_unsupported");

@@ -19,7 +19,6 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::size_t kMaximumRuntimeStagedReadySets = 4096U;
-inline constexpr std::size_t kMaximumRuntimeStagedReadySetsPerApply = 16U;
 
 enum class RuntimeUnitCandidateDisposition {
   kAdded,
@@ -74,7 +73,7 @@ using RuntimePreStartGuard = std::function<void()>;
 
 /// Complete immutable candidate-runtime convergence intent.
 ///
-/// This aggregate is persisted after fence acceptance/rehydration and before
+/// This aggregate is persisted after fence acceptance and before
 /// the first process effect. Empty runtime-unit sets are explicit and legal.
 struct ManagerApplyRuntimeConvergenceIntentDTO final {
   manyforge::core::ApplyId apply_id;
@@ -99,7 +98,7 @@ struct RuntimeUnitConvergenceApplyOwnerDTO final {
   manyforge::core::ApplyGeneration apply_generation;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero();
+    return apply_id.nonzero() && apply_generation.nonzero();
   }
 
   friend bool operator==(const RuntimeUnitConvergenceApplyOwnerDTO &,
@@ -198,9 +197,17 @@ class IRuntimeUnitProgressPort {
 public:
   virtual ~IRuntimeUnitProgressPort() = default;
 
+  /// `answering_after` (OD-295 (1)(a)): only a report answering a progress
+  /// request numbered above it counts; an older one is consumed and absence
+  /// is returned. 0 accepts any report.
   [[nodiscard]] virtual std::optional<RuntimeUnitSourceReport>
   ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
-                  const manyforge::core::RuntimeEpoch &runtime_epoch) = 0;
+                  const manyforge::core::RuntimeEpoch &runtime_epoch,
+                  std::uint64_t answering_after) = 0;
+
+  /// The number of the last progress request sent so far: a request sent
+  /// after this call is numbered above it (OD-295 (1)(a)).
+  [[nodiscard]] virtual std::uint64_t ProgressRequestMark() = 0;
 };
 
 struct RuntimeUnitDependencyEpochDTO final {

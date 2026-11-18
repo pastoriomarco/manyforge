@@ -26,7 +26,7 @@ inline constexpr std::string_view kSiteDeviceAddressRefUnknown =
     "site_device_address_ref_unknown";
 
 /// One structurally decoded generic machine-level site document
-/// (`manyforge.site.v1`). It holds machine facts only, such as a device's
+/// (`manyforge.site.v2`). It holds machine facts only, such as a device's
 /// host name or IP keyed by a portable reference name. No file access or
 /// defaults.
 class SiteSettings final {
@@ -50,8 +50,12 @@ private:
 
 /// Reuses the existing strict JSON/YAML model decoder (duplicate keys refuse)
 /// and closes the approved shape: `schema` plus the optional
-/// `device_addresses` (absent: none; a sim-only machine) and the optional
-/// `project_folders` (unique absolute paths).
+/// `device_addresses` (absent: none; a sim-only machine), the optional
+/// `project_folders` (unique absolute paths) and the optional disk limits
+/// `disk_max_percent` (integer 1-100), `disk_always_free_bytes` and
+/// `disk_machine_minimum_bytes` (integers 0 to 2^53-1), validated and not
+/// carried (the launchers read them). Schema `manyforge.site.v2`, or
+/// `manyforge.site.v1` without the disk limits.
 /// References are portable ids; addresses are non-empty host names or IPs of
 /// at most 253 characters from [A-Za-z0-9.:-]. Throws SiteSettingsError.
 [[nodiscard]] SiteSettings ParseSiteSettings(std::string_view bytes);

@@ -13,7 +13,6 @@ import type {
   ProgramAuthoringDiagnostic,
   ProgramValueSource,
   ProgramWorkspaceResponse,
-  ProgramWorkspaceTransitionResponse,
   ScenarioDocumentDisplayStatus,
   ScenarioDocumentExportResponse,
   ScenarioDocumentIndexResponse,
@@ -41,25 +40,20 @@ import {
   stringAt,
 } from './shared';
 import { parseProgramAuthoringDocument, parseProgramDocument } from './program';
-import {
-  parseManagerApplyResponse,
-  parseManagerDeploymentCandidatePreviewResponse,
-  parsePreparedActivationInput,
-  parseRuntimeAvailability,
-} from './manager';
+import { parseApplyCommands } from './commandRows';
+import { parseRuntimeAvailability } from './manager';
 
 export function parseAuthoringSubmissionOutcome(value: unknown, request: {
-  requestOwnerEpoch: string; requestId: string; expectedAdmissionGeneration: number;
-}): { kind: 'settled' | 'manager_accepted'; apply: { applyId: string; applyGeneration: number } | null } | null {
+  applicationStartId: string; requestKey: string; expectedAdmissionGeneration: number;
+}): { kind: 'settled' | 'manager_accepted'; apply: { applyId: number; applyGeneration: number } | null } | null {
   const path = 'authoringSubmissionOutcome';
   const row = objectAt(value, path);
-  exactKeysAt(row, ['schema_version', 'request_owner_epoch', 'request_id', 'expected_admission_generation', 'owner_epoch', 'outcome'], path);
-  if (row.schema_version !== 'manyforge.authoring_submission_outcome.v1'
-    || row.request_owner_epoch !== request.requestOwnerEpoch || row.request_id !== request.requestId
+  exactKeysAt(row, ['schema_version', 'application_start_id', 'request_key', 'expected_admission_generation', 'outcome'], path);
+  if (row.schema_version !== 'manyforge.authoring_submission_outcome.v2'
+    || row.application_start_id !== request.applicationStartId || row.request_key !== request.requestKey
     || row.expected_admission_generation !== request.expectedAdmissionGeneration) {
     throw new Error('Authoring submission identity mismatch');
   }
-  if (!stringAt(row.owner_epoch, `${path}.owner_epoch`)) fail(path, 'a nonempty owner epoch');
   if (row.outcome === null) return null;
   const result = objectAt(row.outcome, `${path}.outcome`);
   exactKeysAt(result, ['kind', 'operation_kind', 'apply'], `${path}.outcome`);
@@ -68,9 +62,8 @@ export function parseAuthoringSubmissionOutcome(value: unknown, request: {
   if (result.kind !== 'manager_accepted') throw new Error('Invalid authoring submission outcome');
   const apply = objectAt(result.apply, `${path}.outcome.apply`);
   exactKeysAt(apply, ['apply_id', 'apply_generation'], `${path}.outcome.apply`);
-  if (!stringAt(apply.apply_id, `${path}.outcome.apply.apply_id`)) fail(path, 'a nonempty Apply identity');
   return { kind: 'manager_accepted', apply: {
-    applyId: stringAt(apply.apply_id, `${path}.outcome.apply.apply_id`),
+    applyId: positiveIntegerAt(apply.apply_id, `${path}.outcome.apply.apply_id`),
     applyGeneration: positiveIntegerAt(apply.apply_generation, `${path}.outcome.apply.apply_generation`),
   } };
 }
@@ -706,10 +699,10 @@ export function parseDeploymentWorkspaceResponse(
   exactKeysAt(record, [
     'schemaVersion', 'draft', 'saved', 'managerApplied', 'runAdmission',
     'binding', 'scenarioCandidates', 'savedScenarioCandidates',
-    'unavailableReasons', 'authoringWorkspace',
+    'unavailableReasons', 'authoringWorkspace', 'apply_commands',
   ], path);
   const schemaVersion = stringAt(record.schemaVersion, `${path}.schemaVersion`);
-  if (schemaVersion !== 'manyforge.composer_deployment_workspace.v1') {
+  if (schemaVersion !== 'manyforge.composer_deployment_workspace.v2') {
     return fail(`${path}.schemaVersion`, 'the supported Deployment workspace version');
   }
   const draftRecord = objectAt(record.draft, `${path}.draft`);
@@ -949,8 +942,9 @@ export function parseDeploymentWorkspaceResponse(
     );
   }
   return {
-    schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+    schemaVersion: 'manyforge.composer_deployment_workspace.v2',
     authoringWorkspace,
+    applyCommands: parseApplyCommands(record.apply_commands, `${path}.apply_commands`),
     draft: {
       id: stringAt(draftRecord.id, `${path}.draft.id`),
       revision: integerAt(draftRecord.revision, `${path}.draft.revision`),
@@ -1100,8 +1094,8 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     path,
   );
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.applied_program_selection.v4') {
-    return fail(`${path}.schema_version`, 'manyforge.applied_program_selection.v4');
+  if (schemaVersion !== 'manyforge.applied_program_selection.v5') {
+    return fail(`${path}.schema_version`, 'manyforge.applied_program_selection.v5');
   }
   const assistantMode = stringAt(record.assistant_mode, `${path}.assistant_mode`);
   if (!['required', 'optional', 'forbidden'].includes(assistantMode)) {
@@ -1121,14 +1115,16 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
   ).map((value, index) => {
     const ownerPath = `${path}.owner_identities[${index}]`;
     const owner = objectAt(value, ownerPath);
-    exactKeysAt(owner, ['owner_epoch', 'owner_id', 'owner_role'], ownerPath);
+    exactKeysAt(owner, ['application_start_id', 'role'], ownerPath);
     return {
-      ownerRole: stringAt(owner.owner_role, `${ownerPath}.owner_role`),
-      ownerId: stringAt(owner.owner_id, `${ownerPath}.owner_id`),
-      ownerEpoch: stringAt(owner.owner_epoch, `${ownerPath}.owner_epoch`),
+      role: stringAt(owner.role, `${ownerPath}.role`),
+      applicationStartId: stringAt(
+        owner.application_start_id,
+        `${ownerPath}.application_start_id`,
+      ),
     };
   });
-  const ownerRoles = ownerIdentities.map((owner) => owner.ownerRole);
+  const ownerRoles = ownerIdentities.map((owner) => owner.role);
   if (
     ownerRoles.length === 0
     || ownerRoles.some((role, index) => index > 0 && role <= ownerRoles[index - 1])
@@ -1163,7 +1159,6 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       'record_digest',
       'semantic_content_digest',
       'source_generation',
-      'source_owner_epoch',
       'source_owner_id',
     ],
     `${path}.source`,
@@ -1278,10 +1273,6 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
     nodeEnvironmentDigest,
     recordDigest,
     sourceOwnerId: stringAt(source.source_owner_id, `${path}.source.source_owner_id`),
-    sourceOwnerEpoch: stringAt(
-      source.source_owner_epoch,
-      `${path}.source.source_owner_epoch`,
-    ),
     sourceGeneration: positiveIntegerAt(
       source.source_generation,
       `${path}.source.source_generation`,
@@ -1294,144 +1285,6 @@ export function parseAppliedProgramSelection(value: unknown): AppliedProgramSele
       appliedRecordDigest: recordDigest, programBindingId, programRevision,
       retainedBundleId, graphRevision, components, frames,
     },
-  };
-}
-
-function parseProgramApplyResult(
-  value: unknown,
-  path: string,
-): Record<string, JsonValue> {
-  const record = jsonRecordAt(value, path);
-  exactKeysAt(
-    record,
-    [
-      'applied',
-      'preparation',
-      'schema_version',
-      'status',
-    ],
-    path,
-  );
-  if (
-    stringAt(record.schema_version, `${path}.schema_version`)
-    !== 'manyforge.program_apply_result.v2'
-  ) {
-    return fail(
-      `${path}.schema_version`,
-      'manyforge.program_apply_result.v2',
-    );
-  }
-  const status = stringAt(record.status, `${path}.status`);
-  if (status !== 'applied') {
-    return fail(`${path}.status`, 'applied');
-  }
-  jsonRecordAt(record.preparation, `${path}.preparation`);
-  parseAppliedProgramSelection(record.applied);
-  return record;
-}
-
-function parseScenarioLoadResult(
-  value: unknown,
-  path: string,
-): Record<string, JsonValue> {
-  const record = jsonRecordAt(value, path);
-  exactKeysAt(record, ['managerApply', 'programApply', 'scenario'], path);
-  const scenario = jsonRecordAt(record.scenario, `${path}.scenario`);
-  exactKeysAt(
-    scenario,
-    [
-      'deployment_artifact_id',
-      'deployment_revision',
-      'graph_revision',
-      'program_binding_id',
-      'program_id',
-      'program_revision',
-      'retained_bundle_id',
-      'source_document_digest',
-      'scenario_id',
-    ],
-    `${path}.scenario`,
-  );
-  stringAt(scenario.deployment_artifact_id, `${path}.scenario.deployment_artifact_id`);
-  stringAt(scenario.program_id, `${path}.scenario.program_id`);
-  stringAt(scenario.scenario_id, `${path}.scenario.scenario_id`);
-  for (const field of [
-    'deployment_revision',
-    'graph_revision',
-    'program_binding_id',
-    'program_revision',
-    'retained_bundle_id',
-    'source_document_digest',
-  ]) {
-    digestAt(scenario[field], `${path}.scenario.${field}`);
-  }
-  if (record.managerApply !== null) {
-    jsonRecordAt(record.managerApply, `${path}.managerApply`);
-  }
-  if (record.programApply !== null) {
-    parseProgramApplyResult(record.programApply, `${path}.programApply`);
-  }
-  return record;
-}
-
-export function parseProgramWorkspaceTransitionResponse(
-  value: unknown,
-): ProgramWorkspaceTransitionResponse {
-  const path = 'programWorkspaceTransition';
-  const record = objectAt(value, path);
-  exactKeysAt(record, ['headless', 'status', 'workspace'], path);
-  const status = stringAt(record.status, `${path}.status`);
-  if (!['accepted', 'applied', 'loaded', 'reverted'].includes(status)) {
-    return fail(
-      `${path}.status`,
-      'accepted, applied, loaded, or reverted',
-    );
-  }
-  let headless: Record<string, JsonValue> | null;
-  if (record.headless === null) {
-    if (status !== 'reverted') {
-      return fail(`${path}.headless`, 'an owner response');
-    }
-    headless = null;
-  } else if (status === 'accepted' || status === 'applied') {
-    const submitted = jsonRecordAt(record.headless, `${path}.headless`);
-    exactKeysAt(submitted, [
-      'status', 'confirmation_token', 'prepared_activation',
-      'candidate_preview', 'manager_apply', 'preparation', 'phases_ms',
-      'apply_id', ...(status === 'accepted' ? ['apply_generation'] : []),
-    ], `${path}.headless`);
-    if (submitted.status !== status || submitted.confirmation_token !== null
-        || submitted.preparation !== null) {
-      return fail(`${path}.headless`, 'the matching submitted activation');
-    }
-    parsePreparedActivationInput(submitted.prepared_activation,
-      `${path}.headless.prepared_activation`);
-    if (submitted.candidate_preview !== null) {
-      parseManagerDeploymentCandidatePreviewResponse(submitted.candidate_preview);
-    }
-    objectAt(submitted.phases_ms, `${path}.headless.phases_ms`);
-    if (status === 'accepted') {
-      const manager = parseManagerApplyResponse(submitted.manager_apply);
-      if (stringAt(submitted.apply_id, `${path}.headless.apply_id`)
-          !== manager.applyId
-          || positiveIntegerAt(submitted.apply_generation,
-            `${path}.headless.apply_generation`) !== manager.applyGeneration) {
-        return fail(`${path}.headless`, 'the exact accepted Manager operation');
-      }
-    } else if (submitted.manager_apply !== null || submitted.apply_id !== null
-               || submitted.apply_generation !== undefined) {
-      return fail(`${path}.headless`, 'an already-active configuration');
-    }
-    headless = submitted;
-  } else {
-    headless = status === 'loaded'
-      ? parseScenarioLoadResult(record.headless, `${path}.headless`)
-      : parseProgramApplyResult(record.headless, `${path}.headless`);
-  }
-  return {
-    status: status as ProgramWorkspaceTransitionResponse['status'],
-    headless,
-    workspace: parseProgramWorkspaceResponse(record.workspace),
   };
 }
 

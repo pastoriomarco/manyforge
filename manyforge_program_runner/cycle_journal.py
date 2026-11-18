@@ -1,10 +1,9 @@
-"""Durable SQLite journal for the single Program-cycle state machine."""
+"""The single Program-cycle state machine, held in memory and written behind to SQLite."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import ExitStack, contextmanager
-from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -13,7 +12,6 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
-import tempfile
 import unicodedata
 from threading import RLock
 from typing import Any, Callable, Final, Iterator
@@ -22,80 +20,22 @@ import rfc8785
 
 from manyforge_headless_api.program_cycle import ScenePreparationFailureDTO
 
-from .liveness import RetainedLiveness
+from .cycle_journal_writer import CYCLE_COLUMNS, CycleJournalWriter, JournalCommit
 
-
-# Development-only cutover: this runner creates and opens exactly this
-# journal version. Older and newer journals are refused unchanged, before any
-# write; their run history is not migrated or reinterpreted.
-SCHEMA_VERSION: Final = 9
+# The version of the file this runner creates; every start creates a new file.
+# v12: `program_cycle_metadata.records_lost`, set by the writer when records of
+# this start were not written.
+SCHEMA_VERSION: Final = 12
 # How many of the most recent completed persistent-value requests are kept.
 MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS: Final = 16_384
 MAXIMUM_FINISHED_HISTORY_BYTES: Final = 256 * 1024 * 1024
 _LOGGER = logging.getLogger(__name__)
-_REQUIRED_TABLE_SHAPES: Final[dict[str, tuple[tuple[str, str, int, int], ...]]] = {
-    "program_cycle_metadata": (
-        ("singleton", "INTEGER", 0, 1),
-        ("schema_version", "INTEGER", 1, 0),
-    ),
-    "program_cycle": (
-        ("singleton", "INTEGER", 0, 1),
-        ("cycle_generation", "INTEGER", 1, 0),
-        ("state", "TEXT", 1, 0),
-        ("owner_epoch", "TEXT", 1, 0),
-        ("program_run_id", "TEXT", 0, 0),
-        ("claim_json", "TEXT", 0, 0),
-        ("capture_identities_json", "TEXT", 0, 0),
-        ("terminal_reference", "TEXT", 0, 0),
-        ("start_settlement_json", "TEXT", 0, 0),
-        ("release_intent_json", "TEXT", 0, 0),
-        ("reset_result_json", "TEXT", 0, 0),
-        ("reconciliation_required", "INTEGER", 1, 0),
-        ("acquisition_pending_json", "TEXT", 0, 0),
-        ("reconciliation_evidence_digest", "TEXT", 0, 0),
-        ("execution_control_revision", "INTEGER", 1, 0),
-        ("causal_correlation_id", "TEXT", 0, 0),
-        ("causal_session_id", "TEXT", 0, 0),
-        ("causal_client_sequence", "TEXT", 0, 0),
-        ("current_command_kind", "TEXT", 0, 0),
-        ("failure_json", "TEXT", 0, 0),
-        ("reset_phase", "TEXT", 0, 0),
-        ("runtime_controls_json", "TEXT", 0, 0),
-        ("reset_effect_claim_json", "TEXT", 0, 0),
-    ),
-    "program_cycle_inflight_commands": (
-        ("request_owner_epoch", "TEXT", 1, 1),
-        ("request_id", "TEXT", 1, 2),
-        ("request_kind", "TEXT", 1, 0),
-        ("intent_json", "TEXT", 1, 0),
-        ("cycle_generation", "INTEGER", 1, 0),
-    ),
-    "program_runner_liveness": (
-        ("singleton", "INTEGER", 0, 1),
-        ("manager_runtime_epoch", "TEXT", 0, 0),
-        ("manager_owner_epoch", "TEXT", 0, 0),
-        ("predecessor_expired", "INTEGER", 1, 0),
-        ("fault_reference", "TEXT", 0, 0),
-    ),
-    "program_run_history": (
-        ("program_run_id", "TEXT", 0, 1),
-        ("run_revision", "INTEGER", 1, 0),
-        ("snapshot_json", "TEXT", 1, 0),
-        ("terminal", "INTEGER", 1, 0),
-    ),
-    "program_persistent_value_requests": (
-        ("request_owner_epoch", "TEXT", 1, 1),
-        ("request_id", "TEXT", 1, 2),
-        ("action", "TEXT", 1, 0),
-        ("outcome", "TEXT", 1, 0),
-        ("position", "INTEGER", 1, 0),
-    ),
-}
 _REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
     "program_cycle_metadata": f"""
         CREATE TABLE program_cycle_metadata (
           singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-          schema_version INTEGER NOT NULL CHECK(schema_version={SCHEMA_VERSION})
+          schema_version INTEGER NOT NULL CHECK(schema_version={SCHEMA_VERSION}),
+          records_lost INTEGER NOT NULL DEFAULT 0 CHECK(records_lost IN (0,1))
         )
     """,
     "program_cycle": """
@@ -103,53 +43,37 @@ _REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
           singleton INTEGER PRIMARY KEY CHECK(singleton=1),
           cycle_generation INTEGER NOT NULL CHECK(cycle_generation>0),
           state TEXT NOT NULL,
-          owner_epoch TEXT NOT NULL,
-          program_run_id TEXT,
+          program_run_id INTEGER
+            CHECK(program_run_id IS NULL OR program_run_id>0),
           claim_json TEXT,
           capture_identities_json TEXT,
           terminal_reference TEXT,
           start_settlement_json TEXT,
           release_intent_json TEXT,
-          reset_result_json TEXT,
           reconciliation_required INTEGER NOT NULL
             CHECK(reconciliation_required IN (0,1)),
           acquisition_pending_json TEXT,
-          reconciliation_evidence_digest TEXT,
           execution_control_revision INTEGER NOT NULL
             CHECK(execution_control_revision>0),
-          causal_correlation_id TEXT,
-          causal_session_id TEXT,
-          causal_client_sequence TEXT,
+          causal_request_key BLOB
+            CHECK(causal_request_key IS NULL OR length(causal_request_key)=16),
           current_command_kind TEXT,
           failure_json TEXT,
           reset_phase TEXT,
-          runtime_controls_json TEXT,
           reset_effect_claim_json TEXT
         )
     """,
     "program_cycle_inflight_commands": """
         CREATE TABLE program_cycle_inflight_commands (
-          request_owner_epoch TEXT NOT NULL,
-          request_id TEXT NOT NULL,
+          request_key BLOB NOT NULL CHECK(length(request_key)=16) PRIMARY KEY,
           request_kind TEXT NOT NULL,
           intent_json TEXT NOT NULL,
-          cycle_generation INTEGER NOT NULL,
-          PRIMARY KEY(request_owner_epoch, request_id)
-        )
-    """,
-    "program_runner_liveness": """
-        CREATE TABLE program_runner_liveness (
-          singleton INTEGER PRIMARY KEY CHECK(singleton=1),
-          manager_runtime_epoch TEXT,
-          manager_owner_epoch TEXT,
-          predecessor_expired INTEGER NOT NULL
-            CHECK(predecessor_expired IN (0,1)),
-          fault_reference TEXT
+          cycle_generation INTEGER NOT NULL
         )
     """,
     "program_run_history": """
         CREATE TABLE program_run_history (
-          program_run_id TEXT PRIMARY KEY,
+          program_run_id INTEGER PRIMARY KEY CHECK(program_run_id>0),
           run_revision INTEGER NOT NULL CHECK(run_revision>0),
           snapshot_json TEXT NOT NULL,
           terminal INTEGER NOT NULL CHECK(terminal IN (0,1))
@@ -161,12 +85,10 @@ _REQUIRED_TABLE_SQL: Final[dict[str, str]] = {
     # and never appear here.
     "program_persistent_value_requests": """
         CREATE TABLE program_persistent_value_requests (
-          request_owner_epoch TEXT NOT NULL,
-          request_id TEXT NOT NULL,
+          request_key BLOB NOT NULL CHECK(length(request_key)=16) PRIMARY KEY,
           action TEXT NOT NULL CHECK(action IN ('set','reset','clear')),
-          outcome TEXT NOT NULL CHECK(outcome IN ('applied','storage_uncertain')),
-          position INTEGER NOT NULL UNIQUE CHECK(position>0),
-          PRIMARY KEY(request_owner_epoch, request_id)
+          outcome TEXT NOT NULL CHECK(outcome IN ('applied')),
+          position INTEGER NOT NULL UNIQUE CHECK(position>0)
         )
     """,
 }
@@ -178,7 +100,6 @@ STATES: Final = frozenset(
         "idle_after_reset",
         "starting",
         "running",
-        "stopping",
         "resetting",
         "terminal_awaiting_reset",
         "recovery_required",
@@ -191,11 +112,10 @@ _REQUEST_KINDS: Final = frozenset(
         "runtime_blackboard_write",
         "manual_result_stage",
         "recovery_action",
-        "resume_full_stop",
+        "resume_halt",
         "start_motion",
         "resume_motion",
         "prepare_manual_handover",
-        "discard_full_stop",
         "persistent_value_set",
         "persistent_value_reset",
         "persistent_values_clear",
@@ -207,12 +127,8 @@ _PERSISTENT_VALUE_ACTIONS: Final = {
     "persistent_value_reset": "reset",
     "persistent_values_clear": "clear",
 }
-_PERSISTENT_VALUE_OUTCOMES: Final = frozenset({"applied", "storage_uncertain"})
+_PERSISTENT_VALUE_OUTCOMES: Final = frozenset({"applied"})
 _TERMINAL_RUN_STATES: Final = frozenset({"stopped", "succeeded", "failed"})
-
-
-def _normalized_sql(value: str) -> str:
-    return " ".join(value.split())
 
 
 def _bounded_identity(value: object) -> bool:
@@ -222,6 +138,17 @@ def _bounded_identity(value: object) -> bool:
         and unicodedata.normalize("NFC", value) == value
         and len(value.encode("utf-8")) <= 256
     )
+
+
+_JSON_INTEGER_LIMIT: Final = 9_007_199_254_740_991
+
+
+def _is_request_key(value: object) -> bool:
+    return type(value) is bytes and len(value) == 16
+
+
+def _is_run_number(value: object) -> bool:
+    return type(value) is int and 0 < value <= _JSON_INTEGER_LIMIT
 
 
 def _settlement_reference(settlement: Mapping[str, Any]) -> str:
@@ -275,59 +202,24 @@ def _prior_scene_preparation_failure(failure: Mapping[str, Any] | None) -> dict[
     return ScenePreparationFailureDTO.model_validate(prior).model_dump(mode="json")
 
 
-class ProgramCycleJournalVersionError(RuntimeError):
-    """An existing journal of another (older or newer) schema version.
-
-    Development run history is not migrated: the journal is left unchanged
-    and the runner refuses to start until it is replaced by a fresh one.
-    """
-
-    def __init__(self, found_version: int) -> None:
-        self.found_version = found_version
-        recovery = (
-            "Settle and Reset the run using the old version, or clean-start. "
-            if found_version < SCHEMA_VERSION
-            else "Settle and Reset the run using the version that created it, or clean-start. "
-        )
-        super().__init__(
-            f"Program-cycle journal schema version {found_version} is "
-            f"unsupported; this Program runner opens only version "
-            f"{SCHEMA_VERSION} and does not migrate earlier run history. The "
-            f"journal was left unchanged. {recovery}"
-            "To clean-start, stop the development workbench "
-            "(./scripts/compose-dev.sh stop, or stop --keep-evidence to keep "
-            "an incident bundle) and start it again for fresh runtime state."
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class CycleRecord:
     cycle_generation: int
     state: str
-    owner_epoch: str
-    program_run_id: str | None
+    program_run_id: int | None
     claim: dict[str, Any] | None
     capture_identities: dict[str, Any] | None
     terminal_reference: str | None
     start_settlement: dict[str, Any] | None
     release_intent: dict[str, Any] | None
-    reset_result: dict[str, Any] | None
     reconciliation_required: bool
     acquisition_pending: dict[str, Any] | None
-    reconciliation_evidence_digest: str | None
     execution_control_revision: int
-    causal_correlation_id: str | None
-    causal_session_id: str | None
-    causal_client_sequence: str | None
+    causal_request_key: bytes | None
     current_command_kind: str | None
     failure: dict[str, Any] | None
     reset_phase: str | None
-    runtime_controls: dict[str, Any] | None
     reset_effect_claim: dict[str, Any] | None = None
-
-
-class ProgramCycleStopWon(RuntimeError):
-    """The exact accepted Stop won the existing Starting-to-Running CAS."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,11 +229,24 @@ class RequestRecord:
     error: dict[str, Any] | None = None
 
 
+class _Stage:
+    """One method's working copy, swapped in whole when the method returns."""
+
+    __slots__ = ("cycle", "tables", "history_terminal_bytes", "operations")
+
+    def __init__(self, journal: "ProgramCycleJournal") -> None:
+        self.cycle = dict(journal._cycle)
+        self.tables: dict[str, dict[Any, Any]] = {}
+        self.history_terminal_bytes = journal._history_terminal_bytes
+        self.operations: list[tuple[str, tuple[Any, ...]]] = []
+
+
 class ProgramCycleJournal:
     """One-row cycle state plus a bounded set of unresolved commands.
 
     Completed persistent-value requests also keep their identities, bounded,
-    so a resend is refused instead of applied again.
+    so a resend is refused instead of applied again. The state lives in
+    memory under one lock; every change is posted, in order, to one writer.
     """
 
     @staticmethod
@@ -438,516 +343,10 @@ class ProgramCycleJournal:
             )
         return metadata
 
-    @staticmethod
-    def _copy_open_file(source: int, destination: Path) -> None:
-        destination_descriptor = os.open(
-            destination,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-            0o600,
-        )
-        try:
-            os.lseek(source, 0, os.SEEK_SET)
-            while True:
-                chunk = os.read(source, 1024 * 1024)
-                if not chunk:
-                    break
-                remaining = memoryview(chunk)
-                while remaining:
-                    written = os.write(destination_descriptor, remaining)
-                    if written <= 0:
-                        raise RuntimeError(
-                            "Program-cycle journal snapshot write stalled"
-                        )
-                    remaining = remaining[written:]
-        finally:
-            os.close(destination_descriptor)
-
-    @staticmethod
-    @contextmanager
-    def _read_only_snapshot(
-        path: Path,
-        *,
-        parent_descriptor: int,
-        main_metadata: os.stat_result,
-    ) -> Iterator[str]:
-        """Expose the logical database without mutating its live files."""
-
-        rollback_name = f"{path.name}-journal"
-        try:
-            os.stat(
-                rollback_name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            pass
-        except OSError as error:
-            raise RuntimeError(
-                "Program-cycle rollback journal cannot be inspected: " f"{error}"
-            ) from error
-        else:
-            raise RuntimeError(
-                "Program-cycle journal has an unsupported rollback sidecar"
-            )
-
-        wal_name = f"{path.name}-wal"
-        shm_name = f"{path.name}-shm"
-        wal_metadata = ProgramCycleJournal._sidecar_metadata(
-            parent_descriptor,
-            wal_name,
-            label="WAL sidecar",
-        )
-        shm_metadata = ProgramCycleJournal._sidecar_metadata(
-            parent_descriptor,
-            shm_name,
-            label="shared-memory sidecar",
-        )
-        if wal_metadata is None and shm_metadata is not None:
-            raise RuntimeError("Program-cycle journal has shared memory without a WAL")
-
-        main_descriptor = -1
-        wal_descriptor = -1
-        try:
-            main_descriptor = os.open(
-                path.name,
-                os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                dir_fd=parent_descriptor,
-            )
-            opened_main = os.fstat(main_descriptor)
-            if (opened_main.st_dev, opened_main.st_ino) != (
-                main_metadata.st_dev,
-                main_metadata.st_ino,
-            ) or (opened_main.st_size, opened_main.st_mtime_ns) != (
-                main_metadata.st_size,
-                main_metadata.st_mtime_ns,
-            ):
-                raise RuntimeError("Program-cycle journal changed before snapshot")
-            opened_wal: os.stat_result | None = None
-            if wal_metadata is not None:
-                wal_descriptor = os.open(
-                    wal_name,
-                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
-                    dir_fd=parent_descriptor,
-                )
-                opened_wal = os.fstat(wal_descriptor)
-                if (opened_wal.st_dev, opened_wal.st_ino) != (
-                    wal_metadata.st_dev,
-                    wal_metadata.st_ino,
-                ) or (opened_wal.st_size, opened_wal.st_mtime_ns) != (
-                    wal_metadata.st_size,
-                    wal_metadata.st_mtime_ns,
-                ):
-                    raise RuntimeError(
-                        "Program-cycle journal WAL changed before snapshot"
-                    )
-            with tempfile.TemporaryDirectory(
-                prefix="manyforge-cycle-preflight-"
-            ) as temporary_root:
-                snapshot = Path(temporary_root) / path.name
-                ProgramCycleJournal._copy_open_file(main_descriptor, snapshot)
-                if wal_descriptor >= 0:
-                    ProgramCycleJournal._copy_open_file(
-                        wal_descriptor,
-                        Path(f"{snapshot}-wal"),
-                    )
-                after_main = os.fstat(main_descriptor)
-                after_wal = os.fstat(wal_descriptor) if wal_descriptor >= 0 else None
-                current_main = ProgramCycleJournal._sidecar_metadata(
-                    parent_descriptor,
-                    path.name,
-                    label="database",
-                )
-                current_wal = ProgramCycleJournal._sidecar_metadata(
-                    parent_descriptor,
-                    wal_name,
-                    label="WAL sidecar",
-                )
-                current_shm = ProgramCycleJournal._sidecar_metadata(
-                    parent_descriptor,
-                    shm_name,
-                    label="shared-memory sidecar",
-                )
-                try:
-                    os.stat(
-                        rollback_name,
-                        dir_fd=parent_descriptor,
-                        follow_symlinks=False,
-                    )
-                except FileNotFoundError:
-                    rollback_appeared = False
-                except OSError as error:
-                    raise RuntimeError(
-                        "Program-cycle rollback journal changed during snapshot: "
-                        f"{error}"
-                    ) from error
-                else:
-                    rollback_appeared = True
-                if (
-                    rollback_appeared
-                    or current_main is None
-                    or (
-                        after_main.st_dev,
-                        after_main.st_ino,
-                        after_main.st_size,
-                        after_main.st_mtime_ns,
-                    )
-                    != (
-                        main_metadata.st_dev,
-                        main_metadata.st_ino,
-                        main_metadata.st_size,
-                        main_metadata.st_mtime_ns,
-                    )
-                    or (
-                        current_main.st_dev,
-                        current_main.st_ino,
-                        current_main.st_size,
-                        current_main.st_mtime_ns,
-                    )
-                    != (
-                        main_metadata.st_dev,
-                        main_metadata.st_ino,
-                        main_metadata.st_size,
-                        main_metadata.st_mtime_ns,
-                    )
-                    or ((current_wal is None) != (wal_metadata is None))
-                    or (
-                        current_wal is not None
-                        and wal_metadata is not None
-                        and after_wal is not None
-                        and (
-                            (
-                                after_wal.st_dev,
-                                after_wal.st_ino,
-                                after_wal.st_size,
-                                after_wal.st_mtime_ns,
-                            )
-                            != (
-                                wal_metadata.st_dev,
-                                wal_metadata.st_ino,
-                                wal_metadata.st_size,
-                                wal_metadata.st_mtime_ns,
-                            )
-                            or (
-                                current_wal.st_dev,
-                                current_wal.st_ino,
-                                current_wal.st_size,
-                                current_wal.st_mtime_ns,
-                            )
-                            != (
-                                wal_metadata.st_dev,
-                                wal_metadata.st_ino,
-                                wal_metadata.st_size,
-                                wal_metadata.st_mtime_ns,
-                            )
-                        )
-                    )
-                    or (
-                        (current_shm is None) != (shm_metadata is None)
-                        or (
-                            current_shm is not None
-                            and shm_metadata is not None
-                            and (current_shm.st_dev, current_shm.st_ino)
-                            != (shm_metadata.st_dev, shm_metadata.st_ino)
-                        )
-                    )
-                ):
-                    raise RuntimeError(
-                        "Program-cycle journal changed while snapshotting"
-                    )
-                suffix = (
-                    "?mode=ro" if wal_metadata is not None else "?mode=ro&immutable=1"
-                )
-                yield f"{snapshot.as_uri()}{suffix}"
-        except OSError as error:
-            raise RuntimeError(
-                f"Program-cycle journal cannot be snapshotted: {error}"
-            ) from error
-        finally:
-            if wal_descriptor >= 0:
-                os.close(wal_descriptor)
-            if main_descriptor >= 0:
-                os.close(main_descriptor)
-
-    @staticmethod
-    def _preflight_existing(
-        path: Path,
-        *,
-        parent_descriptor: int,
-    ) -> tuple[int, int]:
-        """Validate existing durable state through a strictly read-only handle."""
-
-        try:
-            metadata = os.stat(
-                path.name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-        except OSError as error:
-            raise RuntimeError(
-                f"Program-cycle journal cannot be inspected: {error}"
-            ) from error
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_uid != os.geteuid()
-            or metadata.st_nlink != 1
-            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-            or metadata.st_mode & (stat.S_IRUSR | stat.S_IWUSR)
-            != (stat.S_IRUSR | stat.S_IWUSR)
-        ):
-            raise RuntimeError(
-                "Program-cycle journal is not one safe owner-held regular file"
-            )
-        database: sqlite3.Connection | None = None
-        snapshot_stack = ExitStack()
-        try:
-            snapshot_uri = snapshot_stack.enter_context(
-                ProgramCycleJournal._read_only_snapshot(
-                    path,
-                    parent_descriptor=parent_descriptor,
-                    main_metadata=metadata,
-                )
-            )
-            try:
-                database = sqlite3.connect(
-                    snapshot_uri,
-                    uri=True,
-                    timeout=10.0,
-                    isolation_level=None,
-                    check_same_thread=False,
-                )
-            except (OSError, sqlite3.Error, ValueError) as error:
-                raise RuntimeError(
-                    "Program-cycle journal cannot be opened read-only: " f"{error}"
-                ) from error
-            database.execute("PRAGMA query_only=ON")
-            check = database.execute("PRAGMA quick_check").fetchall()
-            if check != [("ok",)]:
-                raise RuntimeError("Program-cycle journal integrity check failed")
-            tables = {
-                row[0]
-                for row in database.execute(
-                    "SELECT name FROM sqlite_schema WHERE type='table'"
-                )
-            }
-            if "program_cycle_metadata" not in tables:
-                raise RuntimeError("Program-cycle journal metadata is absent")
-            metadata_rows = database.execute(
-                "SELECT singleton,schema_version FROM program_cycle_metadata"
-            ).fetchall()
-            if (
-                len(metadata_rows) == 1
-                and metadata_rows[0][0] == 1
-                and type(metadata_rows[0][1]) is int
-                and metadata_rows[0][1] != SCHEMA_VERSION
-            ):
-                raise ProgramCycleJournalVersionError(metadata_rows[0][1])
-            if metadata_rows != [(1, SCHEMA_VERSION)]:
-                raise RuntimeError("Program-cycle journal metadata is corrupt")
-            expected_shapes = _REQUIRED_TABLE_SHAPES
-            expected_sql = _REQUIRED_TABLE_SQL
-            expected_tables = set(expected_shapes)
-            if tables != expected_tables:
-                raise RuntimeError(
-                    "Program-cycle journal schema has unsupported tables"
-                )
-            schema_rows = {
-                row[0]: row[1]
-                for row in database.execute(
-                    "SELECT name,sql FROM sqlite_schema WHERE type='table'"
-                )
-            }
-            for table, expected_shape in expected_shapes.items():
-                rows = database.execute(f"PRAGMA table_info({table})").fetchall()
-                shape = tuple(
-                    (row[1], str(row[2]).upper(), row[3], row[5]) for row in rows
-                )
-                schema_sql = schema_rows.get(table)
-                if (
-                    shape != expected_shape
-                    or any(row[4] is not None for row in rows)
-                    or not isinstance(schema_sql, str)
-                    or _normalized_sql(schema_sql)
-                    != _normalized_sql(expected_sql[table])
-                ):
-                    raise RuntimeError(
-                        f"Program-cycle journal table {table} has unsupported shape"
-                    )
-            unsupported_objects = database.execute(
-                "SELECT type,name FROM sqlite_schema "
-                "WHERE type IN ('view','trigger') "
-                "OR (type='index' AND sql IS NOT NULL)"
-            ).fetchall()
-            if unsupported_objects:
-                raise RuntimeError(
-                    "Program-cycle journal schema has unsupported objects"
-                )
-            cycle_rows = database.execute("SELECT * FROM program_cycle").fetchall()
-            if (
-                len(cycle_rows) != 1
-                or cycle_rows[0][0] != 1
-                or type(cycle_rows[0][1]) is not int
-                or cycle_rows[0][1] < 1
-                or cycle_rows[0][2] not in STATES
-                or not _bounded_identity(cycle_rows[0][3])
-                or (
-                    cycle_rows[0][4] is not None
-                    and not _bounded_identity(cycle_rows[0][4])
-                )
-                or type(cycle_rows[0][11]) is not int
-                or cycle_rows[0][11] not in {0, 1}
-                or any(
-                    value is not None and not isinstance(value, str)
-                    for value in (cycle_rows[0][7], cycle_rows[0][13])
-                )
-            ):
-                raise RuntimeError("Program-cycle journal owner row is corrupt")
-            for index in (5, 6, 8, 9, 10, 12):
-                _strict_object(cycle_rows[0][index])
-
-            if (
-                type(cycle_rows[0][14]) is not int
-                or not 1 <= cycle_rows[0][14] <= 9_007_199_254_740_991
-                or any(
-                    value is not None and not _bounded_identity(value)
-                    for value in cycle_rows[0][15:19]
-                )
-            ):
-                raise RuntimeError("Program-cycle control identity is corrupt")
-            _strict_object(cycle_rows[0][19])
-            failure = _strict_object(cycle_rows[0][19])
-            if failure is not None and "prior_scene_preparation_failure" in failure:
-                _prior_scene_preparation_failure(failure)
-            if cycle_rows[0][20] is not None and not _bounded_identity(
-                cycle_rows[0][20]
-            ):
-                raise RuntimeError("Program-cycle reset phase is corrupt")
-            _strict_object(cycle_rows[0][21])
-            reset_effect = _strict_object(cycle_rows[0][22])
-            if reset_effect is not None and (
-                set(reset_effect) != {"intent", "claim", "release_intent"}
-                or not isinstance(reset_effect["intent"], dict)
-                or any(reset_effect[key] is not None and not isinstance(reset_effect[key], dict)
-                       for key in ("claim", "release_intent"))
-                or (reset_effect["release_intent"] is not None and reset_effect["claim"] is None)
-            ):
-                raise RuntimeError("Program Reset effect claim register is corrupt")
-
-            request_count = 0
-            reset_request_count = 0
-            for request in database.execute(
-                "SELECT request_owner_epoch,request_id,request_kind,intent_json,"
-                "cycle_generation FROM program_cycle_inflight_commands"
-            ):
-                request_count += 1
-                reset_request_count += request[2] == "reset"
-                if (
-                    (
-                        request_count > 4_096
-                        and (request_count > 4_097 or reset_request_count != 1)
-                    )
-                    or not _bounded_identity(request[0])
-                    or not _bounded_identity(request[1])
-                    or request[2] not in _REQUEST_KINDS
-                    or type(request[4]) is not int
-                    or request[4] < 1
-                ):
-                    raise RuntimeError("Program-cycle request ledger is corrupt")
-                _strict_object(request[3], required=True)
-
-            completed_count = 0
-            for completed in database.execute(
-                "SELECT request_owner_epoch,request_id,action,outcome,position "
-                "FROM program_persistent_value_requests"
-            ):
-                completed_count += 1
-                if (
-                    completed_count > MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS
-                    or not _bounded_identity(completed[0])
-                    or not _bounded_identity(completed[1])
-                    or completed[2] not in _PERSISTENT_VALUE_ACTIONS.values()
-                    or completed[3] not in _PERSISTENT_VALUE_OUTCOMES
-                    or type(completed[4]) is not int
-                    or completed[4] < 1
-                ):
-                    raise RuntimeError(
-                        "Program-cycle persistent-value request table is corrupt"
-                    )
-
-            liveness_rows = database.execute(
-                "SELECT singleton,manager_runtime_epoch,manager_owner_epoch,"
-                "predecessor_expired,fault_reference "
-                "FROM program_runner_liveness"
-            ).fetchall()
-            if (
-                len(liveness_rows) != 1
-                or liveness_rows[0][0] != 1
-                or any(
-                    value is not None and not _bounded_identity(value)
-                    for value in liveness_rows[0][1:3]
-                )
-                or type(liveness_rows[0][3]) is not int
-                or liveness_rows[0][3] not in {0, 1}
-                or (
-                    liveness_rows[0][4] is not None
-                    and not isinstance(liveness_rows[0][4], str)
-                )
-            ):
-                raise RuntimeError("Program-cycle liveness row is corrupt")
-
-            history_count = 0
-            for history in database.execute(
-                "SELECT program_run_id,run_revision,snapshot_json,terminal "
-                "FROM program_run_history"
-            ):
-                history_count += 1
-                snapshot = _strict_object(history[2], required=True)
-                capture = snapshot.get("capture") if snapshot is not None else None
-                if (
-                    history_count > 4_096
-                    or not _bounded_identity(history[0])
-                    or type(history[1]) is not int
-                    or history[1] < 1
-                    or type(history[3]) is not int
-                    or history[3] not in {0, 1}
-                    or not isinstance(capture, dict)
-                    or capture.get("program_run_id") != history[0]
-                    or snapshot.get("run_revision") != history[1]
-                    or (snapshot.get("state") in _TERMINAL_RUN_STATES)
-                    != bool(history[3])
-                ):
-                    raise RuntimeError("Program-run history row is corrupt")
-            after = os.stat(
-                path.name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                (after.st_dev, after.st_ino) != (metadata.st_dev, metadata.st_ino)
-                or not stat.S_ISREG(after.st_mode)
-                or after.st_uid != os.geteuid()
-                or after.st_nlink != 1
-                or after.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                or after.st_mode & (stat.S_IRUSR | stat.S_IWUSR)
-                != (stat.S_IRUSR | stat.S_IWUSR)
-            ):
-                raise RuntimeError(
-                    "Program-cycle journal changed during read-only preflight"
-                )
-        except sqlite3.Error as error:
-            raise RuntimeError(
-                f"Program-cycle journal read-only preflight failed: {error}"
-            ) from error
-        finally:
-            if database is not None:
-                database.close()
-            snapshot_stack.close()
-        return metadata.st_dev, metadata.st_ino
-
     def __init__(
         self,
         path: Path,
         *,
-        owner_epoch: str,
         maximum_inflight_commands: int = 4_096,
         maximum_retained_runs: int = 4_096,
         maximum_finished_history_bytes: int = MAXIMUM_FINISHED_HISTORY_BYTES,
@@ -976,13 +375,7 @@ class ProgramCycleJournal:
         if type(maximum_finished_history_bytes) is not int or maximum_finished_history_bytes < 1:
             raise ValueError("maximum_finished_history_bytes must be a positive integer")
         self._maximum_finished_history_bytes = maximum_finished_history_bytes
-        self._oversize_current_run_logged: str | None = None
-        if (
-            not owner_epoch
-            or unicodedata.normalize("NFC", owner_epoch) != owner_epoch
-            or len(owner_epoch.encode("utf-8")) > 256
-        ):
-            raise ValueError("owner_epoch must be bounded non-empty NFC text")
+        self._oversize_current_run_logged: int | None = None
         self._lock = RLock()
         self._change_observer: Callable[[], None] | None = None
         path = Path(path)
@@ -995,72 +388,51 @@ class ProgramCycleJournal:
             with self._trusted_parent(path) as parent_descriptor:
                 parent_metadata = os.fstat(parent_descriptor)
                 parent_identity = (parent_metadata.st_dev, parent_metadata.st_ino)
-                try:
-                    os.stat(
-                        path.name,
-                        dir_fd=parent_descriptor,
-                        follow_symlinks=False,
-                    )
-                    exists = True
-                except FileNotFoundError:
-                    exists = False
-                except OSError as error:
-                    raise RuntimeError(
-                        f"Program-cycle journal cannot be inspected: {error}"
-                    ) from error
-                new_database = not exists
-                expected_identity: tuple[int, int]
-                if exists:
-                    expected_identity = self._preflight_existing(
-                        path,
-                        parent_descriptor=parent_descriptor,
-                    )
-                else:
-                    orphaned_sidecars: list[str] = []
-                    for suffix in ("-journal", "-wal", "-shm"):
-                        sidecar_name = f"{path.name}{suffix}"
-                        try:
-                            os.stat(
-                                sidecar_name,
-                                dir_fd=parent_descriptor,
-                                follow_symlinks=False,
-                            )
-                        except FileNotFoundError:
-                            continue
-                        except OSError as error:
-                            raise RuntimeError(
-                                "Program-cycle journal absence cannot be "
-                                f"verified: {error}"
-                            ) from error
-                        orphaned_sidecars.append(sidecar_name)
-                    if orphaned_sidecars:
-                        raise RuntimeError(
-                            "Program-cycle journal main database is absent but "
-                            "orphan sidecars remain: " + ", ".join(orphaned_sidecars)
-                        )
+                orphaned_sidecars: list[str] = []
+                for suffix in ("-journal", "-wal", "-shm"):
+                    sidecar_name = f"{path.name}{suffix}"
                     try:
-                        descriptor = os.open(
-                            path.name,
-                            os.O_RDWR
-                            | os.O_CREAT
-                            | os.O_EXCL
-                            | os.O_CLOEXEC
-                            | os.O_NOFOLLOW,
-                            0o600,
+                        os.stat(
+                            sidecar_name,
                             dir_fd=parent_descriptor,
+                            follow_symlinks=False,
                         )
+                    except FileNotFoundError:
+                        continue
                     except OSError as error:
                         raise RuntimeError(
-                            f"Program-cycle journal cannot be reserved: {error}"
+                            "Program-cycle journal absence cannot be "
+                            f"verified: {error}"
                         ) from error
-                    try:
-                        os.fchmod(descriptor, 0o600)
-                        os.fsync(descriptor)
-                        reserved = os.fstat(descriptor)
-                        expected_identity = (reserved.st_dev, reserved.st_ino)
-                    finally:
-                        os.close(descriptor)
-                    os.fsync(parent_descriptor)
+                    orphaned_sidecars.append(sidecar_name)
+                if orphaned_sidecars:
+                    raise RuntimeError(
+                        "Program-cycle journal main database is absent but "
+                        "orphan sidecars remain: " + ", ".join(orphaned_sidecars)
+                    )
+                try:
+                    descriptor = os.open(
+                        path.name,
+                        os.O_RDWR
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | os.O_CLOEXEC
+                        | os.O_NOFOLLOW,
+                        0o600,
+                        dir_fd=parent_descriptor,
+                    )
+                except OSError as error:
+                    raise RuntimeError(
+                        f"Program-cycle journal cannot be reserved: {error}"
+                    ) from error
+                try:
+                    os.fchmod(descriptor, 0o600)
+                    os.fsync(descriptor)
+                    reserved = os.fstat(descriptor)
+                    expected_identity = (reserved.st_dev, reserved.st_ino)
+                finally:
+                    os.close(descriptor)
+                os.fsync(parent_descriptor)
                 try:
                     current = os.stat(
                         path.name,
@@ -1132,100 +504,49 @@ class ProgramCycleJournal:
         self._parent_descriptor = parent_capability
         self._parent_identity = parent_identity
         self._database_identity = expected_identity
-        self._database = database
+        # The memory is the state; the file is a copy written behind by one writer.
+        self._cycle: dict[str, Any] = dict.fromkeys(CYCLE_COLUMNS)
+        self._cycle.update(
+            cycle_generation=1,
+            state="idle_after_reset",
+            reconciliation_required=0,
+            execution_control_revision=1,
+        )
+        self._inflight: dict[bytes, tuple[str, str, int]] = {}
+        # Run id -> (run_revision, snapshot_json, terminal, UTF-8 byte length).
+        self._history: dict[int, tuple[int, str, int, int]] = {}
+        self._history_terminal_bytes = 0
+        # Request key -> (action, outcome, position), in position order.
+        self._persistent: dict[bytes, tuple[str, str, int]] = {}
+        self._stage: _Stage | None = None
+        self._sequence = 0
+        self._closed = False
         try:
-            self._database.execute("PRAGMA foreign_keys=ON")
-            self._database.execute("PRAGMA journal_mode=WAL")
-            self._database.execute(f"PRAGMA journal_size_limit={maximum_finished_history_bytes}")
-            self._database.execute("PRAGMA synchronous=FULL")
-            if new_database:
-                self._database.executescript(_SCHEMA_SQL)
-            with self._transaction():
-                if new_database:
-                    self._database.execute(
-                        "INSERT INTO program_cycle_metadata VALUES(1,?)",
-                        (SCHEMA_VERSION,),
-                    )
-                    self._database.execute(
-                        "INSERT INTO program_runner_liveness "
-                        "VALUES(1,NULL,NULL,0,NULL)"
-                    )
-                    self._database.execute(
-                        """
-                        INSERT INTO program_cycle
-                        (singleton,cycle_generation,state,owner_epoch,program_run_id,
-                         claim_json,capture_identities_json,terminal_reference,
-                         start_settlement_json,
-                         reset_result_json,reconciliation_required,
-                         acquisition_pending_json,reconciliation_evidence_digest,
-                         release_intent_json,execution_control_revision,
-                         causal_correlation_id,causal_session_id,
-                         causal_client_sequence,current_command_kind,
-                         failure_json,reset_phase,runtime_controls_json,reset_effect_claim_json)
-                        VALUES(1,1,'idle_after_reset',?,NULL,NULL,NULL,NULL,NULL,NULL,0,NULL,NULL,NULL,1,NULL,NULL,NULL,NULL,NULL,NULL,NULL,NULL)
-                        """,
-                        (owner_epoch,),
-                    )
-                row = self.read()
-                if not new_database and row.state == "resetting":
-                    # A process cannot truthfully continue an in-memory Reset
-                    # call after restart.  Preserve its durable phase, make
-                    # the interruption explicit, and require the replacement
-                    # owner to reconcile with Kernel before that phase can be
-                    # resumed by a fresh Reset command.
-                    phase = row.reset_phase
-                    failure = {
-                        "code": "program_cycle_reset_interrupted",
-                        "message": "Program Runner restarted during Reset",
-                    }
-                    if _bounded_identity(phase):
-                        failure["failed_phase"] = phase
-                    prior = _prior_scene_preparation_failure(row.failure)
-                    if prior is not None:
-                        failure["prior_scene_preparation_failure"] = prior
-                    self._database.execute(
-                        """
-                        UPDATE program_cycle
-                        SET state='recovery_required',failure_json=?,
-                            reconciliation_required=1,
-                            execution_control_revision=execution_control_revision+1
-                        WHERE singleton=1 AND state='resetting'
-                        """,
-                        (self._dump(failure),),
-                    )
-                    row = self.read()
-                if not new_database and (
-                    row.state != "idle_after_reset"
-                    or row.claim is not None
-                    or row.acquisition_pending is not None
-                ):
-                    self._database.execute(
-                        """
-                        UPDATE program_cycle SET reconciliation_required=1
-                        WHERE singleton=1
-                        """
-                    )
-                    row = self.read()
-                if row.owner_epoch != owner_epoch:
-                    self._database.execute(
-                        """
-                        UPDATE program_cycle SET reconciliation_required=1
-                        WHERE singleton=1
-                        """
-                    )
-                if row.state == "idle_after_reset":
-                    # Only unresolved commands are retained.  An idle current
-                    # cycle proves any predecessor pre-effect command cannot
-                    # still own a physical effect.
-                    self._database.execute(
-                        "DELETE FROM program_cycle_inflight_commands"
-                    )
-                self._prune_finished_history_locked()
+            database.execute("PRAGMA foreign_keys=ON")
+            database.execute("PRAGMA journal_mode=WAL")
+            database.execute(f"PRAGMA journal_size_limit={maximum_finished_history_bytes}")
+            database.execute("PRAGMA synchronous=NORMAL")
+            database.executescript(_SCHEMA_SQL)
+            database.execute("BEGIN IMMEDIATE")
+            database.execute(
+                "INSERT INTO program_cycle_metadata VALUES(1,?,0)", (SCHEMA_VERSION,)
+            )
+            database.execute(
+                "INSERT INTO program_cycle(singleton," + ",".join(CYCLE_COLUMNS) + ") "
+                "VALUES(1," + ",".join("?" for _ in CYCLE_COLUMNS) + ")",
+                self._cycle_row(self._cycle),
+            )
+            database.execute("COMMIT")
         except BaseException:
-            self._database.close()
+            database.close()
             os.close(self._parent_descriptor)
             self._parent_descriptor = -1
             raise
+        self._writer = CycleJournalWriter(
+            database,
+            validate_storage=self._validate_storage,
+            close_storage=self._close_parent,
+        )
 
     @staticmethod
     def _safe_parent(metadata: os.stat_result) -> bool:
@@ -1248,7 +569,15 @@ class ProgramCycleJournal:
             == (stat.S_IRUSR | stat.S_IWUSR)
         )
 
+    def _close_parent(self) -> None:
+        """Release the directory capability; called by the writer after the file closed."""
+
+        os.close(self._parent_descriptor)
+        self._parent_descriptor = -1
+
     def _validate_storage(self) -> None:
+        """Check the file is still the one created; the writer runs it before each commit."""
+
         if self._parent_descriptor < 0:
             raise RuntimeError("Program-cycle journal is closed")
         try:
@@ -1299,143 +628,176 @@ class ProgramCycleJournal:
         self,
         *,
         expected_generation: int,
-        provisional_run_id: str,
+        provisional_run_id: int,
         evidence: Mapping[str, Any],
-        correlation_id: str | None = None,
-        session_id: str | None = None,
-        client_sequence: str | None = None,
+        causal_request_key: bytes | None = None,
     ) -> None:
-        """Durably mark the inherently uncertain acquire/response checkpoint."""
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle
-                SET state='starting', program_run_id=?, acquisition_pending_json=?,
-                    execution_control_revision=execution_control_revision+1,
-                    causal_correlation_id=?,causal_session_id=?,
-                    causal_client_sequence=?,current_command_kind='program_run',
-                    failure_json=NULL,reset_phase=NULL
-                WHERE singleton=1 AND cycle_generation=?
-                  AND state='idle_after_reset' AND claim_json IS NULL
-                  AND acquisition_pending_json IS NULL
-                """,
-                (
-                    provisional_run_id,
-                    self._dump(evidence),
-                    correlation_id,
-                    session_id,
-                    client_sequence,
-                    expected_generation,
-                ),
-            ).rowcount
-            if changed != 1:
+        """Mark the inherently uncertain acquire/response checkpoint."""
+        with self._transaction() as stage:
+            encoded = self._dump(evidence)
+            row = stage.cycle
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["state"] == "idle_after_reset"
+                and row["claim_json"] is None
+                and row["acquisition_pending_json"] is None
+            ):
                 raise RuntimeError("Program-cycle acquire checkpoint is stale")
+            row.update(
+                state="starting",
+                program_run_id=provisional_run_id,
+                acquisition_pending_json=encoded,
+                execution_control_revision=row["execution_control_revision"] + 1,
+                causal_request_key=causal_request_key,
+                current_command_kind="program_run",
+                failure_json=None,
+                reset_phase=None,
+            )
 
     def remember_acquired_claim(
         self,
         *,
         expected_generation: int,
-        provisional_run_id: str,
+        provisional_run_id: int,
         claim: Mapping[str, Any],
     ) -> None:
-        """Close the acquire/local-journal crash window before further reads."""
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle
-                SET program_run_id=?, claim_json=?, acquisition_pending_json=NULL
-                WHERE singleton=1 AND cycle_generation=?
-                  AND state IN ('starting','stopping') AND claim_json IS NULL
-                  AND acquisition_pending_json IS NOT NULL
-                """,
-                (
-                    provisional_run_id,
-                    self._dump(claim),
-                    expected_generation,
-                ),
-            ).rowcount
-            if changed != 1:
+        """Record the acquired claim before further reads.
+
+        In ``recovery_required`` this records the claim a Reset's exact
+        acquire replay returned."""
+        with self._transaction() as stage:
+            encoded = self._dump(claim)
+            row = stage.cycle
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["state"] in {"starting", "recovery_required"}
+                and row["claim_json"] is None
+                and row["acquisition_pending_json"] is not None
+            ):
                 raise RuntimeError("Program-cycle claim persistence is stale")
+            row.update(
+                program_run_id=provisional_run_id,
+                claim_json=encoded,
+                acquisition_pending_json=None,
+            )
 
     def refresh_pending_acquire(
         self,
         *,
         expected_generation: int,
-        provisional_run_id: str,
+        provisional_run_id: int,
         evidence: Mapping[str, Any],
     ) -> None:
         """Replace pre-acquire evidence after scene preparation advanced admission."""
 
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle SET acquisition_pending_json=?
-                WHERE singleton=1 AND cycle_generation=?
-                  AND state='starting' AND program_run_id=?
-                  AND claim_json IS NULL AND acquisition_pending_json IS NOT NULL
-                """,
-                (
-                    self._dump(evidence),
-                    expected_generation,
-                    provisional_run_id,
-                ),
-            ).rowcount
-            if changed != 1:
+        with self._transaction() as stage:
+            encoded = self._dump(evidence)
+            row = stage.cycle
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["state"] == "starting"
+                and row["program_run_id"] == provisional_run_id
+                and row["claim_json"] is None
+                and row["acquisition_pending_json"] is not None
+            ):
                 raise RuntimeError("Program-cycle acquire evidence is stale")
+            row["acquisition_pending_json"] = encoded
 
     def mark_acquire_unknown(self, *, expected_generation: int) -> None:
         """Fail closed without inventing the claim hidden by response loss."""
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle SET reconciliation_required=1,
-                    state='recovery_required',
-                    execution_control_revision=execution_control_revision+1,
-                    failure_json=(
-                      '{"code":"program_cycle_acquire_outcome_unknown"}'
-                    )
-                WHERE singleton=1 AND cycle_generation=?
-                  AND state IN ('starting','stopping') AND claim_json IS NULL
-                  AND acquisition_pending_json IS NOT NULL
-                """,
-                (expected_generation,),
-            ).rowcount
-            if changed != 1:
+        with self._transaction() as stage:
+            row = stage.cycle
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["state"] == "starting"
+                and row["claim_json"] is None
+                and row["acquisition_pending_json"] is not None
+            ):
                 raise RuntimeError("Program-cycle unknown acquire is stale")
+            row.update(
+                reconciliation_required=1,
+                state="recovery_required",
+                execution_control_revision=row["execution_control_revision"] + 1,
+                failure_json='{"code":"program_cycle_acquire_outcome_unknown"}',
+            )
 
     def cancel_rejected_acquire(self, *, expected_generation: int) -> None:
-        """Clear a checkpoint only after an explicit native rejection packet."""
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle
-                SET state='idle_after_reset', program_run_id=NULL,
-                    acquisition_pending_json=NULL,
-                    execution_control_revision=execution_control_revision+1,
-                    current_command_kind=NULL
-                WHERE singleton=1 AND cycle_generation=?
-                  AND state='starting' AND claim_json IS NULL
-                  AND acquisition_pending_json IS NOT NULL
-                """,
-                (expected_generation,),
-            ).rowcount
-            if changed != 1:
+        """Clear a checkpoint only after an explicit native rejection packet.
+
+        In ``recovery_required`` the rejection is a Reset's exact acquire
+        replay; it also clears the latch and failure that the unknown set."""
+        with self._transaction() as stage:
+            row = stage.cycle
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["state"] in {"starting", "recovery_required"}
+                and row["claim_json"] is None
+                and row["acquisition_pending_json"] is not None
+            ):
                 raise RuntimeError("Program-cycle rejected acquire is stale")
+            row.update(
+                state="idle_after_reset",
+                program_run_id=None,
+                acquisition_pending_json=None,
+                execution_control_revision=row["execution_control_revision"] + 1,
+                current_command_kind=None,
+                reconciliation_required=0,
+                failure_json=None,
+            )
+
+    @staticmethod
+    def _cycle_row(cycle: Mapping[str, Any]) -> tuple[Any, ...]:
+        return tuple(cycle[column] for column in CYCLE_COLUMNS)
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("Program-cycle journal is closed")
+
+    def _row(self) -> dict[str, Any]:
+        """The cycle row this thread sees: its own staged copy inside a method."""
+
+        return self._cycle if self._stage is None else self._stage.cycle
+
+    def _table(self, name: str, *, write: bool = False) -> dict[Any, Any]:
+        """A row table as this thread sees it; ``write`` gives the staged copy."""
+
+        stage = self._stage
+        if stage is None:
+            return getattr(self, name)
+        table = stage.tables.get(name)
+        if table is None:
+            table = getattr(self, name)
+            if write:
+                table = dict(table)
+                stage.tables[name] = table
+        return table
 
     @contextmanager
-    def _transaction(self) -> Iterator[None]:
-        committed = False
+    def _transaction(self) -> Iterator[_Stage]:
+        """Change a staged copy; swap it in and post it only if the method returns."""
+
         with self._lock:
-            self._validate_storage()
-            self._database.execute("BEGIN IMMEDIATE")
+            self._require_open()
+            stage = _Stage(self)
+            self._stage = stage
             try:
-                yield
-            except BaseException:
-                self._database.execute("ROLLBACK")
-                raise
-            self._database.execute("COMMIT")
-            committed = True
-        observer = self._change_observer if committed else None
+                yield stage
+            finally:
+                self._stage = None
+            cycle_row = None
+            if stage.cycle != self._cycle:
+                self._cycle = stage.cycle
+                cycle_row = self._cycle_row(stage.cycle)
+            for name, table in stage.tables.items():
+                setattr(self, name, table)
+            self._history_terminal_bytes = stage.history_terminal_bytes
+            if cycle_row is not None or stage.operations:
+                # Posted under the lock, so the file order is the state order.
+                self._sequence += 1
+                self._writer.post(
+                    JournalCommit(self._sequence, cycle_row, tuple(stage.operations))
+                )
+        observer = self._change_observer
         if observer is not None:
             try:
                 observer()
@@ -1473,47 +835,26 @@ class ProgramCycleJournal:
 
     def read(self) -> CycleRecord:
         with self._lock:
-            self._validate_storage()
-            row = self._database.execute(
-                """
-                SELECT cycle_generation,state,owner_epoch,program_run_id,claim_json,
-                       capture_identities_json,terminal_reference,
-                       start_settlement_json,release_intent_json,
-                       reset_result_json,
-                       reconciliation_required,acquisition_pending_json,
-                       reconciliation_evidence_digest,
-                       execution_control_revision,causal_correlation_id,
-                       causal_session_id,causal_client_sequence,
-                       current_command_kind,failure_json,reset_phase,
-                       runtime_controls_json,reset_effect_claim_json
-                FROM program_cycle WHERE singleton=1
-                """
-            ).fetchone()
-        if row is None or row[1] not in STATES:
-            raise RuntimeError("Program-cycle journal is corrupt")
+            self._require_open()
+            row = self._row()
+        # Decoded from the stored text: new objects on every call.
         return CycleRecord(
-            row[0],
-            row[1],
-            row[2],
-            row[3],
-            self._load(row[4]),
-            self._load(row[5]),
-            row[6],
-            self._load(row[7]),
-            self._load(row[8]),
-            self._load(row[9]),
-            bool(row[10]),
-            self._load(row[11]),
-            row[12],
-            row[13],
-            row[14],
-            row[15],
-            row[16],
-            row[17],
-            self._load(row[18]),
-            row[19],
-            self._load(row[20]),
-            self._load(row[21]),
+            row["cycle_generation"],
+            row["state"],
+            row["program_run_id"],
+            self._load(row["claim_json"]),
+            self._load(row["capture_identities_json"]),
+            row["terminal_reference"],
+            self._load(row["start_settlement_json"]),
+            self._load(row["release_intent_json"]),
+            bool(row["reconciliation_required"]),
+            self._load(row["acquisition_pending_json"]),
+            row["execution_control_revision"],
+            row["causal_request_key"],
+            row["current_command_kind"],
+            self._load(row["failure_json"]),
+            row["reset_phase"],
+            self._load(row["reset_effect_claim_json"]),
         )
 
     def remember_release_intent(
@@ -1523,22 +864,23 @@ class ProgramCycleJournal:
         claim_generation: int,
         release: Mapping[str, Any],
     ) -> None:
-        """Durably bind the exact Reset release before invoking the Kernel."""
+        """Bind the exact Reset release before invoking the Kernel."""
         encoded = self._dump(release)
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle SET release_intent_json=?
-                WHERE singleton=1 AND cycle_generation=?
-                  AND state IN ('terminal_awaiting_reset','resetting')
-                  AND reconciliation_required=0
-                  AND CAST(json_extract(claim_json,'$.claim_generation') AS INTEGER)=?
-                  AND (release_intent_json IS NULL OR release_intent_json=?)
-                """,
-                (encoded, expected_generation, claim_generation, encoded),
-            ).rowcount
-            if changed != 1:
+        with self._transaction() as stage:
+            row = stage.cycle
+            claim = self._load(row["claim_json"])
+            # The claim's generation compared as SQLite's integer cast would.
+            stored_generation = None if claim is None else claim.get("claim_generation")
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["state"] in {"terminal_awaiting_reset", "resetting"}
+                and row["reconciliation_required"] == 0
+                and isinstance(stored_generation, (int, float))
+                and int(stored_generation) == claim_generation
+                and row["release_intent_json"] in {None, encoded}
+            ):
                 raise RuntimeError("Program-cycle release intent is stale")
+            row["release_intent_json"] = encoded
 
     def status_snapshot(self) -> tuple[CycleRecord, tuple[dict[str, Any], ...]]:
         """Read cycle and unresolved command evidence under one journal lock."""
@@ -1548,26 +890,28 @@ class ProgramCycleJournal:
     def pending_commands(self) -> tuple[dict[str, Any], ...]:
         """Bounded current unresolved evidence, never an execution/retry queue."""
         with self._lock:
-            self._validate_storage()
-            return tuple(
-                {
-                    "request_owner_epoch": row[0],
-                    "request_id": row[1],
-                    "kind": row[2],
-                    "intent": self._load(row[3]),
-                    "cycle_generation": row[4],
-                }
-                for row in self._database.execute(
-                    "SELECT request_owner_epoch,request_id,request_kind,intent_json,cycle_generation "
-                    "FROM program_cycle_inflight_commands ORDER BY request_owner_epoch,request_id"
-                )
-            )
+            self._require_open()
+            rows = sorted(self._table("_inflight").items())
+        return tuple(
+            {
+                "request_key": request_key,
+                "kind": kind,
+                "intent": self._load(intent_json),
+                "cycle_generation": generation,
+            }
+            for request_key, (kind, intent_json, generation) in rows
+        )
+
+    def _inflight_rows(self) -> dict[bytes, tuple[str, str, int]]:
+        """A copy of the in-flight rows as stored (tests)."""
+
+        with self._lock:
+            return dict(self._inflight)
 
     def record_request(
         self,
         *,
-        owner_epoch: str,
-        request_id: str,
+        request_key: bytes,
         kind: str,
         intent: Mapping[str, Any],
         cycle_generation: int,
@@ -1575,35 +919,21 @@ class ProgramCycleJournal:
         if kind not in _REQUEST_KINDS:
             raise ValueError("Program-cycle request kind is unsupported")
         encoded = self._dump(intent)
-        with self._transaction():
+        with self._transaction() as stage:
             if kind in _PERSISTENT_VALUE_ACTIONS:
-                completed = self._database.execute(
-                    """
-                    SELECT action,outcome FROM program_persistent_value_requests
-                    WHERE request_owner_epoch=? AND request_id=?
-                    """,
-                    (owner_epoch, request_id),
-                ).fetchone()
+                completed = self._table("_persistent").get(request_key)
                 if completed is not None:
                     # Already applied: refused by its identity, never again.
                     return RequestRecord(
                         "completed",
                         result={"action": completed[0], "outcome": completed[1]},
                     )
-            current = self._database.execute(
-                """
-                SELECT request_kind,intent_json
-                FROM program_cycle_inflight_commands
-                WHERE request_owner_epoch=? AND request_id=?
-                """,
-                (owner_epoch, request_id),
-            ).fetchone()
+            inflight = self._table("_inflight")
+            current = inflight.get(request_key)
             if current is not None:
                 same_intent = current[1] == encoded
                 if kind == "reset" and current[0] == kind:
-                    # Missing selectors in this version's request mean off.
-                    # Earlier journal versions are refused unchanged; their
-                    # implicit Scene restoration is never reinterpreted.
+                    # Missing selectors in a request mean off.
                     retained_intent = self._load(current[1])
                     compared_intent = dict(intent)
                     for key in ("reload_initial_scene", "reset_robot_position"):
@@ -1615,10 +945,8 @@ class ProgramCycleJournal:
                         "request identity was reused with different intent"
                     )
                 return RequestRecord("in_progress")
-            total, resets = self._database.execute(
-                "SELECT COUNT(*),COALESCE(SUM(request_kind='reset'),0) "
-                "FROM program_cycle_inflight_commands"
-            ).fetchone()
+            total = len(inflight)
+            resets = sum(row[0] == "reset" for row in inflight.values())
             count = resets if kind == "reset" else total - resets
             # Exactly one Reset occurrence remains admissible when the
             # ordinary guard is full. An uncertain Reset must be continued,
@@ -1626,53 +954,36 @@ class ProgramCycleJournal:
             capacity = 1 if kind == "reset" else self._maximum_inflight_commands
             if count >= capacity or resets > 1:
                 raise OverflowError("Program-cycle in-flight command bound is full")
-            self._database.execute(
-                """
-                INSERT INTO program_cycle_inflight_commands VALUES(?,?,?,?,?)
-                """,
-                (owner_epoch, request_id, kind, encoded, cycle_generation),
+            self._table("_inflight", write=True)[request_key] = (
+                kind,
+                encoded,
+                cycle_generation,
+            )
+            stage.operations.append(
+                ("inflight_put", (request_key, kind, encoded, cycle_generation))
             )
         return RequestRecord("new")
 
     def reject_request(
         self,
         *,
-        owner_epoch: str,
-        request_id: str,
+        request_key: bytes,
         code: str,
         message: str,
         details: Mapping[str, Any] | None = None,
     ) -> None:
         """Forget a proven no-effect command; rejection lives in status/history."""
         del code, message, details
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                DELETE FROM program_cycle_inflight_commands
-                WHERE request_owner_epoch=? AND request_id=?
-                """,
-                (owner_epoch, request_id),
-            ).rowcount
-            if changed != 1:
+        with self._transaction() as stage:
+            if not self._delete_inflight(stage, request_key):
                 raise RuntimeError("Program-cycle in-flight command is absent")
 
-    def cancel_request(
-        self,
-        *,
-        owner_epoch: str,
-        request_id: str,
-    ) -> None:
-        """Remove an explicitly rejected, retryable request before any effect."""
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                DELETE FROM program_cycle_inflight_commands
-                WHERE request_owner_epoch=? AND request_id=?
-                """,
-                (owner_epoch, request_id),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError("Program-cycle in-flight command is absent")
+    def _delete_inflight(self, stage: _Stage, request_key: bytes) -> bool:
+        if request_key not in self._table("_inflight"):
+            return False
+        del self._table("_inflight", write=True)[request_key]
+        stage.operations.append(("inflight_delete", (request_key,)))
+        return True
 
     def transition(
         self,
@@ -1680,145 +991,118 @@ class ProgramCycleJournal:
         expected_generation: int,
         expected_states: tuple[str, ...],
         state: str,
-        program_run_id: str | None = None,
+        program_run_id: int | None = None,
         claim: Mapping[str, Any] | None = None,
         capture_identities: Mapping[str, Any] | None = None,
         run_snapshot: Mapping[str, Any] | None = None,
         terminal_reference: str | None = None,
         start_settlement: Mapping[str, Any] | None = None,
         reconciliation_required: bool = False,
-        correlation_id: str | None = None,
-        session_id: str | None = None,
-        client_sequence: str | None = None,
+        causal_request_key: bytes | None = None,
         command_kind: str | None = None,
         failure: Mapping[str, Any] | None = None,
-        expected_running_owner_epoch: str | None = None,
-        expected_running_claim: Mapping[str, Any] | None = None,
     ) -> None:
         if state not in STATES:
             raise ValueError("invalid Program-cycle state")
         if "terminal_awaiting_reset" in expected_states:
             raise ValueError("terminal Program-cycle evidence is immutable")
-        placeholders = ",".join("?" for _ in expected_states)
-        with self._transaction():
-            changed = self._database.execute(
-                f"""
-                UPDATE program_cycle
-                SET state=?, program_run_id=COALESCE(?,program_run_id),
-                    claim_json=COALESCE(?,claim_json),
-                    capture_identities_json=COALESCE(?,capture_identities_json),
-                    terminal_reference=COALESCE(?,terminal_reference),
-                    start_settlement_json=COALESCE(?,start_settlement_json),
-                    reconciliation_required=?, acquisition_pending_json=NULL,
-                    execution_control_revision=execution_control_revision+1,
-                    causal_correlation_id=COALESCE(?,causal_correlation_id),
-                    causal_session_id=COALESCE(?,causal_session_id),
-                    causal_client_sequence=COALESCE(?,causal_client_sequence),
-                    current_command_kind=COALESCE(?,current_command_kind),
-                    failure_json=COALESCE(failure_json,?)
-                WHERE singleton=1 AND cycle_generation=?
-                  AND state IN ({placeholders})
-                """,
-                (
-                    state,
-                    program_run_id,
-                    self._dump(claim),
-                    self._dump(capture_identities),
-                    terminal_reference,
-                    self._dump(start_settlement),
-                    int(reconciliation_required),
-                    correlation_id,
-                    session_id,
-                    client_sequence,
-                    command_kind,
-                    self._dump(failure),
-                    expected_generation,
-                    *expected_states,
-                ),
-            ).rowcount
-            if changed != 1:
-                if (
-                    state == "running"
-                    and expected_states == ("starting",)
-                    and expected_running_owner_epoch is not None
-                    and expected_running_claim is not None
-                ):
-                    current = self.read()
-                    stopped_terminal = False
-                    if current.state == "terminal_awaiting_reset":
-                        stopped = self.read_run_snapshot(program_run_id)
-                        if stopped is not None and stopped.get("state") == "stopped":
-                            stopped_terminal = current.terminal_reference == (
-                                "sha256:" + hashlib.sha256(rfc8785.dumps({
-                                    "program_run_id": program_run_id,
-                                    "run_revision": stopped.get("run_revision"),
-                                    "state": "stopped",
-                                })).hexdigest()
-                            )
-                    if (
-                        current.cycle_generation == expected_generation
-                        and current.owner_epoch == expected_running_owner_epoch
-                        and current.program_run_id == program_run_id
-                        and current.claim == dict(expected_running_claim)
-                        and (current.state == "stopping" or stopped_terminal)
-                        and current.current_command_kind == "program_stop"
-                        and current.failure is None
-                    ):
-                        raise ProgramCycleStopWon("Accepted Program Stop won Running")
+        with self._transaction() as stage:
+            encoded_claim = self._dump(claim)
+            encoded_capture = self._dump(capture_identities)
+            encoded_settlement = self._dump(start_settlement)
+            encoded_failure = self._dump(failure)
+            row = stage.cycle
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["state"] in expected_states
+            ):
                 raise RuntimeError("Program-cycle transition is stale")
+
+            def kept(column: str, value: Any) -> Any:
+                return row[column] if value is None else value
+
+            row.update(
+                state=state,
+                program_run_id=kept("program_run_id", program_run_id),
+                claim_json=kept("claim_json", encoded_claim),
+                capture_identities_json=kept("capture_identities_json", encoded_capture),
+                terminal_reference=kept("terminal_reference", terminal_reference),
+                start_settlement_json=kept("start_settlement_json", encoded_settlement),
+                reconciliation_required=int(reconciliation_required),
+                acquisition_pending_json=None,
+                execution_control_revision=row["execution_control_revision"] + 1,
+                causal_request_key=kept("causal_request_key", causal_request_key),
+                current_command_kind=kept("current_command_kind", command_kind),
+                failure_json=(
+                    encoded_failure if row["failure_json"] is None else row["failure_json"]
+                ),
+            )
             if run_snapshot is not None:
                 self._retain_run_snapshot_locked(run_snapshot)
 
     @staticmethod
-    def _run_snapshot_identity(snapshot: Mapping[str, Any]) -> tuple[str, int]:
+    def _run_snapshot_identity(snapshot: Mapping[str, Any]) -> tuple[int, int]:
         capture = snapshot.get("capture")
         program_run_id = (
             capture.get("program_run_id") if isinstance(capture, Mapping) else None
         )
         revision = snapshot.get("run_revision")
         if (
-            not isinstance(program_run_id, str)
-            or not program_run_id
+            not _is_run_number(program_run_id)
             or type(revision) is not int
             or revision < 1
         ):
             raise ValueError("Program-run history snapshot has invalid identity")
         return program_run_id, revision
 
+    def _put_history(
+        self, stage: _Stage, program_run_id: int, row: tuple[int, str, int, int]
+    ) -> None:
+        history = self._table("_history", write=True)
+        previous = history.get(program_run_id)
+        if previous is not None and previous[2]:
+            stage.history_terminal_bytes -= previous[3]
+        history[program_run_id] = row
+        if row[2]:
+            stage.history_terminal_bytes += row[3]
+        stage.operations.append(("history_put", (program_run_id, *row[:3])))
+
+    def _delete_history(self, stage: _Stage, program_run_id: int) -> None:
+        removed = self._table("_history", write=True).pop(program_run_id)
+        if removed[2]:
+            stage.history_terminal_bytes -= removed[3]
+        stage.operations.append(("history_delete", (program_run_id,)))
+
+    def _oldest_finished_run(self, current_id: int | None) -> int | None:
+        # The run id is the table's rowid, so the oldest row is the lowest id.
+        return min(
+            (
+                program_run_id
+                for program_run_id, row in self._table("_history").items()
+                if row[2] and program_run_id != current_id
+            ),
+            default=None,
+        )
+
     def _retain_run_snapshot_locked(self, snapshot: Mapping[str, Any]) -> None:
+        stage = self._stage
+        assert stage is not None
         program_run_id, revision = self._run_snapshot_identity(snapshot)
         encoded = self._dump(snapshot)
         assert encoded is not None
-        terminal = snapshot.get("state") in {"stopped", "succeeded", "failed"}
-        existing = self._database.execute(
-            "SELECT run_revision,snapshot_json,terminal FROM program_run_history "
-            "WHERE program_run_id=?",
-            (program_run_id,),
-        ).fetchone()
+        terminal = int(snapshot.get("state") in _TERMINAL_RUN_STATES)
+        stored = (revision, encoded, terminal, len(encoded.encode("utf-8")))
+        history = self._table("_history")
+        existing = history.get(program_run_id)
         if existing is None:
-            count = self._database.execute(
-                "SELECT COUNT(*) FROM program_run_history"
-            ).fetchone()
-            if count is None or count[0] >= self._maximum_retained_runs:
-                removed = self._database.execute(
-                    """
-                    DELETE FROM program_run_history
-                    WHERE rowid=(
-                      SELECT rowid FROM program_run_history
-                      WHERE terminal=1 AND program_run_id IS NOT (
-                        SELECT program_run_id FROM program_cycle WHERE singleton=1
-                      ) ORDER BY rowid LIMIT 1
-                    )
-                    """
-                ).rowcount
-                if removed != 1:
+            if len(history) >= self._maximum_retained_runs:
+                victim = self._oldest_finished_run(stage.cycle["program_run_id"])
+                if victim is None:
                     raise OverflowError(
                         "Program-run history has no resolved row to rotate"
                     )
-            self._database.execute(
-                "INSERT INTO program_run_history VALUES(?,?,?,?)",
-                (program_run_id, revision, encoded, int(terminal)),
-            )
+                self._delete_history(stage, victim)
+            self._put_history(stage, program_run_id, stored)
             self._prune_finished_history_locked()
             return
         if existing[2] and encoded != existing[1]:
@@ -1828,36 +1112,22 @@ class ProgramCycleJournal:
         ):
             raise RuntimeError("Program-run history revision is divergent")
         if revision > existing[0]:
-            self._database.execute(
-                "UPDATE program_run_history SET run_revision=?,snapshot_json=?,terminal=? "
-                "WHERE program_run_id=?",
-                (revision, encoded, int(terminal), program_run_id),
-            )
+            self._put_history(stage, program_run_id, stored)
         self._prune_finished_history_locked()
 
     def _prune_finished_history_locked(self) -> None:
         """Bound finished snapshot payloads without deleting the current run."""
-        current = self._database.execute(
-            "SELECT program_run_id FROM program_cycle WHERE singleton=1"
-        ).fetchone()
-        current_id = current[0] if current else None
-        total = self._database.execute(
-            "SELECT COALESCE(SUM(length(CAST(snapshot_json AS BLOB))),0) "
-            "FROM program_run_history WHERE terminal=1"
-        ).fetchone()[0]
-        while total > self._maximum_finished_history_bytes:
-            oldest = self._database.execute(
-                "SELECT rowid,length(CAST(snapshot_json AS BLOB)) "
-                "FROM program_run_history WHERE terminal=1 AND program_run_id IS NOT ? "
-                "ORDER BY rowid LIMIT 1", (current_id,)
-            ).fetchone()
+        stage = self._stage
+        assert stage is not None
+        current_id = stage.cycle["program_run_id"]
+        while stage.history_terminal_bytes > self._maximum_finished_history_bytes:
+            oldest = self._oldest_finished_run(current_id)
             if oldest is None:
                 if current_id is not None and self._oversize_current_run_logged != current_id:
                     _LOGGER.warning("Current Program run history exceeds the finished-history budget: %s", current_id)
                     self._oversize_current_run_logged = current_id
                 break
-            self._database.execute("DELETE FROM program_run_history WHERE rowid=?", (oldest[0],))
-            total -= oldest[1]
+            self._delete_history(stage, oldest)
 
     def retain_run_snapshot(self, snapshot: Mapping[str, Any]) -> None:
         with self._transaction():
@@ -1865,216 +1135,123 @@ class ProgramCycleJournal:
 
     def require_run_history_capacity(self) -> None:
         with self._lock:
-            self._validate_storage()
-            count = self._database.execute(
-                "SELECT COUNT(*) FROM program_run_history"
-            ).fetchone()
-            terminal = self._database.execute(
-                "SELECT 1 FROM program_run_history WHERE terminal=1 LIMIT 1"
-            ).fetchone()
-        if count is None or (
-            count[0] >= self._maximum_retained_runs and terminal is None
-        ):
+            self._require_open()
+            history = self._table("_history")
+            full = len(history) >= self._maximum_retained_runs and not any(
+                row[2] for row in history.values()
+            )
+        if full:
             raise OverflowError("Program-run history has no resolved row to rotate")
 
-    def read_run_snapshot(self, program_run_id: str) -> dict[str, Any] | None:
+    def read_run_snapshot(self, program_run_id: int) -> dict[str, Any] | None:
         with self._lock:
-            self._validate_storage()
-            row = self._database.execute(
-                "SELECT snapshot_json FROM program_run_history WHERE program_run_id=?",
-                (program_run_id,),
-            ).fetchone()
-        return None if row is None else self._load(row[0])
-
-    def read_runtime_controls(self, program_run_id: str) -> dict[str, Any] | None:
-        """Read only the current run's bounded durable control snapshot."""
-
-        if not _bounded_identity(program_run_id):
-            raise ValueError("Program-run identity is invalid")
-        with self._lock:
-            self._validate_storage()
-            row = self._database.execute(
-                "SELECT program_run_id,runtime_controls_json FROM program_cycle "
-                "WHERE singleton=1"
-            ).fetchone()
-        if row is None or row[0] != program_run_id:
-            return None
-        return deepcopy(self._load(row[1]))
+            self._require_open()
+            row = self._table("_history").get(program_run_id)
+        return None if row is None else self._load(row[1])
 
     def list_run_snapshots(self, *, limit: int) -> tuple[list[dict[str, Any]], bool]:
         if type(limit) is not int or not 1 <= limit <= self._maximum_retained_runs:
             raise ValueError("Program-run history limit is invalid")
         with self._lock:
-            self._validate_storage()
-            rows = self._database.execute(
-                "SELECT snapshot_json FROM program_run_history "
-                "ORDER BY program_run_id LIMIT ?",
-                (limit + 1,),
-            ).fetchall()
-        values = [self._load(row[0]) for row in rows[:limit]]
+            self._require_open()
+            history = self._table("_history")
+            rows = [history[key][1] for key in sorted(history)[: limit + 1]]
+        values = [self._load(row) for row in rows[:limit]]
         return [value for value in values if value is not None], len(rows) > limit
 
     def observe_terminal(
         self,
         *,
         expected_generation: int,
-        program_run_id: str,
+        program_run_id: int,
         terminal_reference: str,
         snapshot: Mapping[str, Any],
     ) -> bool:
         """Record one exact terminal fact, idempotently across observer races."""
-        with self._transaction():
-            row = self._database.execute(
-                """
-                SELECT cycle_generation,state,program_run_id,terminal_reference
-                FROM program_cycle WHERE singleton=1
-                """
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("Program-cycle journal is corrupt")
-            generation, state, current_run_id, current_reference = row
-            if generation != expected_generation or current_run_id != program_run_id:
+        with self._transaction() as stage:
+            row = stage.cycle
+            if (
+                row["cycle_generation"] != expected_generation
+                or row["program_run_id"] != program_run_id
+            ):
                 return False
-            if state == "terminal_awaiting_reset":
-                if current_reference != terminal_reference:
+            if row["state"] == "terminal_awaiting_reset":
+                if row["terminal_reference"] != terminal_reference:
                     raise RuntimeError("terminal Program-cycle evidence conflicts")
                 self._retain_run_snapshot_locked(snapshot)
                 return False
-            if state not in {"running", "stopping"}:
+            if row["state"] != "running":
                 return False
             self._retain_run_snapshot_locked(snapshot)
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle
-                SET state='terminal_awaiting_reset', terminal_reference=?,
-                    execution_control_revision=execution_control_revision+1
-                WHERE singleton=1 AND cycle_generation=?
-                  AND program_run_id=? AND state IN ('running','stopping')
-                """,
-                (
-                    terminal_reference,
-                    expected_generation,
-                    program_run_id,
-                ),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError("Program-cycle terminal observation is stale")
+            row.update(
+                state="terminal_awaiting_reset",
+                terminal_reference=terminal_reference,
+                execution_control_revision=row["execution_control_revision"] + 1,
+            )
             return True
-
-    def mark_stopping(
-        self,
-        *,
-        expected_generation: int,
-        program_run_id: str,
-        correlation_id: str | None = None,
-        session_id: str | None = None,
-        client_sequence: str | None = None,
-    ) -> None:
-        """Close current work before containment, retaining any uncertainty."""
-        with self._transaction():
-            row = self._database.execute(
-                """
-                SELECT cycle_generation,state,program_run_id
-                FROM program_cycle WHERE singleton=1
-                """
-            ).fetchone()
-            if row == (
-                expected_generation,
-                "terminal_awaiting_reset",
-                program_run_id,
-            ):
-                return
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle SET state='stopping',
-                    execution_control_revision=execution_control_revision+
-                      CASE WHEN state IN ('starting','running','recovery_required') THEN 1 ELSE 0 END,
-                    current_command_kind='program_stop',
-                    causal_correlation_id=COALESCE(?,causal_correlation_id),
-                    causal_session_id=COALESCE(?,causal_session_id),
-                    causal_client_sequence=COALESCE(?,causal_client_sequence)
-                WHERE singleton=1 AND cycle_generation=? AND program_run_id=?
-                  AND (state IN ('starting','running','stopping') OR
-                    (state='recovery_required' AND reset_phase IS NULL
-                     AND release_intent_json IS NULL AND acquisition_pending_json IS NULL
-                     AND claim_json IS NOT NULL))
-                """,
-                (
-                    correlation_id,
-                    session_id,
-                    client_sequence,
-                    expected_generation,
-                    program_run_id,
-                ),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError("Program-cycle stopping transition is stale")
 
     def remember_reset_effect_claim(
         self, *, expected_generation: int, expected: Mapping[str, Any] | None,
         retained: Mapping[str, Any],
     ) -> None:
-        """Persist exact acquisition/receipt/release before crossing the owner boundary."""
+        """Record exact acquisition/receipt/release before crossing the owner boundary."""
         encoded = self._dump(retained)
         previous = None if expected is None else self._dump(expected)
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle SET reset_effect_claim_json=?,
-                    execution_control_revision=execution_control_revision+1
-                WHERE singleton=1 AND cycle_generation=? AND state='resetting'
-                  AND claim_json IS NULL AND reset_effect_claim_json IS ?
-                """, (encoded, expected_generation, previous),
-            ).rowcount
-            if changed != 1:
+        with self._transaction() as stage:
+            row = stage.cycle
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["state"] == "resetting"
+                and row["claim_json"] is None
+                and row["reset_effect_claim_json"] == previous
+            ):
                 raise RuntimeError("Program Reset effect claim register is stale")
+            row.update(
+                reset_effect_claim_json=encoded,
+                execution_control_revision=row["execution_control_revision"] + 1,
+            )
 
     def begin_idle_resetting(
         self,
         *,
         expected_generation: int,
-        owner_epoch: str,
-        correlation_id: str,
-        session_id: str | None,
-        client_sequence: str | None,
+        causal_request_key: bytes,
         phase: str,
     ) -> None:
         """Fence explicit no-run Reset effects with the existing lifecycle."""
         if phase not in {"restoring_scene", "restoring_position"}:
             raise ValueError("Idle Reset must begin with a selected effect")
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle
-                SET state='resetting',reset_phase=?,
-                    execution_control_revision=execution_control_revision+1,
-                    causal_correlation_id=?,causal_session_id=?,
-                    causal_client_sequence=?,current_command_kind='program_reset'
-                WHERE singleton=1 AND cycle_generation=? AND owner_epoch=?
-                  AND state='idle_after_reset' AND program_run_id IS NULL
-                  AND claim_json IS NULL AND acquisition_pending_json IS NULL
-                  AND reset_effect_claim_json IS NULL
-                  AND reconciliation_required=0
-                """,
-                (phase, correlation_id, session_id, client_sequence,
-                 expected_generation, owner_epoch),
-            ).rowcount
-            if changed != 1:
+        with self._transaction() as stage:
+            row = stage.cycle
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["state"] == "idle_after_reset"
+                and row["program_run_id"] is None
+                and row["claim_json"] is None
+                and row["acquisition_pending_json"] is None
+                and row["reset_effect_claim_json"] is None
+                and row["reconciliation_required"] == 0
+            ):
                 raise RuntimeError("Idle Program-cycle Reset transition is stale")
+            row.update(
+                state="resetting",
+                reset_phase=phase,
+                execution_control_revision=row["execution_control_revision"] + 1,
+                causal_request_key=causal_request_key,
+                current_command_kind="program_reset",
+            )
 
     def begin_resetting(
         self,
         *,
         expected_generation: int,
-        program_run_id: str,
-        correlation_id: str,
-        session_id: str | None = None,
-        client_sequence: str | None = None,
+        program_run_id: int,
+        causal_request_key: bytes,
         expected_recovery: CycleRecord | None = None,
     ) -> bool:
         """Atomically close ordinary admission before Reset performs Stop."""
 
-        with self._transaction():
+        with self._transaction() as stage:
             if expected_recovery is not None and (
                 self.read() != expected_recovery
                 or not expected_recovery.reconciliation_required
@@ -2086,50 +1263,37 @@ class ProgramCycleJournal:
                 or expected_recovery.claim is None
             ):
                 raise RuntimeError("Program-cycle recovery Reset is stale")
-            row = self._database.execute(
-                """
-                SELECT state,program_run_id,causal_correlation_id
-                FROM program_cycle
-                WHERE singleton=1 AND cycle_generation=?
-                """,
-                (expected_generation,),
-            ).fetchone()
-            if row == ("resetting", program_run_id, correlation_id):
+            row = stage.cycle
+            current = (
+                None
+                if row["cycle_generation"] != expected_generation
+                else (row["state"], row["program_run_id"], row["causal_request_key"])
+            )
+            if current == ("resetting", program_run_id, causal_request_key):
                 return False
             eligible_states = {"running", "terminal_awaiting_reset"}
             if expected_recovery is not None:
                 eligible_states.add("recovery_required")
-            if row is None or row[0] not in eligible_states or row[1] != program_run_id:
+            if (
+                current is None
+                or current[0] not in eligible_states
+                or current[1] != program_run_id
+            ):
                 raise RuntimeError("Program-cycle Reset transition is stale")
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle
-                SET state='resetting',reset_phase='stopping',
-                    execution_control_revision=execution_control_revision+1,
-                    causal_correlation_id=?,causal_session_id=?,
-                    causal_client_sequence=?,current_command_kind='program_reset',
-                    failure_json=NULL
-                WHERE singleton=1 AND cycle_generation=? AND program_run_id=?
-                  AND state IN ('running','terminal_awaiting_reset','recovery_required')
-                """,
-                (
-                    correlation_id,
-                    session_id,
-                    client_sequence,
-                    expected_generation,
-                    program_run_id,
-                ),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError("Program-cycle Reset transition is stale")
+            row.update(
+                state="resetting",
+                reset_phase="stopping",
+                execution_control_revision=row["execution_control_revision"] + 1,
+                causal_request_key=causal_request_key,
+                current_command_kind="program_reset",
+                failure_json=None,
+            )
             return True
 
     def settle_reset_recovery(
         self,
         *,
         expected: CycleRecord,
-        manager_runtime_epoch: str | None,
-        manager_owner_epoch: str | None,
         phase: str = "restoring_scene",
     ) -> None:
         """Persist an externally proved containment join, not guessed outcomes."""
@@ -2143,27 +1307,22 @@ class ProgramCycleJournal:
             or phase not in {"restoring_scene", "restoring_position", "releasing"}
         ):
             raise RuntimeError("Program-cycle containment discharge is invalid")
-        with self._transaction():
-            live = self.liveness()
-            if (
-                self.read() != expected
-                or live.expired
-                or live.manager_runtime_epoch != manager_runtime_epoch
-                or live.manager_owner_epoch != manager_owner_epoch
-            ):
+        with self._transaction() as stage:
+            if self.read() != expected:
                 raise RuntimeError("Program-cycle containment discharge is stale")
-            self._database.execute(
-                "UPDATE program_cycle SET reset_phase=?, "
-                "reconciliation_required=0,failure_json=NULL, "
-                "execution_control_revision=execution_control_revision+1 WHERE singleton=1",
-                (phase,),
+            row = stage.cycle
+            row.update(
+                reset_phase=phase,
+                reconciliation_required=0,
+                failure_json=None,
+                execution_control_revision=row["execution_control_revision"] + 1,
             )
 
     def update_reset_phase(
         self,
         *,
         expected_generation: int,
-        program_run_id: str | None,
+        program_run_id: int | None,
         expected_phase: str,
         phase: str,
         terminal_reference: str | None = None,
@@ -2176,7 +1335,9 @@ class ProgramCycleJournal:
             expected_phase != "restoring_scene" or phase not in {"restoring_position", "releasing"}
         ):
             raise ValueError("Scene completion requires its exact next Reset phase")
-        with self._transaction():
+        with self._transaction() as stage:
+            row = stage.cycle
+            encoded_failure = row["failure_json"]
             if scene_preparation_completed:
                 current = self.read()
                 failure = current.failure
@@ -2184,224 +1345,176 @@ class ProgramCycleJournal:
                     failure = None
                 elif failure is not None and "prior_scene_preparation_failure" in failure:
                     failure = {key: value for key, value in failure.items() if key != "prior_scene_preparation_failure"}
-                self._database.execute(
-                    "UPDATE program_cycle SET failure_json=? WHERE singleton=1 AND cycle_generation=? "
-                    "AND program_run_id IS ? AND state='resetting' AND reset_phase=?",
-                    (None if failure is None else self._dump(failure), expected_generation,
-                     program_run_id, expected_phase),
-                )
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle
-                SET reset_phase=?,terminal_reference=COALESCE(?,terminal_reference),
-                    execution_control_revision=execution_control_revision+1
-                WHERE singleton=1 AND cycle_generation=? AND program_run_id IS ?
-                  AND state='resetting' AND reset_phase=?
-                """,
-                (
-                    phase,
-                    terminal_reference,
-                    expected_generation,
-                    program_run_id,
-                    expected_phase,
-                ),
-            ).rowcount
-            if changed != 1:
+                encoded_failure = None if failure is None else self._dump(failure)
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["program_run_id"] == program_run_id
+                and row["state"] == "resetting"
+                and row["reset_phase"] == expected_phase
+            ):
                 raise RuntimeError("Program-cycle Reset phase is stale")
+            row.update(
+                failure_json=encoded_failure,
+                reset_phase=phase,
+                terminal_reference=(
+                    row["terminal_reference"]
+                    if terminal_reference is None
+                    else terminal_reference
+                ),
+                execution_control_revision=row["execution_control_revision"] + 1,
+            )
 
     def fail_reset(
         self,
         *,
         expected_generation: int,
-        program_run_id: str | None,
+        program_run_id: int | None,
         code: str,
         message: str,
         reconciliation_required: bool = False,
     ) -> None:
-        with self._transaction():
-            row = self._database.execute(
-                """
-                SELECT reset_phase,failure_json FROM program_cycle
-                WHERE singleton=1 AND cycle_generation=? AND program_run_id IS ?
-                  AND state='resetting'
-                """,
-                (expected_generation, program_run_id),
-            ).fetchone()
-            if row is None or not _bounded_identity(row[0]):
+        with self._transaction() as stage:
+            row = stage.cycle
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["program_run_id"] == program_run_id
+                and row["state"] == "resetting"
+                and _bounded_identity(row["reset_phase"])
+            ):
                 raise RuntimeError("Program-cycle failed Reset transition is stale")
             failure = {
                     "code": code,
                     "message": message,
-                    "failed_phase": row[0],
+                    "failed_phase": row["reset_phase"],
                 }
-            prior = _prior_scene_preparation_failure(self._load(row[1]))
+            prior = _prior_scene_preparation_failure(self._load(row["failure_json"]))
             if prior is not None:
                 failure["prior_scene_preparation_failure"] = prior
-            failure = self._dump(failure)
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle SET state='recovery_required',failure_json=?,
-                    reconciliation_required=MAX(reconciliation_required,?),
-                    execution_control_revision=execution_control_revision+1
-                WHERE singleton=1 AND cycle_generation=? AND program_run_id IS ?
-                  AND state='resetting'
-                """,
-                (
-                    failure,
-                    int(reconciliation_required),
-                    expected_generation,
-                    program_run_id,
+            row.update(
+                state="recovery_required",
+                failure_json=self._dump(failure),
+                reconciliation_required=max(
+                    row["reconciliation_required"], int(reconciliation_required)
                 ),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError("Program-cycle failed Reset transition is stale")
+                execution_control_revision=row["execution_control_revision"] + 1,
+            )
 
     def resume_resetting(
         self,
         *,
         expected_generation: int,
-        program_run_id: str | None,
+        program_run_id: int | None,
         expected_failure_code: str,
         phase: str,
-        correlation_id: str,
-        session_id: str | None = None,
-        client_sequence: str | None = None,
-        allow_legacy_scene_failure: bool = False,
+        causal_request_key: bytes,
+        allow_reconciliation: bool = False,
     ) -> None:
-        """Resume only the exact failed Reset phase under a fresh command."""
+        """Resume only the exact failed Reset phase under a fresh command.
 
-        for value in (expected_failure_code, phase, correlation_id):
+        ``allow_reconciliation``: the phase first settles its unknown Kernel
+        exchange (receipt read or exact replay), so the latch may be set."""
+
+        for value in (expected_failure_code, phase):
             if not _bounded_identity(value):
                 raise ValueError("Reset recovery identity must be bounded text")
-        with self._transaction():
-            row = self._database.execute(
-                """
-                SELECT failure_json,reset_phase,reconciliation_required,
-                       release_intent_json
-                FROM program_cycle
-                WHERE singleton=1 AND cycle_generation=? AND program_run_id IS ?
-                  AND state='recovery_required'
-                """,
-                (expected_generation, program_run_id),
-            ).fetchone()
-            if row is None:
+        if not _is_request_key(causal_request_key):
+            raise ValueError("Reset recovery request key must be 16 bytes")
+        with self._transaction() as stage:
+            row = stage.cycle
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["program_run_id"] == program_run_id
+                and row["state"] == "recovery_required"
+            ):
                 raise RuntimeError("Program-cycle Reset recovery is stale")
-            failure = self._load(row[0])
+            failure = self._load(row["failure_json"])
             failed_phase = (
                 failure.get("failed_phase") if isinstance(failure, dict) else None
             )
-            legacy_scene_failure = bool(
-                allow_legacy_scene_failure
-                and isinstance(failure, dict)
-                and failure.get("code")
-                == "program_cycle_reset_scene_preparation_failed"
-                and row[1] == "failed"
-                and bool(row[2])
-                and row[3] is None
-                and phase == "restoring_scene"
-            )
+            latched = bool(row["reconciliation_required"])
             if (
                 not isinstance(failure, dict)
                 or failure.get("code") != expected_failure_code
+                or (latched and not allow_reconciliation)
+                or row["reset_phase"] != phase
                 or (
-                    not legacy_scene_failure
-                    and (bool(row[2]) or row[1] != phase or failed_phase != phase)
+                    failed_phase != phase
+                    # A latched run release records no failed phase.
+                    and not (
+                        allow_reconciliation and latched
+                        and phase == "releasing" and failed_phase is None
+                    )
                 )
             ):
                 raise RuntimeError("Program-cycle Reset recovery is not retryable")
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle
-                SET state='resetting',reset_phase=?,reconciliation_required=0,
-                    failure_json=?,
-                    execution_control_revision=execution_control_revision+1,
-                    causal_correlation_id=?,causal_session_id=?,
-                    causal_client_sequence=?,current_command_kind='program_reset'
-                WHERE singleton=1 AND cycle_generation=? AND program_run_id IS ?
-                  AND state='recovery_required'
-                """,
-                (
-                    phase,
-                    None if _prior_scene_preparation_failure(failure) is None
-                    else self._dump(_prior_scene_preparation_failure(failure)),
-                    correlation_id,
-                    session_id,
-                    client_sequence,
-                    expected_generation,
-                    program_run_id,
-                ),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError("Program-cycle Reset recovery is stale")
+            prior = _prior_scene_preparation_failure(failure)
+            row.update(
+                state="resetting",
+                reset_phase=phase,
+                reconciliation_required=0,
+                failure_json=None if prior is None else self._dump(prior),
+                execution_control_revision=row["execution_control_revision"] + 1,
+                causal_request_key=causal_request_key,
+                current_command_kind="program_reset",
+            )
 
     def record_scene_preparation_failure(
-        self, *, expected_generation: int, owner_epoch: str, failure: Mapping[str, Any]
+        self, *, expected_generation: int, failure: Mapping[str, Any]
     ) -> None:
         if failure.get("code") != "program_scene_preparation_failed":
             raise ValueError("invalid Scene preparation failure")
         encoded = self._dump(failure)
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle SET failure_json=COALESCE(failure_json,?),
-                    execution_control_revision=execution_control_revision+1
-                WHERE singleton=1 AND cycle_generation=? AND owner_epoch=?
-                  AND state='idle_after_reset' AND claim_json IS NULL
-                  AND program_run_id IS NULL AND acquisition_pending_json IS NULL
-                  AND reconciliation_required=0
-                """, (encoded, expected_generation, owner_epoch),
-            ).rowcount
-            if changed != 1:
+        with self._transaction() as stage:
+            row = stage.cycle
+            if not self._is_clean_idle(row, expected_generation):
                 raise RuntimeError("Scene preparation failure is stale")
+            row.update(
+                failure_json=row["failure_json"] if row["failure_json"] is not None else encoded,
+                execution_control_revision=row["execution_control_revision"] + 1,
+            )
 
-    def complete_scene_preparation(self, *, expected_generation: int, owner_epoch: str) -> None:
-        with self._transaction():
+    @staticmethod
+    def _is_clean_idle(row: Mapping[str, Any], expected_generation: int) -> bool:
+        return (
+            row["cycle_generation"] == expected_generation
+            and row["state"] == "idle_after_reset"
+            and row["claim_json"] is None
+            and row["program_run_id"] is None
+            and row["acquisition_pending_json"] is None
+            and row["reconciliation_required"] == 0
+        )
+
+    def complete_scene_preparation(self, *, expected_generation: int) -> None:
+        with self._transaction() as stage:
             current = self.read()
             failure = current.failure
             if failure is not None and failure.get("code") != "program_scene_preparation_failed":
                 raise RuntimeError("Scene preparation cannot clear another failure")
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle SET failure_json=NULL,
-                    execution_control_revision=execution_control_revision+1
-                WHERE singleton=1 AND cycle_generation=? AND owner_epoch=?
-                  AND state='idle_after_reset' AND claim_json IS NULL
-                  AND program_run_id IS NULL AND acquisition_pending_json IS NULL
-                  AND reconciliation_required=0
-                """, (expected_generation, owner_epoch),
-            ).rowcount
-            if changed != 1:
+            row = stage.cycle
+            if not self._is_clean_idle(row, expected_generation):
                 raise RuntimeError("Scene preparation completion is stale")
+            row.update(
+                failure_json=None,
+                execution_control_revision=row["execution_control_revision"] + 1,
+            )
 
     def publish_idle_reset(
-        self, *, expected_generation: int, owner_epoch: str,
-        request_owner_epoch: str, request_id: str, result: Mapping[str, Any]
+        self, *, expected_generation: int, request_key: bytes,
+        result: Mapping[str, Any]
     ) -> None:
-        encoded = self._dump(result)
-        with self._transaction():
-            request = self._database.execute(
-                "SELECT cycle_generation FROM program_cycle_inflight_commands "
-                "WHERE request_owner_epoch=? AND request_id=? AND request_kind='reset'",
-                (request_owner_epoch, request_id),
-            ).fetchone()
-            if request != (expected_generation,):
+        del result
+        with self._transaction() as stage:
+            request = self._table("_inflight").get(request_key)
+            if request is None or request[0] != "reset" or request[2] != expected_generation:
                 raise RuntimeError("Idle Reset in-flight request is absent")
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle SET cycle_generation=cycle_generation+1,
-                    reset_result_json=?,execution_control_revision=execution_control_revision+1
-                WHERE singleton=1 AND cycle_generation=? AND owner_epoch=?
-                  AND state='idle_after_reset' AND claim_json IS NULL
-                  AND program_run_id IS NULL AND acquisition_pending_json IS NULL
-                  AND reconciliation_required=0
-                """, (encoded, expected_generation, owner_epoch),
-            ).rowcount
-            if changed != 1:
+            row = stage.cycle
+            if not self._is_clean_idle(row, expected_generation):
                 raise RuntimeError("Idle Reset completion is stale")
-            self._database.execute(
-                "DELETE FROM program_cycle_inflight_commands WHERE request_owner_epoch=? AND request_id=?",
-                (request_owner_epoch, request_id),
+            row.update(
+                cycle_generation=row["cycle_generation"] + 1,
+                execution_control_revision=row["execution_control_revision"] + 1,
             )
+            self._delete_inflight(stage, request_key)
 
     def require_reconciliation(
         self,
@@ -2413,375 +1526,157 @@ class ProgramCycleJournal:
         retained_failure = self._dump(
             failure or {"code": "program_cycle_reconciliation_required"}
         )
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle SET reconciliation_required=1,
-                    state='recovery_required',
-                    execution_control_revision=execution_control_revision+1,
-                    failure_json=COALESCE(failure_json,?)
-                WHERE singleton=1 AND cycle_generation=?
-                """,
-                (retained_failure, expected_generation),
-            ).rowcount
-            if changed != 1:
+        with self._transaction() as stage:
+            row = stage.cycle
+            if row["cycle_generation"] != expected_generation:
                 raise RuntimeError("Program-cycle reconciliation latch is stale")
-
-    def liveness(self) -> RetainedLiveness:
-        """Read only durable identities/evidence, never a deadline or age."""
-        with self._lock:
-            self._validate_storage()
-            row = self._database.execute(
-                """
-                SELECT manager_runtime_epoch,manager_owner_epoch,
-                       predecessor_expired,fault_reference
-                FROM program_runner_liveness WHERE singleton=1
-                """
-            ).fetchone()
-        if row is None:
-            raise RuntimeError("Program Runner liveness journal is corrupt")
-        return RetainedLiveness(row[0], row[1], bool(row[2]), row[3])
-
-    def retain_liveness_loss(
-        self,
-        *,
-        manager_runtime_epoch: str,
-        manager_owner_epoch: str | None,
-        fault_reference: str,
-        expected_generation: int,
-    ) -> None:
-        """Atomically latch Manager loss and cycle reconciliation evidence."""
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_runner_liveness
-                SET manager_runtime_epoch=?,manager_owner_epoch=?,
-                    predecessor_expired=1,fault_reference=?
-                WHERE singleton=1
-                """,
-                (
-                    manager_runtime_epoch,
-                    manager_owner_epoch,
-                    fault_reference,
+            row.update(
+                reconciliation_required=1,
+                state="recovery_required",
+                execution_control_revision=row["execution_control_revision"] + 1,
+                failure_json=(
+                    retained_failure if row["failure_json"] is None else row["failure_json"]
                 ),
-            ).rowcount
-            cycle_changed = self._database.execute(
-                """
-                UPDATE program_cycle
-                SET reconciliation_required=1,
-                    reconciliation_evidence_digest=?
-                WHERE singleton=1 AND cycle_generation=?
-                """,
-                (fault_reference, expected_generation),
-            ).rowcount
-            if changed != 1 or cycle_changed != 1:
-                raise RuntimeError("Program Runner liveness loss is stale")
-
-    def retain_liveness_manager(
-        self, *, manager_runtime_epoch: str, manager_owner_epoch: str
-    ) -> None:
-        """Retain the accepted Manager identity without persisting receipt age."""
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                UPDATE program_runner_liveness
-                SET manager_runtime_epoch=?,manager_owner_epoch=?,
-                    predecessor_expired=0
-                WHERE singleton=1
-                """,
-                (manager_runtime_epoch, manager_owner_epoch),
-            ).rowcount
-            if changed != 1:
-                raise RuntimeError("Program Runner liveness identity is absent")
-
-    def reconcile_liveness(
-        self,
-        *,
-        owner_epoch: str,
-        evidence_digest: str,
-        require_terminal_release: bool = True,
-        allow_contained_reset: bool = False,
-    ) -> None:
-        """Finalize the local successor after authoritative reconciliation."""
-        with self._transaction():
-            row = self._database.execute(
-                """
-                SELECT state,owner_epoch,acquisition_pending_json
-                FROM program_cycle WHERE singleton=1
-                """
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("Program-cycle journal is corrupt")
-            if row[0] not in {"idle_after_reset", "terminal_awaiting_reset"} and not (
-                allow_contained_reset and row[0] == "recovery_required"
-            ):
-                raise RuntimeError(
-                    "active Program cycle is not contained for reconciliation"
-                )
-            if row[2] is not None:
-                raise RuntimeError("unknown Program-cycle acquisition is unresolved")
-            if require_terminal_release and row[0] == "terminal_awaiting_reset":
-                release = self._database.execute(
-                    "SELECT release_intent_json FROM program_cycle WHERE singleton=1"
-                ).fetchone()
-                if release is None or release[0] is None:
-                    raise RuntimeError(
-                        "terminal Program-cycle release is not durably retained"
-                    )
-            self._database.execute(
-                """
-                UPDATE program_cycle
-                SET owner_epoch=?,reconciliation_required=0,
-                    reconciliation_evidence_digest=?
-                WHERE singleton=1
-                """,
-                (owner_epoch, evidence_digest),
-            )
-
-    def prepare_liveness_reconciliation(
-        self,
-        *,
-        predecessor_owner_epoch: str,
-        evidence_digest: str,
-        require_terminal_release: bool = True,
-        allow_contained_reset: bool = False,
-    ) -> None:
-        """Retain one replaceable intent without claiming the Kernel effect."""
-        if not _bounded_identity(predecessor_owner_epoch):
-            raise ValueError("predecessor owner epoch must be bounded identity text")
-        if (
-            not isinstance(evidence_digest, str)
-            or len(evidence_digest) != 71
-            or not evidence_digest.startswith("sha256:")
-            or any(
-                character not in "0123456789abcdef" for character in evidence_digest[7:]
-            )
-        ):
-            raise ValueError("reconciliation evidence must be a SHA-256 digest")
-        with self._transaction():
-            row = self._database.execute(
-                """
-                SELECT state,acquisition_pending_json,release_intent_json
-                FROM program_cycle WHERE singleton=1
-                """
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("Program-cycle journal is corrupt")
-            if row[0] not in {"idle_after_reset", "terminal_awaiting_reset"} and not (
-                allow_contained_reset and row[0] == "recovery_required"
-            ):
-                raise RuntimeError(
-                    "active Program cycle is not contained for reconciliation"
-                )
-            if row[1] is not None:
-                raise RuntimeError("unknown Program-cycle acquisition is unresolved")
-            if (
-                require_terminal_release
-                and row[0] == "terminal_awaiting_reset"
-                and row[2] is None
-            ):
-                raise RuntimeError(
-                    "terminal Program-cycle release is not durably retained"
-                )
-            self._database.execute(
-                """
-                UPDATE program_cycle
-                SET owner_epoch=?,reconciliation_required=1,
-                    reconciliation_evidence_digest=?
-                WHERE singleton=1
-                """,
-                (predecessor_owner_epoch, evidence_digest),
             )
 
     def complete_request(
         self,
         *,
-        owner_epoch: str,
-        request_id: str,
+        request_key: bytes,
         result: Mapping[str, Any],
     ) -> None:
         del result
-        with self._transaction():
-            changed = self._database.execute(
-                """
-                DELETE FROM program_cycle_inflight_commands
-                WHERE request_owner_epoch=? AND request_id=?
-                """,
-                (owner_epoch, request_id),
-            ).rowcount
-            if changed != 1:
+        with self._transaction() as stage:
+            if not self._delete_inflight(stage, request_key):
                 raise RuntimeError("Program-cycle in-flight command is absent")
 
     def complete_persistent_value_request(
         self,
         *,
-        owner_epoch: str,
-        request_id: str,
+        request_key: bytes,
         outcome: str,
     ) -> None:
         """Resolve one persistent-value request and keep its identity.
 
         The identity joins the bounded completed-request table in the same
-        transaction, so a resend is refused even after the journal reopens;
-        the oldest identities beyond the bound are trimmed.
+        change, so a resend is refused; the oldest identities beyond the
+        bound are trimmed.
         """
 
         if outcome not in _PERSISTENT_VALUE_OUTCOMES:
             raise ValueError("persistent-value request outcome is unsupported")
-        with self._transaction():
-            request = self._database.execute(
-                """
-                SELECT request_kind FROM program_cycle_inflight_commands
-                WHERE request_owner_epoch=? AND request_id=?
-                """,
-                (owner_epoch, request_id),
-            ).fetchone()
+        with self._transaction() as stage:
+            request = self._table("_inflight").get(request_key)
             if request is None or request[0] not in _PERSISTENT_VALUE_ACTIONS:
                 raise RuntimeError("Program-cycle in-flight command is absent")
-            self._database.execute(
-                """
-                DELETE FROM program_cycle_inflight_commands
-                WHERE request_owner_epoch=? AND request_id=?
-                """,
-                (owner_epoch, request_id),
+            self._delete_inflight(stage, request_key)
+            completed = self._table("_persistent", write=True)
+            # Positions only grow, so the last row holds the largest.
+            position = (
+                next(reversed(completed.values()))[2] + 1 if completed else 1
             )
-            (position,) = self._database.execute(
-                "SELECT COALESCE(MAX(position),0)+1 "
-                "FROM program_persistent_value_requests"
-            ).fetchone()
-            self._database.execute(
-                "INSERT INTO program_persistent_value_requests VALUES(?,?,?,?,?)",
-                (
-                    owner_epoch,
-                    request_id,
-                    _PERSISTENT_VALUE_ACTIONS[request[0]],
-                    outcome,
-                    position,
-                ),
+            action = _PERSISTENT_VALUE_ACTIONS[request[0]]
+            completed[request_key] = (action, outcome, position)
+            stage.operations.append(
+                ("persistent_insert", (request_key, action, outcome, position))
             )
-            self._database.execute(
-                "DELETE FROM program_persistent_value_requests WHERE position<=?",
-                (position - self._maximum_completed_persistent_value_requests,),
-            )
+            trim_at_or_below = position - self._maximum_completed_persistent_value_requests
+            oldest = [
+                key for key, row in completed.items() if row[2] <= trim_at_or_below
+            ]
+            for key in oldest:
+                del completed[key]
+            if oldest:
+                stage.operations.append(("persistent_trim", (trim_at_or_below,)))
 
     def complete_control_request(
         self,
         *,
-        owner_epoch: str,
-        request_id: str,
+        request_key: bytes,
         result: Mapping[str, Any],
         run_snapshot: Mapping[str, Any],
         advance_execution_control: bool = False,
     ) -> None:
-        """Atomically retain one runtime-control result and its exact updated run view.
+        """Atomically retain one runtime-control effect's exact updated run view.
 
         ``advance_execution_control`` advances the execution-control revision
-        once in the same transaction; an accepted release of a failure hold
+        once in the same change; an accepted release of a failure hold
         uses it so the release is a later accepted control revision.
         """
 
-        projection = result.get("runtime_controls")
-        if isinstance(projection, Mapping) and isinstance(
-            projection.get("runtime_controls"), Mapping
-        ):
-            projection = projection["runtime_controls"]
-        if not isinstance(projection, Mapping):
-            raise ValueError("runtime-control result omitted its current projection")
-        encoded_controls = self._dump(projection)
-        with self._transaction():
+        del result
+        with self._transaction() as stage:
             self._retain_run_snapshot_locked(run_snapshot)
-            self._database.execute(
-                "UPDATE program_cycle SET runtime_controls_json=?"
-                + (
-                    ",execution_control_revision=execution_control_revision+1"
-                    if advance_execution_control
-                    else ""
-                )
-                + " WHERE singleton=1",
-                (encoded_controls,),
-            )
-            changed = self._database.execute(
-                """
-                DELETE FROM program_cycle_inflight_commands
-                WHERE request_owner_epoch=? AND request_id=?
-                """,
-                (owner_epoch, request_id),
-            ).rowcount
-            if changed != 1:
+            if advance_execution_control:
+                row = stage.cycle
+                row["execution_control_revision"] = row["execution_control_revision"] + 1
+            if not self._delete_inflight(stage, request_key):
                 raise RuntimeError("Program-cycle in-flight command is absent")
 
     def publish_reset(
         self,
         *,
         expected_generation: int,
-        owner_epoch: str,
-        request_owner_epoch: str,
-        request_id: str,
+        request_key: bytes,
         result: Mapping[str, Any],
     ) -> None:
-        encoded = self._dump(result)
-        with self._transaction():
-            request = self._database.execute(
-                """
-                SELECT cycle_generation,intent_json FROM program_cycle_inflight_commands
-                WHERE request_owner_epoch=? AND request_id=?
-                """,
-                (request_owner_epoch, request_id),
-            ).fetchone()
-            if request is None or request[0] != expected_generation:
+        del result
+        with self._transaction() as stage:
+            request = self._table("_inflight").get(request_key)
+            if request is None or request[2] != expected_generation:
                 raise RuntimeError("Program-cycle Reset in-flight command is absent")
             prior = (
                 None if self._load(request[1]).get("reload_initial_scene", False)
                 else _prior_scene_preparation_failure(self.read().failure)
             )
-            changed = self._database.execute(
-                """
-                UPDATE program_cycle
-                SET cycle_generation=cycle_generation+1,
-                    state='idle_after_reset', owner_epoch=?,
-                    program_run_id=NULL, claim_json=NULL,
-                    capture_identities_json=NULL, terminal_reference=NULL,
-                    start_settlement_json=NULL,
-                    release_intent_json=NULL,
-                    reset_result_json=?, reconciliation_required=0,
-                    acquisition_pending_json=NULL,
-                    reconciliation_evidence_digest=NULL,
-                    execution_control_revision=execution_control_revision+1,
-                    current_command_kind=NULL,failure_json=?,reset_phase=NULL
-                    ,runtime_controls_json=NULL
-                    ,reset_effect_claim_json=NULL
-                WHERE singleton=1 AND cycle_generation=?
-                  AND state IN ('terminal_awaiting_reset','resetting')
-                """,
-                (owner_epoch, encoded, None if prior is None else self._dump(prior), expected_generation),
-            ).rowcount
-            if changed != 1:
+            encoded_prior = None if prior is None else self._dump(prior)
+            row = stage.cycle
+            if not (
+                row["cycle_generation"] == expected_generation
+                and row["state"] in {"terminal_awaiting_reset", "resetting"}
+            ):
                 raise RuntimeError("Program-cycle Reset is stale")
+            row.update(
+                cycle_generation=row["cycle_generation"] + 1,
+                state="idle_after_reset",
+                program_run_id=None,
+                claim_json=None,
+                capture_identities_json=None,
+                terminal_reference=None,
+                start_settlement_json=None,
+                release_intent_json=None,
+                reconciliation_required=0,
+                acquisition_pending_json=None,
+                execution_control_revision=row["execution_control_revision"] + 1,
+                current_command_kind=None,
+                failure_json=encoded_prior,
+                reset_phase=None,
+                reset_effect_claim_json=None,
+            )
             # Reaching the successor Idle cycle resolves every command from the
             # predecessor generation. Keeping any of those identities would
             # turn a bounded in-flight guard back into a lifetime ledger.
-            self._database.execute(
-                """
-                DELETE FROM program_cycle_inflight_commands
-                WHERE cycle_generation=?
-                """,
-                (expected_generation,),
-            )
+            for key in [
+                key
+                for key, inflight in self._table("_inflight").items()
+                if inflight[2] == expected_generation
+            ]:
+                self._delete_inflight(stage, key)
             self._prune_finished_history_locked()
 
     def close(self) -> None:
+        """Stop changes, let the writer drain and close the file."""
+
         with self._lock:
-            if self._parent_descriptor < 0:
+            if self._closed:
                 return
-            self._database.close()
-            os.close(self._parent_descriptor)
-            self._parent_descriptor = -1
+            self._closed = True
+        self._writer.close()
 
 
 __all__ = [
     "CycleRecord",
     "MAXIMUM_COMPLETED_PERSISTENT_VALUE_REQUESTS",
-    "ProgramCycleJournalVersionError",
     "ProgramCycleJournal",
     "RequestRecord",
     "SCHEMA_VERSION",

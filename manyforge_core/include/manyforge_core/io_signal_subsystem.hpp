@@ -93,8 +93,7 @@ class IoSignalSubsystem final : public IIoSignalService {
   Result<IoWatchResultDTO> ReadWatch(const IoWatchRegistrationDTO& registration) const override;
   Result<void> ReleaseWatch(const IoWatchRegistrationDTO& registration) override;
   Result<void> ReleaseNodeWatches(const IoWatchScopeDTO& scope) override;
-  Result<void> ReleaseRunWatches(const RequestOwnerEpoch& runner_owner_epoch,
-                                 const ProgramRunId& run_id) override;
+  Result<void> ReleaseRunWatches(const ProgramRunNumber& run_id) override;
 
  private:
   struct State;

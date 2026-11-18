@@ -143,7 +143,7 @@ struct ProgramExecutionTableDTO final {
 /// labels (which may name derived phases). A new attempt never changes scope.
 struct ProgramNodeExecutionScopeDTO final {
   ProgramNodeInstanceId node_instance_id;
-  std::string node_attempt_id;
+  NodeAttemptNumber node_attempt_id{0U};
 
   friend bool operator==(const ProgramNodeExecutionScopeDTO&,
                          const ProgramNodeExecutionScopeDTO&) = default;
@@ -153,8 +153,7 @@ struct ProgramNodeExecutionScopeDTO final {
     const ProgramNodeExecutionScopeDTO& scope) noexcept {
   return !scope.node_instance_id.empty() && scope.node_instance_id.value().size() <= 128U &&
          scope.node_instance_id.value().find('\0') == std::string::npos &&
-         !scope.node_attempt_id.empty() && scope.node_attempt_id.size() <= 512U &&
-         scope.node_attempt_id.find('\0') == std::string::npos;
+         scope.node_attempt_id.nonzero();
 }
 
 /// Declaration metadata derived from the sealed Program's validation view.
@@ -172,14 +171,19 @@ struct ProgramBlackboardKeyDeclarationDTO final {
 
 struct ProgramIoConditionProjectionDTO;
 
+/// Opaque, immutable resolution context of one captured Program run: the
+/// sealed Program and Program Binding the product resolver verified at the
+/// capture (OD-234). Only that resolver creates and reads it; the Kernel keeps
+/// it with the held capture and hands it back for that run's work. Null: no
+/// held run, so the resolver reads and verifies its sources.
+using ProgramRunResolutionContext = std::shared_ptr<const void>;
+
 /// Process-local input from the sealed Program/Binding composition boundary.
 /// Transports carry the identities only, never a caller-supplied table.
 /// Kernel installation independently joins current claim/owner/configuration.
 struct ProgramRunExecutionCaptureDTO final {
-  RequestOwnerEpoch request_owner_epoch;
-  RequestOwnerEpoch program_runner_owner_epoch;
   CellAdmissionClaimGeneration claim_generation;
-  ProgramRunId program_run_id;
+  ProgramRunNumber program_run_id;
   ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
@@ -197,6 +201,9 @@ struct ProgramRunExecutionCaptureDTO final {
   /// Immutable Program-only condition projection compiled from this exact
   /// sealed Program/Binding; Deployment rule references remain a separate join.
   std::shared_ptr<const ProgramIoConditionProjectionDTO> io_conditions{};
+  /// Set only by the composition boundary with the sealed pair above; never
+  /// carried by a transport, never part of a comparison.
+  ProgramRunResolutionContext resolution_context{};
 };
 
 /// Largest authored finite failure-retry budget; zero means Unlimited.

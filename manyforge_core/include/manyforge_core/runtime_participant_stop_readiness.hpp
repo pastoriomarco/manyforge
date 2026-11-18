@@ -1,6 +1,7 @@
 #pragma once
 
 #include <manyforge_core/runtime_participant_binding.hpp>
+#include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/controller_lifecycle.hpp>
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/resolved_stop_base_plan.hpp>
@@ -19,6 +20,12 @@ struct RuntimeParticipantStopReadinessDTO final {
   ComponentLifecycleGeneration component_lifecycle_generation;
   ControllerLifecycleExpectedDomainDTO expected_controller_domain;
   ResolvedStopBasePlanDTO resolved_stop_base_plan;
+  /// The lane's hard-stop completion timeout (the stage helper's own bound
+  /// for the software-hard stage), filled by the execution host from the
+  /// lane configuration. The Kernel's hard-stage watchdog (stop state model
+  /// P7, F4) is stage start + `controlled_stage_watchdog_ns(this)`. Zero
+  /// only for a participant whose plan has no software-hard stage.
+  Duration hard_stop_completion_timeout_ns{};
 
   friend bool operator==(const RuntimeParticipantStopReadinessDTO&,
                          const RuntimeParticipantStopReadinessDTO&) = default;

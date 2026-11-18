@@ -1170,9 +1170,9 @@ TEST(DeploymentApplicabilityCodec,
       R"({"controllable_component_id":"octomap_1","stream_id":"map_updates","budget_ns":5000000000}])"));
   const std::vector<core::StreamParameterOverrideDTO> expected{
       {core::ControllableComponentId("octomap_1"), "map_updates",
-       std::int64_t{5000000000}, std::nullopt, std::nullopt},
+       std::int64_t{5000000000}},
       {core::ControllableComponentId("robot_1"), "measured_joints",
-       std::int64_t{300000000}, std::nullopt, std::nullopt},
+       std::int64_t{300000000}},
   };
   ASSERT_TRUE(candidate.normalized_policies().has_value());
   const auto *streams =

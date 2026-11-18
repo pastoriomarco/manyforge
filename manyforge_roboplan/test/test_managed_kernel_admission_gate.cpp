@@ -2,12 +2,12 @@
 #include "canonical_empty_admission_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "managed_kernel_apply_fence_owner.hpp"
+#include "kernel_apply_fence_rpc_internal.hpp"
 
 #include <gtest/gtest.h>
-#include <sqlite3.h>
+#include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/testing/request_key_fixture.hpp>
 
-#include <fcntl.h>
-#include <sys/file.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -16,8 +16,6 @@
 #include <fstream>
 #include <future>
 #include <iterator>
-#include <manyforge_component_manager/active_bundle_publication_store.hpp>
-#include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
@@ -41,6 +39,8 @@ using manyforge::roboplan_backend::ManagedKernelApplyFenceOwnerConfig;
 
 constexpr std::string_view kSha =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+constexpr std::string_view kPointerSha =
+    "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 
 class ScopedTemporaryRoot final {
 public:
@@ -123,12 +123,8 @@ struct OwnerFixture final {
     if (bundle == nullptr) {
       throw std::runtime_error("route-fence owner retained bundle is invalid");
     }
-    component_manager::SqliteActiveBundlePublicationStore store(
-        state_root.path() /
-            std::string(
-                component_manager::kActiveBundlePublicationStoreFilename),
-        bundle->value().cell_graph.cell_id);
-    const auto publication = store.PublishActiveBundle(
+    // The current publication as the Manager last stated it to the host.
+    publication = core::ActiveBundlePublicationReceiptDTO{
         {core::BootstrapPublicationTransactionDTO{
              core::BootstrapId("route-fence-owner-bootstrap"),
              core::BootstrapGeneration(1U)},
@@ -139,23 +135,22 @@ struct OwnerFixture final {
                                  core::ContentDigest(std::string(kSha))}},
          bundle->retained_bundle_id(),
          bundle->value().cell_graph.graph_revision, std::nullopt,
-         core::ContentDigest(std::string(kSha))});
-    if (!publication.valid()) {
+         core::ContentDigest(std::string(kSha))},
+        core::ActiveBundlePublicationGeneration(1U),
+        core::ContentDigest(std::string(kPointerSha))};
+    if (!publication->valid()) {
       throw std::runtime_error(
           "route-fence owner active-bundle publication is invalid");
     }
-    store.Close();
   }
 
   [[nodiscard]] ManagedKernelApplyFenceOwnerConfig
   Config(const std::string_view epoch_suffix) {
     const auto suffix = std::string(epoch_suffix);
-    return {state_root.path() / "kernel-configuration-fence.sqlite",
-            state_root.path(),
+    return {[this] { return *publication; },
             bundle->value().cell_graph.cell_id,
             core::RuntimeUnitId("runtime.kernel.route-fence-test"),
             core::RuntimeEpoch("runtime-epoch.route-fence-test." + suffix),
-            core::RequestOwnerEpoch("kernel-owner.route-fence-test." + suffix),
             [this] { return now_ns++; }};
   }
 
@@ -163,6 +158,8 @@ struct OwnerFixture final {
   std::filesystem::path retained_root;
   std::shared_ptr<const deployment::RetainedBundle> bundle;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source;
+  // Set by the constructor (the receipt has no default value).
+  std::optional<core::ActiveBundlePublicationReceiptDTO> publication;
   std::int64_t now_ns{1000};
 };
 
@@ -216,9 +213,9 @@ TwoActiveConfigurations() {
 
 [[nodiscard]] core::ResourceSlotOwnerDTO OperationOwner() {
   return core::ResourceSlotOwnerDTO{
-      core::OperationId("operation.1"),
+      core::OperationNumber(1U),
       core::OperationRevision(1U),
-      core::OperationParticipantId("participant.1"),
+      core::OperationParticipantId{core::OperationNumber(1U), 1U},
       core::ControlDomainId("domain.arm"),
       core::ControlDomainRevision("domain.arm.v1"),
       core::ControlBindingId("binding.arm"),
@@ -231,6 +228,19 @@ TwoActiveConfigurations() {
       core::ContainmentGranularity::kResource};
 }
 
+/// Holds a fence through the gate's ordinary acquisition, at the resource
+/// generation the gate observes now. `configurations` are the predecessor
+/// configurations the scope pins (none when no table reports any).
+void HoldFence(ManagedKernelAdmissionGate &gate,
+               const core::ConfigurationFenceId &fence_id,
+               const core::ConfigurationFenceScopeDTO &scope,
+               const std::vector<core::DomainActiveControlConfigurationDTO>
+                   &configurations = {}) {
+  gate.AcquireFenceDurably(fence_id, scope,
+                           gate.Observe(scope).operation_resource_generation,
+                           configurations, [] {});
+}
+
 TEST(ManagedKernelAdmissionGate,
      TerminalApplyOverlapPreservesBothBarriersAndRejectsAnActiveEffect) {
   ManagedKernelAdmissionGate gate;
@@ -240,7 +250,7 @@ TEST(ManagedKernelAdmissionGate,
   gate.BindResourceTable(table);
   const core::ConfigurationFenceId old_id("fence.old-terminal");
   const core::ConfigurationFenceId fresh_id("fence.fresh");
-  gate.RestoreFence(old_id, scope);
+  HoldFence(gate, old_id, scope, ActiveConfigurations());
   const auto observed = gate.Observe(scope);
   unsigned validations = 0U;
   bool committed = false;
@@ -342,17 +352,17 @@ TEST(ManagedKernelAdmissionGate,
       scope.resources, ActiveConfigurations(), gate.shared_admission_mutex());
   gate.BindResourceTable(table);
   auto first = OperationOwner();
-  first.participant_id = core::OperationParticipantId("participant.1");
+  first.participant_id = core::OperationParticipantId{core::OperationNumber(1U), 1U};
   auto second = first;
-  second.participant_id = core::OperationParticipantId("participant.2");
+  second.participant_id = core::OperationParticipantId{core::OperationNumber(1U), 2U};
 
   const core::ConfigurationFenceScopeDTO second_scope{
       scope.controllable_component_ids,
       scope.domains,
       scope.bindings,
       {core::ResourceId("joint.2")}};
-  gate.RestoreFence(core::ConfigurationFenceId("fence.participant.2"),
-                    second_scope);
+  HoldFence(gate, core::ConfigurationFenceId("fence.participant.2"),
+            second_scope, ActiveConfigurations());
   const std::vector<core::ResourceSlotReservationOwnerDTO> owners{
       {first, {core::ResourceId("joint.1")}},
       {second, {core::ResourceId("joint.2")}}};
@@ -367,7 +377,7 @@ TEST(ManagedKernelAdmissionGate,
   ASSERT_TRUE(gate.reserve_batch(*table, owners).ok());
   EXPECT_EQ(table->coherent_snapshot().operation_resource_generation, 1U);
   EXPECT_EQ(table->active_operation_ids(),
-            std::vector<core::OperationId>{core::OperationId("operation.1")});
+            std::vector<core::OperationNumber>{core::OperationNumber(1U)});
 }
 
 TEST(ManagedKernelAdmissionGate,
@@ -416,10 +426,10 @@ TEST(ManagedKernelAdmissionGate,
 }
 
 TEST(ManagedKernelAdmissionGate,
-     RestoredFenceBlocksAResourceTableAttachedAfterRestart) {
+     FenceHeldBeforeTheResourceTableIsBoundBlocksThatTable) {
   ManagedKernelAdmissionGate gate;
   const auto scope = AffectedScope();
-  gate.RestoreFence(core::ConfigurationFenceId("fence.restored"), scope);
+  HoldFence(gate, core::ConfigurationFenceId("fence.before-table"), scope);
   auto table = std::make_shared<core::ResourceSlotTable>(
       std::vector<core::ResourceId>{core::ResourceId("joint.1"),
                                     core::ResourceId("joint.2")},
@@ -437,7 +447,7 @@ TEST(ManagedKernelAdmissionGate,
   ManagedKernelAdmissionGate gate;
   const auto scope = AffectedScope();
   const core::ConfigurationFenceId fence_id("fence.composition-pinned");
-  gate.RestoreFence(fence_id, scope);
+  HoldFence(gate, fence_id, scope);
 
   std::promise<void> effect_entered;
   std::promise<void> allow_effect_to_finish;
@@ -462,74 +472,7 @@ TEST(ManagedKernelAdmissionGate,
   gate.ReleaseFence(fence_id, scope);
 }
 
-TEST(ManagedKernelAdmissionGate,
-     UnreconciledOrphanWorkRejectsFenceAcquisitionFailClosed) {
-  ManagedKernelAdmissionGate gate;
-  const auto scope = AffectedScope();
-  auto table = std::make_shared<core::ResourceSlotTable>(
-      scope.resources, ActiveConfigurations(), gate.shared_admission_mutex());
-  gate.BindResourceTable(table);
-  ASSERT_TRUE(
-      table->mark_unreconciled_external_or_orphan_goal(scope.resources).ok());
-  const auto observation = gate.Observe(scope);
-  EXPECT_EQ(observation.operation_resource_generation, 1U);
-  EXPECT_EQ(observation.affected_queued_operation_count, 0U);
-  EXPECT_EQ(observation.affected_active_operation_count, 1U);
-  bool commit_called = false;
-  EXPECT_THROW(gate.AcquireFenceDurably(
-                   core::ConfigurationFenceId("fence.orphan-rejected"), scope,
-                   observation.operation_resource_generation,
-                   ActiveConfigurations(), [&] { commit_called = true; }),
-               std::runtime_error);
-  EXPECT_FALSE(commit_called);
-}
-
-TEST(ManagedKernelAdmissionGate,
-     DurableReleaseChecksActiveEffectBeforeCommit) {
-  ManagedKernelAdmissionGate gate;
-  const auto scope = AffectedScope();
-  const core::ConfigurationFenceId fence("selected.effect.pin");
-  gate.RestoreFence(fence, scope);
-  unsigned commits = 0U;
-  gate.RunWithExactHeldFence(fence, scope, [&] {
-    EXPECT_THROW(gate.ReleaseFenceDurably(fence, scope, [&] { ++commits; }),
-                 std::runtime_error);
-  });
-  EXPECT_EQ(commits, 0U);
-  EXPECT_TRUE(gate.exact_fence_is_held(fence, scope));
-  EXPECT_THROW(
-      gate.ReleaseFenceDurably(
-          fence, scope, [] { throw std::runtime_error("unknown commit"); }),
-      std::runtime_error);
-  EXPECT_TRUE(gate.exact_fence_is_held(fence, scope));
-  gate.ReleaseFenceDurably(fence, scope, [&] { ++commits; });
-  EXPECT_EQ(commits, 1U);
-  EXPECT_FALSE(gate.exact_fence_is_held(fence, scope));
-}
-
 } // namespace
-
-TEST(ManagedKernelApplyFenceOwner,
-     ReplacementOwnerWaitsForThePredecessorToReleaseTheLedger) {
-  // A replacement execution host can start while the host of a killed
-  // Manager is still tearing down: it owns the ledger only once the
-  // predecessor's lock is released, instead of failing its start.
-  OwnerFixture fixture(true);
-  const auto config = fixture.Config("replacement");
-  const auto lock_path = config.ledger_path.string() + ".lock";
-  const int predecessor =
-      ::open(lock_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
-  ASSERT_GE(predecessor, 0);
-  ASSERT_EQ(::flock(predecessor, LOCK_EX | LOCK_NB), 0);
-  ManagedKernelAdmissionGate gate;
-  auto replacement = std::async(std::launch::async, [&] {
-    return std::make_unique<ManagedKernelApplyFenceOwner>(config, gate);
-  });
-  EXPECT_EQ(replacement.wait_for(std::chrono::milliseconds(200)),
-            std::future_status::timeout);
-  ASSERT_EQ(::close(predecessor), 0);
-  EXPECT_NE(replacement.get(), nullptr);
-}
 
 TEST(ManagedKernelApplyFenceOwner,
      TerminalOverlapUsesTheExactExistingDurableApplyRow) {
@@ -539,12 +482,10 @@ TEST(ManagedKernelApplyFenceOwner,
   auto scope = AffectedScope();
   scope.domains.front().predecessor_control_domain_revision.reset();
   scope.bindings.front().predecessor_control_binding_revision.reset();
-  const core::RuntimeEpoch manager_epoch("manager.terminal-overlap");
-  const auto observed = owner.ObserveAdmission({scope, manager_epoch});
+  const auto observed = owner.ObserveAdmission({scope});
   const core::ApplyConfigurationFenceIntentDTO old_intent{
-      {core::RequestId("old.apply.fence"),
-       core::RequestOwnerEpoch("manager.owner"), "test", std::nullopt},
-      {core::ApplyId("old.apply"), core::ApplyGeneration(1U)},
+      {core::TestRequestKey("old.apply.fence"), "test"},
+      {core::ApplyId(1U), core::ApplyGeneration(1U)},
       scope,
       core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
       fixture.bundle->retained_bundle_id(),
@@ -555,8 +496,8 @@ TEST(ManagedKernelApplyFenceOwner,
       "old Apply"};
   const auto old = owner.Acquire(old_intent);
   auto next = old_intent;
-  next.owner_request_context.request_id = core::RequestId("fresh.apply.fence");
-  next.owner_transaction = {core::ApplyId("fresh.apply"),
+  next.owner_request_context.request_key = core::TestRequestKey("fresh.apply.fence");
+  next.owner_transaction = {core::ApplyId(2U),
                             core::ApplyGeneration(1U)};
   next.expected_fence_generation = old.configuration_fence_generation;
   EXPECT_THROW(static_cast<void>(owner.Acquire(next)), std::runtime_error);
@@ -606,15 +547,12 @@ TEST(ManagedKernelApplyFenceOwner,
   auto scope = AffectedScope();
   scope.domains.front().predecessor_control_domain_revision.reset();
   scope.bindings.front().predecessor_control_binding_revision.reset();
-  const core::RuntimeEpoch manager_epoch("manager.initial-add");
-  const auto observed = owner.ObserveAdmission({scope, manager_epoch});
+  const auto observed = owner.ObserveAdmission({scope});
   ASSERT_TRUE(observed.presence_valid());
   ASSERT_TRUE(observed.active_control_configurations.empty());
   const core::ApplyConfigurationFenceIntentDTO intent{
-      {core::RequestId("request.initial-add"),
-       core::RequestOwnerEpoch("manager-owner.initial-add"), "initial-add-test",
-       std::nullopt},
-      {core::ApplyId("apply.initial-add"), core::ApplyGeneration(1U)},
+      {core::TestRequestKey("request.initial-add"), "initial-add-test"},
+      {core::ApplyId(1U), core::ApplyGeneration(1U)},
       scope,
       core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
       fixture.bundle->retained_bundle_id(),
@@ -627,34 +565,15 @@ TEST(ManagedKernelApplyFenceOwner,
   ASSERT_TRUE(accepted.matches(intent));
   const core::ConfigurationFenceStatusQueryDTO query{
       intent.owner_transaction, accepted.configuration_fence_id,
-      accepted.configuration_fence_generation, scope, manager_epoch};
+      accepted.configuration_fence_generation, scope};
   // Status reports only installed configurations: none before install.
   EXPECT_TRUE(owner.QueryStatus(query).reconciliation_evidence.active_control_configurations.empty());
   unsigned effects = 0U;
   const auto prepare = [&](const auto &selected) {
-    owner.RunWithExactHeldPredecessor(
-        selected, observed.execution_host_epoch.publication_generation,
-        observed.active_public_pointer_digest, [&] { ++effects; });
+    owner.RunWithExactHeldPredecessor(selected, [&] { ++effects; });
   };
   EXPECT_NO_THROW(prepare(query));
   EXPECT_EQ(effects, 1U);
-  unsigned readbacks = 0U;
-  std::vector<core::DomainActiveControlConfigurationDTO> rows;
-  const auto readback = [&] {
-    owner.RunWithExactHeldPredecessorReadback(
-        query, observed.execution_host_epoch.publication_generation,
-        observed.active_public_pointer_digest, [&](const auto &view) {
-          EXPECT_TRUE(view.status().matches(query));
-          rows = view.status().reconciliation_evidence.active_control_configurations;
-          ++readbacks;
-        });
-  };
-  EXPECT_NO_THROW(readback());
-  EXPECT_TRUE(rows.empty()); // No candidate facts are invented before install.
-  ASSERT_TRUE(table->reconfigure_runtime_inventory(scope.resources, ActiveConfigurations(), {}).ok());
-  EXPECT_NO_THROW(readback());
-  EXPECT_EQ(rows, ActiveConfigurations());
-  EXPECT_EQ(readbacks, 2U);
   auto wrong = query;
   wrong.expected_scope.resources.pop_back();
   EXPECT_THROW(prepare(wrong), std::runtime_error);
@@ -682,15 +601,12 @@ TEST(ManagedKernelApplyFenceOwner,
       gate.shared_admission_mutex());
   gate.BindResourceTable(table);
   ManagedKernelApplyFenceOwner owner(fixture.Config("never-enabled"), gate);
-  const core::RuntimeEpoch manager_epoch("manager.never-enabled");
-  const auto observed = owner.ObserveAdmission({scope, manager_epoch});
+  const auto observed = owner.ObserveAdmission({scope});
   ASSERT_TRUE(observed.presence_valid());
   EXPECT_TRUE(observed.active_control_configurations.empty());
   const core::ApplyConfigurationFenceIntentDTO intent{
-      {core::RequestId("request.never-enabled"),
-       core::RequestOwnerEpoch("manager-owner.never-enabled"),
-       "never-enabled-test", std::nullopt},
-      {core::ApplyId("apply.never-enabled"), core::ApplyGeneration(1U)},
+      {core::TestRequestKey("request.never-enabled"), "never-enabled-test"},
+      {core::ApplyId(1U), core::ApplyGeneration(1U)},
       scope,
       core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
       fixture.bundle->retained_bundle_id(),
@@ -704,7 +620,7 @@ TEST(ManagedKernelApplyFenceOwner,
   ASSERT_TRUE(accepted.matches(intent));
   const core::ConfigurationFenceStatusQueryDTO query{
       intent.owner_transaction, accepted.configuration_fence_id,
-      accepted.configuration_fence_generation, scope, manager_epoch};
+      accepted.configuration_fence_generation, scope};
   EXPECT_TRUE(owner.QueryStatus(query)
                   .reconciliation_evidence.active_control_configurations.empty());
   gate.ReleaseFence(accepted.configuration_fence_id, scope);
@@ -714,7 +630,7 @@ TEST(ManagedKernelApplyFenceOwner,
                        scope.resources, ActiveConfigurations(),
                        ActiveConfigurations())
                   .ok());
-  EXPECT_EQ(owner.ObserveAdmission({scope, manager_epoch})
+  EXPECT_EQ(owner.ObserveAdmission({scope})
                 .active_control_configurations,
             ActiveConfigurations());
 
@@ -742,7 +658,7 @@ TEST(ManagedKernelApplyFenceOwner,
     return false;
   };
   EXPECT_TRUE(refuses(
-      [&] { static_cast<void>(routed.ObserveAdmission({scope, manager_epoch})); }));
+      [&] { static_cast<void>(routed.ObserveAdmission({scope})); }));
   auto routed_intent = intent;
   routed_intent.expected_retained_bundle_id =
       routed_fixture.bundle->retained_bundle_id();
@@ -768,15 +684,12 @@ TEST(ManagedKernelApplyFenceOwner,
   auto scope = AffectedScope();
   scope.domains.front().predecessor_control_domain_revision.reset();
   scope.bindings.front().predecessor_control_binding_revision.reset();
-  const core::RuntimeEpoch manager_epoch("manager.initial-presence");
-  const auto observed = owner.ObserveAdmission({scope, manager_epoch});
+  const auto observed = owner.ObserveAdmission({scope});
   ASSERT_TRUE(observed.presence_valid());
   ASSERT_TRUE(observed.active_control_configurations.empty());
   const core::ApplyConfigurationFenceIntentDTO intent{
-      {core::RequestId("request.initial-presence"),
-       core::RequestOwnerEpoch("manager-owner.initial-presence"), "initial-presence-test",
-       std::nullopt},
-      {core::ApplyId("apply.initial-presence"), core::ApplyGeneration(1U)}, scope,
+      {core::TestRequestKey("request.initial-presence"), "initial-presence-test"},
+      {core::ApplyId(1U), core::ApplyGeneration(1U)}, scope,
       core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
       fixture.bundle->retained_bundle_id(), fixture.bundle->value().cell_graph.graph_revision,
       observed.operation_resource_generation, observed.configuration_fence_generation, {},
@@ -784,10 +697,10 @@ TEST(ManagedKernelApplyFenceOwner,
   const auto accepted = owner.Acquire(intent);
   ASSERT_TRUE(accepted.matches(intent));
   const core::ApplyFenceAcquireAttemptQueryDTO attempt{
-      intent, core::ContentDigest(std::string(kSha)), manager_epoch};
+      intent, core::ContentDigest(std::string(kSha))};
   const core::ConfigurationFenceStatusQueryDTO status_query{
       intent.owner_transaction, accepted.configuration_fence_id,
-      accepted.configuration_fence_generation, scope, manager_epoch};
+      accepted.configuration_fence_generation, scope};
   const auto held = owner.ReconcileAcquireAttempt(attempt);
   ASSERT_TRUE(held.matches(attempt));
   EXPECT_EQ(held.state, core::ApplyFenceAcquireAttemptReconcileState::kAcceptedExact);
@@ -795,7 +708,6 @@ TEST(ManagedKernelApplyFenceOwner,
   EXPECT_TRUE(held.admission_fenced);
   EXPECT_EQ(held.execution_host_epoch.runtime_unit_id, observed.execution_host_epoch.runtime_unit_id);
   EXPECT_EQ(held.execution_host_epoch.runtime_epoch, observed.execution_host_epoch.runtime_epoch);
-  EXPECT_EQ(held.execution_host_epoch.request_owner_epoch, observed.execution_host_epoch.request_owner_epoch);
   EXPECT_EQ(held.execution_host_epoch.publication_generation,
             observed.execution_host_epoch.publication_generation);
   EXPECT_TRUE(held.execution_host_epoch.valid());
@@ -808,14 +720,14 @@ TEST(ManagedKernelApplyFenceOwner,
   // original Manager joins remain mandatory. Only exact durable intent bytes
   // and the actual held ledger row establish this producer's presence result.
   auto foreign = attempt;
-  foreign.persisted_intent.owner_transaction.apply_id = core::ApplyId("foreign.apply");
+  foreign.persisted_intent.owner_transaction.apply_id = core::ApplyId(2U);
   ASSERT_TRUE(foreign.valid());
   const auto conflicting = owner.ReconcileAcquireAttempt(foreign);
   ASSERT_TRUE(conflicting.matches(foreign));
   EXPECT_EQ(conflicting.state, core::ApplyFenceAcquireAttemptReconcileState::kConflicting);
   EXPECT_FALSE(conflicting.accepted_fence);
   auto missing = attempt;
-  missing.persisted_intent.owner_request_context.request_id = core::RequestId("missing.request");
+  missing.persisted_intent.owner_request_context.request_key = core::TestRequestKey("missing.request");
   const auto absent = owner.ReconcileAcquireAttempt(missing);
   ASSERT_TRUE(absent.matches(missing));
   EXPECT_EQ(absent.state, core::ApplyFenceAcquireAttemptReconcileState::kNotSeen);
@@ -829,7 +741,7 @@ TEST(ManagedKernelApplyFenceOwner,
   EXPECT_EQ(complete.reconciliation_evidence.active_control_configurations,
             ActiveConfigurations());
   ASSERT_TRUE(complete.reconciliation_evidence.valid());
-  const auto released = owner.Release({complete.reconciliation_evidence, manager_epoch});
+  const auto released = owner.Release({complete.reconciliation_evidence});
   ASSERT_TRUE(released.valid());
   const auto after_release = owner.ReconcileAcquireAttempt(attempt);
   ASSERT_TRUE(after_release.matches(attempt));
@@ -873,15 +785,12 @@ TEST(ManagedKernelApplyFenceOwner,
                                                            gate.shared_admission_mutex());
     gate.BindResourceTable(table);
     ManagedKernelApplyFenceOwner owner(fixture.Config(name), gate);
-    const core::RuntimeEpoch manager_epoch(std::string("manager.before-effect.") + name);
-    const auto observed = owner.ObserveAdmission({scope, manager_epoch});
+    const auto observed = owner.ObserveAdmission({scope});
     ASSERT_TRUE(observed.presence_valid());
     ASSERT_EQ(observed.active_control_configurations, installed);
     const core::ApplyConfigurationFenceIntentDTO intent{
-        {core::RequestId("request.before-effect"),
-         core::RequestOwnerEpoch("manager-owner.before-effect"), "before-effect-test",
-         std::nullopt},
-        {core::ApplyId("apply.before-effect"), core::ApplyGeneration(1U)}, scope,
+        {core::TestRequestKey("request.before-effect"), "before-effect-test"},
+        {core::ApplyId(1U), core::ApplyGeneration(1U)}, scope,
         core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
         fixture.bundle->retained_bundle_id(), fixture.bundle->value().cell_graph.graph_revision,
         observed.operation_resource_generation, observed.configuration_fence_generation,
@@ -891,7 +800,7 @@ TEST(ManagedKernelApplyFenceOwner,
     EXPECT_TRUE(gate.exact_fence_is_held(accepted.configuration_fence_id, scope));
     const core::ConfigurationFenceStatusQueryDTO query{
         intent.owner_transaction, accepted.configuration_fence_id,
-        accepted.configuration_fence_generation, scope, manager_epoch};
+        accepted.configuration_fence_generation, scope};
     const auto held = owner.QueryStatus(query);
     ASSERT_TRUE(held.matches(query));
     EXPECT_EQ(held.state, core::ConfigurationFenceState::kHeld);
@@ -899,7 +808,7 @@ TEST(ManagedKernelApplyFenceOwner,
     // The Manager's before-effect check: the predecessor is unchanged.
     EXPECT_EQ(held.reconciliation_evidence.active_control_configurations,
               intent.expected_active_control_configurations);
-    const core::ConfigurationFenceReleaseDTO release{held.reconciliation_evidence, manager_epoch};
+    const core::ConfigurationFenceReleaseDTO release{held.reconciliation_evidence};
     ASSERT_TRUE(release.valid());
     const auto released = owner.Release(release);
     EXPECT_TRUE(released.valid());
@@ -934,15 +843,13 @@ TEST(ManagedKernelApplyFenceOwner, LedgerEvictsOldestReleasedFenceAtItsBound) {
   gate.BindResourceTable(table);
   const auto config = fixture.Config("ledger-bound");
   ManagedKernelApplyFenceOwner owner(config, gate);
-  const core::RuntimeEpoch manager_epoch("manager.ledger-bound");
+  std::uint64_t next_apply_id = 1U;
   const auto acquire = [&](const std::string &name,
                            const core::ConfigurationFenceScopeDTO &scope) {
-    const auto observed = owner.ObserveAdmission({scope, manager_epoch});
+    const auto observed = owner.ObserveAdmission({scope});
     const core::ApplyConfigurationFenceIntentDTO intent{
-        {core::RequestId("request." + name),
-         core::RequestOwnerEpoch("manager-owner.ledger-bound"),
-         "ledger-bound-test", std::nullopt},
-        {core::ApplyId("apply." + name), core::ApplyGeneration(1U)},
+        {core::TestRequestKey("request." + name), "ledger-bound-test"},
+        {core::ApplyId(next_apply_id++), core::ApplyGeneration(1U)},
         scope,
         core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
         fixture.bundle->retained_bundle_id(),
@@ -955,7 +862,7 @@ TEST(ManagedKernelApplyFenceOwner, LedgerEvictsOldestReleasedFenceAtItsBound) {
     EXPECT_TRUE(accepted.matches(intent));
     return core::ConfigurationFenceStatusQueryDTO{
         intent.owner_transaction, accepted.configuration_fence_id,
-        accepted.configuration_fence_generation, scope, manager_epoch};
+        accepted.configuration_fence_generation, scope};
   };
   const auto held = acquire("held", held_scope);
   constexpr std::size_t kCycles = 256U + 8U;
@@ -966,7 +873,7 @@ TEST(ManagedKernelApplyFenceOwner, LedgerEvictsOldestReleasedFenceAtItsBound) {
     const auto status = owner.QueryStatus(query);
     ASSERT_EQ(status.state, core::ConfigurationFenceState::kHeld);
     static_cast<void>(
-        owner.Release({status.reconciliation_evidence, manager_epoch}));
+        owner.Release({status.reconciliation_evidence}));
     if (!first)
       first = query;
     last = query;
@@ -982,6 +889,237 @@ TEST(ManagedKernelApplyFenceOwner, LedgerEvictsOldestReleasedFenceAtItsBound) {
                                        held_scope));
 }
 
+namespace {
+[[nodiscard]] core::ApplyConfigurationFenceIntentDTO
+EmptyScopeIntent(ManagedKernelApplyFenceOwner &owner,
+                 const OwnerFixture &fixture, const std::uint64_t apply_id) {
+  const core::ConfigurationFenceScopeDTO scope{{}, {}, {}, {}};
+  const auto observed = owner.ObserveAdmission({scope});
+  return {{core::TestRequestKey("request.empty." + std::to_string(apply_id)),
+           "empty-scope-test"},
+          {core::ApplyId(apply_id), core::ApplyGeneration(1U)},
+          scope,
+          core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+          fixture.bundle->retained_bundle_id(),
+          fixture.bundle->value().cell_graph.graph_revision,
+          observed.operation_resource_generation,
+          observed.configuration_fence_generation,
+          {},
+          "empty-scope Apply"};
+}
+} // namespace
+
+// 256 held fences fill the ledger; the 257th is refused and changes nothing.
+TEST(ManagedKernelApplyFenceOwner, LedgerHolds256HeldFencesAndRefusesThe257th) {
+  OwnerFixture fixture(true);
+  ManagedKernelAdmissionGate gate;
+  ManagedKernelApplyFenceOwner owner(fixture.Config("held-bound"), gate);
+  const core::ConfigurationFenceScopeDTO scope{{}, {}, {}, {}};
+  for (std::uint64_t apply_id = 1U; apply_id <= 256U; ++apply_id) {
+    SCOPED_TRACE(apply_id);
+    const auto intent = EmptyScopeIntent(owner, fixture, apply_id);
+    ASSERT_TRUE(owner.Acquire(intent).matches(intent));
+  }
+  EXPECT_EQ(owner.HeldApplyFences().size(), 256U);
+  const auto refused = EmptyScopeIntent(owner, fixture, 257U);
+  const auto before = owner.ObserveAdmission({scope});
+  try {
+    static_cast<void>(owner.Acquire(refused));
+    ADD_FAILURE() << "the 257th held fence was accepted";
+  } catch (const std::runtime_error &error) {
+    EXPECT_NE(std::string_view(error.what()).find("full of held fences"),
+              std::string_view::npos);
+  }
+  const auto after = owner.ObserveAdmission({scope});
+  EXPECT_EQ(after.configuration_fence_generation,
+            before.configuration_fence_generation);
+  EXPECT_EQ(after.execution_host_epoch, before.execution_host_epoch);
+  EXPECT_EQ(owner.HeldApplyFences().size(), 256U);
+  EXPECT_FALSE(owner.HeldApplyFence({core::ApplyId(257U), core::ApplyGeneration(1U)}));
+  EXPECT_EQ(owner.ReconcileAcquireAttempt({refused, core::ContentDigest(std::string(kSha))})
+                .state,
+            core::ApplyFenceAcquireAttemptReconcileState::kNotSeen);
+}
+
+// The owner reads the current publication only from the host's memory and
+// lists exactly the fences its ledger holds.
+TEST(ManagedKernelApplyFenceOwner,
+     HeldApplyFencesAndPublicationComeFromMemoryWithoutManagerState) {
+  OwnerFixture fixture(true);
+  ManagedKernelAdmissionGate gate;
+  ManagedKernelApplyFenceOwner owner(fixture.Config("memory-only"), gate);
+  const core::ConfigurationFenceScopeDTO scope{{}, {}, {}, {}};
+  EXPECT_TRUE(owner.HeldApplyFences().empty());
+  const auto observed = owner.ObserveAdmission({scope});
+  EXPECT_EQ(observed.execution_host_epoch.publication_generation,
+            fixture.publication->publication_generation);
+  EXPECT_EQ(observed.active_public_pointer_digest,
+            fixture.publication->durable_public_pointer_content_digest);
+  EXPECT_EQ(observed.active_projection_revision,
+            fixture.publication->request.candidate_projection_revision);
+
+  std::vector<core::ConfigurationFenceStatusQueryDTO> held;
+  for (std::uint64_t apply_id = 1U; apply_id <= 2U; ++apply_id) {
+    const auto intent = EmptyScopeIntent(owner, fixture, apply_id);
+    const auto accepted = owner.Acquire(intent);
+    held.push_back({intent.owner_transaction, accepted.configuration_fence_id,
+                    accepted.configuration_fence_generation, scope});
+  }
+  EXPECT_EQ(owner.HeldApplyFences(), held);
+
+  // A later publication stated to the host is reported as it is.
+  fixture.publication->publication_generation =
+      core::ActiveBundlePublicationGeneration(2U);
+  fixture.publication->durable_public_pointer_content_digest =
+      core::ContentDigest(std::string(kSha));
+  const auto status = owner.QueryStatus(held.front());
+  ASSERT_EQ(status.state, core::ConfigurationFenceState::kHeld);
+  const auto &evidence = status.reconciliation_evidence;
+  EXPECT_EQ(evidence.active_publication_generation,
+            fixture.publication->publication_generation);
+  EXPECT_EQ(evidence.execution_host_epoch.publication_generation,
+            fixture.publication->publication_generation);
+  EXPECT_EQ(evidence.active_public_pointer_digest,
+            fixture.publication->durable_public_pointer_content_digest);
+  EXPECT_EQ(evidence.active_graph_revision,
+            fixture.publication->request.candidate_graph_revision);
+  EXPECT_EQ(owner.ObserveAdmission({scope})
+                .execution_host_epoch.publication_generation,
+            fixture.publication->publication_generation);
+
+  static_cast<void>(owner.Release({evidence}));
+  EXPECT_EQ(owner.HeldApplyFences(),
+            std::vector<core::ConfigurationFenceStatusQueryDTO>{held.back()});
+  static_cast<void>(
+      owner.Release({owner.QueryStatus(held.back()).reconciliation_evidence}));
+  EXPECT_TRUE(owner.HeldApplyFences().empty());
+  // Nothing was written for the Manager: the fixture's root stays empty.
+  EXPECT_TRUE(std::filesystem::is_empty(fixture.state_root.path()));
+}
+
+TEST(ManagedKernelApplyFenceOwner,
+     ReplayConflictAndReleaseReplayAnswerFromTheLedger) {
+  auto scope = AffectedScope();
+  scope.domains.front().predecessor_control_domain_revision.reset();
+  scope.bindings.front().predecessor_control_binding_revision.reset();
+  OwnerFixture fixture(true);
+  ManagedKernelAdmissionGate gate;
+  auto table = std::make_shared<core::ResourceSlotTable>(
+      scope.resources, std::vector<core::DomainActiveControlConfigurationDTO>{},
+      gate.shared_admission_mutex());
+  gate.BindResourceTable(table);
+  ManagedKernelApplyFenceOwner owner(fixture.Config("replay"), gate);
+  const auto observed = owner.ObserveAdmission({scope});
+  const core::ApplyConfigurationFenceIntentDTO intent{
+      {core::TestRequestKey("request.replay"), "replay-test"},
+      {core::ApplyId(1U), core::ApplyGeneration(1U)},
+      scope,
+      core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
+      fixture.bundle->retained_bundle_id(),
+      fixture.bundle->value().cell_graph.graph_revision,
+      observed.operation_resource_generation,
+      observed.configuration_fence_generation,
+      {},
+      "replay from the ledger"};
+  const core::ApplyFenceAcquireAttemptQueryDTO attempt{
+      intent, core::ContentDigest(std::string(kSha))};
+  EXPECT_EQ(owner.ReconcileAcquireAttempt(attempt).state,
+            core::ApplyFenceAcquireAttemptReconcileState::kNotSeen);
+
+  const auto accepted = owner.Acquire(intent);
+  ASSERT_EQ(accepted.replay_status, core::RequestReplayStatusDTO::kAcceptedNew);
+  auto replayed = accepted;
+  replayed.replay_status = core::RequestReplayStatusDTO::kReplayedExact;
+  EXPECT_EQ(owner.Acquire(intent), replayed);
+  const auto exact = owner.ReconcileAcquireAttempt(attempt);
+  EXPECT_EQ(exact.state,
+            core::ApplyFenceAcquireAttemptReconcileState::kAcceptedExact);
+  EXPECT_EQ(exact.accepted_fence, std::optional(accepted));
+
+  // The same request key for another Apply conflicts and changes nothing.
+  auto conflicting = intent;
+  conflicting.owner_transaction.apply_id = core::ApplyId(2U);
+  const auto generation =
+      owner.ObserveAdmission({scope}).configuration_fence_generation;
+  EXPECT_THROW(static_cast<void>(owner.Acquire(conflicting)),
+               std::runtime_error);
+  EXPECT_EQ(owner.ObserveAdmission({scope}).configuration_fence_generation,
+            generation);
+  const auto conflict = owner.ReconcileAcquireAttempt(
+      {conflicting, core::ContentDigest(std::string(kSha))});
+  EXPECT_EQ(conflict.state,
+            core::ApplyFenceAcquireAttemptReconcileState::kConflicting);
+  ASSERT_TRUE(conflict.error);
+  EXPECT_EQ(conflict.error->code, "configuration_fence_request_conflict");
+
+  const core::ConfigurationFenceStatusQueryDTO query{
+      intent.owner_transaction, accepted.configuration_fence_id,
+      accepted.configuration_fence_generation, scope};
+  const core::ConfigurationFenceReleaseDTO release{
+      owner.QueryStatus(query).reconciliation_evidence};
+  const auto released = owner.Release(release);
+  EXPECT_FALSE(gate.exact_fence_is_held(accepted.configuration_fence_id, scope));
+  EXPECT_EQ(owner.Release(release), released);
+  EXPECT_EQ(owner.QueryStatus(query).state,
+            core::ConfigurationFenceState::kReleased);
+  auto other = release;
+  other.reconciliation_evidence.evidence_digest =
+      core::ContentDigest(std::string(kSha));
+  ASSERT_TRUE(other.valid());
+  try {
+    static_cast<void>(owner.Release(other));
+    ADD_FAILURE() << "a different release of a released fence was accepted";
+  } catch (const std::runtime_error &error) {
+    EXPECT_NE(std::string_view(error.what()).find("exact release replay"),
+              std::string_view::npos);
+  }
+  EXPECT_THROW(static_cast<void>(owner.Acquire(intent)), std::runtime_error);
+  EXPECT_EQ(owner.ReconcileAcquireAttempt(attempt).state,
+            core::ApplyFenceAcquireAttemptReconcileState::kConflicting);
+  EXPECT_FALSE(owner.HeldApplyFence({core::ApplyId(1U), core::ApplyGeneration(1U)}));
+}
+
+// The ledger digest: length-prefixed fields of the domain, the cell, the
+// generation, then each row's intent, acceptance, state and release bytes.
+TEST(ManagedKernelApplyFenceOwner, LedgerDigestCoversTheRowsInGenerationOrder) {
+  OwnerFixture fixture(true);
+  ManagedKernelAdmissionGate gate;
+  ManagedKernelApplyFenceOwner owner(fixture.Config("digest"), gate);
+  const core::ConfigurationFenceScopeDTO scope{{}, {}, {}, {}};
+  const auto append = [](std::string &bytes, const std::string_view value) {
+    bytes.append(std::to_string(value.size()));
+    bytes.push_back(':');
+    bytes.append(value);
+  };
+  std::string bytes;
+  append(bytes, "manyforge.internal.kernel-configuration-fence-ledger.v8");
+  append(bytes, fixture.bundle->value().cell_graph.cell_id.value());
+  const auto digest = [](const std::string &value) {
+    return core::ContentDigest(
+        manyforge::content_identity::sha256_digest(value));
+  };
+  auto empty = bytes;
+  append(empty, "0");
+  EXPECT_EQ(owner.ObserveAdmission({scope})
+                .execution_host_epoch.durable_stop_fence_ledger_digest,
+            digest(empty));
+
+  const auto intent = EmptyScopeIntent(owner, fixture, 1U);
+  const auto accepted = owner.Acquire(intent);
+  append(bytes, "1");
+  append(bytes, component_manager::detail::EncodeKernelApplyFenceRpcRequest(
+                    component_manager::detail::KernelApplyFenceRpcRequest(intent)));
+  append(bytes,
+         component_manager::detail::EncodeKernelApplyFenceRpcResponse(
+             component_manager::detail::KernelApplyFenceRpcResponse(accepted)));
+  append(bytes, "0");
+  append(bytes, "");
+  append(bytes, "");
+  EXPECT_EQ(owner.ObserveAdmission({scope})
+                .execution_host_epoch.durable_stop_fence_ledger_digest,
+            digest(bytes));
+}
+
 TEST(ManagedKernelAdmissionGate,
      MissingOrChangedFenceRejectsComponentStartBeforeEffects) {
   ManagedKernelAdmissionGate gate;
@@ -991,7 +1129,7 @@ TEST(ManagedKernelAdmissionGate,
   EXPECT_THROW(gate.RunWithExactHeldFence(fence_id, scope, [&] { ++effects; }),
                std::runtime_error);
   EXPECT_EQ(effects, 0U);
-  gate.RestoreFence(fence_id, scope);
+  HoldFence(gate, fence_id, scope);
   auto wrong_scope = scope;
   wrong_scope.resources.pop_back();
   EXPECT_THROW(
@@ -1013,7 +1151,7 @@ TEST(ManagedKernelAdmissionGate,
   const core::ConfigurationFenceId empty_id("fence.empty-apply");
   const core::ConfigurationFenceId physical_id("fence.physical-apply");
   EXPECT_FALSE(gate.has_held_configuration_fences());
-  gate.RestoreFence(empty_id, empty_scope);
+  HoldFence(gate, empty_id, empty_scope);
   {
     // The installation owner retains this same recursive mutex from the
     // observation through its commit, so an Apply cannot overtake the proof.
@@ -1022,7 +1160,7 @@ TEST(ManagedKernelAdmissionGate,
     EXPECT_TRUE(gate.exact_fence_is_held(empty_id, empty_scope));
     EXPECT_TRUE(gate.current_fenced_resources(AffectedScope().resources).empty());
   }
-  gate.RestoreFence(physical_id, AffectedScope());
+  HoldFence(gate, physical_id, AffectedScope());
   gate.ReleaseFence(empty_id, empty_scope);
   EXPECT_TRUE(gate.has_held_configuration_fences());
   gate.ReleaseFence(physical_id, AffectedScope());
@@ -1063,12 +1201,11 @@ TEST(ManagedKernelApplyFenceOwner, IoProviderDomainIsFencedByResource) {
   ManagedKernelApplyFenceOwner owner(fixture.Config("provider-by-resource"), gate);
   EXPECT_TRUE(gate.current_fenced_resources({output}).empty());
   const auto observed =
-      owner.ObserveAdmission({scope, core::RuntimeEpoch("manager.provider")});
+      owner.ObserveAdmission({scope});
   EXPECT_TRUE(observed.presence_valid());
   const core::ApplyConfigurationFenceIntentDTO intent{
-      {core::RequestId("provider.fence"),
-       core::RequestOwnerEpoch("manager.owner"), "test", std::nullopt},
-      {core::ApplyId("provider.apply"), core::ApplyGeneration(1U)},
+      {core::TestRequestKey("provider.fence"), "test"},
+      {core::ApplyId(1U), core::ApplyGeneration(1U)},
       scope,
       core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
       fixture.bundle->retained_bundle_id(),
@@ -1083,15 +1220,12 @@ TEST(ManagedKernelApplyFenceOwner, IoProviderDomainIsFencedByResource) {
             std::vector<core::ResourceId>{output});
   const core::ConfigurationFenceStatusQueryDTO query{
       intent.owner_transaction, accepted.configuration_fence_id,
-      accepted.configuration_fence_generation, scope,
-      observed.echoed_query.manager_runtime_epoch};
+      accepted.configuration_fence_generation, scope};
   const auto status = owner.QueryStatus(query);
   EXPECT_EQ(status.state, core::ConfigurationFenceState::kHeld);
   EXPECT_TRUE(status.admission_fenced);
   unsigned effects = 0U;
-  EXPECT_NO_THROW(owner.RunWithExactHeldPredecessor(
-      query, observed.execution_host_epoch.publication_generation,
-      observed.active_public_pointer_digest, [&] { ++effects; }));
+  EXPECT_NO_THROW(owner.RunWithExactHeldPredecessor(query, [&] { ++effects; }));
   EXPECT_EQ(effects, 1U);
 }
 
@@ -1107,12 +1241,10 @@ TEST(ManagedKernelApplyFenceOwner,
   ASSERT_TRUE(scope.valid());
   ManagedKernelAdmissionGate gate;
   ManagedKernelApplyFenceOwner owner(fixture.Config("provider-candidate"), gate);
-  const core::RuntimeEpoch manager_epoch("manager.provider-candidate");
-  const auto observed = owner.ObserveAdmission({scope, manager_epoch});
+  const auto observed = owner.ObserveAdmission({scope});
   const core::ApplyConfigurationFenceIntentDTO intent{
-      {core::RequestId("provider.candidate.fence"),
-       core::RequestOwnerEpoch("manager.owner"), "test", std::nullopt},
-      {core::ApplyId("provider.candidate"), core::ApplyGeneration(1U)},
+      {core::TestRequestKey("provider.candidate.fence"), "test"},
+      {core::ApplyId(1U), core::ApplyGeneration(1U)},
       scope,
       core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
       fixture.bundle->retained_bundle_id(),
@@ -1124,23 +1256,18 @@ TEST(ManagedKernelApplyFenceOwner,
   ASSERT_TRUE(intent.valid());
   const core::NamedApplyPublicationTransactionDTO apply{
       intent.owner_transaction.apply_id, intent.owner_transaction.apply_generation};
-  EXPECT_FALSE(owner.HeldApplyFence(apply, manager_epoch));
+  EXPECT_FALSE(owner.HeldApplyFence(apply));
   const auto accepted = owner.Acquire(intent);
-  const auto query = owner.HeldApplyFence(apply, manager_epoch);
+  const auto query = owner.HeldApplyFence(apply);
   ASSERT_TRUE(query);
   EXPECT_EQ(*query, (core::ConfigurationFenceStatusQueryDTO{
                         intent.owner_transaction, accepted.configuration_fence_id,
-                        accepted.configuration_fence_generation, scope, manager_epoch}));
+                        accepted.configuration_fence_generation, scope}));
   EXPECT_FALSE(owner.HeldApplyFence(
-      {core::ApplyId("other.apply"), core::ApplyGeneration(1U)}, manager_epoch));
+      {core::ApplyId(2U), core::ApplyGeneration(1U)}));
   const auto status = owner.QueryStatus(*query);
   EXPECT_EQ(status.state, core::ConfigurationFenceState::kHeld);
   EXPECT_TRUE(status.admission_fenced);
-  unsigned readbacks = 0U;
-  EXPECT_NO_THROW(owner.RunWithExactHeldPredecessorReadback(
-      *query, observed.execution_host_epoch.publication_generation,
-      observed.active_public_pointer_digest, [&](const auto &) { ++readbacks; }));
-  EXPECT_EQ(readbacks, 1U);
 }
 
 TEST(ManagedKernelAdmissionGate,

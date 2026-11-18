@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 
 import rfc8785
 
+from .identity import ApplicationRole, parse_application_start_id
+
 
 MAX_NATIVE_RESPONSE_BYTES = 64 * 1024 * 1024
 # Shared native/HTTP bound: two independently bounded projection children plus
@@ -63,28 +65,28 @@ class HeadlessApiError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class HeadlessApiConfig:
-    projection_root: Path
     install_root: Path
     artifact_root: Path
     node_catalog_path: Path
     node_environment_manifest_path: Path
     alarm_catalog_path: Path
-    historian_database_path: Path
+    historian_directory: Path
     manager_run_root: Path
     execution_run_root: Path
     cell_id: str
-    owner_id: str = "headless-api"
-    # Deterministic override for in-process qualification only. Production
-    # launchers leave this unset so every owner restart mints a new epoch.
-    owner_epoch: str | None = None
+    # ``A``: 16 lowercase hex characters, handed over at launch (contract 1.1).
+    application_start_id: str
+    # OD-216: the Manager is not answering when its status stream shows no new
+    # tick of its main loop for this long (or the stream ended).
     freshness_milliseconds: int = 2_000
     historian_queue_capacity: int = 1_024
     historian_record_retention: int = 100_000
-    # Apply and scene commits are durable Manager transactions, not health
-    # probes. Keep their local transport wait bounded but long enough for the
-    # owner to return the authoritative result instead of reporting an
-    # ambiguous timeout after the mutation has committed.
+    # Limits connecting to the Manager's command socket only; a connected
+    # command waits for the Manager's answer, ended by the reply or the
+    # Manager closing the connection (OD-298 (a)).
     manager_timeout_seconds: float = DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS
+    # Limits connecting to the execution host only; a connected request
+    # waits for the host's answer (OD-214).
     execution_timeout_seconds: float = 10.0
     execution_event_poll_milliseconds: int = 100
     maximum_request_body_bytes: int = MAX_STANDARD_REQUEST_BODY_BYTES
@@ -97,6 +99,11 @@ class HeadlessApiConfig:
     canonical_empty_admission_filename: Path | None = None
     workbench_previous_session_reports_root: Path | None = None
     workbench_previous_session_id: str | None = None
+    # OD-215: the disk check's floor (free bytes on a file system that holds
+    # the records) and the margin above it at which the stop ends. Without a
+    # floor there is no disk check (both launchers pass both).
+    disk_free_floor_bytes: int | None = None
+    disk_free_margin_bytes: int | None = None
 
     def __post_init__(self) -> None:
         if self.workbench_previous_session_id is not None and (
@@ -110,13 +117,12 @@ class HeadlessApiConfig:
         ):
             raise ValueError("previous-session reports root must be absolute")
         path_values = (
-            self.projection_root,
             self.install_root,
             self.artifact_root,
             self.node_catalog_path,
             self.node_environment_manifest_path,
             self.alarm_catalog_path,
-            self.historian_database_path,
+            self.historian_directory,
             self.manager_run_root,
             self.execution_run_root,
         )
@@ -144,19 +150,13 @@ class HeadlessApiConfig:
                 for run_root in (manager_run, execution_run)
             ):
                 raise ValueError("durable Headless paths must be outside disposable run roots")
-        for label, value in (("cell_id", self.cell_id), ("owner_id", self.owner_id)):
-            if (
-                not value
-                or unicodedata.normalize("NFC", value) != value
-                or len(value.encode("utf-8")) > 256
-            ):
-                raise ValueError(f"{label} must be bounded non-empty NFC text")
-        if self.owner_epoch is not None and (
-            not self.owner_epoch
-            or unicodedata.normalize("NFC", self.owner_epoch) != self.owner_epoch
-            or len(self.owner_epoch.encode("utf-8")) > 256
+        if (
+            not self.cell_id
+            or unicodedata.normalize("NFC", self.cell_id) != self.cell_id
+            or len(self.cell_id.encode("utf-8")) > 256
         ):
-            raise ValueError("owner_epoch must be bounded non-empty NFC text")
+            raise ValueError("cell_id must be bounded non-empty NFC text")
+        parse_application_start_id(self.application_start_id)
         if self.freshness_milliseconds < 1:
             raise ValueError("freshness_milliseconds must be positive")
         if not 0 < self.manager_timeout_seconds <= MAX_MANAGER_COMMAND_TIMEOUT_SECONDS:
@@ -215,6 +215,11 @@ class HeadlessApiConfig:
             raise ValueError("canonical-empty admission filename must be root-local")
         if not 1_024 <= self.maximum_request_body_bytes <= 1024 * 1024:
             raise ValueError("maximum_request_body_bytes must be between 1024 and 1048576")
+        if (self.disk_free_floor_bytes is None) != (self.disk_free_margin_bytes is None) or any(
+            value is not None and (type(value) is not int or value < 0)
+            for value in (self.disk_free_floor_bytes, self.disk_free_margin_bytes)
+        ):
+            raise ValueError("the disk floor and its margin are given together as nonnegative integers")
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,7 +289,9 @@ class HeadlessCorePort(Protocol):
 
     def history(self, **kwargs: Any) -> dict[str, Any]: ...
     def history_export(self, **kwargs: Any) -> dict[str, Any]: ...
-    def history_discovery(self, *, kind: str, after: str, limit: int) -> dict[str, Any]: ...
+    def history_discovery(
+        self, *, kind: str, after: str, limit: int, application_start_id: str | None = None
+    ) -> dict[str, Any]: ...
     def history_captures(self, *, before_capture_id: int | None, limit: int) -> dict[str, Any]: ...
     def history_detail(self, sequence: int) -> dict[str, Any]: ...
     def record_client_incident(self, **kwargs: Any) -> dict[str, Any]: ...
@@ -294,11 +301,6 @@ class HeadlessCorePort(Protocol):
     def record_activity(self, record: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def historian_health(self) -> dict[str, Any]: ...
-
-    def reconcile_historian_health(
-        self,
-        **kwargs: Any,
-    ) -> dict[str, Any]: ...
 
     def commit_program_model_attempt(
         self,
@@ -319,6 +321,14 @@ class HeadlessCorePort(Protocol):
     def observe_program_failure_condition(
         self, condition_json: str
     ) -> dict[str, Any]: ...
+
+    def observe_operation_table(self, operations_json: str) -> dict[str, Any]: ...
+
+    def observe_component_faults(self, faults_json: str) -> dict[str, Any]: ...
+
+    def history_disk_signals(self) -> dict[str, Any]: ...
+
+    def observe_disk_records_condition(self, condition: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def mark_operation_event_source_unknown(
         self,
@@ -392,19 +402,19 @@ class NativeHeadlessCore:
                 "headless_native_binding_unavailable",
                 "manyforge_headless_py is not importable",
             ) from exc
-        self.workbench_previous_session_registration: dict[str, str] | None = None
         try:
             self._native = manyforge_headless_py.HeadlessApiCore(
-                str(config.projection_root),
                 str(config.install_root),
                 str(config.artifact_root),
                 str(config.node_catalog_path),
                 str(config.node_environment_manifest_path),
                 str(config.alarm_catalog_path),
-                str(config.historian_database_path),
+                str(config.historian_directory),
                 config.cell_id,
-                config.owner_id,
-                config.owner_epoch,
+                # Headless's role and ``A`` replace its owner id and its
+                # minted epoch (contract 1.2, role 8 ``headless``).
+                ApplicationRole.HEADLESS.value,
+                config.application_start_id,
                 config.freshness_milliseconds,
                 config.historian_queue_capacity,
                 config.historian_record_retention,
@@ -478,7 +488,6 @@ class NativeHeadlessCore:
                     or receipt["session_id"] != current_identity
                     or receipt["status"] not in {"registered", "acknowledged", "quiet"}):
                     raise ValueError("current previous-session registration receipt is invalid")
-                self.workbench_previous_session_registration = receipt
         finally:
             os.close(reports)
 
@@ -697,6 +706,30 @@ class NativeHeadlessCore:
             method="runtime_snapshot",
         )
 
+    def apply_manager_status_frame(self, frame: bytes) -> dict[str, Any]:
+        """Apply one Manager status stream frame to the one mirror (OD-216).
+
+        Returns ``{control_changed, tick_advanced, viewer_changed}``; raises the frame's own code for
+        an ``error`` frame and ``manager_status_stream_invalid`` for an
+        invalid one."""
+
+        return self._require_object(
+            self._invoke("apply_manager_status_frame", frame),
+            method="apply_manager_status_frame",
+        )
+
+    def mark_manager_status_disconnected(self) -> bool:
+        """The status subscription ended; True when it was connected."""
+
+        return bool(self._native.mark_manager_status_disconnected())
+
+    def viewer_pose_sources(self) -> tuple[str, str] | None:
+        """Scene-runtime payload and pose sessions (canonical JSON) while the
+        Manager answers; None otherwise."""
+
+        sources = self._native.viewer_pose_sources()
+        return None if sources is None else (sources[0], sources[1])
+
     def node_environment_projection(self) -> dict[str, Any]:
         return self._require_object(
             self._invoke("node_environment_projection"),
@@ -841,9 +874,17 @@ class NativeHeadlessCore:
             method="history_captures",
         )
 
-    def history_discovery(self, *, kind: str, after: str, limit: int) -> dict[str, Any]:
+    def history_discovery(
+        self, *, kind: str, after: str, limit: int, application_start_id: str | None = None
+    ) -> dict[str, Any]:
         return self._require_object(
-            self._invoke("history_discovery", kind=kind, after=after, limit=limit),
+            self._invoke(
+                "history_discovery",
+                kind=kind,
+                after=after,
+                limit=limit,
+                application_start_id=application_start_id,
+            ),
             method="history_discovery",
         )
 
@@ -882,12 +923,6 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("historian_health"),
             method="historian_health",
-        )
-
-    def reconcile_historian_health(self, **kwargs: Any) -> dict[str, Any]:
-        return self._require_object(
-            self._invoke("reconcile_historian_health", **kwargs),
-            method="reconcile_historian_health",
         )
 
     def commit_program_model_attempt(
@@ -937,6 +972,44 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("observe_runtime_fault_conditions", **kwargs),
             method="observe_runtime_fault_conditions",
+        )
+
+    def observe_operation_table(self, operations_json: str) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("observe_operation_table", operations_json=operations_json),
+            method="observe_operation_table",
+        )
+
+    def observe_component_faults(self, faults_json: str) -> dict[str, Any]:
+        return self._require_object(
+            self._invoke("observe_component_faults", faults_json=faults_json),
+            method="observe_component_faults",
+        )
+
+    def history_disk_signals(self) -> dict[str, Any]:
+        """OD-215: History's queue level, without the core lock."""
+        value = self._require_object(
+            self._invoke("history_disk_signals"), method="history_disk_signals"
+        )
+        if set(value) != {"queue_full", "storage_full"} or any(
+            type(item) is not bool for item in value.values()
+        ):
+            raise HeadlessApiError(
+                "headless_projection_response_invalid",
+                "native history_disk_signals has an invalid shape",
+            )
+        return value
+
+    def observe_disk_records_condition(
+        self, condition: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """OD-215: raise or clear the disk check's alarm (memory work only)."""
+        return self._require_object(
+            self._invoke(
+                "observe_disk_records_condition",
+                condition_json=rfc8785.dumps(dict(condition)).decode("utf-8"),
+            ),
+            method="observe_disk_records_condition",
         )
 
     def observe_program_failure_condition(

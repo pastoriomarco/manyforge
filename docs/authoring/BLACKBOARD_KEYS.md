@@ -79,9 +79,9 @@ the Program runner itself, so a key declared `read` still receives its
 - A stored value that the applied Program no longer accepts (for example a
   pose outside a narrowed `allowed_frames`) is dropped with a notice when the
   run starts, and the run still starts from `initial:`.
-- If the runner missed an Apply, the values are kept and the page shows the
-  fault "Applied Program not seen by stored values"
-  (`applied_program_not_observed`) so the cause can be found and fixed.
+- Stored values follow the Program the runner actually activates. An Apply
+  that a later one replaced before the runner activated it has no effect on
+  them.
 - A Reset with **Reload initial scene** also resets every persistent key,
   whatever its access, to `initial:` (or empty). Its confirmation lists the
   stored values it resets (current value → new value), and each reset is
@@ -156,8 +156,8 @@ The system writes three families of read-only keys: `node_outcome.<node>`
 (each motion node's last outcome, `none` until it ends in this Run),
 `interrupt_state.<rule_id>` (each Deployment global rule's state: `inactive`,
 `clear` or `tripped`; no value while the rule can't watch its signals) and
-`active_tcp.<target_role>` (the [Active TCP](TCPS.md#the-active-tcp) of the
-robot bound to that role, as a `tcp_entry`). You never declare or write
+`active_tcp/<component_id>/<command_target_id>` (the
+[Active TCP](TCPS.md#the-active-tcp) of that robot target, as a `tcp_entry`). You never declare or write
 these keys, and no key, namespace or Program parameter may use the names
 `node_outcome`, `interrupt_state` or `active_tcp`. The first two values are
 listed in [Interrupts](INTERRUPTS.md#6-system-keys-and-their-values).

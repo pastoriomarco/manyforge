@@ -110,10 +110,13 @@ describe('application and viewport composition', () => {
     expect(app).not.toContain('<ComposerSettingsLauncher');
     expect(app).toContain('useComposerSettingsNotices();');
     expect(transport).toContain("'Halting' : 'Halt'");
-    expect(transport).toContain('program.fullStop()');
-    expect(transport).toContain('program.resumeFullStop()');
+    // The All column's Stop is Stop all; Halt sends Stop all, then Halt.
+    expect(transport).toContain('if (allColumn) void program.stopAll();');
+    expect(transport).toContain('program.halt()');
+    expect(transport).toContain('program.resumeHalt()');
     // Cell Full Stop left the run details.
     expect(transport).not.toContain("robot.fullStop()");
+    expect(transport).not.toMatch(/fullStop|FullStop/);
     expect(transport).not.toContain('transport-stop-disclosure');
     expect(transport).not.toContain("motionPaused ? robot.resume() : robot.pause()");
     expect(transport).not.toContain('recoverStopFault');
@@ -121,7 +124,7 @@ describe('application and viewport composition', () => {
     expect(transport).toContain('program.setGroupRuntimeScale');
     expect(robotControl).toContain("sendExecutionCommand(");
     // The robot hook has no Cell Full Stop helper or command literal.
-    expect(robotControl).not.toMatch(/fullStop|FullStop|'cell_full_stop'/);
+    expect(robotControl).not.toMatch(/fullStop|FullStop|'cell_full_stop'|'stop_all'|'halt'/);
     expect(transport).not.toContain('setVelocityScale');
     expect(robotControl).toContain('runtimeScaleQueued.current = bounded');
     expect(robotControl).toContain('runtimeScaleInFlight.current');

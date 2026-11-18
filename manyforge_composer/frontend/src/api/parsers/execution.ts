@@ -24,8 +24,11 @@ import type {
   TargetStopResponse,
   ManualControlAvailability,
   ManualProgramHandoverContext,
+  CellStopActionStatus,
+  StopEventResult,
 } from '../../types/robotControl';
 import { tcpEntryIdentityKey } from '../../types/robotControl';
+import { isApplicationStartId, isRequestKey } from '../applicationIdentity';
 import type { JsonObject } from './shared';
 import { ioSignalBindingsAt, systemSignalsAt } from './ioSignals';
 import {
@@ -37,6 +40,7 @@ import {
   exactKeysAt,
   fail,
   integerAt,
+  monotonicNanosecondsAt,
   nonEmptyStringAt,
   nullableNumberAt,
   nullableStringAt,
@@ -48,6 +52,26 @@ import {
   stringAt,
 } from './shared';
 import { parseApiErrorDto, runtimeScaleControlStatusAt } from './programRuntime';
+
+/** `StopKind` tokens (contract §5.1): the requested and the applied level of a Stop event. */
+const STOP_KINDS: ReadonlySet<string> = new Set([
+  'groups', 'stop_all', 'halt', 'operation', 'cell_stop', 'rule_fail_node', 'rule_hold',
+  'interrupt_rule', 'runner_loss', 'program_end', 'internal_fault', 'takeover',
+  'partial_dispatch', 'runtime_collision', 'hold_timeout', 'operation_reset',
+  'prepared_dispatch_invalid', 'planned_stop', 'stop_failed_halt',
+]);
+/** A completed Stop event's results (`pending` only while it runs). */
+const COMPLETED_STOP_RESULTS: ReadonlySet<string> = new Set([
+  'no_effect', 'stopped', 'stopped_escalated', 'some_failed',
+]);
+
+/**
+ * Headless keeps an HTTP client key's bytes 1-15 and sets byte 0 (class and
+ * part, contract 1.4), so an echoed key matches the sent one on those bytes.
+ */
+export function sameClientRequestKey(echoed: string, sent: string): boolean {
+  return echoed.slice(2) === sent.slice(2);
+}
 
 // Keep the GUI's TCP inventory bound aligned with the native program-binding
 // nested-role limit so every advertised Deployment row remains parseable.
@@ -702,22 +726,22 @@ function manualControlGripperDescriptorAt(
 }
 
 function executionIdentityAt(value: unknown, path: string): ExecutionIdentity {
-  // execution_identity.v2: runtime identity only. No primary
+  // execution_identity.v3: runtime identity only. No primary
   // target roles and no Program fields: a manual target's direct-control
   // binding lives in that target, the authored Program outcome elsewhere.
   const identity = objectAt(value, path);
   exactKeysAt(identity, [
     'active_publication_generation',
+    'application_start_id',
     'cell_id',
     'control_management_mode',
     'graph_revision',
-    'owner_epoch',
     'retained_bundle_id',
     'schema_version',
   ], path);
   if (stringAt(identity.schema_version, `${path}.schema_version`)
-      !== 'manyforge.execution_identity.v2') {
-    return fail(`${path}.schema_version`, 'manyforge.execution_identity.v2');
+      !== 'manyforge.execution_identity.v3') {
+    return fail(`${path}.schema_version`, 'manyforge.execution_identity.v3');
   }
   const controlManagementMode = stringAt(
     identity.control_management_mode,
@@ -730,7 +754,7 @@ function executionIdentityAt(value: unknown, path: string): ExecutionIdentity {
     );
   }
   return {
-    ownerEpoch: stringAt(identity.owner_epoch, `${path}.owner_epoch`),
+    applicationStartId: stringAt(identity.application_start_id, `${path}.application_start_id`),
     cellId: stringAt(identity.cell_id, `${path}.cell_id`),
     activePublicationGeneration: positiveIntegerAt(
       identity.active_publication_generation,
@@ -754,7 +778,7 @@ export function parseExecutionIdentity(value: unknown): ExecutionIdentity {
   );
   if (
     stringAt(envelope.api_version, 'executionIdentity.api_version')
-      !== 'manyforge.execution_command_response.v4'
+      !== 'manyforge.execution_command_response.v6'
     || booleanAt(envelope.ok, 'executionIdentity.ok') !== true
     || stringAt(envelope.command, 'executionIdentity.command') !== 'identity'
   ) {
@@ -775,7 +799,7 @@ export function parseExecutionControlStatus(
   );
   if (
     stringAt(targetsEnvelope.api_version, 'executionTargets.api_version')
-      !== 'manyforge.execution_command_response.v4'
+      !== 'manyforge.execution_command_response.v6'
     || booleanAt(targetsEnvelope.ok, 'executionTargets.ok') !== true
     || stringAt(targetsEnvelope.command, 'executionTargets.command') !== 'targets'
   ) {
@@ -789,7 +813,7 @@ export function parseExecutionControlStatus(
   );
   if (
     stringAt(controlEnvelope.api_version, 'executionControlState.api_version')
-      !== 'manyforge.execution_command_response.v4'
+      !== 'manyforge.execution_command_response.v6'
     || booleanAt(controlEnvelope.ok, 'executionControlState.ok') !== true
     || stringAt(controlEnvelope.command, 'executionControlState.command')
       !== 'control_state'
@@ -804,7 +828,10 @@ export function parseExecutionControlStatus(
     controlEnvelope.identity,
     'executionControlState.identity',
   );
-  if (JSON.stringify(targetIdentity) !== JSON.stringify(controlIdentity)) {
+  // Both documents come from one shell of one start: the start identity is
+  // not compared, only the product identity.
+  if (JSON.stringify({ ...targetIdentity, applicationStartId: null })
+      !== JSON.stringify({ ...controlIdentity, applicationStartId: null })) {
     return fail('executionControlStatus', 'matching owner/product identities');
   }
   // execution_targets.v3 + execution_control_state.v6: every
@@ -820,8 +847,8 @@ export function parseExecutionControlStatus(
     ? []
     : systemSignalsAt(targets.system_signals, 'executionTargets.targets.system_signals');
   if (stringAt(targets.schema_version, 'executionTargets.targets.schema_version')
-    !== 'manyforge.execution_targets.v4') {
-    return fail('executionTargets.targets.schema_version', 'manyforge.execution_targets.v4');
+    !== 'manyforge.execution_targets.v5') {
+    return fail('executionTargets.targets.schema_version', 'manyforge.execution_targets.v5');
   }
   const control = objectAt(
     controlEnvelope.control_state,
@@ -837,10 +864,10 @@ export function parseExecutionControlStatus(
   if (stringAt(
     control.schema_version,
     'executionControlState.control_state.schema_version',
-  ) !== 'manyforge.execution_control_state.v7') {
+  ) !== 'manyforge.execution_control_state.v8') {
     return fail(
       'executionControlState.control_state.schema_version',
-      'manyforge.execution_control_state.v7',
+      'manyforge.execution_control_state.v8',
     );
   }
   const rowKey = (componentId: unknown, targetId: unknown, capabilityId: unknown) => (
@@ -935,7 +962,7 @@ export function parseExecutionControlStatus(
         const command = objectAt(target.command, `${targetPath}.command`);
         const manual = objectAt(command.manual_control, `${targetPath}.command.manual_control`);
         exactKeysAt(manual, [
-          'program_binding_id', 'program_id', 'program_revision', 'program_run_id',
+          'program_binding_id', 'program_id', 'program_revision',
         ], `${targetPath}.command.manual_control`);
         const commandFields = { ...command };
         delete commandFields.manual_control;
@@ -1009,10 +1036,6 @@ export function parseExecutionControlStatus(
     );
   }
   const identity = targetIdentity;
-  const allowedProgramRuns = new Set([...motionRows, ...gripperRows].map((row, index) => stringAt(
-    row.program_run_id,
-    `executionTargets.targets.program_run_id[${index}]`,
-  )));
   const manualRows = arrayAt(
     control.manual_operations,
     'executionControlState.control_state.manual_operations',
@@ -1029,14 +1052,10 @@ export function parseExecutionControlStatus(
       `executionControlState.control_state.manual_operations[${index}]`);
     const operation = objectAt(projection.operation,
       `executionControlState.control_state.manual_operations[${index}].operation`);
-    const programRunId = stringAt(
-      operation.program_run_id,
-      `executionControlState.control_state.manual_operations[${index}].program_run_id`,
-    );
-    if (!allowedProgramRuns.has(programRunId)) {
+    if (operation.program_run_id !== null) {
       return fail(
-        `executionControlState.control_state.manual_operations[${index}].program_run_id`,
-        'one of the exact direct-control Program runs',
+        `executionControlState.control_state.manual_operations[${index}].operation.program_run_id`,
+        'null for a manual operation',
       );
     }
     const observed = parseOperationObservation({
@@ -1051,19 +1070,25 @@ export function parseExecutionControlStatus(
       return fail('executionControlState.control_state.manual_operations',
         'a terminal state for nonresident results');
     }
-    return { ...observed, programRunId };
+    if (observed.controllableComponentId === undefined || observed.commandTargetId === undefined) {
+      return fail(`executionControlState.control_state.manual_operations[${index}].operation.participants[0]`,
+        'the manual target');
+    }
+    return observed;
   });
+  // Each manual target (component, command target) keeps its own latest result.
   if (new Set(manualOperations.map((operation) => operation.operationId)).size
       !== manualOperations.length
-    || new Set(manualOperations.map((operation) => operation.programRunId)).size
-      !== manualOperations.length) {
+    || new Set(manualOperations.map((operation) => JSON.stringify([
+      operation.controllableComponentId, operation.commandTargetId,
+    ]))).size !== manualOperations.length) {
     return fail(
       'executionControlState.control_state.manual_operations',
       'unique operation and manual-target identities',
     );
   }
   const status = normalizedOwnerStatusAt({
-    api_version: 'manyforge.execution_command_response.v4',
+    api_version: 'manyforge.execution_command_response.v6',
     command: 'status',
     ok: true,
     status: {
@@ -1077,15 +1102,10 @@ export function parseExecutionControlStatus(
       direct_control_targets: motionRows,
       direct_control_gripper_targets: gripperRows,
       graph_revision: identity.graphRevision,
-      owner_epoch: identity.ownerEpoch,
+      application_start_id: identity.applicationStartId,
       retained_bundle_id: identity.retainedBundleId,
     },
   });
-  if (status.directControlTargets.some((target) => (
-    target.activeTcp !== null && target.activeTcp.ownerEpoch !== identity.ownerEpoch
-  ))) {
-    return fail('executionControlState.control_state.observed_targets', 'Active TCPs of the current execution owner');
-  }
   // Null when no motion target supports scaling (for example gripper-only).
   const runtimeScaleControl = control.runtime_scale_control === null
     ? null
@@ -1163,7 +1183,9 @@ export function targetStopResponseAt(value: unknown, path: string): TargetStopRe
  * One addressed direct-control motion target and its observation (internal
  * normalized shape; the wire contract is execution_targets.v3/control v6).
  */
-function directControlMotionAt(value: unknown): {
+// The Active TCP row carries no owner identity; it belongs to the owner of
+// the status that carries it.
+function directControlMotionAt(value: unknown, applicationStartId: string): {
   directControl: DirectControlMotionStatus;
   observedMotion: ObservedMotionTarget | null;
 } {
@@ -1185,7 +1207,6 @@ function directControlMotionAt(value: unknown): {
     'program_binding_id',
     'program_id',
     'program_revision',
-    'program_run_id',
     'target',
     'target_descriptor',
     'tcp_frame',
@@ -1363,13 +1384,13 @@ function directControlMotionAt(value: unknown): {
   if (direct.active_tcp !== null) {
     const path = 'executionStatus.status.direct_control.active_tcp';
     const active = objectAt(direct.active_tcp, path);
-    exactKeysAt(active, ['entry', 'display', 'owner_epoch', 'registration_generation', 'sequence'], path);
+    exactKeysAt(active, ['entry', 'display', 'registration_generation', 'sequence'], path);
     const entry = active.entry === null ? null : tcpEntryAt(active.entry, `${path}.entry`);
     if ((entry === null) !== (active.display === null)) return fail(path, 'entry and display both present or both null');
     activeTcp = {
       entry,
       display: active.display === null ? null : stringAt(active.display, `${path}.display`),
-      ownerEpoch: nonEmptyStringAt(active.owner_epoch, `${path}.owner_epoch`),
+      applicationStartId,
       registrationGeneration: positiveIntegerAt(active.registration_generation, `${path}.registration_generation`),
       sequence: integerAt(active.sequence, `${path}.sequence`),
     };
@@ -1400,10 +1421,6 @@ function directControlMotionAt(value: unknown): {
       programBindingId: stringAt(
         direct.program_binding_id,
         'executionStatus.status.direct_control.program_binding_id',
-      ),
-      programRunId: stringAt(
-        direct.program_run_id,
-        'executionStatus.status.direct_control.program_run_id',
       ),
       joints,
       targetDescriptor: motionDescriptor,
@@ -1436,7 +1453,6 @@ function directControlGripperAt(value: unknown): {
     'program_binding_id',
     'program_id',
     'program_revision',
-    'program_run_id',
     'resource',
     'target',
     'target_descriptor',
@@ -1628,10 +1644,6 @@ function directControlGripperAt(value: unknown): {
         directGripper.program_binding_id,
         'executionStatus.status.direct_control_gripper.program_binding_id',
       ),
-      programRunId: stringAt(
-        directGripper.program_run_id,
-        'executionStatus.status.direct_control_gripper.program_run_id',
-      ),
       commandSchemaId: stringAt(
         directGripper.command_schema_id,
         'executionStatus.status.direct_control_gripper.command_schema_id',
@@ -1652,16 +1664,17 @@ function directControlGripperAt(value: unknown): {
 }
 
 /**
- * Aggregate status/diagnostics (`manyforge.execution_status.v3`):
- * a pure composition of one owner snapshot's identity.v2, targets.v3 and
- * control_state.v6 payloads, normalized exactly like the separate commands.
+ * Aggregate status/diagnostics (`manyforge.execution_status.v4`):
+ * a composition of one owner snapshot's identity, targets and control_state
+ * payloads, normalized exactly like the separate commands, plus the per-robot
+ * collision-check counts (`runtime_collision_checks`, shape-checked only).
  */
 export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus {
   const envelope = objectAt(value, 'executionStatus');
   exactKeysAt(envelope, ['api_version', 'command', 'ok', 'status'], 'executionStatus');
   if (
     stringAt(envelope.api_version, 'executionStatus.api_version')
-      !== 'manyforge.execution_command_response.v4'
+      !== 'manyforge.execution_command_response.v6'
     || booleanAt(envelope.ok, 'executionStatus.ok') !== true
     || stringAt(envelope.command, 'executionStatus.command') !== 'status'
   ) {
@@ -1669,20 +1682,34 @@ export function parseExecutionOwnerStatus(value: unknown): ExecutionOwnerStatus 
   }
   const status = objectAt(envelope.status, 'executionStatus.status');
   exactKeysAt(status, [
-    'control_state', 'identity', 'schema_version', 'targets',
+    'control_state', 'identity', 'runtime_collision_checks', 'schema_version', 'targets',
   ], 'executionStatus.status');
   if (stringAt(status.schema_version, 'executionStatus.status.schema_version')
-    !== 'manyforge.execution_status.v3') {
-    return fail('executionStatus.status.schema_version', 'manyforge.execution_status.v3');
+    !== 'manyforge.execution_status.v4') {
+    return fail('executionStatus.status.schema_version', 'manyforge.execution_status.v4');
   }
+  // OD-217 per-robot check counts: checked for shape, not shown by the panel.
+  boundedArrayAt(status.runtime_collision_checks, 'executionStatus.status.runtime_collision_checks', 128)
+    .forEach((value, index) => {
+      const path = `executionStatus.status.runtime_collision_checks[${index}]`;
+      const row = objectAt(value, path);
+      exactKeysAt(row, [
+        'check_period_ns', 'checks_late', 'checks_run', 'controllable_component_id', 'periods_skipped',
+      ], path);
+      nonEmptyStringAt(row.controllable_component_id, `${path}.controllable_component_id`);
+      positiveIntegerAt(row.check_period_ns, `${path}.check_period_ns`);
+      integerAt(row.checks_run, `${path}.checks_run`);
+      integerAt(row.checks_late, `${path}.checks_late`);
+      integerAt(row.periods_skipped, `${path}.periods_skipped`);
+    });
   return parseExecutionControlStatus({
-    api_version: 'manyforge.execution_command_response.v4',
+    api_version: 'manyforge.execution_command_response.v6',
     command: 'targets',
     identity: status.identity,
     ok: true,
     targets: status.targets,
   }, {
-    api_version: 'manyforge.execution_command_response.v4',
+    api_version: 'manyforge.execution_command_response.v6',
     command: 'control_state',
     control_state: status.control_state,
     identity: status.identity,
@@ -1700,43 +1727,21 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
     return fail('executionStatus', 'a successful status response');
   }
   const status = objectAt(envelope.status, 'executionStatus.status');
+  const applicationStartId = stringAt(status.application_start_id, 'executionStatus.status.application_start_id');
   // Null exactly for a component without motion capability.
   const motion = status.direct_control === null
     ? null
-    : directControlMotionAt(status.direct_control);
+    : directControlMotionAt(status.direct_control, applicationStartId);
   // Null exactly for an arm-only component (no gripper target).
   const { directControlGripper, observedGripper } = directControlGripperAt(
     status.direct_control_gripper,
   );
-  const certificateRefAt = (input: unknown, path: string) => {
-    const record = objectAt(input, path);
-    exactKeysAt(record, [
-      'stop_certificate_id', 'stop_certificate_revision',
-      'stop_generation', 'stop_id',
-    ], path);
-    return {
-      stopCertificateId: stringAt(
-        record.stop_certificate_id,
-        `${path}.stop_certificate_id`,
-      ),
-      stopCertificateRevision: positiveIntegerAt(
-        record.stop_certificate_revision,
-        `${path}.stop_certificate_revision`,
-      ),
-      stopId: stringAt(record.stop_id, `${path}.stop_id`),
-      stopGeneration: positiveIntegerAt(
-        record.stop_generation,
-        `${path}.stop_generation`,
-      ),
-    };
-  };
   const cellStop = objectAt(
     status.cell_stop_action,
     'executionStatus.status.cell_stop_action',
   );
   exactKeysAt(cellStop, [
-    'available', 'expected_stop_generation', 'latest_terminal',
-    'unavailable_reason',
+    'available', 'last_completed', 'last_event_id', 'unavailable_reason',
   ], 'executionStatus.status.cell_stop_action');
   const cellStopAvailable = booleanAt(
     cellStop.available,
@@ -1752,85 +1757,35 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
       'an unavailable reason exactly when the action is unavailable',
     );
   }
-  let latestTerminal: ExecutionOwnerStatus['cellStopAction']['latestTerminal'] = null;
-  if (cellStop.latest_terminal !== null) {
-    const terminal = objectAt(
-      cellStop.latest_terminal,
-      'executionStatus.status.cell_stop_action.latest_terminal',
+  const lastEventId = cellStop.last_event_id === null
+    ? null
+    : positiveIntegerAt(
+      cellStop.last_event_id,
+      'executionStatus.status.cell_stop_action.last_event_id',
     );
-    exactKeysAt(terminal, [
-      'certificate', 'escalated', 'executed_stages',
-      'hard_stop_floor_used', 'result',
-    ], 'executionStatus.status.cell_stop_action.latest_terminal');
-    const result = stringAt(
-      terminal.result,
-      'executionStatus.status.cell_stop_action.latest_terminal.result',
-    );
-    if (![
-      'succeeded_nominal', 'succeeded_escalated', 'partial',
-      'failed_uncontained',
-    ].includes(result)) {
-      return fail(
-        'executionStatus.status.cell_stop_action.latest_terminal.result',
-        'a Stop certificate result',
-      );
+  let lastCompleted: CellStopActionStatus['lastCompleted'] = null;
+  if (cellStop.last_completed !== null) {
+    const path = 'executionStatus.status.cell_stop_action.last_completed';
+    const completed = objectAt(cellStop.last_completed, path);
+    exactKeysAt(completed, [
+      'applied', 'completed_at_ns', 'escalated', 'event_id', 'result',
+    ], path);
+    const applied = stringAt(completed.applied, `${path}.applied`);
+    if (!STOP_KINDS.has(applied)) return fail(`${path}.applied`, 'a Stop kind');
+    const result = stringAt(completed.result, `${path}.result`);
+    if (!COMPLETED_STOP_RESULTS.has(result)) {
+      return fail(`${path}.result`, 'a completed Stop event result');
     }
-    const executedStages = arrayAt(
-      terminal.executed_stages,
-      'executionStatus.status.cell_stop_action.latest_terminal.executed_stages',
-    ).map((item, index) => {
-      const path = `executionStatus.status.cell_stop_action.latest_terminal.executed_stages[${index}]`;
-      const stage = objectAt(item, path);
-      exactKeysAt(stage, [
-        'action_class', 'executed_mode', 'operation_id', 'outcome',
-        'participant_id', 'stage_id', 'stage_index', 'substitution_reason',
-      ], path);
-      const actionClass = stringAt(stage.action_class, `${path}.action_class`);
-      if (!['controlled', 'software_hard', 'safety_system_request'].includes(actionClass)) {
-        return fail(`${path}.action_class`, 'a Stop action class');
-      }
-      const outcome = stringAt(stage.outcome, `${path}.outcome`);
-      if (!['succeeded', 'partial', 'failed', 'superseded_no_effect'].includes(outcome)) {
-        return fail(`${path}.outcome`, 'a Stop stage outcome');
-      }
-      const executedMode = nullableStringAt(
-        stage.executed_mode,
-        `${path}.executed_mode`,
-      );
-      if (executedMode !== null && ![
-        'soft_on_path', 'spring_back_hold', 'spring_back_fast', 'hard_deceleration',
-      ].includes(executedMode)) {
-        return fail(`${path}.executed_mode`, 'a controlled Stop mode');
-      }
-      return {
-        operationId: stringAt(stage.operation_id, `${path}.operation_id`),
-        participantId: stringAt(stage.participant_id, `${path}.participant_id`),
-        stageId: stringAt(stage.stage_id, `${path}.stage_id`),
-        stageIndex: integerAt(stage.stage_index, `${path}.stage_index`),
-        actionClass: actionClass as 'controlled' | 'software_hard' | 'safety_system_request',
-        outcome: outcome as 'succeeded' | 'partial' | 'failed' | 'superseded_no_effect',
-        executedMode: executedMode as 'soft_on_path' | 'spring_back_hold' | 'spring_back_fast' | 'hard_deceleration' | null,
-        substitutionReason: nullableStringAt(
-          stage.substitution_reason,
-          `${path}.substitution_reason`,
-        ),
-      };
-    });
-    latestTerminal = {
-      certificate: certificateRefAt(
-        terminal.certificate,
-        'executionStatus.status.cell_stop_action.latest_terminal.certificate',
-      ),
-      result: result as 'succeeded_nominal' | 'succeeded_escalated' | 'partial' | 'failed_uncontained',
-      escalated: booleanAt(
-        terminal.escalated,
-        'executionStatus.status.cell_stop_action.latest_terminal.escalated',
-      ),
-      hardStopFloorUsed: booleanAt(
-        terminal.hard_stop_floor_used,
-        'executionStatus.status.cell_stop_action.latest_terminal.hard_stop_floor_used',
-      ),
-      executedStages,
+    const eventId = positiveIntegerAt(completed.event_id, `${path}.event_id`);
+    if (lastEventId === null || eventId > lastEventId) {
+      return fail(path, 'an event no newer than the last accepted Stop');
+    }
+    lastCompleted = {
+      eventId,
+      applied,
+      result: result as StopEventResult,
+      escalated: booleanAt(completed.escalated, `${path}.escalated`),
+      completedAtNs: monotonicNanosecondsAt(completed.completed_at_ns, `${path}.completed_at_ns`),
     };
   }
   // Every addressed target is parsed on its own: a gripper never needs a
@@ -1838,7 +1793,7 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
   const motionEntries = arrayAt(
     status.direct_control_targets,
     'executionStatus.status.direct_control_targets',
-  ).map((entry) => directControlMotionAt(entry));
+  ).map((entry) => directControlMotionAt(entry, applicationStartId));
   const gripperEntries = arrayAt(
     status.direct_control_gripper_targets,
     'executionStatus.status.direct_control_gripper_targets',
@@ -1887,7 +1842,7 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
     .map((entry) => entry.observedGripper)
     .filter((entry): entry is ObservedGripperTarget => entry !== null);
   return {
-    ownerEpoch: stringAt(status.owner_epoch, 'executionStatus.status.owner_epoch'),
+    applicationStartId,
     cellId: stringAt(status.cell_id, 'executionStatus.status.cell_id'),
     activePublicationGeneration: positiveIntegerAt(
       status.active_publication_generation,
@@ -1920,11 +1875,8 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
     cellStopAction: {
       available: cellStopAvailable,
       unavailableReason: cellStopUnavailableReason,
-      expectedStopGeneration: integerAt(
-        cellStop.expected_stop_generation,
-        'executionStatus.status.cell_stop_action.expected_stop_generation',
-      ),
-      latestTerminal,
+      lastEventId,
+      lastCompleted,
     },
   };
 }
@@ -2003,7 +1955,7 @@ function motionPreviewResolvedTcpAt(
 ): MotionPreviewReceipt['resolvedTcp'] {
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    'entry', 'owner_epoch', 'registration_generation', 'sequence', 'source',
+    'entry', 'registration_generation', 'sequence', 'source',
   ], path);
   const entry = objectAt(record.entry, `${path}.entry`);
   exactKeysAt(entry, ['frame', 'target'], `${path}.entry`);
@@ -2037,7 +1989,6 @@ function motionPreviewResolvedTcpAt(
       },
     },
     source,
-    ownerEpoch: nonEmptyStringAt(record.owner_epoch, `${path}.owner_epoch`),
     registrationGeneration: positiveIntegerAt(
       record.registration_generation,
       `${path}.registration_generation`,
@@ -2049,9 +2000,10 @@ function motionPreviewResolvedTcpAt(
 export function parseManualControlAvailability(value: unknown): ManualControlAvailability {
   const path = 'manualControlAvailability';
   const envelope = objectAt(value, path);
-  exactKeysAt(envelope, ['api_version', 'command', 'ok', 'request_id',
-    'request_owner_epoch', 'intent_digest', 'availability', 'manual_handover'], path);
-  if (envelope.api_version !== 'manyforge.execution_command_response.v4'
+  exactKeysAt(envelope, ['api_version', 'command', 'ok', 'request_key',
+    'intent_digest', 'availability', 'manual_handover'], path);
+  if (!isRequestKey(envelope.request_key)) return fail(`${path}.request_key`, '32 lowercase hex characters');
+  if (envelope.api_version !== 'manyforge.execution_command_response.v6'
     || envelope.command !== 'read_manual_handover' || envelope.ok !== true) {
     return fail(path, 'a successful manual availability response');
   }
@@ -2063,14 +2015,12 @@ export function parseManualControlAvailability(value: unknown): ManualControlAva
   let manualHandover: ManualProgramHandoverContext | null = null;
   if (envelope.manual_handover !== null) {
     const context = objectAt(envelope.manual_handover, `${path}.manual_handover`);
-    exactKeysAt(context, ['program_runner_owner_epoch', 'program_run_id',
-      'claim_generation', 'selection_revision'], `${path}.manual_handover`);
-    const selection = integerAt(context.selection_revision, `${path}.selection_revision`);
+    exactKeysAt(context, ['program_run_id',
+      'claim_generation', 'hold_revision'], `${path}.manual_handover`);
     manualHandover = {
-      program_runner_owner_epoch: stringAt(context.program_runner_owner_epoch, `${path}.program_runner_owner_epoch`),
-      program_run_id: stringAt(context.program_run_id, `${path}.program_run_id`),
+      program_run_id: positiveIntegerAt(context.program_run_id, `${path}.program_run_id`),
       claim_generation: positiveIntegerAt(context.claim_generation, `${path}.claim_generation`),
-      selection_revision: selection,
+      hold_revision: integerAt(context.hold_revision, `${path}.hold_revision`),
     };
   }
   if (available === (unavailableReason !== null)
@@ -2078,8 +2028,7 @@ export function parseManualControlAvailability(value: unknown): ManualControlAva
     return fail(path, 'consistent availability, reason and cleanup context');
   }
   return {
-    requestId: stringAt(envelope.request_id, `${path}.request_id`),
-    requestOwnerEpoch: stringAt(envelope.request_owner_epoch, `${path}.request_owner_epoch`),
+    requestKey: stringAt(envelope.request_key, `${path}.request_key`),
     intentDigest: digestAt(envelope.intent_digest, `${path}.intent_digest`),
     available, unavailableReason, cleanupRequired, manualHandover,
   };
@@ -2096,27 +2045,33 @@ export function parseProgramNodeCorrectionPreview(
   const path = 'programNodeCorrectionPreview';
   const record = objectAt(value, path);
   exactKeysAt(record, [
-    'schema_version', 'request_id', 'program_run_id', 'program_id',
+    'schema_version', 'request_key', 'application_start_id', 'display',
+    'program_run_id', 'program_id',
     'program_revision', 'program_binding_id', 'node_instance_id',
-    'node_attempt_id', 'program_runner_owner_epoch', 'run_revision',
+    'node_attempt_id', 'run_revision',
     'retained_bundle_id', 'graph_revision', 'node_id', 'proposed_paths',
     'parameters_digest', 'target', 'unavailable_reason', 'preview_check',
     'preview',
   ], path);
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
-  if (schemaVersion !== 'manyforge.program_node_correction_preview.v2') {
-    return fail(`${path}.schema_version`, 'manyforge.program_node_correction_preview.v2');
+  if (schemaVersion !== 'manyforge.program_node_correction_preview.v3') {
+    return fail(`${path}.schema_version`, 'manyforge.program_node_correction_preview.v3');
   }
   const proposedPaths = stringArrayAt(record.proposed_paths, `${path}.proposed_paths`);
+  if (!isRequestKey(record.request_key)) return fail(`${path}.request_key`, '32 lowercase hex characters');
+  if (!isApplicationStartId(record.application_start_id)) {
+    return fail(`${path}.application_start_id`, '16 lowercase hex characters');
+  }
+  nonEmptyStringAt(record.display, `${path}.display`);
   if (
-    record.request_id !== request.request_id
+    !sameClientRequestKey(stringAt(record.request_key, `${path}.request_key`), request.request_key)
+    || record.application_start_id !== request.application_start_id
     || record.program_run_id !== request.program_run_id
     || record.program_id !== request.program_id
     || record.program_revision !== request.program_revision
     || record.program_binding_id !== request.program_binding_id
     || record.node_instance_id !== request.node_instance_id
     || record.node_attempt_id !== request.node_attempt_id
-    || record.program_runner_owner_epoch !== request.expected_owner_epoch
     || proposedPaths.length !== request.proposed_inputs.length
     || proposedPaths.some((item, index) => item !== request.proposed_inputs[index].path)
   ) {
@@ -2150,8 +2105,7 @@ export function parseProgramNodeCorrectionPreview(
     if (envelope.ok === true) {
       const receipt = parseMotionPreviewResponse(envelope);
       if (
-        receipt.requestId !== request.request_id
-        || receipt.programRunId !== request.program_run_id
+        receipt.programRunId !== request.program_run_id
         || receipt.programBindingId !== request.program_binding_id
         || receipt.programId !== request.program_id
         || receipt.programRevision !== request.program_revision
@@ -2180,14 +2134,14 @@ export function parseProgramNodeCorrectionPreview(
   }
   return {
     schemaVersion,
-    requestId: request.request_id,
+    requestKey: request.request_key,
+    applicationStartId: request.application_start_id,
     programRunId: request.program_run_id,
     programId: request.program_id,
     programRevision: request.program_revision,
     programBindingId: request.program_binding_id,
     nodeInstanceId: request.node_instance_id,
     nodeAttemptId: request.node_attempt_id,
-    programRunnerOwnerEpoch: request.expected_owner_epoch,
     runRevision: positiveIntegerAt(record.run_revision, `${path}.run_revision`),
     retainedBundleId: digestAt(record.retained_bundle_id, `${path}.retained_bundle_id`),
     graphRevision: digestAt(record.graph_revision, `${path}.graph_revision`),
@@ -2310,12 +2264,12 @@ export function parseMotionPreviewDiagnostic(value: unknown): MotionPreviewPath 
     const envelope = objectAt(value, 'motionPreviewFailure');
     exactKeysAt(envelope, ['detail'], 'motionPreviewFailure');
     const detail = objectAt(envelope.detail, 'motionPreviewFailure.detail');
-    allowedKeysAt(detail, ['code', 'message', 'details', 'diagnostic_preview'], ['producer', 'request_id'], 'motionPreviewFailure.detail');
+    allowedKeysAt(detail, ['code', 'message', 'details', 'diagnostic_preview'], ['producer', 'request_key'], 'motionPreviewFailure.detail');
     nonEmptyStringAt(detail.code, 'motionPreviewFailure.detail.code');
     stringAt(detail.message, 'motionPreviewFailure.detail.message');
     if (detail.details !== null) objectAt(detail.details, 'motionPreviewFailure.detail.details');
     if (detail.producer !== undefined) nonEmptyStringAt(detail.producer, 'motionPreviewFailure.detail.producer');
-    if (detail.request_id !== undefined) nonEmptyStringAt(detail.request_id, 'motionPreviewFailure.detail.request_id');
+    if (detail.request_key !== undefined) nonEmptyStringAt(detail.request_key, 'motionPreviewFailure.detail.request_key');
     const containsAuthority = (item: unknown): boolean => {
       if (Array.isArray(item)) return item.some(containsAuthority);
       if (item === null || typeof item !== 'object') return false;
@@ -2341,7 +2295,7 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
     'motionPreview.preview_receipt',
   );
   const schemaVersion = stringAt(receipt.schema_version, 'motionPreview.preview_receipt.schema_version');
-  if (schemaVersion !== 'manyforge.direct_control_motion_preview.v4') {
+  if (schemaVersion !== 'manyforge.direct_control_motion_preview.v5') {
     return fail('motionPreview.preview_receipt.schema_version', 'v4 motion preview');
   }
   exactKeysAt(receipt, [
@@ -2357,8 +2311,7 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
     'program_revision',
     'program_run_id',
     'receipt_digest',
-    'request_id',
-    'request_owner_epoch',
+    'request_key',
     'resolved_tcp',
     'required_capability_id',
     'retained_bundle_id',
@@ -2368,20 +2321,13 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
     'start_positions_rad',
     'target',
   ], 'motionPreview.preview_receipt');
-  const requestOwnerEpoch = stringAt(
-    receipt.request_owner_epoch,
-    'motionPreview.preview_receipt.request_owner_epoch',
-  );
+  if (!isRequestKey(receipt.request_key)) {
+    return fail('motionPreview.preview_receipt.request_key', '32 lowercase hex characters');
+  }
   const resolvedTcp = motionPreviewResolvedTcpAt(
     receipt.resolved_tcp,
     'motionPreview.preview_receipt.resolved_tcp',
   );
-  if (resolvedTcp.ownerEpoch !== requestOwnerEpoch) {
-    return fail(
-      'motionPreview.preview_receipt.resolved_tcp.owner_epoch',
-      'the same owner epoch as the motion preview receipt',
-    );
-  }
   const sourceJointNames = stringArrayAt(
     receipt.source_joint_names,
     'motionPreview.preview_receipt.source_joint_names',
@@ -2460,11 +2406,7 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
       receipt.intent_digest,
       'motionPreview.preview_receipt.intent_digest',
     ),
-    requestId: stringAt(
-      receipt.request_id,
-      'motionPreview.preview_receipt.request_id',
-    ),
-    requestOwnerEpoch,
+    requestKey: stringAt(receipt.request_key, 'motionPreview.preview_receipt.request_key'),
     programId: stringAt(
       receipt.program_id,
       'motionPreview.preview_receipt.program_id',
@@ -2477,10 +2419,9 @@ export function parseMotionPreviewResponse(value: unknown): MotionPreviewReceipt
       receipt.program_binding_id,
       'motionPreview.preview_receipt.program_binding_id',
     ),
-    programRunId: stringAt(
-      receipt.program_run_id,
-      'motionPreview.preview_receipt.program_run_id',
-    ),
+    programRunId: receipt.program_run_id === null
+      ? null
+      : positiveIntegerAt(receipt.program_run_id, 'motionPreview.preview_receipt.program_run_id'),
     graphRevision: stringAt(
       receipt.graph_revision,
       'motionPreview.preview_receipt.graph_revision',
@@ -2558,8 +2499,7 @@ export function parseCapabilityCommandPreviewResponse(
     'program_revision',
     'program_run_id',
     'receipt_digest',
-    'request_id',
-    'request_owner_epoch',
+    'request_key',
     'required_capability_id',
     'retained_bundle_id',
     'schema_version',
@@ -2572,13 +2512,16 @@ export function parseCapabilityCommandPreviewResponse(
     receipt.schema_version,
     'capabilityCommandPreview.preview_receipt.schema_version',
   );
+  if (!isRequestKey(receipt.request_key)) {
+    return fail('capabilityCommandPreview.preview_receipt.request_key', '32 lowercase hex characters');
+  }
   if (
     schemaVersion
-    !== 'manyforge.direct_control_capability_command_preview.v2'
+    !== 'manyforge.direct_control_capability_command_preview.v3'
   ) {
     return fail(
       'capabilityCommandPreview.preview_receipt.schema_version',
-      'manyforge.direct_control_capability_command_preview.v2',
+      'manyforge.direct_control_capability_command_preview.v3',
     );
   }
   const coordinateKind = stringAt(
@@ -2641,13 +2584,9 @@ export function parseCapabilityCommandPreviewResponse(
       receipt.intent_digest,
       'capabilityCommandPreview.preview_receipt.intent_digest',
     ),
-    requestId: stringAt(
-      receipt.request_id,
-      'capabilityCommandPreview.preview_receipt.request_id',
-    ),
-    requestOwnerEpoch: stringAt(
-      receipt.request_owner_epoch,
-      'capabilityCommandPreview.preview_receipt.request_owner_epoch',
+    requestKey: stringAt(
+      receipt.request_key,
+      'capabilityCommandPreview.preview_receipt.request_key',
     ),
     programId: stringAt(
       receipt.program_id,
@@ -2661,10 +2600,9 @@ export function parseCapabilityCommandPreviewResponse(
       receipt.program_binding_id,
       'capabilityCommandPreview.preview_receipt.program_binding_id',
     ),
-    programRunId: stringAt(
-      receipt.program_run_id,
-      'capabilityCommandPreview.preview_receipt.program_run_id',
-    ),
+    programRunId: receipt.program_run_id === null
+      ? null
+      : positiveIntegerAt(receipt.program_run_id, 'capabilityCommandPreview.preview_receipt.program_run_id'),
     graphRevision: stringAt(
       receipt.graph_revision,
       'capabilityCommandPreview.preview_receipt.graph_revision',
@@ -2793,13 +2731,23 @@ export function parseOperationObservation(value: unknown): OperationObservation 
     return fail('operationObservation.operation.operation_revision', 'positive');
   }
   checkParticipantBinding(participant, 'operationObservation.operation.participants[0]');
+  const payloadKind = stringAt(
+    participant.payload_kind,
+    'operationObservation.operation.participants[0].payload_kind',
+  );
+  if (payloadKind !== 'motion' && payloadKind !== 'capability_command') {
+    return fail(
+      'operationObservation.operation.participants[0].payload_kind',
+      'motion or capability_command',
+    );
+  }
   const optionalParticipantText = (key: string): string | undefined => (
     typeof participant[key] === 'string' && participant[key] !== ''
       ? participant[key] as string
       : undefined
   );
   return {
-    operationId: stringAt(
+    operationId: positiveIntegerAt(
       operation.operation_id,
       'operationObservation.operation.operation_id',
     ),
@@ -2810,17 +2758,14 @@ export function parseOperationObservation(value: unknown): OperationObservation 
     ),
     state: stateValue,
     progress,
-    activeStopId: nullableStringAt(
-      operation.active_stop_id,
-      'operationObservation.operation.active_stop_id',
-    ),
-    activeStopGeneration: operation.active_stop_generation === null
+    stopEventId: operation.stop_event_id === null
       ? null
-      : integerAt(
-        operation.active_stop_generation,
-        'operationObservation.operation.active_stop_generation',
-    ),
+      : positiveIntegerAt(
+        operation.stop_event_id,
+        'operationObservation.operation.stop_event_id',
+      ),
     terminalError,
+    payloadKind,
     controllableComponentId: optionalParticipantText('controllable_component_id'),
     commandTargetId: optionalParticipantText('command_target_id'),
   };

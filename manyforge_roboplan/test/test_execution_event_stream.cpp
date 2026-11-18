@@ -6,11 +6,16 @@
 
 #include <gtest/gtest.h>
 
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <functional>
+#include <future>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -18,6 +23,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -34,21 +40,34 @@ using namespace std::chrono_literals;
 /// owner/journal locks a Stop or control command also takes.
 struct FakeOwner final {
   std::mutex mutex;
-  std::string epoch = "kernel-1";
   std::vector<std::uint64_t> sequences;
   std::string carried = "none";
   std::optional<double> progress;  // One executing operation, or none.
+  // The event with this sequence carries a payload above the message bound.
+  std::uint64_t oversized_sequence = 0;
+  // A scripted slow journal-file read: called before a page read that has
+  // rows, outside the lock.
+  std::function<void()> page_gate;
+  std::atomic<int> page_reads{0};
 
   ExecutionEventStreamSource Source() {
     return {
         [this] {
           std::lock_guard lock(mutex);
-          return std::pair{epoch, CanonicalValue(CanonicalValue::Object{
-                                      {"carried", CanonicalValue(carried)}})};
+          return CanonicalValue(CanonicalValue::Object{{"carried", CanonicalValue(carried)}});
         },
-        [this](const std::string &owner_epoch, const std::uint64_t after) {
+        [this](const std::uint64_t after) {
+          ++page_reads;
+          if (page_gate) {
+            bool rows = false;
+            {
+              std::lock_guard lock(mutex);
+              rows = std::any_of(sequences.begin(), sequences.end(),
+                                 [&](const auto sequence) { return sequence > after; });
+            }
+            if (rows) page_gate();
+          }
           std::lock_guard lock(mutex);
-          EXPECT_EQ(owner_epoch, epoch);
           CanonicalValue::Array events;
           bool more = false;
           for (const auto sequence : sequences) {
@@ -57,9 +76,13 @@ struct FakeOwner final {
               more = true;
               break;
             }
-            events.emplace_back(CanonicalValue::Object{
+            CanonicalValue::Object event{
                 {"record_kind", CanonicalValue("operation_terminal")},
-                {"sequence", CanonicalValue(static_cast<double>(sequence))}});
+                {"sequence", CanonicalValue(static_cast<double>(sequence))}};
+            if (sequence == oversized_sequence)
+              event.emplace_back("padding",
+                                 CanonicalValue(std::string(4U * 1024U * 1024U + 1U, 'x')));
+            events.emplace_back(std::move(event));
           }
           return CanonicalValue(CanonicalValue::Object{
               {"events", CanonicalValue(std::move(events))},
@@ -70,7 +93,7 @@ struct FakeOwner final {
           CanonicalValue::Array rows;
           if (progress)
             rows.emplace_back(CanonicalValue::Object{
-                {"operation_id", CanonicalValue("operation.1")},
+                {"operation_id", CanonicalValue(1.0)},
                 {"progress", CanonicalValue(*progress)}});
           return CanonicalValue(std::move(rows));
         }};
@@ -109,9 +132,7 @@ protected:
     std::filesystem::remove_all(directory_);
   }
 
-  [[nodiscard]] int Subscribe(const std::uint64_t after,
-                              const std::optional<std::string> &epoch,
-                              const int receive_buffer = 0) const {
+  [[nodiscard]] int Subscribe(const std::uint64_t after, const int receive_buffer = 0) const {
     const int client = ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
     if (receive_buffer > 0)
       ::setsockopt(client, SOL_SOCKET, SO_RCVBUF, &receive_buffer, sizeof(receive_buffer));
@@ -121,9 +142,8 @@ protected:
     EXPECT_EQ(::connect(client, reinterpret_cast<sockaddr *>(&address), sizeof(address)), 0);
     const auto request = canonical_json(CanonicalValue(CanonicalValue::Object{
         {"after_cursor", CanonicalValue(static_cast<double>(after))},
-        {"api_version", CanonicalValue("manyforge.execution_command.v3")},
-        {"command", CanonicalValue("subscribe_events")},
-        {"owner_epoch", epoch ? CanonicalValue(*epoch) : CanonicalValue(nullptr)}}));
+        {"api_version", CanonicalValue("manyforge.execution_command.v4")},
+        {"command", CanonicalValue("subscribe_events")}}));
     EXPECT_EQ(::send(client, request.data(), request.size(), MSG_NOSIGNAL),
               static_cast<ssize_t>(request.size()));
     return client;
@@ -176,7 +196,7 @@ protected:
 
 TEST_F(StreamFixture, DeliversSnapshotThenEveryEventInOrderThenLiveAppends) {
   for (std::uint64_t sequence = 1; sequence <= 40; ++sequence) owner_.sequences.push_back(sequence);
-  const int client = Subscribe(0, std::nullopt);
+  const int client = Subscribe(0);
   const auto snapshot = Next(client);
   ASSERT_EQ(Type(snapshot), "snapshot");
   EXPECT_EQ(Field(snapshot, "cursor"), 0.0);
@@ -191,7 +211,7 @@ TEST_F(StreamFixture, DeliversSnapshotThenEveryEventInOrderThenLiveAppends) {
 
 TEST_F(StreamFixture, ResumesStrictlyAfterItsCursor) {
   owner_.sequences = {3, 5, 8};
-  const int client = Subscribe(5, std::string("kernel-1"));
+  const int client = Subscribe(5);
   const auto snapshot = Next(client);
   ASSERT_EQ(Type(snapshot), "snapshot");
   EXPECT_EQ(Field(snapshot, "cursor"), 5.0);
@@ -199,23 +219,8 @@ TEST_F(StreamFixture, ResumesStrictlyAfterItsCursor) {
   ::close(client);
 }
 
-TEST_F(StreamFixture, AnotherOwnerEpochIsAGapThenASnapshotFromTheStart) {
-  owner_.sequences = {1, 2};
-  const int client = Subscribe(9, std::string("kernel-0"));  // Host restarted.
-  const auto gap = Next(client);
-  ASSERT_EQ(Type(gap), "gap");
-  EXPECT_EQ(gap.find_object_member("reason")->as_string(), "owner_epoch_changed");
-  const auto snapshot = Next(client);
-  ASSERT_EQ(Type(snapshot), "snapshot");
-  EXPECT_EQ(Field(snapshot, "cursor"), 0.0);
-  EXPECT_EQ(snapshot.find_object_member("owner_epoch")->as_string(), "kernel-1");
-  EXPECT_EQ(Sequence(Next(client)), 1.0);
-  EXPECT_EQ(Sequence(Next(client)), 2.0);
-  ::close(client);
-}
-
 TEST_F(StreamFixture, StateChangeIsOneTypedMessage) {
-  const int client = Subscribe(0, std::nullopt);
+  const int client = Subscribe(0);
   ASSERT_EQ(Type(Next(client)), "snapshot");
   {
     std::lock_guard lock(owner_.mutex);
@@ -228,8 +233,47 @@ TEST_F(StreamFixture, StateChangeIsOneTypedMessage) {
   ::close(client);
 }
 
+// OD-205 (b): each round sends a changed state before the rows, so a stalled
+// journal-file read never delays the Kernel's memory facts.
+TEST_F(StreamFixture, StateIsSentBeforeTheRowsOfItsRoundAndNotBehindASlowPageRead) {
+  std::promise<void> release;
+  const auto released = release.get_future().share();
+  owner_.page_gate = [released] { released.wait(); };
+  bool open = false;
+  const auto open_gate = [&] {
+    if (!std::exchange(open, true)) release.set_value();
+  };
+  struct OpenAtExit final {
+    std::function<void()> open;
+    ~OpenAtExit() { open(); }
+  } open_at_exit{open_gate};
+  const int client = Subscribe(0);
+  ASSERT_EQ(Type(Next(client)), "snapshot");
+  // The first round has read its (empty) page: the writer is idle or waiting.
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  while (owner_.page_reads.load() < 1 && std::chrono::steady_clock::now() < deadline)
+    std::this_thread::yield();
+  ASSERT_GE(owner_.page_reads.load(), 1);
+  {
+    std::lock_guard lock(owner_.mutex);
+    owner_.carried = "lost";
+    owner_.sequences.push_back(1);
+  }
+  signal_.Notify();
+  // The page read of this round is held; the state arrives anyway.
+  const auto state = Next(client);
+  ASSERT_EQ(Type(state), "state");
+  EXPECT_EQ(state.find_object_member("state")->find_object_member("carried")->as_string(), "lost");
+  EXPECT_EQ(state.find_object_member("api_version")->as_string(),
+            "manyforge.execution_event_stream.v4");
+  EXPECT_FALSE(Receive(client, 200ms).has_value());  // The row waits on the page read.
+  open_gate();
+  EXPECT_EQ(Sequence(Next(client)), 1.0);
+  ::close(client);
+}
+
 TEST_F(StreamFixture, ProgressIsStreamedWhenItChangesAndSampledWhileExecuting) {
-  const int client = Subscribe(0, std::nullopt);
+  const int client = Subscribe(0);
   ASSERT_EQ(Type(Next(client)), "snapshot");
   const auto progress = [](const CanonicalValue &message) {
     EXPECT_EQ(Type(message), "progress");
@@ -266,7 +310,7 @@ TEST_F(StreamFixture, ProgressIsStreamedWhenItChangesAndSampledWhileExecuting) {
 
 TEST_F(StreamFixture, HeartbeatCarriesTheCursorEverySecond) {
   owner_.sequences = {4};
-  const int client = Subscribe(0, std::nullopt);
+  const int client = Subscribe(0);
   ASSERT_EQ(Type(Next(client)), "snapshot");
   EXPECT_EQ(Sequence(Next(client)), 4.0);
   const auto heartbeat = Receive(client, 1500ms);
@@ -281,7 +325,7 @@ TEST_F(StreamFixture, SlowSubscriberBlocksNeitherOtherSubscribersNorTheOwnerLock
   // own send. A concurrent "Stop/control" (the owner lock) and another
   // subscriber are unaffected.
   for (std::uint64_t sequence = 1; sequence <= 4000; ++sequence) owner_.sequences.push_back(sequence);
-  const int slow = Subscribe(0, std::nullopt, 4096);
+  const int slow = Subscribe(0, 4096);
   std::this_thread::sleep_for(200ms);  // Its writer is now stuck sending.
   const auto locked_at = std::chrono::steady_clock::now();
   {
@@ -291,7 +335,7 @@ TEST_F(StreamFixture, SlowSubscriberBlocksNeitherOtherSubscribersNorTheOwnerLock
   }
   signal_.Notify();
   EXPECT_LT(std::chrono::steady_clock::now() - locked_at, 50ms);
-  const int fast = Subscribe(4000, std::nullopt);
+  const int fast = Subscribe(4000);
   ASSERT_EQ(Type(Next(fast)), "snapshot");
   EXPECT_EQ(Sequence(Next(fast)), 4001.0);
   ::close(fast);
@@ -299,8 +343,8 @@ TEST_F(StreamFixture, SlowSubscriberBlocksNeitherOtherSubscribersNorTheOwnerLock
 }
 
 TEST_F(StreamFixture, ShutdownClosesEverySubscription) {
-  const int first = Subscribe(0, std::nullopt);
-  const int second = Subscribe(0, std::nullopt);
+  const int first = Subscribe(0);
+  const int second = Subscribe(0);
   ASSERT_EQ(Type(Next(first)), "snapshot");
   ASSERT_EQ(Type(Next(second)), "snapshot");
   const auto started = std::chrono::steady_clock::now();
@@ -330,6 +374,68 @@ TEST_F(StreamFixture, MalformedSubscribeIsRefused) {
   EXPECT_EQ(error->find_object_member("error")->find_object_member("code")->as_string(),
             "execution_event_subscription_invalid");
   ::close(client);
+}
+
+// Characterisation of the host stream's bounds (pinned before the move onto
+// the shared private stream library; must hold before and after it).
+
+TEST_F(StreamFixture, NinthSubscriberIsRefusedAsFullAndTheEightKeepTheirStreams) {
+  std::vector<int> clients;
+  for (int index = 0; index < 8; ++index) {
+    clients.push_back(Subscribe(0));
+    ASSERT_EQ(Type(Next(clients.back())), "snapshot");
+  }
+  const int ninth = Subscribe(0);
+  const auto error = Receive(ninth);
+  ASSERT_TRUE(error.has_value());
+  EXPECT_EQ(Type(*error), "error");
+  EXPECT_EQ(error->find_object_member("api_version")->as_string(),
+            "manyforge.execution_event_stream.v4");
+  EXPECT_EQ(error->find_object_member("error")->find_object_member("code")->as_string(),
+            "execution_event_subscribers_full");
+  EXPECT_FALSE(Receive(ninth, 500ms).has_value());  // Closed after the error.
+  ::close(ninth);
+  owner_.Append(signal_, 1);
+  for (const int client : clients) {
+    EXPECT_EQ(Sequence(Next(client)), 1.0);
+    ::close(client);
+  }
+}
+
+TEST_F(StreamFixture, MessageAboveFourMebibytesEndsOnlyThatSubscription) {
+  owner_.sequences = {1, 2};
+  owner_.oversized_sequence = 1;
+  const int other = Subscribe(1);
+  ASSERT_EQ(Type(Next(other)), "snapshot");
+  EXPECT_EQ(Sequence(Next(other)), 2.0);
+  const int oversized = Subscribe(0);
+  ASSERT_EQ(Type(Next(oversized)), "snapshot");
+  // The oversized event is never sent, nor an error: the connection closes.
+  std::optional<CanonicalValue> message;
+  do {
+    message = Receive(oversized, 1000ms);
+  } while (message && Type(*message) == "heartbeat");
+  EXPECT_FALSE(message.has_value());
+  ::close(oversized);
+  owner_.Append(signal_, 3);
+  EXPECT_EQ(Sequence(Next(other)), 3.0);
+  ::close(other);
+}
+
+TEST_F(StreamFixture, SubscriberThatStopsReadingIsDroppedAfterTheSendDeadline) {
+  // Real time: the 3 s send deadline is a fixed host bound (no clock seam).
+  for (std::uint64_t sequence = 1; sequence <= 4000; ++sequence) owner_.sequences.push_back(sequence);
+  const auto started = std::chrono::steady_clock::now();
+  const int slow = Subscribe(0, 4096);
+  // Its buffer fills at once; the writer then waits in one send until the
+  // deadline and closes the connection (POLLHUP with data still unread).
+  pollfd hangup{slow, 0, 0};
+  ASSERT_EQ(::poll(&hangup, 1, 5000), 1);
+  const auto dropped_after = std::chrono::steady_clock::now() - started;
+  EXPECT_NE(hangup.revents & POLLHUP, 0);
+  EXPECT_GE(dropped_after, 3000ms);
+  EXPECT_LT(dropped_after, 3000ms + 100ms + 300ms);  // One poll slice + slack.
+  ::close(slow);
 }
 
 } // namespace

@@ -7,6 +7,7 @@ import threading
 
 import pytest
 
+from manyforge_headless_api.control_protocol import is_stop_command
 from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlClient,
@@ -128,15 +129,31 @@ def test_lane_spec_rejects_unbounded_or_undersized_configuration() -> None:
         ExecutionControlLaneSpec(2, 1)
 
 
-def test_default_stop_reserve_has_no_waiting_queue() -> None:
+def test_default_stop_lane_has_two_workers_and_never_refuses() -> None:
+    """PD-5: two Stop workers; a Stop beyond them waits behind Stops only."""
+
     client = ExecutionControlClient()
     try:
         status = client.status()
         assert status["stop"]["workers"] == 2
-        assert status["stop"]["maximum_admitted"] == 2
+        assert status["stop"]["maximum_admitted"] is None
         assert status["ordinary"]["workers"] == 2
         assert status["ordinary"]["maximum_admitted"] == 2
         assert status["stop"]["queued"] == 0
         assert status["ordinary"]["queued"] == 0
     finally:
         client.close()
+
+
+@pytest.mark.parametrize(
+    "kind", ["program_motion_stop", "operation_stop", "stop_all", "halt"]
+)
+def test_every_stop_kind_takes_the_stop_lane(kind: str) -> None:
+    assert is_stop_command(kind)
+
+
+@pytest.mark.parametrize(
+    "kind", ["program_resume_halt", "program_discard_halt", "program_reset"]
+)
+def test_halt_releases_take_the_ordinary_lane(kind: str) -> None:
+    assert not is_stop_command(kind)

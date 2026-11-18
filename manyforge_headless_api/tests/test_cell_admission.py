@@ -8,7 +8,6 @@ import os
 import socket
 import struct
 import threading
-import time
 from typing import Any
 
 import pytest
@@ -30,8 +29,8 @@ def test_client_has_no_headless_import_or_readiness_writer() -> None:
 @pytest.mark.parametrize(
     "payload",
     [
-        b'{"api_version":"manyforge.execution_command_response.v4",'
-        b'"api_version":"manyforge.execution_command_response.v4"}',
+        b'{"api_version":"manyforge.execution_command_response.v5",'
+        b'"api_version":"manyforge.execution_command_response.v5"}',
         b'{"ok":NaN}',
         b'{ "ok":true}',
         b"[]",
@@ -74,17 +73,65 @@ def _intent() -> dict[str, Any]:
         "claim_kind": "program_cycle",
         "expected_admission_generation": 7,
         "intervention_evidence": None,
-        "owner_epoch": "runner-epoch",
         "owner_role": "program_runner",
-        "owner_transaction_id": "program-cycle.1",
+        "owner_transaction_id": 1,
         "program_cycle_evidence": {
             "applied_program_revision": "sha256:" + "2" * 64,
             "draft_program_revision": "sha256:" + "2" * 64,
         },
-        "request_id": "run.start.1",
-        "request_payload_digest": "sha256:" + "3" * 64,
+        # The Run request's class 2 key, part 0 (run 1, attempt 0).
+        "request_key": "80" + "00000000000001" + "0000000000000000",
         "scope": {"configurations": [], "resources": []},
     }
+
+
+def _release() -> dict[str, Any]:
+    return {
+        "acquired_admission_generation": 7,
+        "claim_generation": 3,
+        "owner_role": "program_runner",
+        "owner_transaction_id": 1,
+        "request_key": "0" * 31 + "1",
+        "settlement": {"settlement_kind": "explicit_reset", "evidence_digest": "sha256:" + "b" * 64},
+    }
+
+
+def test_claim_intent_and_release_refuse_request_digest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Claim intents and releases carry no request digest; one that does is
+    not sent."""
+
+    change = {"request_payload_digest": "sha256:" + "3" * 64}
+
+    client = CellAdmissionClient(tmp_path)
+    monkeypatch.setattr(client, "_exchange", lambda *_args, **_kwargs: pytest.fail("sent"))
+    with pytest.raises(ValueError, match="exact A1 projection"):
+        client.acquire({**_intent(), **change})
+    with pytest.raises(ValueError, match="exact A1 projection"):
+        client.release({**_release(), **change})
+
+
+@pytest.mark.parametrize("transaction_id", [None, 1, 9_007_199_254_740_991])
+def test_release_sends_typed_transaction_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, transaction_id: int | None
+) -> None:
+    client = CellAdmissionClient(tmp_path)
+    release = {**_release(), "owner_transaction_id": transaction_id}
+    packets: list[dict[str, Any]] = []
+
+    def exchange(packet: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        packets.append(packet)
+        return {
+            "api_version": "manyforge.execution_command_response.v5",
+            "authoring_admission": {"admission_generation": 8, "authoring_allowed": True},
+            "command": "cell_admission_release",
+            "ok": True,
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    assert client.release(release)["admission_generation"] == 8
+    assert packets[0]["request"] == release
 
 
 def test_exact_native_get_request_and_admission_response(
@@ -96,7 +143,7 @@ def test_exact_native_get_request_and_admission_response(
     def exchange(packet: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         packets.append(packet)
         return {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v5",
             "authoring_admission": {
                 "admission_generation": 7,
                 "authoring_allowed": True,
@@ -112,7 +159,7 @@ def test_exact_native_get_request_and_admission_response(
     }
     assert packets == [
         {
-            "api_version": "manyforge.execution_command.v3",
+            "api_version": "manyforge.execution_command.v4",
             "command": "cell_admission_get",
         }
     ]
@@ -128,7 +175,7 @@ def test_exact_native_acquire_request_and_claim_response(
     def exchange(packet: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
         packets.append(packet)
         return {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v5",
             "claim": {
                 "accepted_at_ns": 42,
                 "acquired_admission_generation": 7,
@@ -143,9 +190,49 @@ def test_exact_native_acquire_request_and_claim_response(
     assert client.acquire(intent)["claim_generation"] == 3
     assert packets == [
         {
-            "api_version": "manyforge.execution_command.v3",
+            "api_version": "manyforge.execution_command.v4",
             "command": "cell_admission_acquire",
             "request": intent,
+        }
+    ]
+
+
+def test_program_reset_acquire_carries_the_runner_status_beside_its_intent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """OD-139: the Kernel proves a Reset claim from the runner's current cycle
+    status, a sibling of the intent so intent equality and replay hold."""
+
+    client = CellAdmissionClient(tmp_path)
+    intent = {**_intent(), "claim_kind": "program_reset", "owner_role": "program_runner"}
+    status = {
+        "cycle_generation": 3, "state": "resetting", "program_run_id": None,
+        "cycle_claim_generation": None, "terminal_or_settlement_reference": None,
+        "accepted_reset": {"request_key": "0" * 31 + "1",
+                           "request_payload_digest": "sha256:" + "a" * 64,
+                           "reload_initial_scene": True, "reset_robot_position": False,
+                           "reset_claim_generation": None},
+    }
+    packets: list[dict[str, Any]] = []
+
+    def exchange(packet: dict[str, Any], **_kwargs: Any) -> dict[str, Any]:
+        packets.append(packet)
+        return {
+            "api_version": "manyforge.execution_command_response.v5",
+            "claim": {"accepted_at_ns": 42, "acquired_admission_generation": 7,
+                      "claim_generation": 3, "intent": intent},
+            "command": "cell_admission_acquire",
+            "ok": True,
+        }
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    assert client.acquire(intent, program_cycle_status=status)["intent"] == intent
+    assert packets == [
+        {
+            "api_version": "manyforge.execution_command.v4",
+            "command": "cell_admission_acquire",
+            "request": intent,
+            "program_cycle_status": status,
         }
     ]
 
@@ -158,7 +245,7 @@ def test_exact_native_error_is_preserved_as_known_outcome(
         client,
         "_exchange",
         lambda _packet, **_kwargs: {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v5",
             "command": "cell_admission_acquire",
             "error": {
                 "code": "stale_generation",
@@ -179,13 +266,13 @@ def test_exact_native_error_is_preserved_as_known_outcome(
     "response",
     [
         {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v5",
             "command": "cell_admission_get",
             "ok": True,
             "result": {"admission_generation": 1, "authoring_allowed": True},
         },
         {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v5",
             "authoring_admission": {
                 "admission_generation": 1,
                 "authoring_allowed": True,
@@ -227,11 +314,9 @@ def _attention_projection(generation: int = 4) -> dict[str, Any]:
                 },
             }
         ],
-        "owner_epoch": "alarm.owner.1",
         "owner_host_boot_id": "boot.test",
-        "owner_incarnation_us": 42,
         "reconciled": True,
-        "schema_version": "manyforge.operator_alarm_motion_attention.v3",
+        "schema_version": "manyforge.operator_alarm_motion_attention.v4",
     }
 
 
@@ -240,38 +325,34 @@ def test_operator_alarm_attention_is_published_on_the_cell_admission_port(
 ) -> None:
     client = CellAdmissionClient(tmp_path)
     sent: list[dict[str, Any]] = []
-    deadlines: list[float | None] = []
+    stop_fds: list[Any] = []
     socket_files: list[str | None] = []
     command = "cell_admission_publish_operator_alarm_attention"
 
     def exchange(packet: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         sent.append(packet)
-        deadlines.append(kwargs.get("deadline"))
+        stop_fds.append(kwargs.get("stop_fd"))
         socket_files.append(kwargs.get("socket_file"))
         return {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v5",
             "command": command,
             "ok": True,
-            "operator_alarm_attention": {
-                "generation": 4,
-                "owner_epoch": "alarm.owner.1",
-            },
+            "operator_alarm_attention": {"generation": 4},
         }
 
     monkeypatch.setattr(client, "_exchange", exchange)
     projection = _attention_projection()
-    deadline = time.monotonic() + 0.2
-    assert client.publish_operator_alarm_attention(projection, deadline=deadline) == {
+    assert client.publish_operator_alarm_attention(projection, stop_fd=7) == {
         "generation": 4,
-        "owner_epoch": "alarm.owner.1",
     }
-    # The overall publication deadline reaches the socket exchange, and the
-    # heartbeat travels beside Stop on the independent control socket.
-    assert deadlines == [deadline]
-    assert socket_files == [cell_admission.EXECUTION_CONTROL_SOCKET_FILE]
+    # The publisher's stop pipe reaches the socket exchange (no deadline,
+    # OD-307), and the heartbeat travels on the independent component socket.
+    assert stop_fds == [7]
+    assert socket_files == [cell_admission.EXECUTION_COMPONENT_SOCKET_FILE]
+    assert cell_admission.EXECUTION_COMPONENT_SOCKET_FILE == "execution-component.sock"
     assert sent == [
         {
-            "api_version": "manyforge.execution_command.v3",
+            "api_version": "manyforge.execution_command.v4",
             "command": command,
             "request": projection,
         }
@@ -282,62 +363,95 @@ def test_operator_alarm_attention_is_published_on_the_cell_admission_port(
         "_exchange",
         lambda _packet, **_kwargs: {
             **exchange(_packet),
-            "operator_alarm_attention": {"generation": 3, "owner_epoch": "alarm.owner.1"},
+            "operator_alarm_attention": {"generation": 3},
         },
     )
     with pytest.raises(CellAdmissionError) as mismatched:
-        client.publish_operator_alarm_attention(
-            projection, deadline=time.monotonic() + 0.2
-        )
+        client.publish_operator_alarm_attention(projection)
     assert mismatched.value.code == "execution_command_response_invalid"
 
 
-def test_publication_deadline_bounds_the_whole_exchange_not_each_step(
-    tmp_path,
-) -> None:
-    """A peer that accepts but never answers ends the call at its deadline.
-
-    The per-operation timeout (1 s here) would let connect, send and receive
-    each take that long; the overall monotonic deadline caps them together.
-    """
+def test_publication_waits_for_its_answer_until_stopped(tmp_path) -> None:
+    """OD-307: a peer that accepts but never answers is waited for; only the
+    caller's stop pipe (or the peer closing) ends the wait."""
     run_root = tmp_path / "run"
     run_root.mkdir(mode=0o700)
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    listener.bind(str(run_root / cell_admission.EXECUTION_CONTROL_SOCKET_FILE))
-    os.chmod(run_root / cell_admission.EXECUTION_CONTROL_SOCKET_FILE, 0o600)
-    listener.listen(1)
-    accepted: list[socket.socket] = []
+    listener.bind(str(run_root / cell_admission.EXECUTION_COMPONENT_SOCKET_FILE))
+    os.chmod(run_root / cell_admission.EXECUTION_COMPONENT_SOCKET_FILE, 0o600)
+    listener.listen(2)
+    received, done = threading.Event(), threading.Event()
 
-    def accept() -> None:
+    def serve() -> None:
         connection, _address = listener.accept()
-        accepted.append(connection)
-        connection.recv(cell_admission.MAXIMUM_PACKET_BYTES)  # never answers
+        with connection:
+            connection.recv(cell_admission.MAXIMUM_PACKET_BYTES)
+            received.set()
+            done.wait()  # never answers
 
-    peer = threading.Thread(target=accept, daemon=True)
+    peer = threading.Thread(target=serve)
     peer.start()
+    stop_read, stop_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+    failures: list[CellAdmissionError] = []
+
+    def publish() -> None:
+        try:
+            CellAdmissionClient(run_root, timeout_seconds=1.0).publish_operator_alarm_attention(
+                _attention_projection(), stop_fd=stop_read
+            )
+        except CellAdmissionError as error:
+            failures.append(error)
+
+    publisher = threading.Thread(target=publish)
+    publisher.start()
     try:
-        client = CellAdmissionClient(run_root, timeout_seconds=1.0)
-        started = time.monotonic()
-        with pytest.raises(CellAdmissionError) as failed:
-            client.publish_operator_alarm_attention(
-                _attention_projection(), deadline=started + 0.15
+        assert received.wait(timeout=5.0)
+        assert publisher.is_alive() and not failures
+        os.write(stop_write, b"\0")
+        publisher.join(timeout=5.0)
+        assert not publisher.is_alive()
+        assert len(failures) == 1
+        assert failures[0].code == "execution_owner_unavailable"
+        assert failures[0].outcome_unknown
+        assert "stopped" in str(failures[0])
+        # An exchange started after the stop ends at once: the pipe stays
+        # readable, so its wait for the answer returns immediately (the
+        # listener's backlog takes the connection; nobody answers it).
+        with pytest.raises(CellAdmissionError) as stopped:
+            CellAdmissionClient(run_root, timeout_seconds=1.0).publish_operator_alarm_attention(
+                _attention_projection(), stop_fd=stop_read
             )
-        elapsed = time.monotonic() - started
-        assert failed.value.code == "execution_owner_unavailable"
-        assert failed.value.outcome_unknown
-        assert 0.15 <= elapsed < 0.5
-        # An already elapsed deadline sends nothing.
-        with pytest.raises(CellAdmissionError) as elapsed_deadline:
-            client.publish_operator_alarm_attention(
-                _attention_projection(), deadline=time.monotonic()
-            )
-        assert "deadline elapsed" in str(elapsed_deadline.value)
-        assert len(accepted) == 1
+        assert stopped.value.code == "execution_owner_unavailable"
+        assert "stopped" in str(stopped.value)
     finally:
+        done.set()
         peer.join(timeout=5.0)
-        for connection in accepted:
-            connection.close()
+        publisher.join()
         listener.close()
+        os.close(stop_read)
+        os.close(stop_write)
+
+
+def test_publication_ends_when_the_host_closes_the_connection(tmp_path) -> None:
+    run_root = tmp_path / "run"
+    run_root.mkdir(mode=0o700)
+    listener, peer = _host_that_exits_before_answering(
+        run_root, cell_admission.EXECUTION_COMPONENT_SOCKET_FILE
+    )
+    stop_read, stop_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
+    try:
+        # The stop pipe is never written: the peer's close ends the wait.
+        with pytest.raises(CellAdmissionError) as lost:
+            CellAdmissionClient(run_root, timeout_seconds=1.0).publish_operator_alarm_attention(
+                _attention_projection(), stop_fd=stop_read
+            )
+        peer.join(timeout=5.0)
+    finally:
+        listener.close()
+        os.close(stop_read)
+        os.close(stop_write)
+    assert lost.value.code == "execution_command_response_invalid"
+    assert lost.value.outcome_unknown
 
 
 def test_transport_failure_logs_syscall_errno_and_peer_without_changing_error(
@@ -412,6 +526,29 @@ def test_transport_failure_logs_syscall_errno_and_peer_without_changing_error(
     assert "private-path-or-user-text" not in caplog.text
 
 
+def test_component_requests_resolve_the_component_socket(tmp_path, monkeypatch) -> None:
+    from manyforge_headless_api.execution import ExecutionCommandClient
+
+    execution = ExecutionCommandClient(tmp_path)
+    sent: list[tuple[str, str]] = []
+
+    def exchange_on(packet: dict[str, Any], socket_path) -> dict[str, Any]:
+        sent.append((packet["command"], socket_path.name))
+        return {"ok": False, "error": {"code": "component_not_found"}}
+
+    monkeypatch.setattr(execution, "_exchange_on", exchange_on)
+    execution.component_model()
+    execution.component_action("robot", "enable")
+    execution.component_recovery_preflight("robot")
+    execution.component_recover_enable("robot", {"snapshot_id": "s", "confirmed": []})
+    assert sent == [
+        ("read_component_model", "execution-component.sock"),
+        ("component_action", "execution-component.sock"),
+        ("component_recovery_preflight", "execution-component.sock"),
+        ("component_action", "execution-component.sock"),
+    ]
+
+
 @pytest.mark.parametrize(
     ("producer", "expected_producer"),
     [("component_manager", "component_manager"), (None, "kernel")],
@@ -444,3 +581,130 @@ def test_cell_admission_error_retains_optional_producer(
     assert refused.value.code == "stale_generation"
     assert refused.value.details == {"reason": "expected_generation_stale"}
     assert refused.value.producer == expected_producer
+
+
+class _RecordingSocket:
+    """A connected socket that records its timeouts and answers once."""
+
+    def __init__(self, reply: bytes) -> None:
+        self.reply = reply
+        self.timeouts: list[float | None] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def setsockopt(self, *_args):
+        pass
+
+    def settimeout(self, timeout):
+        self.timeouts.append(timeout)
+
+    def connect(self, _address):
+        pass
+
+    def getsockopt(self, *_args):
+        return struct.pack("3i", 1234, os.geteuid(), os.getegid())
+
+    def send(self, packet):
+        return len(packet)
+
+    def recvmsg(self, _size):
+        return self.reply, [], 0, None
+
+
+def test_connected_requests_wait_for_their_answer_with_only_the_connection_limited(
+    tmp_path, monkeypatch
+) -> None:
+    """OD-214: the execution and cell-admission sockets limit the connect
+    step only; the request then waits for the host's answer."""
+
+    from contextlib import contextmanager
+
+    import rfc8785
+
+    from manyforge_headless_api import execution as execution_module
+    from manyforge_headless_api.execution import ExecutionCommandClient
+
+    class RunRoot:
+        @contextmanager
+        def socket_address(self, _filename):
+            yield "/private/execution-command.sock"
+
+    admission_reply = _RecordingSocket(rfc8785.dumps({
+        "api_version": cell_admission.EXECUTION_RESPONSE_VERSION,
+        "authoring_admission": {"admission_generation": 1, "authoring_allowed": True},
+        "command": "cell_admission_get",
+        "ok": True,
+    }))
+    client = CellAdmissionClient(tmp_path, timeout_seconds=1.5)
+    client._run_root = RunRoot()
+    monkeypatch.setattr(cell_admission.socket, "socket", lambda *_args: admission_reply)
+    assert client.get()["authoring_allowed"] is True
+    assert admission_reply.timeouts == [1.5, None]
+
+    execution_reply = _RecordingSocket(rfc8785.dumps({
+        "api_version": execution_module.EXECUTION_RESPONSE_VERSION,
+        "command": "test",
+        "ok": True,
+    }))
+    execution = ExecutionCommandClient(tmp_path, timeout_seconds=1.5)
+    execution._run_root = RunRoot()
+    monkeypatch.setattr(execution_module.socket, "socket", lambda *_args: execution_reply)
+    assert execution._exchange_on({"command": "test"}, execution._socket_path)["ok"] is True
+    assert execution_reply.timeouts == [1.5, None]
+
+
+def _host_that_exits_before_answering(run_root, socket_file: str):
+    """A peer that takes the request and closes the connection unanswered,
+    as an execution host process that exits does."""
+
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+    listener.bind(str(run_root / socket_file))
+    os.chmod(run_root / socket_file, 0o600)
+    listener.listen(1)
+
+    def serve() -> None:
+        connection, _address = listener.accept()
+        with connection:
+            connection.recv(cell_admission.MAXIMUM_PACKET_BYTES)
+
+    peer = threading.Thread(target=serve, daemon=True)
+    peer.start()
+    return listener, peer
+
+
+def test_a_waiting_request_ends_when_the_host_closes_the_connection(tmp_path) -> None:
+    from manyforge_headless_api.execution import ExecutionCommandClient
+    from manyforge_headless_api.native import HeadlessApiError
+
+    run_root = tmp_path / "run"
+    run_root.mkdir(mode=0o700)
+    listener, peer = _host_that_exits_before_answering(
+        run_root, cell_admission.EXECUTION_SOCKET_FILE
+    )
+    try:
+        with pytest.raises(CellAdmissionError) as admission_lost:
+            CellAdmissionClient(run_root, timeout_seconds=1.0).get()
+        peer.join(timeout=5.0)
+    finally:
+        listener.close()
+    # An unknown outcome now means only a closed connection (or a malformed
+    # answer), never a time limit.
+    assert admission_lost.value.code == "execution_command_response_invalid"
+    assert admission_lost.value.outcome_unknown
+
+    (run_root / cell_admission.EXECUTION_SOCKET_FILE).unlink()
+    listener, peer = _host_that_exits_before_answering(
+        run_root, cell_admission.EXECUTION_SOCKET_FILE
+    )
+    try:
+        execution = ExecutionCommandClient(run_root, timeout_seconds=1.0)
+        with pytest.raises(HeadlessApiError) as execution_lost:
+            execution._exchange_on({"command": "test"}, execution._socket_path)
+        peer.join(timeout=5.0)
+    finally:
+        listener.close()
+    assert execution_lost.value.code == "execution_command_response_invalid"

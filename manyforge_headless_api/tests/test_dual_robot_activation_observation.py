@@ -11,9 +11,10 @@ from manyforge_headless_api.process_tests.test_dual_robot_grouped_execution impo
 )
 
 
+APPLICATION_START_ID = "3f9a0000000000a1"
 CANDIDATE = {"retained_bundle_id": "bundle", "graph_revision": "graph"}
 APPLY = {
-    "apply_id": "apply", "apply_generation": 2, "request_owner_epoch": "owner",
+    "apply_id": 7, "apply_generation": 2, "request_key": "ab" * 16,
     "state": "succeeded", "ok": True, "candidate_projection_revision": CANDIDATE,
     "failure_acknowledgement": "unavailable",
     "prepared_activation": {"deployment_artifact_id": "deployment-id",
@@ -25,11 +26,11 @@ def _sample():
     return {
         "apply": deepcopy(APPLY),
         "manager": {
-            "source": {"source_owner_epoch": "owner", "available": True,
+            "source": {"source_owner_id": "owner", "available": True,
                        "freshness": "fresh", "known_gaps": []},
             "status": {"manager_ready": True, "runtime": {"converged": True},
                        "active": {"publication": {
-                           "transaction": {"kind": "named_apply", "apply_id": "apply",
+                           "transaction": {"kind": "named_apply", "apply_id": 7,
                                            "apply_generation": 2},
                            "projection_revision": deepcopy(CANDIDATE)}}},
         },
@@ -51,7 +52,7 @@ class Observations:
         self.sleeps = []
         self.headless = SimpleNamespace(
             manager_apply_status=self.apply, manager_status=self.manager,
-            program_applied_status=self.program,
+            program_applied_status=self.program, request=self.control_state,
         )
         self.composer = SimpleNamespace(request=self.workspace)
 
@@ -59,9 +60,15 @@ class Observations:
     def current(self):
         return self.samples[min(self.index, len(self.samples) - 1)]
 
-    def apply(self, *identity):
+    def control_state(self, method, path):
+        # This start's ``A``, read once before the observation (1.6).
+        assert (method, path) == ("GET", "/api/control/state")
+        return {"application_start_id": APPLICATION_START_ID}
+
+    def apply(self, *identity, application_start_id):
         self.calls.append(("GET Apply", identity))
-        assert identity == ("apply", 2)
+        assert identity == (7, 2)
+        assert application_start_id == APPLICATION_START_ID
         return self.current["apply"]
 
     def manager(self):
@@ -109,11 +116,13 @@ def test_transient_program_selection_waits_for_exact_fresh_converged_tuple(code)
     assert all(call[0].startswith("GET") for call in reads.calls)
 
 
-@pytest.mark.parametrize("foreign", ["owner", "candidate", "composer", "program", "binding"])
+@pytest.mark.parametrize("foreign", ["request_key", "candidate", "composer", "program", "binding"])
 def test_foreign_identity_refuses_without_effect_or_observation_retry(foreign):
     sample = _sample()
-    if foreign == "owner":
-        sample["manager"]["source"]["source_owner_epoch"] = "foreign"
+    if foreign == "request_key":
+        # Another request's Apply status (the Manager source's owner epoch
+        # is no longer compared: one start, one Manager, BS 0).
+        sample["apply"]["request_key"] = "cd" * 16
     elif foreign == "candidate":
         sample["apply"]["candidate_projection_revision"]["graph_revision"] = "foreign"
     elif foreign == "composer":
@@ -166,18 +175,18 @@ def _predecessor(sample):
 
 def test_exact_captured_predecessor_waits_for_the_new_named_apply():
     previous = _sample()
-    previous["manager"]["status"]["active"]["publication"]["transaction"]["apply_id"] = "previous"
+    previous["manager"]["status"]["active"]["publication"]["transaction"]["apply_id"] = 6
     # Repeating the same Scenario may keep its semantic selection tuple;
     # the new exact named transaction is still mandatory.
     reads = Observations([previous, _sample()])
     result = reads.observe(predecessor=_predecessor(previous))
-    assert result["active_publication"]["transaction"]["apply_id"] == "apply"
+    assert result["active_publication"]["transaction"]["apply_id"] == 7
     assert reads.sleeps == [0.02]
 
 
 def test_changed_predecessor_candidate_is_not_treated_as_a_pending_projection():
     previous = _sample()
-    previous["manager"]["status"]["active"]["publication"]["transaction"]["apply_id"] = "previous"
+    previous["manager"]["status"]["active"]["publication"]["transaction"]["apply_id"] = 6
     changed = deepcopy(previous)
     changed["manager"]["status"]["active"]["publication"]["projection_revision"]["graph_revision"] = "foreign"
     reads = Observations([changed])
@@ -199,7 +208,7 @@ def test_incoherent_predecessor_does_not_allow_stale_acceptance():
 def test_distinct_captured_predecessor_channels_can_converge_independently():
     previous = _sample()
     publication = previous["manager"]["status"]["active"]["publication"]
-    publication["transaction"]["apply_id"] = "previous"
+    publication["transaction"]["apply_id"] = 6
     publication["projection_revision"] = {"retained_bundle_id": "previous-bundle",
                                           "graph_revision": "previous-graph"}
     previous["selected"] = {"scenarioId": "previous-scenario",
@@ -236,20 +245,9 @@ def test_fresh_bootstrap_with_no_program_selection_converges_to_scenario():
     assert reads.sleeps == [0.02]
 
 
-def test_historical_predecessor_request_owner_is_distinct_from_current_manager_source():
-    previous = _sample()
-    previous["manager"]["status"]["active"]["publication"]["transaction"]["apply_id"] = "previous"
-    predecessor = _predecessor(previous)
-    predecessor["apply_status"]["request_owner_epoch"] = "historical-owner"
-    reads = Observations([previous, _sample()])
-    result = reads.observe(predecessor=predecessor)
-    assert result["manager_source"]["source_owner_epoch"] == APPLY["request_owner_epoch"]
-    assert reads.sleeps == [0.02]
-
-
 def test_same_deployment_predecessor_program_binding_waits_for_accepted_binding():
     previous = _sample()
-    previous["manager"]["status"]["active"]["publication"]["transaction"]["apply_id"] = "previous"
+    previous["manager"]["status"]["active"]["publication"]["transaction"]["apply_id"] = 6
     previous["program"]["program_binding_id"] = "previous-binding"
     partial = deepcopy(previous)
     partial["manager"] = _sample()["manager"]

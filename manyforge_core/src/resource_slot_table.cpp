@@ -28,7 +28,6 @@ namespace {
       return next == ResourceSlotState::kTerminal;
     case ResourceSlotState::kFree:
     case ResourceSlotState::kTerminal:
-    case ResourceSlotState::kUnreconciledExternalOrOrphanGoal:
       return false;
   }
   return false;
@@ -46,10 +45,6 @@ namespace {
                             [](const auto& left, const auto& right) {
                               return left.control_domain_id == right.control_domain_id;
                             }) == configurations.end();
-}
-
-[[nodiscard]] auto stop_fence_owner_key(const ResourceSlotStopFenceOwnerDTO& row) noexcept {
-  return std::tie(row.expected_owner.operation_id, row.expected_owner.participant_id);
 }
 
 [[nodiscard]] auto reservation_owner_key(const ResourceSlotReservationOwnerDTO& row) noexcept {
@@ -74,7 +69,7 @@ template <typename Value>
 }  // namespace
 
 bool ResourceSlotOwnerDTO::valid() const noexcept {
-  if (operation_id.empty() || !operation_revision.nonzero() || participant_id.empty() ||
+  if (!operation_id.nonzero() || !operation_revision.nonzero() || !participant_id.nonzero() ||
       !binding_identity.locally_valid()) return false;
   return !controller().controller_topology_id.empty() &&
       !controller().topology_revision.empty() && !controller().control_route_id.empty() &&
@@ -106,7 +101,7 @@ ResourceSlotTable::ResourceSlotTable(
   slots_.reserve(resources.size());
   for (auto& resource : resources) {
     slots_.push_back(ResourceSlotSnapshotDTO{std::move(resource), ResourceSlotState::kFree,
-                                             std::nullopt, StopGeneration(0U)});
+                                             std::nullopt, StopEventId(0U)});
   }
 }
 
@@ -200,7 +195,7 @@ Result<void> ResourceSlotTable::reserve_batch(
   std::vector<std::pair<std::size_t, const ResourceSlotOwnerDTO*>> assignments;
   assignments.reserve(slots_.size());
   std::set<ResourceId> complete_resources;
-  std::optional<std::pair<OperationId, OperationRevision>> operation_revision;
+  std::optional<std::pair<OperationNumber, OperationRevision>> operation_revision;
   std::vector<std::size_t> indices;
   for (const auto& row : owners) {
     if (!row.owner.valid() || row.resources.empty() ||
@@ -631,195 +626,102 @@ Result<std::vector<ResourceSlotOwnerDTO>> ResourceSlotTable::transition_and_revi
   return revise_owner_batch_locked(owners, next_state, next_operation_revision);
 }
 
-Result<ResourceSlotStopFenceResultDTO> ResourceSlotTable::stop_fence_batch(
-    const ResourceSlotStopFenceRequestDTO& request) {
-  if (!request.stop_generation.nonzero() || request.owners.size() > kMaxKernelResourceSlots ||
-      request.orphan_resources.size() > kMaxKernelResourceSlots ||
-      request.revision_only_owners.size() > kMaxKernelResourceSlots ||
-      request.owners.size() + request.revision_only_owners.size() > kMaxKernelResourceSlots ||
-      (request.owners.empty() && request.orphan_resources.empty() &&
-       request.revision_only_owners.empty())) {
-    return reject_value<ResourceSlotStopFenceResultDTO>(
-        "batch Stop fence has an invalid generation or scope count",
-        "resource_stop_fence_shape_invalid", ErrorCode::kInvalidRequest);
-  }
-  const auto canonical_owners = [](const auto& rows) {
-    return std::is_sorted(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
-      return stop_fence_owner_key(left) < stop_fence_owner_key(right);
-    }) && std::adjacent_find(rows.begin(), rows.end(), [](const auto& left, const auto& right) {
-      return stop_fence_owner_key(left) == stop_fence_owner_key(right);
-    }) == rows.end();
+std::optional<std::string_view> ResourceSlotTable::stop_fence_batch(
+    const StopEventId stop_event_id, ResourceSlotStopFenceScratch& scratch) noexcept {
+  const std::span<const ResourceSlotStopFenceRow> rows(scratch.rows);
+  if (!stop_event_id.nonzero() || rows.empty() || rows.size() > kMaxKernelResourceSlots)
+    return "resource_stop_fence_shape_invalid";
+  const auto key = [](const ResourceSlotStopFenceRow& row) noexcept {
+    return std::tie(row.expected_owner->operation_id, row.expected_owner->participant_id);
   };
-  if (!canonical_owners(request.revision_only_owners) ||
-      !std::is_sorted(request.owners.begin(), request.owners.end(),
-                      [](const auto& left, const auto& right) {
-                        return stop_fence_owner_key(left) < stop_fence_owner_key(right);
-                      }) ||
-      std::adjacent_find(request.owners.begin(), request.owners.end(),
-                         [](const auto& left, const auto& right) {
-                           return stop_fence_owner_key(left) == stop_fence_owner_key(right);
-                         }) != request.owners.end() ||
-      !std::is_sorted(request.orphan_resources.begin(), request.orphan_resources.end()) ||
-      std::adjacent_find(request.orphan_resources.begin(), request.orphan_resources.end()) !=
-          request.orphan_resources.end()) {
-    return reject_value<ResourceSlotStopFenceResultDTO>("batch Stop fence rows are not canonical",
-                                                        "resource_stop_fence_not_canonical",
-                                                        ErrorCode::kInvalidRequest);
-  }
-
-  auto all_owners = request.owners;
-  all_owners.insert(all_owners.end(), request.revision_only_owners.begin(),
-                    request.revision_only_owners.end());
-  std::sort(all_owners.begin(), all_owners.end(), [](const auto& left, const auto& right) {
-    return stop_fence_owner_key(left) < stop_fence_owner_key(right);
-  });
-  if (!canonical_owners(all_owners)) {
-    return reject_value<ResourceSlotStopFenceResultDTO>(
-        "batch Stop fence repeats an owner", "resource_stop_fence_not_canonical",
-        ErrorCode::kInvalidRequest);
-  }
-
-  std::size_t resource_count = request.orphan_resources.size();
-  std::set<ResourceId> unique_resources(request.orphan_resources.begin(),
-                                        request.orphan_resources.end());
-  if (unique_resources.size() != request.orphan_resources.size() ||
-      std::any_of(request.orphan_resources.begin(), request.orphan_resources.end(),
-                  [](const auto& resource) { return resource.empty(); })) {
-    return reject_value<ResourceSlotStopFenceResultDTO>("batch Stop fence orphan scope is invalid",
-                                                        "resource_stop_fence_scope_invalid",
-                                                        ErrorCode::kInvalidRequest);
-  }
-  for (std::size_t index = 0U; index < all_owners.size(); ++index) {
-    const auto& row = all_owners[index];
-    if (!row.expected_owner.valid() || !row.next_operation_revision.nonzero() ||
-        row.next_operation_revision <= row.expected_owner.operation_revision ||
-        row.resources.empty() || row.resources.size() > kMaxKernelResourceSlots ||
-        !std::is_sorted(row.resources.begin(), row.resources.end()) ||
-        std::adjacent_find(row.resources.begin(), row.resources.end()) != row.resources.end() ||
-        std::any_of(row.resources.begin(), row.resources.end(),
-                    [](const auto& resource) { return resource.empty(); }) ||
-        row.resources.size() > kMaxKernelResourceSlots - resource_count) {
-      return reject_value<ResourceSlotStopFenceResultDTO>(
-          "batch Stop fence owner scope or revision is invalid",
-          "resource_stop_fence_owner_invalid", ErrorCode::kInvalidRequest);
-    }
-    resource_count += row.resources.size();
-    for (const auto& resource : row.resources) {
-      if (!unique_resources.insert(resource).second) {
-        return reject_value<ResourceSlotStopFenceResultDTO>(
-            "batch Stop fence resource scopes overlap", "resource_stop_fence_scope_overlap",
-            ErrorCode::kInvalidRequest);
-      }
-    }
-    if (index != 0U &&
-        all_owners[index - 1U].expected_owner.operation_id == row.expected_owner.operation_id &&
-        (all_owners[index - 1U].expected_owner.operation_revision !=
-             row.expected_owner.operation_revision ||
-         all_owners[index - 1U].next_operation_revision != row.next_operation_revision)) {
-      return reject_value<ResourceSlotStopFenceResultDTO>(
-          "one operation has inconsistent owner revisions in the batch Stop fence",
-          "resource_stop_fence_operation_revision_inconsistent", ErrorCode::kInvalidRequest);
-    }
+  for (std::size_t index = 0U; index < rows.size(); ++index) {
+    const auto& row = rows[index];
+    if (row.expected_owner == nullptr || !row.expected_owner->valid() ||
+        !row.next_operation_revision.nonzero() ||
+        row.next_operation_revision <= row.expected_owner->operation_revision ||
+        row.resources.empty() || !std::is_sorted(row.resources.begin(), row.resources.end()) ||
+        std::adjacent_find(row.resources.begin(), row.resources.end()) != row.resources.end())
+      return "resource_stop_fence_owner_invalid";
+    if (index == 0U) continue;
+    const auto& previous = rows[index - 1U];
+    if (!(key(previous) < key(row))) return "resource_stop_fence_not_canonical";
+    if (previous.expected_owner->operation_id == row.expected_owner->operation_id &&
+        (previous.expected_owner->operation_revision != row.expected_owner->operation_revision ||
+         previous.next_operation_revision != row.next_operation_revision))
+      return "resource_stop_fence_operation_revision_inconsistent";
   }
 
   std::lock_guard lock(data_mutex_);
-  if (request.expected_operation_resource_generation != operation_resource_generation_) {
-    return reject_value<ResourceSlotStopFenceResultDTO>(
-        "batch Stop fence names a stale operation-resource generation",
-        "operation_resource_generation_stale");
-  }
-  auto generation = require_generation_available_locked();
-  if (!generation.ok()) {
-    return Result<ResourceSlotStopFenceResultDTO>::Err(generation.error());
-  }
-
-  std::vector<std::vector<std::size_t>> owner_indices;
-  owner_indices.reserve(all_owners.size());
-  for (const auto& row : all_owners) {
-    owner_indices.emplace_back();
-    auto validation = validate_resource_set_locked(row.resources, owner_indices.back());
-    if (!validation.ok()) {
-      return Result<ResourceSlotStopFenceResultDTO>::Err(validation.error());
-    }
-    for (const auto index : owner_indices.back()) {
-      const auto& slot = slots_[index];
-      if (!slot.owner.has_value() || *slot.owner != row.expected_owner) {
-        return reject_value<ResourceSlotStopFenceResultDTO>(
-            "batch Stop fence owner does not match the resource slot", "resource_owner_mismatch");
-      }
-      const bool revision_only = std::any_of(
-          request.revision_only_owners.begin(), request.revision_only_owners.end(),
-          [&](const auto& companion) { return companion.expected_owner == row.expected_owner; });
-      if (!revision_only && slot.state != ResourceSlotState::kReserved &&
-          slot.state != ResourceSlotState::kDispatched &&
-          slot.state != ResourceSlotState::kTerminal) {
+  if (operation_resource_generation_ == std::numeric_limits<std::uint64_t>::max())
+    return "operation_resource_generation_exhausted";
+  // Validate every row before any slot changes; the claimed marks detect
+  // overlapping scopes and are cleared again on every return below.
+  scratch.slot_indices.clear();
+  const auto clear_claims = [&]() noexcept {
+    for (const auto slot_index : scratch.slot_indices) scratch.claimed[slot_index] = 0U;
+  };
+  for (const auto& row : rows) {
+    for (const auto& resource : row.resources) {
+      const auto slot =
+          std::lower_bound(slots_.begin(), slots_.end(), resource,
+                           [](const ResourceSlotSnapshotDTO& candidate, const ResourceId& id) {
+                             return candidate.resource_id < id;
+                           });
+      std::string_view refusal;
+      if (slot == slots_.end() || slot->resource_id != resource)
+        refusal = "resource_scope_unknown";
+      else if (scratch.claimed[static_cast<std::size_t>(slot - slots_.begin())] != 0U)
+        refusal = "resource_stop_fence_scope_overlap";
+      else if (!slot->owner.has_value() || *slot->owner != *row.expected_owner)
+        refusal = "resource_owner_mismatch";
+      else if (row.fence && slot->state != ResourceSlotState::kReserved &&
+               slot->state != ResourceSlotState::kDispatched &&
+               slot->state != ResourceSlotState::kTerminal)
         // A terminal observation does not prove that an in-flight provider
-        // call returned. The Kernel may still resolve this owned resource as
-        // effect-uncertain; its exact Stop fence must remain admissible.
-        return reject_value<ResourceSlotStopFenceResultDTO>(
-            "batch Stop fence owner is not reserved, dispatched or terminal",
-            "resource_stop_fence_state_invalid", ErrorCode::kInvalidStateTransition);
+        // call returned; its exact Stop fence must remain admissible.
+        refusal = "resource_stop_fence_state_invalid";
+      if (!refusal.empty()) {
+        clear_claims();
+        return refusal;
       }
-      if (!revision_only && request.stop_generation <= slot.stop_generation) {
-        return reject_value<ResourceSlotStopFenceResultDTO>(
-            "batch Stop generation does not advance the selected resource",
-            "resource_stop_generation_stale");
-      }
+      const auto slot_index = static_cast<std::size_t>(slot - slots_.begin());
+      scratch.claimed[slot_index] = 1U;
+      scratch.slot_indices.push_back(slot_index);
     }
   }
-
-  std::vector<std::size_t> orphan_indices;
-  if (!request.orphan_resources.empty()) {
-    auto validation = validate_resource_set_locked(request.orphan_resources, orphan_indices);
-    if (!validation.ok()) {
-      return Result<ResourceSlotStopFenceResultDTO>::Err(validation.error());
-    }
-    for (const auto index : orphan_indices) {
-      const auto& slot = slots_[index];
-      if (slot.state != ResourceSlotState::kUnreconciledExternalOrOrphanGoal ||
-          slot.owner.has_value()) {
-        return reject_value<ResourceSlotStopFenceResultDTO>(
-            "batch Stop orphan scope is not an unreconciled unowned resource",
-            "resource_stop_fence_orphan_state_invalid", ErrorCode::kInvalidStateTransition);
-      }
-      if (request.stop_generation <= slot.stop_generation) {
-        return reject_value<ResourceSlotStopFenceResultDTO>(
-            "batch Stop generation does not advance the orphan resource",
-            "resource_stop_generation_stale");
-      }
-    }
-  }
-
-  ResourceSlotStopFenceResultDTO result;
-  result.operation_resource_generation = operation_resource_generation_ + 1U;
-  result.stop_generation = request.stop_generation;
-  result.revised_owners.reserve(all_owners.size());
-  for (const auto& row : all_owners) {
-    auto revised = row.expected_owner;
-    revised.operation_revision = row.next_operation_revision;
-    result.revised_owners.push_back(std::move(revised));
-  }
-  result.orphan_resources = request.orphan_resources;
-
-  // All validation and every potentially throwing allocation/copy is complete.
-  // The remaining scalar writes cannot expose a partially accepted fence.
-  for (std::size_t row_index = 0U; row_index < all_owners.size(); ++row_index) {
-    for (const auto slot_index : owner_indices[row_index]) {
-      auto& slot = slots_[slot_index];
-      const bool fenced = std::any_of(request.owners.begin(), request.owners.end(),
-          [&](const auto& row) { return row.expected_owner == all_owners[row_index].expected_owner; });
-      if (fenced) {
+  // Scalar writes only: no partially accepted fence is observable.
+  std::size_t cursor = 0U;
+  for (const auto& row : rows) {
+    for (std::size_t count = 0U; count < row.resources.size(); ++count, ++cursor) {
+      auto& slot = slots_[scratch.slot_indices[cursor]];
+      if (row.fence) {
         slot.state = ResourceSlotState::kStopping;
-        slot.stop_generation = request.stop_generation;
+        slot.stop_event_id = stop_event_id;
       }
-      slot.owner->operation_revision = all_owners[row_index].next_operation_revision;
+      slot.owner->operation_revision = row.next_operation_revision;
     }
   }
-  for (const auto index : orphan_indices) {
-    slots_[index].stop_generation = request.stop_generation;
-  }
+  clear_claims();
   advance_generation_locked();
-  return Result<ResourceSlotStopFenceResultDTO>::Ok(std::move(result));
+  scratch.operation_resource_generation = operation_resource_generation_;
+  return std::nullopt;
+}
+
+bool ResourceSlotTable::owner_holds_any(const ResourceSlotOwnerDTO& owner,
+                                        const std::span<const ResourceId> resources) const noexcept {
+  std::lock_guard lock(data_mutex_);
+  for (const auto& resource : resources) {
+    const auto slot =
+        std::lower_bound(slots_.begin(), slots_.end(), resource,
+                         [](const ResourceSlotSnapshotDTO& candidate, const ResourceId& id) {
+                           return candidate.resource_id < id;
+                         });
+    if (slot != slots_.end() && slot->resource_id == resource && slot->owner.has_value() &&
+        slot->owner->operation_id == owner.operation_id &&
+        slot->owner->participant_id == owner.participant_id)
+      return true;
+  }
+  return false;
 }
 
 Result<void> ResourceSlotTable::release(const ResourceSlotOwnerDTO& owner,
@@ -911,72 +813,6 @@ Result<void> ResourceSlotTable::release_batch(
   return Result<void>::Ok();
 }
 
-Result<void> ResourceSlotTable::mark_unreconciled_external_or_orphan_goal(
-    const std::vector<ResourceId>& resources) {
-  std::lock_guard lock(data_mutex_);
-  std::vector<std::size_t> indices;
-  auto validation = validate_resource_set_locked(resources, indices);
-  if (!validation.ok()) {
-    return validation;
-  }
-  for (const auto index : indices) {
-    if (slots_[index].state != ResourceSlotState::kFree || slots_[index].owner.has_value()) {
-      return reject("only free unowned resources can become orphan-unreconciled",
-                    "resource_orphan_mark_state_invalid", ErrorCode::kInvalidStateTransition);
-    }
-  }
-  auto generation = require_generation_available_locked();
-  if (!generation.ok()) {
-    return generation;
-  }
-  for (const auto index : indices) {
-    slots_[index].state = ResourceSlotState::kUnreconciledExternalOrOrphanGoal;
-  }
-  advance_generation_locked();
-  return Result<void>::Ok();
-}
-
-Result<std::uint64_t> ResourceSlotTable::reconcile_unreconciled_external_or_orphan_goal(
-    const std::uint64_t expected_operation_resource_generation,
-    const std::vector<ResourceId>& resources) {
-  std::lock_guard lock(data_mutex_);
-  if (expected_operation_resource_generation != operation_resource_generation_) {
-    return Result<std::uint64_t>::Err(
-        ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
-                 "orphan-resource reconciliation names a stale slot-table generation",
-                 {{"reason", "resource_orphan_reconciliation_generation_stale"}}});
-  }
-  if (!std::is_sorted(resources.begin(), resources.end())) {
-    return Result<std::uint64_t>::Err(
-        ErrorDTO{std::string(to_string(ErrorCode::kInvalidRequest)),
-                 "orphan-resource reconciliation scope is not canonical",
-                 {{"reason", "resource_orphan_reconciliation_scope_noncanonical"}}});
-  }
-  std::vector<std::size_t> indices;
-  auto validation = validate_resource_set_locked(resources, indices);
-  if (!validation.ok()) {
-    return Result<std::uint64_t>::Err(validation.error());
-  }
-  for (const auto index : indices) {
-    if (slots_[index].state != ResourceSlotState::kUnreconciledExternalOrOrphanGoal ||
-        slots_[index].owner.has_value()) {
-      return Result<std::uint64_t>::Err(
-          ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
-                   "orphan-resource reconciliation requires an exact unowned orphan row",
-                   {{"reason", "resource_orphan_reconciliation_state_invalid"}}});
-    }
-  }
-  auto generation = require_generation_available_locked();
-  if (!generation.ok()) {
-    return Result<std::uint64_t>::Err(generation.error());
-  }
-  for (const auto index : indices) {
-    slots_[index].state = ResourceSlotState::kFree;
-  }
-  advance_generation_locked();
-  return Result<std::uint64_t>::Ok(operation_resource_generation_);
-}
-
 Result<void> ResourceSlotTable::reconfigure_runtime_inventory(
     std::vector<ResourceId> resources,
     std::vector<DomainActiveControlConfigurationDTO> active_control_configurations,
@@ -1037,7 +873,7 @@ Result<void> ResourceSlotTable::reconfigure_runtime_inventory(
       candidate_slots.push_back(*existing);
     } else {
       candidate_slots.push_back(ResourceSlotSnapshotDTO{
-          std::move(resource), ResourceSlotState::kFree, std::nullopt, StopGeneration(0U)});
+          std::move(resource), ResourceSlotState::kFree, std::nullopt, StopEventId(0U)});
     }
   }
   slots_ = std::move(candidate_slots);
@@ -1085,15 +921,10 @@ ResourceSlotAdmissionSnapshotDTO ResourceSlotTable::admission_snapshot(
       throw std::invalid_argument("affected resource admission scope is noncanonical");
     }
   }
-  std::set<OperationId> queued;
-  std::set<OperationId> active;
-  bool unreconciled_orphan_present = false;
+  std::set<OperationNumber> queued;
+  std::set<OperationNumber> active;
   for (const auto& slot : slots_) {
     if (!affected.contains(slot.resource_id)) {
-      continue;
-    }
-    if (slot.state == ResourceSlotState::kUnreconciledExternalOrOrphanGoal) {
-      unreconciled_orphan_present = true;
       continue;
     }
     if (!slot.owner.has_value()) {
@@ -1110,12 +941,12 @@ ResourceSlotAdmissionSnapshotDTO ResourceSlotTable::admission_snapshot(
   return ResourceSlotAdmissionSnapshotDTO{
       operation_resource_generation_, active_control_configurations_,
       route_published_active_control_configurations_, static_cast<std::uint64_t>(queued.size()),
-      static_cast<std::uint64_t>(active.size()) + (unreconciled_orphan_present ? 1U : 0U)};
+      static_cast<std::uint64_t>(active.size())};
 }
 
-std::vector<OperationId> ResourceSlotTable::active_operation_ids() const {
+std::vector<OperationNumber> ResourceSlotTable::active_operation_ids() const {
   std::lock_guard lock(data_mutex_);
-  std::vector<OperationId> operations;
+  std::vector<OperationNumber> operations;
   operations.reserve(slots_.size());
   for (const auto& slot : slots_) {
     if (slot.owner.has_value()) {

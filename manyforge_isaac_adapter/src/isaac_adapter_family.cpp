@@ -7,6 +7,7 @@
 #include <manyforge_isaac_adapter/isaac_backend_config.hpp>
 #include <manyforge_isaac_adapter/isaac_lane.hpp>
 #include <manyforge_roboplan/component_adapter_registry.hpp>
+#include <manyforge_roboplan/ros2_control_component_adapter.hpp>
 #include <manyforge_roboplan/ros2_control_lane_family.hpp>
 
 #include <optional>
@@ -21,9 +22,17 @@ namespace contract = manyforge::deployment::ros2_control_execution_runtime_contr
   return isaac::load_isaac_lane_settings(isaac::installed_isaac_lane_dir());
 }
 
-/// The lane adapter is the component's adapter: Isaac has no vendor steps.
+/// The lane adapter is the component's adapter: Isaac has no vendor steps. As an
+/// xArm machine's driver, an exited launch is started again by Prepare or
+/// Recover through the host's driver-restart entry.
 ComponentAdapters make_isaac_adapter(const ComponentAdapterContext &context) {
-  return {context.lane_adapter, {}, std::nullopt, std::nullopt};
+  if (!context.lane_adapter || !context.ros2_control || !context.restart_driver)
+    return {context.lane_adapter, {}, std::nullopt, std::nullopt};
+  return {std::make_shared<Ros2ControlDriverRestartAdapter>(
+              context.lane_adapter,
+              [handle = context.ros2_control] { return handle->ControllerLaunchExited(); },
+              context.restart_driver),
+          {}, std::nullopt, std::nullopt};
 }
 
 /// Every Isaac robot: the lane's topic-based hardware with its vendor's

@@ -124,7 +124,6 @@ TEST(ManualSchedulerTest, PriorityAdvanceLeavesOtherDueLanesPending) {
 TEST(StuckDrainWaitTest, DrainWithinBoundWritesNothing) {
   int calls = 0;
   int stuck_hooks = 0;
-  const char* before = FirstStuckDrainName();
   testing::internal::CaptureStderr();
   WaitForDrain(
       "test.drain", std::chrono::milliseconds(5),
@@ -137,32 +136,22 @@ TEST(StuckDrainWaitTest, DrainWithinBoundWritesNothing) {
   EXPECT_EQ(testing::internal::GetCapturedStderr(), "");
   EXPECT_EQ(calls, 1);
   EXPECT_EQ(stuck_hooks, 0);
-  EXPECT_EQ(FirstStuckDrainName(), before);
 }
 
 TEST(StuckDrainWaitTest, StuckDrainIsReportedOnceAndWaitedForInsteadOfTerminating) {
   int calls = 0;
   int stuck_hooks = 0;
-  const char* before = FirstStuckDrainName();
   testing::internal::CaptureStderr();
   WaitForDrain(
       "test.drain", std::chrono::milliseconds(5),
       [&](std::chrono::nanoseconds) { return ++calls == 4; },
       [&] {
         ++stuck_hooks;
-        ASSERT_NE(FirstStuckDrainName(), nullptr);
         throw 1;  // A failing evidence hook never stops the wait.
       });
   const auto output = testing::internal::GetCapturedStderr();
   EXPECT_EQ(calls, 4);
   EXPECT_EQ(stuck_hooks, 1);
-  const char* first = FirstStuckDrainName();
-  ASSERT_NE(first, nullptr);
-  if (before == nullptr) {
-    EXPECT_STREQ(first, "test.drain");
-  } else {
-    EXPECT_EQ(first, before);
-  }
   EXPECT_EQ(output,
             "manyforge_fault code=drain_stuck drain=test.drain bound_ms=5 "
             "state=waiting_for_operator\n"
@@ -174,7 +163,6 @@ TEST(StuckDrainWaitTest, StuckDrainIsReportedOnceAndWaitedForInsteadOfTerminatin
                [&](std::chrono::nanoseconds) { return ++later_calls == 2; });
   static_cast<void>(testing::internal::GetCapturedStderr());
   EXPECT_EQ(later_calls, 2);
-  EXPECT_EQ(FirstStuckDrainName(), first);
 }
 
 }  // namespace manyforge::core

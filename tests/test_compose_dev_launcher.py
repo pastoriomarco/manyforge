@@ -21,6 +21,10 @@ def _copy_retention_helper(launcher: Path) -> None:
     (target.parent / "workbench_session.py").write_text(
         (REPOSITORY_ROOT / "scripts/lib/workbench_session.py").read_text()
     )
+    # The session helper loads the shared run selection by file.
+    shared = launcher.parents[1] / "manyforge_operator/run_session.py"
+    shared.parent.mkdir(exist_ok=True)
+    shared.write_text((REPOSITORY_ROOT / "manyforge_operator/run_session.py").read_text())
 
 
 def _copy_writable_launcher(tmp_path: Path) -> Path:
@@ -498,7 +502,7 @@ def test_developer_start_forwards_explicit_site_settings(tmp_path: Path) -> None
     inputs.mkdir()
     site = inputs / "manyforge.site.json"
     site.write_text(
-        '{"schema":"manyforge.site.v1","device_addresses":{"lite6_main":"192.168.1.31"}}\n',
+        '{"schema":"manyforge.site.v2","device_addresses":{"lite6_main":"192.168.1.31"}}\n',
         encoding="utf-8",
     )
     environment = _fake_docker_environment(
@@ -528,6 +532,49 @@ def test_developer_start_forwards_explicit_site_settings(tmp_path: Path) -> None
         "sha256:test python3 scripts/dev-workbench.py serve "
         f"--site-settings {site}"
     )
+
+
+@pytest.mark.parametrize("variable, member", [
+    ("MANYFORGE_LOG_EVIDENCE_MAX_DISK_PERCENT", "disk_max_percent"),
+    ("MANYFORGE_LOG_EVIDENCE_MIN_FREE_BYTES", "disk_always_free_bytes"),
+])
+def test_start_refuses_the_removed_disk_variables(tmp_path: Path, variable: str, member: str) -> None:
+    completed, environment = _run_launcher(
+        tmp_path, "start", FAKE_CONTAINER_PRESENT="false", MANYFORGE_DEV_IMAGE="sha256:test",
+        **{variable: "10"},
+    )
+    assert completed.returncode == 64
+    assert (f"{variable} is no longer read: set {member} in the site settings file "
+            "(MANYFORGE_DEV_SITE_SETTINGS) and unset the variable") in completed.stderr
+    # Refused before Docker is asked anything.
+    assert not Path(environment["FAKE_DOCKER_CALLS"]).exists()
+
+
+@pytest.mark.parametrize("contents, accepted", [
+    ({"schema": "manyforge.site.v1", "device_addresses": {}}, True),
+    ({"schema": "manyforge.site.v2", "disk_max_percent": 100, "disk_always_free_bytes": 0,
+      "disk_machine_minimum_bytes": 0}, True),
+    ({"schema": "manyforge.site.v1", "disk_always_free_bytes": 0}, False),
+])
+def test_start_reads_the_site_file_versions_and_disk_limits(tmp_path: Path, contents: dict, accepted: bool) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    site = tmp_path / "manyforge.site.json"
+    site.write_text(json.dumps(contents))
+    environment = _fake_docker_environment(
+        tmp_path, FAKE_WORKSPACE=str(launcher.parents[1]),
+        MANYFORGE_DEV_IMAGE="sha256:test", FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_SITE_SETTINGS=str(site),
+    )
+    completed = subprocess.run(
+        ["bash", str(launcher), "start"], cwd=launcher.parents[1],
+        env=environment, capture_output=True, text=True, check=False,
+    )
+    if accepted:
+        assert completed.returncode == 0, completed.stderr
+    else:
+        assert completed.returncode == 64
+        assert ("project_folder_invalid: site settings disk_always_free_bytes needs schema manyforge.site.v2: "
+                "change the first line's schema to manyforge.site.v2; no other change is needed") in completed.stderr
 
 
 @pytest.mark.parametrize("setting", ["relative/site.json", "/missing/manyforge.site.json"])
@@ -575,7 +622,7 @@ def test_start_mounts_external_project_folders_with_stable_composer_roots(tmp_pa
     for folder in folders:
         folder.mkdir(parents=True)
     site = tmp_path / "manyforge.site.json"
-    site.write_text(json.dumps({"schema": "manyforge.site.v1", "project_folders": list(map(str, folders))}))
+    site.write_text(json.dumps({"schema": "manyforge.site.v2", "project_folders": list(map(str, folders))}))
     environment = _fake_docker_environment(
         tmp_path,
         FAKE_WORKSPACE=str(launcher.parents[1]),
@@ -608,7 +655,7 @@ def test_start_mounts_external_project_folders_with_stable_composer_roots(tmp_pa
 def test_start_accepts_site_without_project_folders(tmp_path: Path) -> None:
     launcher = _copy_writable_launcher(tmp_path)
     site = tmp_path / "manyforge.site.json"
-    site.write_text(json.dumps({"schema": "manyforge.site.v1", "device_addresses": {}}))
+    site.write_text(json.dumps({"schema": "manyforge.site.v2", "device_addresses": {}}))
     environment = _fake_docker_environment(
         tmp_path, FAKE_WORKSPACE=str(launcher.parents[1]),
         MANYFORGE_DEV_IMAGE="sha256:test", FAKE_CONTAINER_PRESENT="false",
@@ -630,7 +677,7 @@ def test_start_accepts_site_without_project_folders(tmp_path: Path) -> None:
 def test_start_refuses_unavailable_project_folders(tmp_path: Path, folder: str) -> None:
     launcher = _copy_writable_launcher(tmp_path)
     site = tmp_path / "manyforge.site.json"
-    site.write_text(json.dumps({"schema": "manyforge.site.v1", "project_folders": [folder]}))
+    site.write_text(json.dumps({"schema": "manyforge.site.v2", "project_folders": [folder]}))
     environment = _fake_docker_environment(
         tmp_path,
         FAKE_WORKSPACE=str(launcher.parents[1]),
@@ -658,7 +705,7 @@ def test_start_refuses_project_folder_names_unsupported_by_root_encoding(
     folder = tmp_path / name
     folder.mkdir()
     site = tmp_path / "manyforge.site.json"
-    site.write_text(json.dumps({"schema": "manyforge.site.v1", "project_folders": [str(folder)]}))
+    site.write_text(json.dumps({"schema": "manyforge.site.v2", "project_folders": [str(folder)]}))
     environment = _fake_docker_environment(
         tmp_path,
         FAKE_WORKSPACE=str(launcher.parents[1]),
@@ -683,7 +730,7 @@ def test_start_refuses_colon_in_project_folder_parent(tmp_path: Path) -> None:
     folder = tmp_path / "parent:one" / "projects"
     folder.mkdir(parents=True)
     site = tmp_path / "manyforge.site.json"
-    site.write_text(json.dumps({"schema": "manyforge.site.v1", "project_folders": [str(folder)]}))
+    site.write_text(json.dumps({"schema": "manyforge.site.v2", "project_folders": [str(folder)]}))
     environment = _fake_docker_environment(
         tmp_path, FAKE_WORKSPACE=str(launcher.parents[1]),
         MANYFORGE_DEV_IMAGE="sha256:test", FAKE_CONTAINER_PRESENT="false",
@@ -702,8 +749,8 @@ def test_start_refuses_colon_in_project_folder_parent(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("contents", [
     "{invalid json", "[]", "{}", '{"schema": "wrong"}',
-    '{"schema": "manyforge.site.v1", "unknown": true}',
-    '{"schema": "manyforge.site.v1", "project_folders": "not-a-list"}',
+    '{"schema": "manyforge.site.v2", "unknown": true}',
+    '{"schema": "manyforge.site.v2", "project_folders": "not-a-list"}',
 ])
 def test_start_refuses_invalid_project_folder_site_settings(tmp_path: Path, contents: str) -> None:
     launcher = _copy_writable_launcher(tmp_path)
@@ -733,7 +780,7 @@ def test_start_refuses_duplicate_project_folders(tmp_path: Path) -> None:
     folder.mkdir()
     site = tmp_path / "manyforge.site.json"
     site.write_text(json.dumps({
-        "schema": "manyforge.site.v1", "project_folders": [str(folder), str(folder)],
+        "schema": "manyforge.site.v2", "project_folders": [str(folder), str(folder)],
     }))
     environment = _fake_docker_environment(
         tmp_path, FAKE_WORKSPACE=str(launcher.parents[1]),
@@ -782,7 +829,7 @@ def test_cold_start_requires_no_overlapping_live_bind_before_session_rotation(tm
         # No overlapping mount is present. A genuinely fresh root needs no
         # predecessor proof; nonempty unknown legacy roots remain protected.
         assert (root / "current/session.json").is_file()
-        assert not (root / "previous-sessions").exists()
+        assert not (root / "previous-runs").exists()
     else:
         assert result.returncode == 69
         assert "overlapping live ManyForge state root" in result.stderr
@@ -1093,9 +1140,11 @@ def test_older_default_root_retry_uses_aggregate_accounting_from_actual_mount(tm
             "container_id":"c"*64,"image":"sha256:"+"e"*64,"manyforge_export_kind":"console_tail",
             "state":{"running":False},"mounts":[{"Type":"bind","Source":str(current_root),"Destination":"/tmp/manyforge-state"},
                 {"Type":"bind","Source":str(REPOSITORY_ROOT),"Destination":"/workspace"}]}))
+    site = tmp_path / "manyforge.site.json"
+    site.write_text(json.dumps({"schema": "manyforge.site.v2", "disk_always_free_bytes": 2**53 - 1}))
     completed, environment = _run_launcher(tmp_path, "stop", FAKE_ACTUAL_STATE_ROOT=str(current_root),
         FAKE_LOGS_FAIL="true", FAKE_OLDER_LOGS_FAIL="false",
-        MANYFORGE_LOG_EVIDENCE_MIN_FREE_BYTES=str(2**60), **settings)
+        MANYFORGE_DEV_SITE_SETTINGS=str(site), **settings)
     assert completed.returncode == 69
     assert "capture succeeded" in completed.stderr
     assert "default-root aggregate log/evidence pressure" in completed.stderr
@@ -1217,8 +1266,10 @@ def test_start_completes_mounted_stopped_predecessor_capture_and_preserves_durab
     fake = fake.replace('    : > "$FAKE_DOCKER_STARTED"',
         '    rm -f -- "$FAKE_DOCKER_STOPPED"\n    : > "$FAKE_DOCKER_STARTED"')
     docker.write_text(fake)
-    durable = root/'execution-state/operation-journal.sqlite3'
-    durable.parent.mkdir()
+    # The predecessor's owner data in its session folder (the pre-session
+    # root layout is no longer migrated, OD-276).
+    durable = root/'current/execution-state/operation-journal.sqlite3'
+    durable.parent.mkdir(parents=True)
     durable.write_bytes(b'owner journal')
     before = durable.read_bytes()
     partial = root/'evidence'/('.mounted-'+'d'*64+'.partial')
@@ -1236,7 +1287,7 @@ def test_start_completes_mounted_stopped_predecessor_capture_and_preserves_durab
     calls = Path(environment['FAKE_DOCKER_CALLS']).read_text().splitlines()
     position = lambda command: next(index for index, call in enumerate(calls) if call.startswith(command+' '))
     assert position('stop') < position('logs') < position('rm') < position('run --rm') < position('run -d')
-    archived = list((root / "previous-sessions").iterdir())
+    archived = list((root / "previous-runs").iterdir())
     assert len(archived) == 1
     archived_durable = archived[0] / "execution-state/operation-journal.sqlite3"
     assert archived_durable.read_bytes() == before and not partial.exists()

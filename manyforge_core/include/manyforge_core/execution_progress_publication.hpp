@@ -89,11 +89,17 @@ class ExecutionProgressPublication final {
       std::uint64_t execution_generation) noexcept;
 
   /// Read existing hazard authority for one exact generation. Nullopt means
-  /// another/no generation; this never claims or clears authority. Handover
-  /// callers serialize this read through publication with the same Kernel
-  /// protection lock used by claim_hazard_authority.
+  /// another/no generation; this never claims or clears authority. One load
+  /// of the hazard word; no lock.
   [[nodiscard]] std::optional<bool> hazard_authority_claimed(
       std::uint64_t execution_generation) const noexcept;
+
+  /// The take-over's "decide" step (OD-175 D2): one compare-and-swap of this
+  /// generation's word from open to closed, taking no lock. False when the
+  /// generation was claimed (the claim won) or is not the current one. Once
+  /// closed, a claim of this generation reports a generation mismatch, and
+  /// only a newer generation's publication opens the word again.
+  [[nodiscard]] bool close_hazard_authority(std::uint64_t execution_generation) noexcept;
 
   /// Lifecycle-bound invalidation is guaranteed, not best effort, and retires
   /// the current generation. Readers see either the preceding complete even
@@ -143,6 +149,8 @@ class ExecutionProgressPublication final {
   };
   // Writer-only; requires writer_mutex_.
   void store_locked() noexcept;
+  // Writer-only; requires writer_mutex_: a claimed word back to open.
+  void release_hazard_claim_locked() noexcept;
 
   const ExecutionProgressSourceKind source_kind_;
   const ExecutionProgressAuthorityProfile authority_profile_;
@@ -150,7 +158,12 @@ class ExecutionProgressPublication final {
   const std::int64_t freshness_budget_ns_;
 
   mutable std::mutex writer_mutex_;
-  bool hazard_authority_claimed_ = false;
+  /// Hazard authority of one generation (OD-175 D2): the generation shifted
+  /// left by two bits, the state (open, claimed, closed) in the low bits.
+  /// Every writer but `close_hazard_authority` holds `writer_mutex_`; the
+  /// close changes it only by compare-and-swap, so a claim and the close of
+  /// one generation linearise on this word and exactly one of them wins.
+  std::atomic<std::uint64_t> hazard_word_{0U};
   std::uint64_t next_sequence_ = 1;
   Cursor current_;
   Slot slots_[2];

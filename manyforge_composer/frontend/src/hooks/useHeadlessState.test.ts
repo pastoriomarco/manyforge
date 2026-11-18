@@ -3,12 +3,12 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import localDeltaFixture from '../../../../manyforge_headless_api/tests/fixtures/control-v2-local-delta.json';
 
 import type { ComposerHeadlessState } from '../types/headless';
+import { parseComposerHeadlessState } from '../api/parsers/headless';
 import { deriveTransportGuidance } from '../components/ProgramRuntimePanel';
 import {
   HEADLESS_SHELL_PUBLICATION_MS,
   HeadlessStateSource,
   admitHeadlessState,
-  executionCommandPayload,
   getHeadlessStateQualificationSnapshot,
   parseExecutionObservationFrame,
   sameShellPublication,
@@ -18,9 +18,14 @@ import {
   useViewerHeadlessState,
 } from './useHeadlessState';
 
+/** The application-start id `A` of the test start. */
+const TEST_START_ID = '3f9a0000000000a1';
+/** The `A` of a later application start. */
+const NEXT_START_ID = '3f9a0000000000a2';
+
 function componentOverview(): ComposerHeadlessState['componentOverview'] {
   return {
-    schemaVersion: 'manyforge.component_overview.v2',
+    schemaVersion: 'manyforge.component_overview.v3',
     overviewRevision: `sha256:${'a'.repeat(64)}`,
     readiness: 'ready',
     summaryLabel: 'Application surfaces ready',
@@ -31,43 +36,36 @@ function componentOverview(): ComposerHeadlessState['componentOverview'] {
     components: [],
     maintenanceOperation: null,
     basis: {
-      runtimeProjectionOwnerEpoch: null,
       runtimeProjectionGeneration: null,
-      managerSourceOwnerEpoch: null,
-      logicalSceneSourceOwnerEpoch: null,
       logicalSceneSourceGeneration: null,
-      sceneRuntimeSourceOwnerEpoch: null,
       sceneRuntimeSourceGeneration: null,
-      alarmOwnerEpoch: null,
       alarmGeneration: null,
       alarmStateRevision: null,
       admissionGeneration: null,
-      programRunnerOwnerEpoch: null,
       programCycleGeneration: null,
-      appliedProgramOwnerEpoch: null,
       appliedProgramGeneration: null,
-      executionOwnerEpoch: null,
       executionPublicationGeneration: null,
     },
   };
 }
 
+// The owner labels name the case only; no snapshot member carries them.
 function state(
-  runtimeEpoch: string,
+  _runtimeLabel: string,
   runtimeGeneration: number,
-  alarmEpoch = 'alarms.epoch.1',
+  _alarmLabel = 'alarms.epoch.1',
   alarmGeneration = 3,
   alarmStateRevision = alarmGeneration,
 ): ComposerHeadlessState {
   return {
-    schemaVersion: 'manyforge.composer_headless_state.v2',
+    schemaVersion: 'manyforge.composer_headless_state.v4',
+    applyCommands: { inProgress: null, ended: [] },
     complete: true,
     executionControlStatus: null,
     componentOverview: componentOverview(),
     authoringAdmission: { authoringAllowed: true, admissionGeneration: 1 },
     heldRunDraftEditAllowed: false,
     programCycle: {
-      programRunnerOwnerEpoch: 'runner.epoch.1',
       cycleGeneration: 1,
       state: 'idle_after_reset',
       programRunId: null,
@@ -77,10 +75,9 @@ function state(
       nodeStatusRevision: null,
       runtimeControlRevision: null,
       executionControlRevision: 1,
-      causalCorrelationId: null,
-      causalSessionId: null,
-      causalClientSequence: null,
-      currentCommandKind: null,
+      causalRequestKey: null,
+      causalDisplay: null,
+      currentCommandKind: null, runnerCommands: { inProgress: null, ended: [] },
       failure: null,
       resetPhase: null, resetOptions: null,
       resetRobotPosition: { available: false, reason: 'unsupported' },
@@ -97,14 +94,13 @@ function state(
       deploymentDraftRevision: 1,
     },
     authoringWorkspaceContainment: null,
-    receiverEpoch: runtimeEpoch,
+    applicationStartId: TEST_START_ID,
     snapshotSequence: Math.max(1, runtimeGeneration),
     runtime: {
-      schemaVersion: 'manyforge.headless_runtime_snapshot.v1',
+      schemaVersion: 'manyforge.headless_runtime_snapshot.v3',
       activeConfiguration: null,
       complete: true,
       projectionGeneration: runtimeGeneration,
-      projectionOwnerEpoch: runtimeEpoch,
       projectionOwnerId: 'headless.owner',
       reasons: [],
       unavailableSections: [],
@@ -115,7 +111,6 @@ function state(
           knownGaps: [],
           payload: {},
           sourceGeneration: 1,
-          sourceOwnerEpoch: 'manager.epoch.1',
           sourceOwnerId: 'manager.owner',
           receiverAgeNs: 1,
         },
@@ -125,7 +120,6 @@ function state(
           knownGaps: [],
           payload: {},
           sourceGeneration: 1,
-          sourceOwnerEpoch: 'scene.epoch.1',
           sourceOwnerId: 'scene.owner',
           receiverAgeNs: 1,
         },
@@ -135,16 +129,14 @@ function state(
           knownGaps: [],
           payload: {},
           sourceGeneration: 1,
-          sourceOwnerEpoch: 'runtime.epoch.1',
           sourceOwnerId: 'runtime.owner',
           receiverAgeNs: 1,
         },
       },
     },
     alarms: {
-      schemaVersion: 'manyforge.operator_alarm_snapshot.v2',
+      schemaVersion: 'manyforge.operator_alarm_snapshot.v3',
       ownerId: 'alarm.owner',
-      ownerEpoch: alarmEpoch,
       generation: alarmGeneration,
       stateRevision: alarmStateRevision,
       reconciled: true,
@@ -253,25 +245,6 @@ function sceneRuntimePayload(sample: number) {
 }
 
 describe('Headless owner-frame admission', () => {
-  it('copies the current native owner fence only onto native commands', () => {
-    expect(executionCommandPayload(
-      'runtime_scale',
-      { scale: 0.25 },
-      'kernel.epoch.4',
-    )).toEqual({
-      scale: 0.25,
-      expected_execution_owner_epoch: 'kernel.epoch.4',
-    });
-    const programPayload = { scenario_id: 'lite6' };
-    expect(executionCommandPayload(
-      'program_run',
-      programPayload,
-      null,
-    )).toBe(programPayload);
-    expect(() => executionCommandPayload('operation_stop', {}, null))
-      .toThrow('Execution owner identity is unavailable.');
-  });
-
   it('publishes owner runtime-control revisions without invalidating the viewer', () => {
     const current = state('receiver.epoch.1', 2);
     const next = structuredClone(current);
@@ -382,7 +355,7 @@ describe('Headless owner-frame admission', () => {
     diagnostic.runtime.sections.logicalScene.sourceGeneration = 7;
     // Unchanged domains keep their identity in a merged delta.
     for (const name of [
-      'alarms', 'componentOverview', 'programCycle', 'authoringAdmission',
+      'alarms', 'componentOverview', 'programCycle', 'applyCommands', 'authoringAdmission',
       'authoringWorkspace', 'executionControlStatus',
     ] as const) {
       (diagnostic as unknown as Record<string, unknown>)[name] = current[name];
@@ -486,13 +459,10 @@ describe('Headless owner-frame admission', () => {
     later.runtime.sections.logicalScene.sourceGeneration = 5;
     expect(sameViewerIdentity(current, later)).toBe(true);
     for (const change of [
-      (next: ComposerHeadlessState) => { next.receiverEpoch = 'receiver.epoch.2'; },
-      (next: ComposerHeadlessState) => { next.runtime.projectionOwnerEpoch = 'other'; },
+      (next: ComposerHeadlessState) => { next.applicationStartId = NEXT_START_ID; },
+      (next: ComposerHeadlessState) => { next.runtime.projectionOwnerId = 'other'; },
       (next: ComposerHeadlessState) => {
-        next.runtime.sections.logicalScene.sourceOwnerEpoch = 'scene.epoch.2';
-      },
-      (next: ComposerHeadlessState) => {
-        next.runtime.sections.manager.sourceOwnerEpoch = 'manager.epoch.2';
+        next.runtime.sections.manager.sourceOwnerId = 'manager.owner.2';
       },
       (next: ComposerHeadlessState) => {
         next.runtime.sections.manager.payload = {
@@ -510,7 +480,7 @@ describe('Headless owner-frame admission', () => {
     const current = state('receiver.epoch.1', 2);
     for (const change of [
       { available: false }, { freshness: 'stale' as const },
-      { knownGaps: ['lost_update'] }, { sourceOwnerEpoch: 'manager.epoch.2' },
+      { knownGaps: ['lost_update'] },
       { sourceOwnerId: 'other.manager' }, { sourceGeneration: null },
     ]) {
       const next = structuredClone(current);
@@ -519,15 +489,17 @@ describe('Headless owner-frame admission', () => {
     }
   });
 
-  it('accepts forward stream frames and a replacement receiver epoch', () => {
+  it('accepts forward stream frames and a new application start', () => {
     expect(admitHeadlessState(null, state('runtime.epoch.1', 2)).accepted).toBe(true);
     expect(admitHeadlessState(
       state('runtime.epoch.1', 2),
       state('runtime.epoch.1', 3),
     ).accepted).toBe(true);
+    const nextStart = state('runtime.epoch.2', 0, 'alarms.epoch.2', 0);
+    nextStart.applicationStartId = NEXT_START_ID;
     expect(admitHeadlessState(
       state('runtime.epoch.1', 20, 'alarms.epoch.1', 30),
-      state('runtime.epoch.2', 0, 'alarms.epoch.2', 0),
+      nextStart,
     ).accepted).toBe(true);
   });
 
@@ -559,6 +531,36 @@ describe('Headless owner-frame admission', () => {
       expect(admitHeadlessState(current, state('runtime.epoch.2', 99)).accepted)
         .toBe(true);
     });
+
+  it('resynchronizes on a new application start and orders snapshots within one start', () => {
+    const current = state('runtime.epoch.1', 5);
+    // Same start: a lower snapshot sequence is a regression.
+    const older = state('runtime.epoch.1', 4);
+    expect(admitHeadlessState(current, older)).toEqual({
+      accepted: false,
+      reason: 'Headless snapshot sequence regressed.',
+    });
+    // A new start (different `A`) is accepted at once, whatever its sequence.
+    const restarted = state('runtime.epoch.1', 1);
+    restarted.applicationStartId = NEXT_START_ID;
+    expect(admitHeadlessState(current, restarted)).toEqual({ accepted: true, reason: null });
+    // A new start with a changed workspace at an equal sequence is accepted too.
+    const sameSequence = state('runtime.epoch.1', 5);
+    sameSequence.applicationStartId = NEXT_START_ID;
+    sameSequence.authoringWorkspace = {
+      ...sameSequence.authoringWorkspace,
+      workspaceRevision: sameSequence.authoringWorkspace.workspaceRevision + 1,
+    };
+    expect(admitHeadlessState(current, sameSequence).accepted).toBe(true);
+  });
+});
+
+describe('Composer headless state version', () => {
+  it('parses the current version and refuses the receiver-epoch version 2', () => {
+    expect(parseComposerHeadlessState(wireState(1)).applicationStartId).toBe(TEST_START_ID);
+    const previous = { ...wireState(1), schema_version: 'manyforge.composer_headless_state.v2' };
+    expect(() => parseComposerHeadlessState(previous)).toThrow();
+  });
 });
 
 function wireState(generation: number): Record<string, unknown> {
@@ -568,14 +570,13 @@ function wireState(generation: number): Record<string, unknown> {
     known_gaps: [],
     payload: {},
     source_generation: generation,
-    source_owner_epoch: 'source.epoch.1',
     source_owner_id: 'source.owner',
     receiver_age_ns: 1,
   };
   return {
-    schema_version: 'manyforge.composer_headless_state.v2',
+    schema_version: 'manyforge.composer_headless_state.v4',
     component_overview: {
-      schema_version: 'manyforge.component_overview.v2',
+      schema_version: 'manyforge.component_overview.v3',
       overview_revision: `sha256:${'a'.repeat(64)}`,
       readiness: 'ready',
       summary_label: 'Application surfaces ready',
@@ -586,22 +587,14 @@ function wireState(generation: number): Record<string, unknown> {
       components: [],
       maintenance_operation: null,
       basis: {
-        runtime_projection_owner_epoch: null,
         runtime_projection_generation: null,
-        manager_source_owner_epoch: null,
-        logical_scene_source_owner_epoch: null,
         logical_scene_source_generation: null,
-        scene_runtime_source_owner_epoch: null,
         scene_runtime_source_generation: null,
-        alarm_owner_epoch: null,
         alarm_generation: null,
         alarm_state_revision: null,
         admission_generation: null,
-        program_runner_owner_epoch: null,
         program_cycle_generation: null,
-        applied_program_owner_epoch: null,
         applied_program_generation: null,
-        execution_owner_epoch: null,
         execution_publication_generation: null,
       },
     },
@@ -609,8 +602,8 @@ function wireState(generation: number): Record<string, unknown> {
     held_run_draft_edit_allowed: false,
     execution_targets: null,
     execution_control_state: null,
+    apply_commands: { in_progress: null, ended: [] },
     program_cycle: {
-      program_runner_owner_epoch: 'runner.epoch.1',
       cycle_generation: 1,
       state: 'idle_after_reset',
       program_run_id: null,
@@ -620,10 +613,9 @@ function wireState(generation: number): Record<string, unknown> {
       node_status_revision: null,
       runtime_control_revision: null,
       execution_control_revision: Math.max(1, generation),
-      causal_correlation_id: null,
-      causal_session_id: null,
-      causal_client_sequence: null,
+      causal_request_key: null,
       current_command_kind: null,
+      runner_commands: { in_progress: null, ended: [] },
       failure: null,
       reset_phase: null, reset_options: null,
       reset_robot_position: { available: false, reason: 'unsupported' },
@@ -641,14 +633,14 @@ function wireState(generation: number): Record<string, unknown> {
       deployment_draft_revision: 1,
     },
     authoring_workspace_containment: null,
-    receiver_epoch: 'receiver.epoch.1',
+    application_start_id: TEST_START_ID,
     snapshot_sequence: Math.max(1, generation + 1),
     complete: true,
     runtime: {
-      schema_version: 'manyforge.headless_runtime_snapshot.v1',
+      schema_version: 'manyforge.headless_runtime_snapshot.v3',
+      application_start_id: TEST_START_ID,
       complete: true,
       projection_generation: generation,
-      projection_owner_epoch: 'runtime.epoch.1',
       projection_owner_id: 'headless.owner',
       reasons: [],
       unavailable_sections: [],
@@ -659,9 +651,8 @@ function wireState(generation: number): Record<string, unknown> {
       },
     },
     alarms: {
-      schema_version: 'manyforge.operator_alarm_snapshot.v2',
+      schema_version: 'manyforge.operator_alarm_snapshot.v3',
       owner_id: 'alarm.owner',
-      owner_epoch: 'alarms.epoch.1',
       generation,
       state_revision: generation,
       reconciled: true,
@@ -684,11 +675,22 @@ type ControlTestSocket = {
   testServerSequence?: number;
 };
 
-const CONTROL_SESSION_ID = 'control-session.test-1';
+const CONTROL_SESSION_NUMBER = 1;
 
 function nextControlServerSequence(socket: ControlTestSocket): string {
   socket.testServerSequence = (socket.testServerSequence ?? 0) + 1;
   return String(socket.testServerSequence);
+}
+
+/**
+ * The key an HTTP receipt echoes: Headless sets byte 0 (class 3, part 0)
+ * and keeps the client's bytes 1-15.
+ */
+function echoedRequestKey(request: RequestInit | undefined): string {
+  const body = JSON.parse(String(request?.body)) as {
+    payload: { request_key: string };
+  };
+  return `c0${body.payload.request_key.slice(2)}`;
 }
 
 function receiveControl(socket: ControlTestSocket, value: unknown): void {
@@ -698,8 +700,6 @@ function receiveControl(socket: ControlTestSocket, value: unknown): void {
 function controlFreshness(revision: number): Record<string, unknown> {
   return {
     context_id: `freshness.${revision}`,
-    receiver_incarnation: 'headless.receiver.1',
-    semantic_owner_epoch: 'runner.epoch.1',
     execution_control_revision: Math.max(1, revision),
     issued_server_sequence: String(Math.max(1, revision)),
     valid_for_ns: 750_000_000,
@@ -708,14 +708,14 @@ function controlFreshness(revision: number): Record<string, unknown> {
 
 function synchronizeControl(
   socket: ControlTestSocket,
-  sessionId = CONTROL_SESSION_ID,
+  sessionNumber = CONTROL_SESSION_NUMBER,
 ): void {
   socket.testServerSequence = 0;
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v2',
+    schema_version: 'manyforge.execution_control.v4',
     message_kind: 'server_hello',
-    receiver_incarnation: 'headless.receiver.1',
-    control_session_id: sessionId,
+    application_start_id: TEST_START_ID,
+    control_session_number: sessionNumber,
     heartbeat_period_ns: 250_000_000,
     heartbeat_delayed_ns: 500_000_000,
     heartbeat_stale_ns: 1_000_000_000,
@@ -723,9 +723,9 @@ function synchronizeControl(
     maximum_messages_per_second: 64,
   });
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v2',
+    schema_version: 'manyforge.execution_control.v4',
     message_kind: 'heartbeat_challenge',
-    control_session_id: sessionId,
+    control_session_number: sessionNumber,
     server_sequence: nextControlServerSequence(socket),
     challenge_sequence: '1',
     received_client_sequence: null,
@@ -734,9 +734,9 @@ function synchronizeControl(
     freshness: controlFreshness(1),
   });
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v2',
+    schema_version: 'manyforge.execution_control.v4',
     message_kind: 'heartbeat_challenge',
-    control_session_id: sessionId,
+    control_session_number: sessionNumber,
     server_sequence: nextControlServerSequence(socket),
     challenge_sequence: '2',
     received_client_sequence: '1',
@@ -750,13 +750,13 @@ function receiveHeartbeat(
   socket: ControlTestSocket,
   challenge: number,
   receivedClientSequence: string,
-  sessionId = CONTROL_SESSION_ID,
+  sessionNumber = CONTROL_SESSION_NUMBER,
   controlRevision = 1,
 ): void {
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v2',
+    schema_version: 'manyforge.execution_control.v4',
     message_kind: 'heartbeat_challenge',
-    control_session_id: sessionId,
+    control_session_number: sessionNumber,
     server_sequence: nextControlServerSequence(socket),
     challenge_sequence: String(challenge),
     received_client_sequence: receivedClientSequence,
@@ -769,22 +769,20 @@ function receiveHeartbeat(
 function receiveControlSnapshot(
   socket: ControlTestSocket,
   shell: Record<string, unknown>,
-  sessionId = CONTROL_SESSION_ID,
+  sessionNumber = CONTROL_SESSION_NUMBER,
   receivedClientSequence = '2',
 ): void {
   const cycle = shell.program_cycle as Record<string, unknown>;
   const revision = cycle.execution_control_revision as number;
   const serverSequence = nextControlServerSequence(socket);
   receiveControl(socket, {
-    schema_version: 'manyforge.execution_control.v2',
+    schema_version: 'manyforge.execution_control.v4',
     message_kind: 'snapshot',
-    control_session_id: sessionId,
+    control_session_number: sessionNumber,
     server_sequence: serverSequence,
     state_sequence: serverSequence,
     received_client_sequence: receivedClientSequence,
     control: {
-      receiver_incarnation: 'headless.receiver.1',
-      semantic_owner_epoch: 'runner.epoch.1',
       execution_control_revision: revision,
       freshness: controlFreshness(revision),
     },
@@ -795,8 +793,8 @@ function receiveControlSnapshot(
 
 function wireObservation(sequence: number): Record<string, unknown> {
   return {
-    schema_version: 'manyforge.execution_observation_frame.v4',
-    owner_epoch: 'execution-owner.1',
+    schema_version: 'manyforge.execution_observation_frame.v5',
+    application_start_id: 'execution-owner.1',
     cell_id: 'cell-1',
     retained_bundle_id: 'bundle-1',
     graph_revision: 'graph-1',
@@ -958,8 +956,7 @@ describe('zero-physical-component viewer demand', () => {
     viewer.receive(wireObservation(1));
     source.markExecutionObservationApplied(source.getLatestExecutionObservation()!);
     const applied = {
-      owner_epoch: 'execution-owner.1', source_epoch: 'joint-source.1',
-      source_sequence: 1, delivery_sequence: 1,
+      source_epoch: 'joint-source.1', source_sequence: 1, delivery_sequence: 1,
     };
     expect(JSON.parse(viewer.sent.at(-1)!)).toMatchObject({ last_applied: applied, pose_rate_hz: 25 });
     source.setViewerPoseRateHz(5);
@@ -1094,7 +1091,7 @@ describe('zero-physical-component viewer demand', () => {
     vi.advanceTimersByTime(1000);
     const replacement = Socket.instances
       .filter((socket) => new URL(socket.url).pathname === '/ws/control')[1]!;
-    synchronizeControl(replacement, 'control-session.test-2');
+    synchronizeControl(replacement, 2);
     expect(transitions(replacement)).toEqual([
       expect.objectContaining({ phase: 'resolved', incident_id: incidentId }),
     ]);
@@ -1103,7 +1100,7 @@ describe('zero-physical-component viewer demand', () => {
     vi.advanceTimersByTime(1000);
     const third = Socket.instances
       .filter((socket) => new URL(socket.url).pathname === '/ws/control')[2]!;
-    synchronizeControl(third, 'control-session.test-3');
+    synchronizeControl(third, 3);
     expect(transitions(third)).toEqual([]);
     source.dispose();
   });
@@ -1158,15 +1155,14 @@ describe('zero-physical-component viewer demand', () => {
 });
 
 describe('HeadlessStateSource delivery scheduling', () => {
+  // Execute answers at acceptance (OD-214): a failure after it is the row's
+  // end, never the reply; a refusal before it is a known outcome.
   it.each([
-    [422, 'program_run_started_then_failed', 'Run failed:', true, false],
-    [422, 'program_run_superseded_by_stop', 'Run stopped. Reset required', true, false],
-    [409, 'program_run_stopped_before_start', 'Run stopped before start. Reset required', true, false],
-    [503, 'program_cycle_reconciliation_required', 'Command delivery is unconfirmed', false, false],
-    [500, 'program_runner_internal_error', 'Command delivery is unconfirmed', false, false],
-    [422, 'program_run_started_then_failed', 'Run outcome could not be read', true, true],
-  ] as const)('distinguishes known Run outcomes from unknown delivery for HTTP %s/%s', async (
-    status, code, message, confirmed, malformed,
+    [409, 'execution_control_ingress_busy', 'Another command in progress', true],
+    [503, 'program_cycle_reconciliation_required', 'Command delivery is unconfirmed', false],
+    [500, 'program_runner_internal_error', 'Command delivery is unconfirmed', false],
+  ] as const)('distinguishes known refusals from unknown delivery for HTTP %s/%s', async (
+    status, code, message, confirmed,
   ) => {
     class FakeWebSocket {
       static readonly OPEN = 1;
@@ -1193,18 +1189,11 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const fetch = vi.fn().mockResolvedValue({
       ok: false, status,
       json: async () => ({ detail: {
-        code, message: code === 'program_run_started_then_failed'
-          ? 'Required component changed after claim' : 'Operator Stop won the start',
-        details: { program_run_id: 'program-cycle.2',
-          claim_generation: code === 'program_run_stopped_before_start' ? null : 9,
-          needs_reset: malformed ? 'true' : true, component_id: 'arm.1',
-          cause_code: code === 'program_run_started_then_failed'
-            ? 'program_required_component_not_active' : 'program_run_superseded_by_stop',
-          cause_message: code === 'program_run_started_then_failed'
-            ? 'Required component changed after claim' : 'Operator Stop won the start',
-          ...(['program_run_superseded_by_stop', 'program_run_stopped_before_start'].includes(code)
-            ? { stopped_by_operator: true } : {}),
-          ...(code === 'program_run_stopped_before_start' ? { no_effect: true } : {}),
+        code, message: 'Required component changed after claim',
+        details: { program_run_id: 2, claim_generation: 9,
+          needs_reset: true, component_id: 'arm.1',
+          cause_code: 'component_not_enabled',
+          cause_message: 'Required component changed after claim',
         },
       } }),
     });
@@ -1216,20 +1205,21 @@ describe('HeadlessStateSource delivery scheduling', () => {
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
     try {
       const failure = await source.sendExecutionCommand(
-        'program_run', { scenario_id: 'lite6' }, 'run.http.outcome',
+        'program_run', { scenario_id: 'lite6' },
       ).catch((error: unknown) => error);
       expect(failure).toBeInstanceOf(Error);
       expect((failure as Error).message).toContain(message);
-      if (confirmed && !malformed) {
-        expect((failure as Error).message).toContain('program-cycle.2');
-        expect((failure as Error).message).toContain(code === 'program_run_started_then_failed'
-          ? 'Required component changed after claim' : 'Operator Stop won the start');
-        expect((failure as Error).message).toContain('Reset required');
-      }
-      if (malformed) expect((failure as Error).message).not.toContain('Reset required');
-      expect(FakeWebSocket.shell.readyState).toBe(confirmed ? FakeWebSocket.OPEN : 3);
-      expect(FakeWebSocket.shell.sent.some((frame) =>
-        JSON.parse(frame).incident_kind === 'command_delivery_unconfirmed')).toBe(!confirmed);
+      if (confirmed) expect((failure as Error).message).toContain('Program run id: 2');
+      // An unknown outcome keeps the connection open; it is recorded with the
+      // command kind and the HTTP status, and blocks commands other than Stop.
+      expect(FakeWebSocket.shell.readyState).toBe(FakeWebSocket.OPEN);
+      expect(FakeWebSocket.shell.sent.some((frame) => {
+        const value = JSON.parse(frame) as Record<string, unknown>;
+        return value.incident_kind === 'command_delivery_unconfirmed'
+          && value.reason_code === `http_response_unconfirmed:program_run:http_${status}`;
+      })).toBe(!confirmed);
+      expect(source.getShellSnapshot().transportError).toBe(confirmed ? null
+        : 'Command delivery is unconfirmed; commands other than Stop are disabled.');
       expect(fetch).toHaveBeenCalledTimes(1);
     } finally {
       source.dispose();
@@ -1261,20 +1251,19 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
     const sent = vi.fn<(url: string, request: RequestInit) => Promise<
       Pick<Response, 'ok' | 'json'>
-    >>(async () => ({
+    >>(async (_url, request) => ({
       ok: true,
       json: async () => ({
         receipt: {
-          schema_version: 'manyforge.execution_command_receipt.v1',
-          correlation_id: 'run.http.1',
-          control_session_id: null,
+          schema_version: 'manyforge.execution_command_receipt.v3',
+          request_key: echoedRequestKey(request),
+          command: null,
+          control_session_number: null,
           client_sequence: null,
-          receiver_incarnation: 'headless.receiver.1',
           received_server_sequence: '10',
           received_monotonic_ns: '100',
           disposition: 'received',
           code: 'program_run_received',
-          semantic_owner_epoch: 'runner.epoch.1',
           execution_control_revision: 1,
         },
         result: { accepted: true },
@@ -1288,24 +1277,42 @@ describe('HeadlessStateSource delivery scheduling', () => {
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
     await expect(source.sendExecutionCommand(
-      'program_run', { scenario_id: 'lite6' }, 'run.http.1',
+      'program_run', { scenario_id: 'lite6' },
     )).resolves.toMatchObject({ disposition: 'received', code: 'program_run_received' });
     const [url, request] = sent.mock.calls[0]!;
     expect(new URL(url, 'http://composer.test/').pathname).toBe('/api/control/commands');
     const body = JSON.parse(String(request.body)) as {
-      command_envelope: { command_kind: string; control_session_id: null };
+      command_envelope: Record<string, unknown>;
+      payload: Record<string, unknown>;
     };
-    expect(body.command_envelope).toMatchObject({
-      command_kind: 'program_run', control_session_id: null,
+    // An HTTP-admitted command is named by a fresh 32-hex request key and
+    // carries the application start `A`, both in its payload (Headless reads
+    // them there); it has no session or sequence.
+    expect(body.command_envelope).toEqual({
+      schema_version: 'manyforge.execution_command.v2',
+      command_kind: 'program_run',
+      source_label: 'operator_ui',
+      control_session_number: null,
+      client_sequence: null,
+      freshness: controlFreshness(1),
+      expected_execution_control_revision: 1,
+    });
+    expect(body.payload).toEqual({
+      scenario_id: 'lite6',
+      request_key: expect.stringMatching(/^[0-9a-f]{32}$/),
+      application_start_id: TEST_START_ID,
     });
     expect(FakeWebSocket.shell.sent.every((frame) =>
       (JSON.parse(frame) as { message_kind: string }).message_kind !== 'command',
     )).toBe(true);
     vi.stubGlobal('fetch', vi.fn().mockRejectedValue(new Error('connection lost')));
     await expect(source.sendExecutionCommand(
-      'program_run', { scenario_id: 'lite6' }, 'run.http.unknown',
-    )).rejects.toThrow('Command delivery is unconfirmed');
-    expect(FakeWebSocket.shell.readyState).toBe(3);
+      'program_run', { scenario_id: 'lite6' },
+    )).rejects.toThrow('Command delivery is unconfirmed; commands other than Stop are disabled.');
+    expect(FakeWebSocket.shell.readyState).toBe(FakeWebSocket.OPEN);
+    expect(FakeWebSocket.shell.sent.some((frame) => (
+      JSON.parse(frame).reason_code === 'http_response_unconfirmed:program_run:network'
+    ))).toBe(true);
     source.dispose();
   });
 
@@ -1352,26 +1359,25 @@ describe('HeadlessStateSource delivery scheduling', () => {
         }),
       })));
       await expect(source.sendExecutionCommand(
-        'program_run', { scenario_id: 'lite6' }, 'run.http.refused',
+        'program_run', { scenario_id: 'lite6' },
       )).rejects.toThrow(
         /^Too many retained requests: .*cell-admission request rejected \(Reason: claim_capacity_exhausted\)$/,
       );
 
-      vi.stubGlobal('fetch', vi.fn(async () => ({
+      vi.stubGlobal('fetch', vi.fn(async (_url: string, request?: RequestInit) => ({
         ok: true,
         status: 200,
         json: async () => ({
           receipt: {
-            schema_version: 'manyforge.execution_command_receipt.v1',
-            correlation_id: 'run.http.rejected',
-            control_session_id: null,
+            schema_version: 'manyforge.execution_command_receipt.v3',
+            request_key: echoedRequestKey(request),
+            command: null,
+            control_session_number: null,
             client_sequence: null,
-            receiver_incarnation: 'headless.receiver.1',
             received_server_sequence: '11',
             received_monotonic_ns: '101',
             disposition: 'rejected',
             code: 'invalid_request',
-            semantic_owner_epoch: 'runner.epoch.1',
             execution_control_revision: 1,
           },
           result: {
@@ -1385,7 +1391,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
         }),
       })));
       const rejection = await source.sendExecutionCommand(
-        'program_run', { scenario_id: 'lite6' }, 'run.http.rejected',
+        'program_run', { scenario_id: 'lite6' },
       ).catch((error: unknown) => error);
       expect(rejection).toMatchObject({ executionResult: { ok: false, error: {
         code: 'invalid_request', details: { reason: 'claim_capacity_exhausted' },
@@ -1394,32 +1400,31 @@ describe('HeadlessStateSource delivery scheduling', () => {
         /^invalid_request: Request is invalid: .*cell-admission request rejected \(Reason: claim_capacity_exhausted\)$/,
       );
 
-      const pending = source.sendExecutionCommand('program_reset', {}, 'reset.ws.rejected');
+      const pending = source.sendExecutionCommand('program_reset', {});
       const command = JSON.parse(FakeWebSocket.shell.sent.at(-1)!) as { client_sequence: string };
       receiveControl(FakeWebSocket.shell, {
-        schema_version: 'manyforge.execution_control.v2',
+        schema_version: 'manyforge.execution_control.v4',
         message_kind: 'command_receipt',
-        control_session_id: CONTROL_SESSION_ID,
+        control_session_number: CONTROL_SESSION_NUMBER,
         server_sequence: nextControlServerSequence(FakeWebSocket.shell),
         received_client_sequence: command.client_sequence,
         emitted_monotonic_ns: '200',
         receipt: {
-          schema_version: 'manyforge.execution_command_receipt.v1',
-          correlation_id: 'reset.ws.rejected',
-          control_session_id: CONTROL_SESSION_ID,
+          schema_version: 'manyforge.execution_command_receipt.v3',
+          request_key: null,
+          command: null,
+          control_session_number: CONTROL_SESSION_NUMBER,
           client_sequence: command.client_sequence,
-          receiver_incarnation: 'headless.receiver.1',
           received_server_sequence: '12',
           received_monotonic_ns: '102',
           disposition: 'rejected',
           code: 'request_ledger_full',
-          semantic_owner_epoch: 'runner.epoch.1',
           execution_control_revision: 1,
           current_identity: null,
         },
         result: {
           code: 'request_ledger_full',
-          correlation_id: 'reset.ws.rejected',
+          client_sequence: command.client_sequence,
           message: 'cell-admission request rejected',
           details: { reason: 'claim_capacity_exhausted' },
         },
@@ -1464,21 +1469,20 @@ describe('HeadlessStateSource delivery scheduling', () => {
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
     try {
-      const fetch = vi.fn(async () => ({
+      const fetch = vi.fn(async (_url: string, request?: RequestInit) => ({
         ok: true,
         status: 200,
         json: async () => ({
           receipt: {
-            schema_version: 'manyforge.execution_command_receipt.v1',
-            correlation_id: 'run.refused.once',
-            control_session_id: null,
+            schema_version: 'manyforge.execution_command_receipt.v3',
+            request_key: echoedRequestKey(request),
+            command: null,
+            control_session_number: null,
             client_sequence: null,
-            receiver_incarnation: 'headless.receiver.1',
             received_server_sequence: '21',
             received_monotonic_ns: '121',
             disposition: 'rejected',
             code: 'cell_latched',
-            semantic_owner_epoch: 'runner.epoch.1',
             execution_control_revision: 1,
           },
           result: {
@@ -1493,7 +1497,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
       }));
       vi.stubGlobal('fetch', fetch);
       await expect(source.sendExecutionCommand(
-        'program_run', { scenario_id: 'lite6' }, 'run.refused.once',
+        'program_run', { scenario_id: 'lite6' },
       )).rejects.toThrow(/^cell_latched: Cell latched: a component needs attention/);
       await vi.advanceTimersByTimeAsync(20_000);
       expect(fetch).toHaveBeenCalledTimes(1);
@@ -1636,21 +1640,21 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.reconnect();
     expect(FakeWebSocket.instances).toHaveLength(4);
     const restarted = wireObservation(1);
-    restarted.owner_epoch = 'execution-owner.2';
+    restarted.application_start_id = 'execution-owner.2';
     restarted.source_epoch = 'joint-source.2';
     FakeWebSocket.instances.filter(
       (socket) => new URL(socket.url).pathname === '/ws/scene/viewer',
     )[1]!.send(restarted);
     animationFrames.shift()!(32);
     expect(source.getLatestExecutionObservation()).toMatchObject({
-      ownerEpoch: 'execution-owner.2',
+      applicationStartId: 'execution-owner.2',
       sourceEpoch: 'joint-source.2',
       sourceSequence: 1,
     });
 
     firstSocket.send(wireObservation(51));
     expect(animationFrames).toHaveLength(0);
-    expect(source.getLatestExecutionObservation()?.ownerEpoch)
+    expect(source.getLatestExecutionObservation()?.applicationStartId)
       .toBe('execution-owner.2');
     source.dispose();
   });
@@ -1739,16 +1743,14 @@ describe('HeadlessStateSource delivery scheduling', () => {
     receiveControlSnapshot(FakeWebSocket.shell, second);
     changed.mockClear();
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v2',
+      schema_version: 'manyforge.execution_control.v4',
       message_kind: 'delta',
-      control_session_id: CONTROL_SESSION_ID,
+      control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
       state_sequence: '4',
       received_client_sequence: '2',
       event_class: 'critical',
       control: {
-        receiver_incarnation: 'headless.receiver.1',
-        semantic_owner_epoch: 'runner.epoch.1',
         execution_control_revision: 1,
         freshness: controlFreshness(1),
       },
@@ -1812,15 +1814,13 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const delta = (runtime: Record<string, unknown>) => {
       const sequence = nextControlServerSequence(FakeWebSocket.shell);
       receiveControl(FakeWebSocket.shell, {
-        schema_version: 'manyforge.execution_control.v2',
+        schema_version: 'manyforge.execution_control.v4',
         message_kind: 'delta',
-        control_session_id: CONTROL_SESSION_ID,
+        control_session_number: CONTROL_SESSION_NUMBER,
         server_sequence: sequence,
         state_sequence: sequence,
         received_client_sequence: '2',
         control: {
-          receiver_incarnation: 'headless.receiver.1',
-          semantic_owner_epoch: 'runner.epoch.1',
           execution_control_revision: 1,
           freshness: controlFreshness(1),
         },
@@ -1946,14 +1946,13 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.subscribeShell(shellChanged);
     source.subscribeViewer(viewerChanged);
     source.subscribeOperationProgress(progressChanged);
-    const progress = [{ owner_epoch: 'owner.1', operation_id: 'op.1', operation_revision: 1, progress: 0.6 }];
+    const progress = [{ operation_id: 1, operation_revision: 1, progress: 0.6 }];
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v2', message_kind: 'delta',
-      control_session_id: CONTROL_SESSION_ID,
+      schema_version: 'manyforge.execution_control.v4', message_kind: 'delta',
+      control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
       state_sequence: '2', received_client_sequence: '2', event_class: 'cold',
       control: {
-        receiver_incarnation: 'headless.receiver.1', semantic_owner_epoch: 'runner.epoch.1',
         execution_control_revision: 1, freshness: controlFreshness(1),
       },
       shell: { complete: false, operation_progress: progress },
@@ -1968,12 +1967,11 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(source.getGlobalRules()).toBeNull();
     const rules = [{ rule_id: 'door', state: 'tripped', keys: [] }];
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v2', message_kind: 'delta',
-      control_session_id: CONTROL_SESSION_ID,
+      schema_version: 'manyforge.execution_control.v4', message_kind: 'delta',
+      control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
       state_sequence: '2', received_client_sequence: '2', event_class: 'cold',
       control: {
-        receiver_incarnation: 'headless.receiver.1', semantic_owner_epoch: 'runner.epoch.1',
         execution_control_revision: 1, freshness: controlFreshness(1),
       },
       shell: { complete: false, global_rules: rules },
@@ -1989,12 +1987,11 @@ describe('HeadlessStateSource delivery scheduling', () => {
     // can't read the host's model) clears them, so the GUI shows
     // "unavailable" rather than last values.
     const cellDelta = (shell: Record<string, unknown>) => receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v2', message_kind: 'delta',
-      control_session_id: CONTROL_SESSION_ID,
+      schema_version: 'manyforge.execution_control.v4', message_kind: 'delta',
+      control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
       state_sequence: '2', received_client_sequence: '2', event_class: 'cold',
       control: {
-        receiver_incarnation: 'headless.receiver.1', semantic_owner_epoch: 'runner.epoch.1',
         execution_control_revision: 1, freshness: controlFreshness(1),
       },
       shell: { complete: false, ...shell },
@@ -2023,22 +2020,20 @@ describe('HeadlessStateSource delivery scheduling', () => {
       held_run_draft_edit_allowed: true,
     };
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v2',
+      schema_version: 'manyforge.execution_control.v4',
       message_kind: 'delta',
-      control_session_id: CONTROL_SESSION_ID,
+      control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
       state_sequence: '2',
       received_client_sequence: '2',
       event_class: 'critical',
       control: {
-        receiver_incarnation: 'headless.receiver.1',
-        semantic_owner_epoch: 'runner.epoch.1',
         execution_control_revision: 2,
         freshness: controlFreshness(2),
       },
       shell: local,
     });
-    receiveHeartbeat(FakeWebSocket.shell, 3, '2', CONTROL_SESSION_ID, 2);
+    receiveHeartbeat(FakeWebSocket.shell, 3, '2', CONTROL_SESSION_NUMBER, 2);
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
 
     const merged = source.getShellSnapshot().snapshot!;
@@ -2059,7 +2054,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     });
     expect(merged.snapshotSequence).toBe(initial.snapshot_sequence);
     expect(merged.runtime).toBe(source.getViewerSnapshot().snapshot?.runtime);
-    expect(merged.alarms.ownerEpoch).toBe('alarms.epoch.1');
+    expect(merged.alarms.ownerId).toBe('alarm.owner');
     source.dispose();
   });
 
@@ -2101,7 +2096,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const presented = source.getViewerSnapshot().snapshot;
     source.markViewerPresented(presented);
     expect(source.getPresentedRuntimeFrame()).toEqual({
-      ownerEpoch: 'runtime.epoch.1', generation: 1,
+      applicationStartId: TEST_START_ID, generation: 1,
     });
 
     const heartbeat = structuredClone(first);
@@ -2113,7 +2108,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     receiveControlSnapshot(FakeWebSocket.shell, heartbeat);
     expect(animationFrames).toHaveLength(1);
     expect(source.getPresentedRuntimeFrame()).toEqual({
-      ownerEpoch: 'runtime.epoch.1', generation: 2,
+      applicationStartId: TEST_START_ID, generation: 2,
     });
 
     const sceneChange = structuredClone(heartbeat);
@@ -2133,7 +2128,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     animationFrames[1]!(32);
     source.markViewerPresented(source.getViewerSnapshot().snapshot);
     expect(source.getPresentedRuntimeFrame()).toEqual({
-      ownerEpoch: 'runtime.epoch.1', generation: 3,
+      applicationStartId: TEST_START_ID, generation: 3,
     });
 
     // The Scene has already published. Apply completion must independently
@@ -2548,11 +2543,11 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(viewer.sent.every((message) => {
       const credit = JSON.parse(message) as Record<string, unknown>;
       return credit.schema_version
-          === 'manyforge.execution_observation_credit.v1';
+          === 'manyforge.execution_observation_credit.v2';
     })).toBe(true);
+    expect(JSON.parse(viewer.sent.at(-1)!).last_applied).not.toHaveProperty('application_start_id');
     expect(JSON.parse(viewer.sent.at(-1)!)).toMatchObject({
       last_applied: {
-        owner_epoch: 'execution-owner.1',
         source_epoch: 'joint-source.1',
         source_sequence: 1,
       },
@@ -2610,7 +2605,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
       error: 'Headless WebSocket transport failed.',
     });
     expect(source.getPresentedRuntimeFrame()).toEqual({
-      ownerEpoch: 'runtime.epoch.1', generation: 7,
+      applicationStartId: TEST_START_ID, generation: 7,
     });
     source.dispose();
   });
@@ -2657,7 +2652,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.advanceTimersByTime(450);
     expect(source.getShellSnapshot()).toMatchObject({
       snapshot: expect.any(Object),
-      error: 'Control connection is delayed; commands are disabled.',
+      error: 'Control connection is delayed; commands other than Stop are disabled.',
       transportStatus: 'delayed',
       semanticStatus: 'current',
     });
@@ -2674,7 +2669,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(FakeWebSocket.shell.closed).toBe(false);
     expect(source.getShellSnapshot()).toMatchObject({
       snapshot: expect.any(Object),
-      error: 'Control connection is stale; commands are disabled.',
+      error: 'Control connection is stale; commands other than Stop are disabled.',
       transportStatus: 'stale',
       semanticStatus: 'current',
     });
@@ -2759,9 +2754,9 @@ describe('HeadlessStateSource delivery scheduling', () => {
     // Semantic unavailable on a connected transport: not current.
     rulesChanged.mockClear();
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v2',
+      schema_version: 'manyforge.execution_control.v4',
       message_kind: 'heartbeat_challenge',
-      control_session_id: CONTROL_SESSION_ID,
+      control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
       challenge_sequence: '5',
       received_client_sequence: '4',
@@ -2771,6 +2766,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     });
     expect(source.getShellSnapshot()).toMatchObject({
       transportStatus: 'connected', semanticStatus: 'unavailable',
+      error: 'Control state is unavailable (owner_unavailable); commands other than Stop are disabled.',
     });
     expect(source.getGlobalRulesCurrent()).toBe(false);
     expect(source.getGlobalRules()).toBe(rows);
@@ -2840,13 +2836,16 @@ describe('HeadlessStateSource delivery scheduling', () => {
     // Reconnect and recovery: a new session's snapshot is current again.
     vi.advanceTimersByTime(1000); // RECONNECT_DELAY_MS
     expect(FakeWebSocket.shell).not.toBe(failing);
-    synchronizeControl(FakeWebSocket.shell, 'control-session.test-2');
-    receiveControlSnapshot(FakeWebSocket.shell, withRules, 'control-session.test-2');
+    synchronizeControl(FakeWebSocket.shell, 2);
+    receiveControlSnapshot(FakeWebSocket.shell, withRules, 2);
     expect(source.getGlobalRules()).toEqual([{ ruleId: 'door', state: 'clear', keys: [] }]);
-    // The re-sent disconnect incident took a client sequence: rows stay not
-    // current until the heartbeat confirms the latest echo.
+    // The re-sent disconnect and invalid-projection incidents, and the
+    // latter's resolution, took client sequences: rows stay not current until
+    // the heartbeat confirms the latest echo.
     expect(source.getGlobalRulesCurrent()).toBe(false);
-    receiveHeartbeat(FakeWebSocket.shell, 3, '3', 'control-session.test-2');
+    const latestClientSequence = (source as unknown as { controlClientSequence: number })
+      .controlClientSequence;
+    receiveHeartbeat(FakeWebSocket.shell, 3, String(latestClientSequence), 2);
     expect(source.getShellSnapshot().transportStatus).toBe('connected');
     expect(source.getGlobalRulesCurrent()).toBe(true);
     source.dispose();
@@ -2879,16 +2878,14 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
     let stateSequence = 1;
     const runtimeDelta = (runtime: unknown) => receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v2',
+      schema_version: 'manyforge.execution_control.v4',
       message_kind: 'delta',
-      control_session_id: CONTROL_SESSION_ID,
+      control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
       state_sequence: String(++stateSequence),
       received_client_sequence: '2',
       event_class: 'cold',
       control: {
-        receiver_incarnation: 'headless.receiver.1',
-        semantic_owner_epoch: 'runner.epoch.1',
         execution_control_revision: 1,
         freshness: controlFreshness(1),
       },
@@ -2924,13 +2921,13 @@ describe('HeadlessStateSource delivery scheduling', () => {
 
     // A new owner identity crosses the barrier: the frozen frame is dropped.
     const ownerChange = structuredClone(sceneUpdate);
-    (ownerChange.sections as Record<string, Record<string, unknown>>).manager.source_owner_epoch =
-      'source.epoch.2';
+    (ownerChange.sections as Record<string, Record<string, unknown>>).manager.source_owner_id =
+      'source.owner.2';
     runtimeDelta(ownerChange);
     expect(animationFrames).toHaveLength(1);
     animationFrames.shift()!(32);
-    expect(source.getViewerSnapshot().snapshot?.runtime.sections.manager.sourceOwnerEpoch)
-      .toBe('source.epoch.2');
+    expect(source.getViewerSnapshot().snapshot?.runtime.sections.manager.sourceOwnerId)
+      .toBe('source.owner.2');
     source.dispose();
   });
 
@@ -2952,16 +2949,14 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.stubGlobal('WebSocket', FakeWebSocket);
     let stateSequence = 1;
     const runtimeDelta = (runtime: unknown) => receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v2',
+      schema_version: 'manyforge.execution_control.v4',
       message_kind: 'delta',
-      control_session_id: CONTROL_SESSION_ID,
+      control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
       state_sequence: String(++stateSequence),
       received_client_sequence: '2',
       event_class: 'cold',
       control: {
-        receiver_incarnation: 'headless.receiver.1',
-        semantic_owner_epoch: 'runner.epoch.1',
         execution_control_revision: 1,
         freshness: controlFreshness(1),
       },
@@ -3044,7 +3039,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
     expect(source.getShellSnapshot().error).toBeNull();
 
-    receiveHeartbeat(FakeWebSocket.shell, 3, '2', CONTROL_SESSION_ID, 2);
+    receiveHeartbeat(FakeWebSocket.shell, 3, '2', CONTROL_SESSION_NUMBER, 2);
 
     expect(FakeWebSocket.shell.closed).toBe(false);
     expect(JSON.parse(FakeWebSocket.shell.sent.at(-1)!)).toMatchObject({
@@ -3052,7 +3047,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
       challenge_sequence: '3',
     });
     expect(source.getShellSnapshot().error).toBe(
-      'Control state is synchronizing; commands are disabled.',
+      'Control state is synchronizing; commands other than Stop are disabled.',
     );
     expect(source.getShellSnapshot()).toMatchObject({
       transportStatus: 'connected',
@@ -3104,10 +3099,10 @@ describe('HeadlessStateSource delivery scheduling', () => {
     source.setViewerPoseRateHz(30);
     source.setEnabled(true);
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v2',
+      schema_version: 'manyforge.execution_control.v4',
       message_kind: 'server_hello',
-      receiver_incarnation: 'headless.receiver.1',
-      control_session_id: CONTROL_SESSION_ID,
+      application_start_id: TEST_START_ID,
+      control_session_number: CONTROL_SESSION_NUMBER,
       heartbeat_period_ns: 250_000_000,
       heartbeat_delayed_ns: 500_000_000,
       heartbeat_stale_ns: 1_000_000_000,
@@ -3119,10 +3114,108 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(FakeWebSocket.shell.closed).toBe(false);
     expect(source.getShellSnapshot()).toMatchObject({
       snapshot: null,
-      error: 'Control connection is stale; commands are disabled.',
+      error: 'Control connection is stale; commands other than Stop are disabled.',
     });
     source.dispose();
     expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('sends a client hello without a client incarnation and reads the server hello session number and A', () => {
+    vi.useFakeTimers();
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static instances: FakeWebSocket[] = [];
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      closed: number | null = null;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.instances.push(this);
+      }
+      close(code?: number): void { this.closed = code ?? 1000; this.readyState = 3; }
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
+    source.setEnabled(true);
+    const socket = FakeWebSocket.instances[0]!;
+    socket.onopen?.();
+    // Headless requires the browser's identity in the hello (it refuses the
+    // session without it).
+    expect(JSON.parse(socket.sent[0]!)).toEqual({
+      schema_version: 'manyforge.execution_control.v4',
+      message_kind: 'client_hello',
+      supported_versions: ['manyforge.execution_control.v4'],
+      client_incarnation: expect.stringMatching(/^control-client\.[A-Za-z0-9_-]{8,256}$/),
+      source_label: 'operator_ui',
+    });
+    const hello = (override: Record<string, unknown>) => ({
+      schema_version: 'manyforge.execution_control.v4',
+      message_kind: 'server_hello',
+      application_start_id: TEST_START_ID,
+      control_session_number: 7,
+      heartbeat_period_ns: 250_000_000,
+      heartbeat_delayed_ns: 500_000_000,
+      heartbeat_stale_ns: 1_000_000_000,
+      maximum_message_bytes: 65_536,
+      maximum_messages_per_second: 64,
+      ...override,
+    });
+    // A text session id, a missing or all-zero `A` and a v2 receiver
+    // incarnation in place of `A` are invalid hellos.
+    for (const invalid of [
+      hello({ control_session_number: 'control-session.1' }),
+      hello({ control_session_number: 0 }),
+      hello({ application_start_id: undefined }),
+      hello({ application_start_id: '0000000000000000' }),
+      hello({ application_start_id: 'receiver.1' }),
+    ]) {
+      receiveControl(socket, invalid);
+      expect(socket.closed).toBe(4002);
+      socket.closed = null;
+      socket.readyState = FakeWebSocket.OPEN;
+    }
+    receiveControl(socket, hello({}));
+    receiveControl(socket, {
+      schema_version: 'manyforge.execution_control.v4',
+      message_kind: 'heartbeat_challenge',
+      control_session_number: 7,
+      server_sequence: '1',
+      challenge_sequence: '1',
+      received_client_sequence: null,
+      semantic_status: 'current',
+      semantic_reason: null,
+      freshness: controlFreshness(1),
+    });
+    expect(socket.closed).toBeNull();
+    const echo = socket.sent.map((value) => JSON.parse(value) as Record<string, unknown>)
+      .find((value) => value.message_kind === 'heartbeat_echo');
+    expect(echo).toMatchObject({ control_session_number: 7, challenge_sequence: '1' });
+    expect(echo).not.toHaveProperty('control_session_id');
+    // A frame of another session number is invalid.
+    receiveControl(socket, {
+      schema_version: 'manyforge.execution_control.v4',
+      message_kind: 'heartbeat_challenge',
+      control_session_number: 8,
+      server_sequence: '2',
+      challenge_sequence: '2',
+      received_client_sequence: '1',
+      semantic_status: 'current',
+      semantic_reason: null,
+      freshness: controlFreshness(1),
+    });
+    expect(socket.closed).toBe(4002);
+    source.dispose();
   });
 
   it('reports one durable disconnect episode after the same browser reconnects', () => {
@@ -3150,11 +3243,6 @@ describe('HeadlessStateSource delivery scheduling', () => {
       requestAnimationFrame: vi.fn(),
       cancelAnimationFrame: vi.fn(),
     });
-    let retainedIdentity: string | null = null;
-    vi.stubGlobal('localStorage', {
-      getItem: () => retainedIdentity,
-      setItem: (_key: string, value: string) => { retainedIdentity = value; },
-    });
     vi.stubGlobal('WebSocket', FakeWebSocket);
 
     const source = new HeadlessStateSource();
@@ -3169,9 +3257,9 @@ describe('HeadlessStateSource delivery scheduling', () => {
     vi.advanceTimersByTime(1_000);
     const replacement = FakeWebSocket.instances[1]!;
     replacement.onopen?.();
-    synchronizeControl(replacement);
-    receiveHeartbeat(replacement, 3, '3');
-    receiveControlSnapshot(replacement, wireState(1), CONTROL_SESSION_ID, '3');
+    synchronizeControl(replacement, 2);
+    receiveHeartbeat(replacement, 3, '3', 2);
+    receiveControlSnapshot(replacement, wireState(1), 2, '3');
     const transitions = replacement.sent
       .map((value) => JSON.parse(value) as Record<string, unknown>)
       .filter((value) => value.message_kind === 'client_incident');
@@ -3230,7 +3318,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('correlates a receipt under a newer cumulative watermark without inventing lifecycle state', async () => {
+  it('matches a receipt by its client sequence under a newer cumulative watermark without inventing lifecycle state', async () => {
     vi.useFakeTimers();
     class FakeWebSocket {
       static readonly OPEN = 1;
@@ -3264,25 +3352,45 @@ describe('HeadlessStateSource delivery scheduling', () => {
     const before = source.getShellSnapshot().snapshot?.programCycle.state;
     const receiptPromise = source.sendExecutionCommand(
       'program_reset',
-      {},
-      'correlation.test-1',
+      { program_run_id: 3 },
     );
     const command = JSON.parse(FakeWebSocket.shell.sent.at(-1)!) as {
       client_sequence: string;
     };
+    // A WebSocket command carries no request id, request key, correlation id
+    // or `A`: the session number and client sequence name it.
+    expect(command).toEqual({
+      schema_version: 'manyforge.execution_control.v4',
+      message_kind: 'command',
+      control_session_number: CONTROL_SESSION_NUMBER,
+      client_sequence: command.client_sequence,
+      command: {
+        command_envelope: {
+          schema_version: 'manyforge.execution_command.v2',
+          command_kind: 'program_reset',
+          source_label: 'operator_ui',
+          control_session_number: CONTROL_SESSION_NUMBER,
+          client_sequence: command.client_sequence,
+          freshness: controlFreshness(1),
+          expected_execution_control_revision: 1,
+        },
+        payload: { program_run_id: 3 },
+      },
+    });
+    expect(command.client_sequence).toMatch(/^[1-9][0-9]*$/);
     for (const draftRevision of [2, 3]) {
       receiveControl(FakeWebSocket.shell, {
-        schema_version: 'manyforge.execution_control.v2',
+        schema_version: 'manyforge.execution_control.v4',
         message_kind: 'delta',
-        control_session_id: CONTROL_SESSION_ID,
+        control_session_number: CONTROL_SESSION_NUMBER,
         server_sequence: nextControlServerSequence(FakeWebSocket.shell),
         event_class: 'cold',
         control: null,
         shell: {
-          schema_version: 'manyforge.composer_headless_state.v2',
+          schema_version: 'manyforge.composer_headless_state.v4',
           complete: false,
           authoring_workspace_containment: null,
-          receiver_epoch: 'receiver.epoch.1',
+          application_start_id: TEST_START_ID,
           snapshot_sequence: draftRevision + 1,
           authoring_workspace: {
             workspace_epoch: 'workspace.epoch.1',
@@ -3299,23 +3407,22 @@ describe('HeadlessStateSource delivery scheduling', () => {
       source.getShellSnapshot().snapshot?.authoringWorkspace.programDraftRevision,
     ).toBe(1);
     receiveControl(FakeWebSocket.shell, {
-      schema_version: 'manyforge.execution_control.v2',
+      schema_version: 'manyforge.execution_control.v4',
       message_kind: 'command_receipt',
-      control_session_id: CONTROL_SESSION_ID,
+      control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(FakeWebSocket.shell),
       received_client_sequence: String(BigInt(command.client_sequence) + 2n),
       emitted_monotonic_ns: '200',
       receipt: {
-        schema_version: 'manyforge.execution_command_receipt.v1',
-        correlation_id: 'correlation.test-1',
-        control_session_id: CONTROL_SESSION_ID,
+        schema_version: 'manyforge.execution_command_receipt.v3',
+        request_key: null,
+        command: null,
+        control_session_number: CONTROL_SESSION_NUMBER,
         client_sequence: command.client_sequence,
-        receiver_incarnation: 'headless.receiver.1',
         received_server_sequence: '10',
         received_monotonic_ns: '100',
         disposition: 'received',
         code: 'program_reset_received',
-        semantic_owner_epoch: 'runner.epoch.1',
         execution_control_revision: 1,
         current_identity: { cycle_generation: 1 },
       },
@@ -3323,7 +3430,8 @@ describe('HeadlessStateSource delivery scheduling', () => {
     });
 
     await expect(receiptPromise).resolves.toMatchObject({
-      correlationId: 'correlation.test-1',
+      controlSessionNumber: CONTROL_SESSION_NUMBER,
+      clientSequence: command.client_sequence,
       disposition: 'received',
       receivedServerSequence: '10',
       receivedMonotonicNs: '100',
@@ -3339,7 +3447,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it('fails closed once for unconfirmed delivery until a fresh session snapshot', async () => {
+  it('keeps the connection after an unconfirmed command and clears its latch on the watermark', async () => {
     vi.useFakeTimers();
     class FakeWebSocket {
       static readonly OPEN = 1;
@@ -3375,40 +3483,47 @@ describe('HeadlessStateSource delivery scheduling', () => {
     receiveControlSnapshot(first, wireState(1));
     (source as unknown as { clearControlHeartbeatWatch: () => void })
       .clearControlHeartbeatWatch();
+    const frames = () => first.sent.map((value) => JSON.parse(value) as Record<string, unknown>);
+    const commands = () => frames().filter((value) => value.message_kind === 'command') as Array<{
+      client_sequence: string; command: { command_envelope: { command_kind: string } };
+    }>;
     const pending = source.sendExecutionCommand(
-      'program_reset', {}, 'correlation.unconfirmed-1',
+      'program_reset', {},
     );
     const rejection = expect(pending).rejects.toThrow(
       'Command delivery is unconfirmed',
     );
+    const resetSequence = commands()[0]!.client_sequence;
 
     vi.advanceTimersByTime(1_000);
     await rejection;
-    expect(first.readyState).toBe(3);
-    const activated = first.sent
-      .map((value) => JSON.parse(value) as Record<string, unknown>)
-      .find((value) => value.message_kind === 'client_incident');
-    expect(activated).toMatchObject({
+    // The lost receipt names the WebSocket command it belongs to.
+    await expect(pending).rejects.toMatchObject({
+      command: { controlSessionNumber: CONTROL_SESSION_NUMBER, clientSequence: resetSequence },
+    });
+    // The socket stays open; the event is recorded with kind and sequence.
+    expect(first.readyState).toBe(FakeWebSocket.OPEN);
+    expect(FakeWebSocket.instances).toHaveLength(1);
+    expect(frames().find((value) => value.message_kind === 'client_incident')).toMatchObject({
       incident_kind: 'command_delivery_unconfirmed',
       phase: 'activated',
+      reason_code: `command_watermark_missing:program_reset:${resetSequence}`,
     });
+    expect(source.getShellSnapshot().transportError)
+      .toBe('Command delivery is unconfirmed; commands other than Stop are disabled.');
+    expect(source.getShellSnapshot().commandLatch).toBe(true);
+    // Commands other than Stop stay disabled; a Stop goes out.
+    await expect(source.sendExecutionCommand('program_reset', {}))
+      .rejects.toThrow('Control connection is not synchronized.');
+    const stop = source.sendExecutionCommand('program_motion_stop', {});
+    void stop.catch(() => undefined);
+    expect(commands().map((value) => value.command.command_envelope.command_kind))
+      .toEqual(['program_reset', 'program_motion_stop']);
 
-    vi.advanceTimersByTime(1_000);
-    const replacement = FakeWebSocket.instances[1]!;
-    replacement.onopen?.();
-    synchronizeControl(replacement, 'control-session.test-2');
-    expect(source.getShellSnapshot().error).not.toBeNull();
-    receiveControlSnapshot(replacement, wireState(1), 'control-session.test-2');
-    expect(replacement.sent.some((value) => (
-      JSON.parse(value).incident_kind === 'command_delivery_unconfirmed'
-      && JSON.parse(value).phase === 'resolved'
-    ))).toBe(false);
-    receiveHeartbeat(replacement, 3, '4', 'control-session.test-2');
-    expect(source.getShellSnapshot().error).toBeNull();
-    const transitions = replacement.sent
-      .map((value) => JSON.parse(value) as Record<string, unknown>)
-      .filter((value) => value.message_kind === 'client_incident');
-    expect(transitions).toEqual(expect.arrayContaining([
+    // The owner's watermark reaches the late command: the latch clears.
+    receiveHeartbeat(first, 3, resetSequence);
+    expect(source.getShellSnapshot().transportError).toBeNull();
+    expect(frames()).toEqual(expect.arrayContaining([
       expect.objectContaining({
         incident_kind: 'command_delivery_unconfirmed',
         phase: 'resolved',
@@ -3451,7 +3566,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
     synchronizeControl(socket);
     receiveControlSnapshot(socket, wireState(1));
     const pending = source.sendExecutionCommand(
-      'program_reset', {}, 'correlation.receipt-missing-1',
+      'program_reset', {},
     );
     const command = JSON.parse(socket.sent.at(-1)!) as { client_sequence: string };
     receiveHeartbeat(socket, 3, command.client_sequence);
@@ -3472,36 +3587,35 @@ describe('HeadlessStateSource delivery scheduling', () => {
       current_command_kind: 'program_reset', reset_phase: 'restoring_scene',
       reset_options: { reload_initial_scene: true, reset_robot_position: false },
     });
-    receiveControlSnapshot(socket, resetting, CONTROL_SESSION_ID, command.client_sequence);
+    receiveControlSnapshot(socket, resetting, CONTROL_SESSION_NUMBER, command.client_sequence);
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
     expect(source.getShellSnapshot().snapshot?.programCycle.state).toBe('resetting');
     expect(settled).toBe(false);
 
     receiveControl(socket, {
-      schema_version: 'manyforge.execution_control.v2',
+      schema_version: 'manyforge.execution_control.v4',
       message_kind: 'command_receipt',
-      control_session_id: CONTROL_SESSION_ID,
+      control_session_number: CONTROL_SESSION_NUMBER,
       server_sequence: nextControlServerSequence(socket),
       received_client_sequence: command.client_sequence,
       emitted_monotonic_ns: '200',
       receipt: {
-        schema_version: 'manyforge.execution_command_receipt.v1',
-        correlation_id: 'correlation.receipt-missing-1',
-        control_session_id: CONTROL_SESSION_ID,
+        schema_version: 'manyforge.execution_command_receipt.v3',
+        request_key: null,
+        command: null,
+        control_session_number: CONTROL_SESSION_NUMBER,
         client_sequence: command.client_sequence,
-        receiver_incarnation: 'headless.receiver.1',
         received_server_sequence: '10',
         received_monotonic_ns: '100',
         disposition: 'received',
         code: 'program_reset_received',
-        semantic_owner_epoch: 'runner.epoch.1',
         execution_control_revision: 2,
         current_identity: { cycle_generation: 1 },
       },
       result: null,
     });
     await expect(pending).resolves.toMatchObject({
-      correlationId: 'correlation.receipt-missing-1',
+      clientSequence: command.client_sequence,
       disposition: 'received',
     });
     source.dispose();
@@ -3540,16 +3654,16 @@ describe('HeadlessStateSource delivery scheduling', () => {
     synchronizeControl(FakeWebSocket.shell);
     receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
     const internal = source as unknown as {
-      latest: { executionControlStatus: { ownerEpoch: string } | null } | null;
+      latest: { executionControlStatus: { applicationStartId: string } | null } | null;
     };
     expect(internal.latest).not.toBeNull();
-    internal.latest!.executionControlStatus = { ownerEpoch: 'execution.epoch.1' };
+    internal.latest!.executionControlStatus = { applicationStartId: TEST_START_ID };
 
     const scale = source.sendExecutionCommand(
-      'runtime_scale', { scale: 0.5 }, 'correlation.scale-1',
+      'runtime_scale', { scale: 0.5 },
     );
     const reset = source.sendExecutionCommand(
-      'program_reset', {}, 'correlation.reset-1',
+      'program_reset', {},
     );
     const commands = FakeWebSocket.shell.sent
       .map((value) => JSON.parse(value) as Record<string, unknown>)
@@ -3559,10 +3673,10 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(commands.map((value) => value.command.command_envelope.command_kind))
       .toEqual(['runtime_scale', 'program_reset']);
     await expect(source.sendExecutionCommand(
-      'runtime_scale', { scale: 0.6 }, 'correlation.scale-2',
+      'runtime_scale', { scale: 0.6 },
     )).rejects.toThrow('runtime velocity update is pending');
     await expect(source.sendExecutionCommand(
-      'program_reset', {}, 'correlation.reset-2',
+      'program_reset', {},
     )).rejects.toThrow('ordinary control command is pending');
 
     const scaleRejected = expect(scale).rejects.toThrow(
@@ -3575,6 +3689,592 @@ describe('HeadlessStateSource delivery scheduling', () => {
     await scaleRejected;
     await resetRejected;
     expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe('Stop is never refused on an open control socket', () => {
+  function mountOpenSession() {
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static shell: FakeWebSocket;
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+
+      close(): void { this.readyState = 3; }
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
+    source.setEnabled(true);
+    synchronizeControl(FakeWebSocket.shell);
+    receiveControlSnapshot(FakeWebSocket.shell, wireState(1));
+    const socket = FakeWebSocket.shell;
+    const sentCommands = () => socket.sent
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .filter((value) => value.message_kind === 'command') as Array<{
+        command: {
+          command_envelope: Record<string, unknown> & { command_kind: string };
+          payload: Record<string, unknown>;
+        };
+      }>;
+    const sentKinds = () => sentCommands().map((value) => value.command.command_envelope.command_kind);
+    const internal = source as unknown as {
+      latest: unknown;
+      controlTransportError: string | null;
+    };
+    const pending: Array<Promise<unknown>> = [];
+    const send = (kind: Parameters<HeadlessStateSource['sendExecutionCommand']>[0], id: string) => {
+      const promise = source.sendExecutionCommand(kind, { reason: id });
+      pending.push(promise.catch(() => undefined));
+      return promise;
+    };
+    const dispose = async () => {
+      source.dispose();
+      await Promise.all(pending);
+    };
+    return { source, socket, sentCommands, sentKinds, internal, send, dispose };
+  }
+
+  it('sends every Stop kind while the heartbeat is delayed or stale; other commands stay refused', async () => {
+    vi.useFakeTimers();
+    const session = mountOpenSession();
+    vi.advanceTimersByTime(500);
+    expect(session.source.getShellSnapshot().transportStatus).toBe('delayed');
+    await expect(session.send('program_reset', 'reset.delayed')).rejects
+      .toThrow('Control connection is not synchronized.');
+    session.send('program_motion_stop', 'motion-stop.delayed');
+    session.send('operation_stop', 'operation-stop.delayed');
+    vi.advanceTimersByTime(500);
+    expect(session.source.getShellSnapshot().transportStatus).toBe('stale');
+    await expect(session.send('runtime_scale', 'scale.stale')).rejects
+      .toThrow('Control connection is not synchronized.');
+    session.send('stop_all', 'stop-all.stale');
+    session.send('halt', 'halt.stale');
+    expect(session.sentKinds()).toEqual([
+      'program_motion_stop', 'operation_stop', 'stop_all', 'halt',
+    ]);
+    await session.dispose();
+  });
+
+  it('sends a Stop despite a latched transport error or another pending command', async () => {
+    vi.useFakeTimers();
+    const session = mountOpenSession();
+    session.send('program_reset', 'reset.pending');
+    session.send('program_motion_stop', 'motion-stop.during-reset');
+    // A repeated press sends another Stop; the owner joins it.
+    session.send('program_motion_stop', 'motion-stop.repeated');
+    session.internal.controlTransportError = 'Command delivery is unconfirmed; commands other than Stop are disabled.';
+    await expect(session.send('program_resume_halt', 'resume.latched')).rejects
+      .toThrow('Control connection is not synchronized.');
+    session.send('halt', 'halt.latched');
+    expect(session.sentKinds()).toEqual([
+      'program_reset', 'program_motion_stop', 'program_motion_stop', 'halt',
+    ]);
+    await session.dispose();
+  });
+
+  it('leaves a latched transport error untouched when a Stop goes through it', async () => {
+    vi.useFakeTimers();
+    const session = mountOpenSession();
+    const latched = 'Command delivery is unconfirmed; commands other than Stop are disabled.';
+    session.internal.controlTransportError = latched;
+    const before = session.source.getShellSnapshot();
+    session.send('program_motion_stop', 'motion-stop.through-latch');
+    session.send('operation_stop', 'operation-stop.through-latch');
+    expect(session.sentKinds()).toEqual(['program_motion_stop', 'operation_stop']);
+    // The Stop neither clears nor changes the latch or the published condition.
+    expect(session.internal.controlTransportError).toBe(latched);
+    expect(session.source.getShellSnapshot()).toBe(before);
+    // The latch still gates every other command afterwards.
+    await expect(session.send('program_reset', 'reset.after-stop')).rejects
+      .toThrow('Control connection is not synchronized.');
+    await expect(session.send('runtime_scale', 'scale.after-stop')).rejects
+      .toThrow('Control connection is not synchronized.');
+    expect(session.sentKinds()).toEqual(['program_motion_stop', 'operation_stop']);
+    expect(session.internal.controlTransportError).toBe(latched);
+    await session.dispose();
+  });
+
+  it('sends a Stop without `A` or any request id; an HTTP command without `A` is refused locally', async () => {
+    vi.useFakeTimers();
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+    const session = mountOpenSession();
+    session.internal.latest = null;
+    session.send('operation_stop', 'operation-stop.no-start');
+    await expect(session.send('program_run', 'run.no-start')).rejects
+      .toThrow('Execution owner identity is unavailable.');
+    expect(fetch).not.toHaveBeenCalled();
+    const [stop] = session.sentCommands();
+    expect(stop.command.command_envelope.command_kind).toBe('operation_stop');
+    expect(stop.command.payload).toEqual({ reason: 'operation-stop.no-start' });
+    for (const name of ['correlation_id', 'request_id', 'request_key', 'application_start_id',
+      'expected_semantic_owner_epoch']) {
+      expect(stop.command.command_envelope).not.toHaveProperty(name);
+      expect(stop.command.payload).not.toHaveProperty(name);
+    }
+    expect(stop.command.payload).not.toHaveProperty('expected_execution_owner_epoch');
+    await session.dispose();
+  });
+
+  it('refuses a Stop only when the control socket is not open', async () => {
+    vi.useFakeTimers();
+    const session = mountOpenSession();
+    session.socket.readyState = 3;
+    await expect(session.send('program_motion_stop', 'motion-stop.closed')).rejects
+      .toThrow('Control connection is not synchronized.');
+    expect(session.sentKinds()).toEqual([]);
+    await session.dispose();
+  });
+});
+
+describe('Stop all and Halt without a usable control session go over the HTTP Stop route', () => {
+  type StopReply = Pick<Response, 'ok' | 'status' | 'json'>;
+  function mountUnsynchronizedSession(reply: StopReply | Error = {
+    ok: true, status: 200, json: async () => ({ ok: true, stopped: true }),
+  }) {
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static shell: FakeWebSocket;
+      readonly sent: string[] = [];
+      readyState = FakeWebSocket.OPEN;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        if (new URL(url).pathname === '/ws/control') FakeWebSocket.shell = this;
+      }
+      close(): void { this.readyState = 3; }
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const fetch = vi.fn<(url: string, request: RequestInit) => Promise<StopReply>>(async () => {
+      if (reply instanceof Error) throw reply;
+      return reply;
+    });
+    vi.stubGlobal('fetch', fetch);
+    const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
+    source.setEnabled(true);
+    const socket = FakeWebSocket.shell;
+    const commandKinds = () => socket.sent
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .filter((value) => value.message_kind === 'command')
+      .map((value) => (value.command as { command_envelope: { command_kind: string } })
+        .command_envelope.command_kind);
+    const posted = () => fetch.mock.calls.map(([url, request]) => ({
+      path: new URL(url, 'http://composer.test/').pathname,
+      method: request.method,
+      signal: request.signal,
+      body: JSON.parse(String(request.body)) as unknown,
+    }));
+    return { source, socket, fetch, commandKinds, posted };
+  }
+
+  it.each([
+    ['stop_all', '/api/execution/stop-all'],
+    ['halt', '/api/execution/halt'],
+  ] as const)('sends %s before the first snapshot to %s and resolves from the reply', async (kind, path) => {
+    const session = mountUnsynchronizedSession();
+    // The hello and heartbeats have arrived; the first snapshot has not.
+    synchronizeControl(session.socket);
+    await expect(session.source.sendExecutionCommand(kind, {})).resolves.toEqual({
+      controlSessionNumber: null,
+      clientSequence: null,
+      disposition: null,
+      code: null,
+      result: { ok: true, stopped: true },
+      receivedServerSequence: null,
+      receivedMonotonicNs: null,
+      emittedMonotonicNs: null,
+      requestKey: null,
+      command: null,
+    });
+    // The body carries only the request context; no time limit is attached.
+    expect(session.posted()).toEqual([{
+      path, method: 'POST', signal: undefined,
+      body: { request_context: { source_label: 'operator_ui' } },
+    }]);
+    expect(session.commandKinds()).toEqual([]);
+    session.source.dispose();
+  });
+
+  it.each([
+    ['stop_all', '/api/execution/stop-all'],
+    ['halt', '/api/execution/halt'],
+  ] as const)('sends %s to %s while the control socket is closed', async (kind, path) => {
+    const session = mountUnsynchronizedSession();
+    synchronizeControl(session.socket);
+    receiveControlSnapshot(session.socket, wireState(1));
+    session.socket.readyState = 3;
+    await expect(session.source.sendExecutionCommand(kind, {}))
+      .resolves.toMatchObject({ result: { ok: true, stopped: true } });
+    expect(session.posted()).toEqual([expect.objectContaining({
+      path, body: { request_context: { source_label: 'operator_ui' } },
+    })]);
+    expect(session.commandKinds()).toEqual([]);
+    session.source.dispose();
+  });
+
+  it('sends Stop all and Halt as frames, not over HTTP, on a usable control session', async () => {
+    vi.useFakeTimers();
+    const session = mountUnsynchronizedSession();
+    synchronizeControl(session.socket);
+    receiveControlSnapshot(session.socket, wireState(1));
+    const stopAll = session.source.sendExecutionCommand('stop_all', {});
+    const halt = session.source.sendExecutionCommand('halt', {});
+    expect(session.commandKinds()).toEqual(['stop_all', 'halt']);
+    expect(session.fetch).not.toHaveBeenCalled();
+    session.source.dispose();
+    await Promise.all([stopAll, halt].map((pending) => pending.catch(() => undefined)));
+  });
+
+  it('surfaces a refused or failed HTTP Stop as a failed Stop', async () => {
+    const refused = mountUnsynchronizedSession({
+      ok: false,
+      status: 409,
+      json: async () => ({
+        detail: {
+          code: 'request_ledger_full',
+          details: { reason: 'claim_capacity_exhausted' },
+          message: 'cell-admission request rejected',
+        },
+      }),
+    });
+    await expect(refused.source.sendExecutionCommand('stop_all', {})).rejects.toThrow(
+      /^Too many retained requests: .*cell-admission request rejected \(Reason: claim_capacity_exhausted\)$/,
+    );
+    refused.source.dispose();
+
+    const failed = mountUnsynchronizedSession({
+      ok: false, status: 500, json: async () => ({}),
+    });
+    await expect(failed.source.sendExecutionCommand('halt', {}))
+      .rejects.toThrow('Execution command rejected (HTTP 500).');
+    failed.source.dispose();
+
+    const lost = mountUnsynchronizedSession(new Error('connection lost'));
+    await expect(lost.source.sendExecutionCommand('stop_all', {}))
+      .rejects.toThrow('The Composer did not answer, so the Stop is not confirmed.');
+    lost.source.dispose();
+  });
+
+  it('still refuses a Stop naming a run or an operation before the first snapshot', async () => {
+    const session = mountUnsynchronizedSession();
+    synchronizeControl(session.socket);
+    await expect(session.source.sendExecutionCommand('program_motion_stop', {}))
+      .rejects.toThrow('Control connection is not synchronized.');
+    await expect(session.source.sendExecutionCommand('operation_stop', {}))
+      .rejects.toThrow('Control connection is not synchronized.');
+    expect(session.fetch).not.toHaveBeenCalled();
+    expect(session.commandKinds()).toEqual([]);
+    session.source.dispose();
+  });
+});
+
+describe('The control connection stays open for Stop', () => {
+  function mountSession(cycleState: string) {
+    class FakeWebSocket {
+      static readonly OPEN = 1;
+      static instances: FakeWebSocket[] = [];
+      readonly sent: string[] = [];
+      readonly url: string;
+      readyState = FakeWebSocket.OPEN;
+      closed: number | null = null;
+      onopen: (() => void) | null = null;
+      onmessage: ((message: MessageEvent) => void) | null = null;
+      onerror: (() => void) | null = null;
+      onclose: (() => void) | null = null;
+
+      constructor(url: string) {
+        this.url = url;
+        FakeWebSocket.instances.push(this);
+      }
+      close(code?: number): void { this.closed = code ?? 1000; this.readyState = 3; }
+      send(value: string): void { this.sent.push(value); }
+    }
+    vi.stubGlobal('window', {
+      location: { href: 'http://composer.test/' },
+      requestAnimationFrame: vi.fn(),
+      cancelAnimationFrame: vi.fn(),
+    });
+    vi.stubGlobal('WebSocket', FakeWebSocket);
+    const source = new HeadlessStateSource();
+    source.setViewerPoseRateHz(30);
+    source.setEnabled(true);
+    const controls = () => FakeWebSocket.instances
+      .filter((socket) => new URL(socket.url).pathname === '/ws/control');
+    const socket = controls()[0]!;
+    synchronizeControl(socket);
+    const shell = wireState(1);
+    (shell.program_cycle as Record<string, unknown>).state = cycleState;
+    receiveControlSnapshot(socket, shell);
+    const commandKinds = () => socket.sent
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .filter((value) => value.message_kind === 'command')
+      .map((value) => (value.command as { command_envelope: { command_kind: string } })
+        .command_envelope.command_kind);
+    const pending: Array<Promise<unknown>> = [];
+    const send = (kind: Parameters<HeadlessStateSource['sendExecutionCommand']>[0], _label: string) => {
+      const promise = source.sendExecutionCommand(kind, {});
+      pending.push(promise.catch(() => undefined));
+      return promise;
+    };
+    const dispose = async () => {
+      source.dispose();
+      await Promise.all(pending);
+    };
+    return { source, socket, controls, commandKinds, send, dispose };
+  }
+  const invalidDelta = (socket: ControlTestSocket) => receiveControl(socket, {
+    schema_version: 'manyforge.execution_control.v4',
+    message_kind: 'delta',
+    control_session_number: CONTROL_SESSION_NUMBER,
+    server_sequence: nextControlServerSequence(socket),
+    event_class: 'cold',
+    control: null,
+    shell: null,
+  });
+
+  it('latches an invalid control message during a run, keeps the socket and still sends Stop', async () => {
+    vi.useFakeTimers();
+    const session = mountSession('starting');
+    expect(session.source.getShellSnapshot().snapshot?.programCycle.state).toBe('starting');
+    invalidDelta(session.socket);
+    expect(session.socket.closed).toBeNull();
+    // Recorded with what was invalid, the message kind and its sequence.
+    expect(session.socket.sent.map((value) => JSON.parse(value) as Record<string, unknown>)
+      .find((value) => value.message_kind === 'client_incident')).toMatchObject({
+      incident_kind: 'control_projection_invalid',
+      phase: 'activated',
+      reason_code: 'invalid_projection:delta:4',
+    });
+    expect(session.source.getShellSnapshot().commandLatch).toBe(true);
+    expect(session.source.getShellSnapshot().transportError)
+      .toBe('Control state is invalid; commands other than Stop are disabled. Reconnect when motion has stopped.');
+    await expect(session.send('program_reset', 'reset.invalid')).rejects
+      .toThrow('Control connection is not synchronized.');
+    session.send('halt', 'halt.invalid');
+    expect(session.commandKinds()).toEqual(['halt']);
+    // Owner state is no longer applied; heartbeats are still answered.
+    const shell = wireState(2);
+    (shell.program_cycle as Record<string, unknown>).state = 'idle_after_reset';
+    receiveControlSnapshot(session.socket, shell);
+    expect(session.source.getShellSnapshot().snapshot?.programCycle.state).toBe('starting');
+    const echoes = session.socket.sent.filter((value) => JSON.parse(value).message_kind === 'heartbeat_echo').length;
+    receiveHeartbeat(session.socket, 3, '2');
+    expect(session.socket.sent.filter((value) => JSON.parse(value).message_kind === 'heartbeat_echo'))
+      .toHaveLength(echoes + 1);
+    expect(session.source.getShellSnapshot().transportError)
+      .toBe('Control state is invalid; commands other than Stop are disabled. Reconnect when motion has stopped.');
+    expect(session.socket.closed).toBeNull();
+    await session.dispose();
+  });
+
+  it('closes on an invalid control message, as before, when nothing is active, and resolves its record after the reconnect', async () => {
+    vi.useFakeTimers();
+    const session = mountSession('idle_after_reset');
+    invalidDelta(session.socket);
+    expect(session.socket.closed).toBe(4002);
+    expect(session.source.getShellSnapshot().commandLatch).toBe(false);
+    expect(session.socket.sent.some((value) => (
+      JSON.parse(value).incident_kind === 'control_projection_invalid'
+      && JSON.parse(value).phase === 'activated'
+    ))).toBe(true);
+    // The fake close does not report the close; the replacement is opened
+    // as the reconnect path does.
+    session.source.reconnect();
+    const replacement = session.controls().at(-1)!;
+    synchronizeControl(replacement, 2);
+    receiveControlSnapshot(replacement, wireState(1), 2);
+    expect(replacement.sent.map((value) => JSON.parse(value) as Record<string, unknown>))
+      .toEqual(expect.arrayContaining([expect.objectContaining({
+        incident_kind: 'control_projection_invalid',
+        phase: 'resolved',
+      })]));
+    await session.dispose();
+  });
+
+  it.each([
+    ['intervention_required', 'running'],
+    ['halting', 'running'],
+    ['halted', 'running'],
+  ] as const)('treats a run that is %s as active', async (runState, cycleState) => {
+    vi.useFakeTimers();
+    const session = mountSession(cycleState);
+    const internal = session.source as unknown as {
+      latest: { programCycle: { state: string; run: { state: string } | null } };
+      executionActive: () => boolean;
+    };
+    internal.latest.programCycle.state = 'terminal_awaiting_reset';
+    internal.latest.programCycle.run = { state: runState };
+    expect(internal.executionActive()).toBe(true);
+    internal.latest.programCycle.run = { state: 'succeeded' };
+    expect(internal.executionActive()).toBe(false);
+    await session.dispose();
+  });
+
+  it('replaces a connection stale for 30 s only while no run or operation is active', async () => {
+    vi.useFakeTimers();
+    const session = mountSession('starting');
+    vi.advanceTimersByTime(1_000);
+    expect(session.source.getShellSnapshot().transportStatus).toBe('stale');
+    vi.advanceTimersByTime(30_000);
+    // A run is active: the stale connection is kept for Stop.
+    expect(session.socket.closed).toBeNull();
+    expect(session.controls()).toHaveLength(1);
+    session.send('program_motion_stop', 'stop.stale');
+    expect(session.commandKinds()).toEqual(['program_motion_stop']);
+    const internal = session.source as unknown as {
+      latest: { programCycle: { state: string } };
+    };
+    internal.latest.programCycle.state = 'idle_after_reset';
+    vi.advanceTimersByTime(1_000);
+    expect(session.socket.closed).toBe(1000);
+    expect(session.socket.sent.some((value) => (
+      JSON.parse(value).incident_kind === 'control_disconnected'
+      && JSON.parse(value).reason_code === 'control_stale_reconnect'
+    ))).toBe(true);
+    vi.advanceTimersByTime(1_000);
+    expect(session.controls()).toHaveLength(2);
+    await session.dispose();
+  });
+
+  // OD-214: a runner command answers at its acceptance with its row.
+  const acceptedReceipt = (request: RequestInit | undefined, step: string) => ({
+    ok: true,
+    status: 200,
+    json: async () => ({
+      receipt: {
+        schema_version: 'manyforge.execution_command_receipt.v3',
+        request_key: echoedRequestKey(request),
+        command: {
+          kind: 'start', request_key: echoedRequestKey(request), step,
+          accepted_at_ns: '1763112345678901234', end: null,
+        },
+        control_session_number: null,
+        client_sequence: null,
+        received_server_sequence: '10',
+        received_monotonic_ns: '100',
+        disposition: 'received',
+        code: 'program_run_received',
+        execution_control_revision: 1,
+      },
+      result: null,
+    }),
+  });
+
+  it('waits for an HTTP command\'s acceptance without a time limit and returns its row', async () => {
+    vi.useFakeTimers();
+    let answer!: (value: unknown) => void;
+    const fetch = vi.fn((_url: string, _request?: RequestInit) => {
+      void _url; void _request;
+      return new Promise((resolve) => { answer = resolve; });
+    });
+    vi.stubGlobal('fetch', fetch);
+    const session = mountSession('idle_after_reset');
+    let settled = false;
+    const receipt = session.send('program_run', 'run.slow');
+    void receipt.then(() => { settled = true; }, () => { settled = true; });
+    // The request carries no abort signal and nothing gives up on it.
+    expect(fetch.mock.calls[0]![1]).not.toHaveProperty('signal');
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(settled).toBe(false);
+    expect(session.socket.sent.some((frame) => (
+      String(JSON.parse(frame).reason_code ?? '').startsWith('http_response_unconfirmed')
+    ))).toBe(false);
+    answer(acceptedReceipt(fetch.mock.calls[0]![1], 'admitting'));
+    const accepted = await receipt;
+    expect(accepted.requestKey).toBe(echoedRequestKey(fetch.mock.calls[0]![1]));
+    expect(accepted.command).toMatchObject({ kind: 'start', step: 'admitting', end: null });
+    await session.dispose();
+  });
+
+  it('refuses a v3 receipt without its command row and a v2 receipt', async () => {
+    for (const change of [
+      (receipt: Record<string, unknown>) => { delete receipt.command; },
+      (receipt: Record<string, unknown>) => { receipt.schema_version = 'manyforge.execution_command_receipt.v2'; },
+      (receipt: Record<string, unknown>) => { receipt.command = { kind: 'start' }; },
+    ]) {
+      vi.stubGlobal('fetch', vi.fn(async (_url: string, request?: RequestInit) => {
+        const reply = acceptedReceipt(request, 'admitting');
+        const body = await reply.json() as { receipt: Record<string, unknown> };
+        change(body.receipt);
+        return { ...reply, json: async () => body };
+      }));
+      const session = mountSession('idle_after_reset');
+      await expect(session.send('program_run', 'run.invalid')).rejects.toThrow('Command delivery is unconfirmed');
+      await session.dispose();
+    }
+  });
+
+  it('resends an HTTP command whose reply was lost with its key; any other command gets a new one', async () => {
+    vi.useFakeTimers();
+    const lost = vi.fn().mockRejectedValue(new TypeError('Failed to fetch'));
+    vi.stubGlobal('fetch', lost);
+    const session = mountSession('idle_after_reset');
+    await expect(session.send('program_run', 'run.lost')).rejects.toThrow('Command delivery is unconfirmed');
+    const sentKey = (call: unknown[]) => (
+      JSON.parse(String((call[1] as RequestInit).body)) as { payload: { request_key: string } }
+    ).payload.request_key;
+    const lostKey = sentKey(lost.mock.calls[0]!);
+    // The owner state moved past it (the latch clears); the operator sends
+    // the same command again.
+    receiveControlSnapshot(session.socket, wireState(2));
+    receiveHeartbeat(session.socket, 3, '2', CONTROL_SESSION_NUMBER, 2);
+    expect(session.source.getShellSnapshot().transportError).toBeNull();
+    const answered = vi.fn(async (_url: string, request?: RequestInit) => {
+      const reply = acceptedReceipt(request, 'claiming');
+      const body = await reply.json() as { receipt: Record<string, unknown> };
+      body.receipt.execution_control_revision = 2;
+      return { ...reply, json: async () => body };
+    });
+    vi.stubGlobal('fetch', answered);
+    await expect(session.send('program_run', 'run.again')).resolves.toMatchObject({
+      requestKey: `c0${lostKey.slice(2)}`, command: { step: 'claiming' },
+    });
+    expect(sentKey(answered.mock.calls[0]!)).toBe(lostKey);
+    // Answered: the next command is a new one.
+    await session.send('program_run', 'run.next');
+    expect(sentKey(answered.mock.calls[1]!)).not.toBe(lostKey);
+    await session.dispose();
+  });
+
+  it('clears an unconfirmed HTTP command once the owner state moves past it', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue({
+      ok: false, status: 503, json: async () => ({}),
+    }));
+    const session = mountSession('idle_after_reset');
+    await expect(session.send('program_run', 'run.unknown')).rejects
+      .toThrow('Command delivery is unconfirmed');
+    expect(session.socket.closed).toBeNull();
+    expect(session.source.getShellSnapshot().transportError)
+      .toBe('Command delivery is unconfirmed; commands other than Stop are disabled.');
+    receiveControlSnapshot(session.socket, wireState(2));
+    expect(session.source.getShellSnapshot().transportError).toBeNull();
+    await session.dispose();
   });
 });
 

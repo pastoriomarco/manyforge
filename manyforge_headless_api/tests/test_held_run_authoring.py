@@ -18,7 +18,7 @@ def _cycle(
     offer: bool = True,
 ) -> dict[str, Any]:
     selections: dict[str, Any] = {
-        "selection_revision": 2,
+        "hold_revision": 2,
         "groups": [{"group_id": "all", "state": "held", "node_count": 3, "held_node_count": 3}],
     }
     if motion_held is not None:
@@ -59,7 +59,7 @@ LIVE_STOPPED_RUN = {
     },
     "recovery_offer": None,
     "runtime_controls": {"execution_selections": {
-        "selection_revision": 3,
+        "hold_revision": 3,
         "motion_held": True,
         "groups": [{"group_id": "all", "state": "ready", "node_count": 7, "held_node_count": 4}],
     }},
@@ -80,7 +80,7 @@ def test_live_operator_stop_with_unstarted_motion_and_running_control_flow_is_ed
         _cycle(),  # failure pause, Stop of other motion confirmed
         _cycle(run_state="running"),  # operator Stop, or Executed but never Run
         _cycle(run_state="running", offer=False),
-        _cycle(run_state="full_stopped", motion_held=None, active_operation_count=0),
+        _cycle(run_state="halted", motion_held=None, active_operation_count=0),
     ],
 )
 @pytest.mark.parametrize(
@@ -108,10 +108,9 @@ def test_held_run_with_all_motion_stopped_is_editable(cycle, manual) -> None:
         (_cycle(motion_held=None), []),
         ({**_cycle(), "runtime_controls": None}, []),
         (_cycle(containment_pending=True), []),
-        (_cycle(run_state="full_stopping", active_operation_count=1), []),
-        (_cycle(run_state="full_stopped", active_operation_count=None), []),
+        (_cycle(run_state="halting", active_operation_count=1), []),
+        (_cycle(run_state="halted", active_operation_count=None), []),
         (_cycle(run_state="stopping"), []),
-        ({**_cycle(), "state": "stopping"}, []),
         ({**_cycle(), "program_run_id": "run.2"}, []),
         (_cycle(), [{"resident": True, "operation": {"state": "executing"}}]),
         # Not affirmatively settled: effect unproven, authority retained,

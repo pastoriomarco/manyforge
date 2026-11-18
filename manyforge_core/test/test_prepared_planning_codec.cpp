@@ -30,7 +30,7 @@ PlanRequestDTO MovingRequest() {
   suffix.velocities =
       std::vector<CoordinateVelocityDTO>{AngularVelocityDTO{0.0}, AngularVelocityDTO{0.0}};
   request.moving_replacement =
-      MovingReplacementInputDTO{{ControllerGoalId("old.goal"), ControllerGoalGeneration(3U)},
+      MovingReplacementInputDTO{ControllerGoalId{OperationNumber(901U), 1U, 3U},
                                 ExecutionBindingEpoch(4U),
                                 2.0,
                                 std::move(prefix),
@@ -256,8 +256,7 @@ TEST(PreparedPlanningCodecTest, MovingRequestBindsSourceTimeFramesAndClosedConte
   ASSERT_TRUE(decoded.ok()) << decoded.error().details.at("reason");
   ASSERT_TRUE(decoded.value().moving_replacement);
   const auto& source = *decoded.value().moving_replacement;
-  EXPECT_EQ(source.source_goal.controller_goal_id.value(), "old.goal");
-  EXPECT_EQ(source.source_goal.controller_goal_generation.value(), 3U);
+  EXPECT_EQ(source.source_goal, (ControllerGoalId{OperationNumber(901U), 1U, 3U}));
   EXPECT_EQ(source.source_binding_epoch.value(), 4U);
   EXPECT_DOUBLE_EQ(source.source_cursor_s, 2.0);
   EXPECT_DOUBLE_EQ(source.divergence_cursor_s, 2.25);

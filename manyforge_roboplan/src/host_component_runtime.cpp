@@ -42,8 +42,8 @@ class HostComponentRuntime::RouteOpeningAdapter final : public core::IComponentA
   [[nodiscard]] bool CanRecoverSharedOwner() const override {
     if (hooks_.shared_transport_fault) {
       const auto fault = hooks_.shared_transport_fault(component_id_);
-      // A stall is not an executor failure and does not enable shared-owner
-      // recovery; its Recover route remains held pending OD51.
+      // A stall is not an executor failure and offers no recovery: it clears
+      // by itself when the owner's task finishes.
       if (fault && fault->code == core::FaultCode::kOwnerStalled) return false;
       if (fault) return true;
     }
@@ -223,7 +223,24 @@ core::Result<core::ComponentActionInProgress> HostComponentRuntime::SubmitRecove
                                            std::move(owner_recovered));
 }
 
-void HostComponentRuntime::InterruptActions() { coordinator_.InterruptActions(); }
+void HostComponentRuntime::InterruptActions(const core::StopComponentInterrupts &interrupts) {
+  if (interrupts.all) {
+    coordinator_.InterruptActions();
+    return;
+  }
+  // Bit i of the event's set names (*table)[i] (the applied cell's sorted
+  // controllable components); no id string is copied.
+  const auto &table = *interrupts.table;
+  coordinator_.InterruptActionsOf([&](const std::string_view component_id) {
+    const auto row = std::lower_bound(
+        table.begin(), table.end(), component_id,
+        [](const auto &candidate, const std::string_view id) { return candidate.value() < id; });
+    if (row == table.end() || row->value() != component_id) return false;
+    const auto index = static_cast<std::size_t>(row - table.begin());
+    return index / 64U < interrupts.bits.size() &&
+           ((interrupts.bits[index / 64U] >> (index % 64U)) & 1U) != 0U;
+  });
+}
 
 void HostComponentRuntime::Refresh() {
   if (hooks_.refresh_shared_transport) hooks_.refresh_shared_transport();

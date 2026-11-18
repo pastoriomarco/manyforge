@@ -1,6 +1,6 @@
 schema_version: manyforge.operator_alarm_catalog.v1
-catalog_version: 2.9.0
-descriptor_digest: sha256:366e2643d348456d350b638b9b2c2ab22828f2475e05f26b6d9f6b1941623413
+catalog_version: 2.13.0
+descriptor_digest: sha256:5d3199014adcc6b3dba1fc832cccf09e6ec195178668b51a70780a15e17e5a9e
 definitions:
   - definition_id: manyforge.motion.runtime_collision
     version: 2
@@ -48,8 +48,38 @@ definitions:
       motion.
     operator_response: >-
       Check the robot controller, its connection and the robot component's
-      status (an open component incident names its cause), then use the
-      permitted recovery action. Acknowledge the alarm to move it to History.
+      status (its fault names the cause), then use the permitted recovery
+      action. Acknowledge the alarm to move it to History.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.runtime_collision_condition
+    clear_authority: manyforge.kernel.runtime_collision_condition
+    adapter_id: manyforge.alarm_adapter.kernel_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: true
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 32
+
+  - definition_id: manyforge.motion.runtime_monitor_checks_stopped
+    version: 1
+    title: Collision checks stopped
+    message_template: "The collision checks of {resource_ids} did not run in time, so the robot was stopped. Check the load on the controller computer, then Recover."
+    alarm_class: motion
+    priority: critical
+    priority_rationale: >-
+      Motion stopped because the robot's collision checks did not run in time;
+      it requires immediate awareness before recovery. Priority does not imply
+      a safety-rated annunciator.
+    consequence: >-
+      Motion remains stopped. Nothing was detected in contact, but the robot
+      moved without collision checks until it stopped, so recovering without
+      checking the cause can repeat the stop. Acknowledgement never gates
+      motion.
+    operator_response: >-
+      Check the load on the controller computer, then use the permitted
+      recovery action. Acknowledge the alarm to move it to History.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.kernel.runtime_collision_condition
     clear_authority: manyforge.kernel.runtime_collision_condition
@@ -232,6 +262,34 @@ definitions:
     requires_motion_attention: true
     max_evidence_refs: 16
 
+  - definition_id: manyforge.runtime.history_missing_records
+    version: 1
+    title: History is missing records
+    message_template: "Some events could not be written to the event history and were dropped. The history has gaps from that moment. This alone does not stop motion. If the disk is full or not taking records, a separate alarm stops operation. The alarm clears when the history writes again; if it stays, check the disk."
+    alarm_class: runtime_health
+    priority: low
+    priority_rationale: >-
+      Records the event history dropped leave gaps the operator should know
+      about; nothing else is constrained.
+    consequence: >-
+      Some events could not be written to the event history and were dropped.
+      The history has gaps from that moment. This alone does not stop motion.
+      If the disk is full or not taking records, a separate alarm stops
+      operation.
+    operator_response: >-
+      The alarm clears when the history writes again; if it stays, check the
+      disk.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.headless.history_loss_condition
+    clear_authority: manyforge.headless.history_loss_condition
+    adapter_id: manyforge.alarm_adapter.runtime_health_condition
+    runtime_modes:
+      - all
+    acknowledgement_required: false
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 1
+
   - definition_id: manyforge.runtime.previous_session_unclean
     version: 1
     title: ManyForge did not close correctly last time
@@ -260,22 +318,23 @@ definitions:
 
   - definition_id: manyforge.runtime.program_runner_loss
     version: 1
-    title: Program Runner lost during a run
-    message_template: "Program Runner lost during a run; restart the Workbench"
+    title: Program Runner lost or failed during a run
+    message_template: "The Program Runner stopped answering or failed during a run, and the run was halted. The alarm clears when the Program Runner works again."
     alarm_class: runtime_health
     priority: high
     priority_rationale: >-
-      An unrecoverable Workbench runtime fault requires prompt operator
-      attention and a Workbench restart.
+      A running Program was halted because its Program Runner stopped
+      answering or failed; the operator must act to continue.
     consequence: >-
-      The Program owner is unavailable. Motion containment remains owned by
-      the existing Manager-presence lease and Stop certificate; this alarm
-      does not prove that motion has stopped. Acknowledgement never gates
-      motion.
+      The run was halted and stays halted until the operator continues or
+      resets it. While the Program Runner does not answer or has failed, the
+      Program cannot be continued. Acknowledgement never gates motion.
     operator_response: >-
-      Review the fault details and containment status, then restart the
-      Workbench. Acknowledge the alarm to move it to History. Acknowledgement
-      does not clear the fault.
+      Wait for the alarm to clear: it clears by itself when the Program Runner
+      answers again. Then press Execute to continue the halted Program, and
+      Resume or Run to restart its motion, or Reset the Program. If the alarm
+      stays, stop ManyForge and start it again. Acknowledge the alarm to move
+      it to History.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.kernel.runtime_fault_condition
     clear_authority: manyforge.kernel.runtime_fault_condition
@@ -289,21 +348,83 @@ definitions:
     max_evidence_refs: 1
 
   - definition_id: manyforge.runtime.operation_journal_write_fault
+    version: 2
+    title: Operation records are being lost
+    message_template: "Some operation records could not be written to the journal and were dropped. History and the previous-session report have gaps from that moment. This alone does not stop motion. If the disk is full or not taking records, a separate alarm stops operation. The alarm clears when the journal writes again; if it stays, check the disk."
+    alarm_class: runtime_health
+    priority: low
+    priority_rationale: >-
+      Operation records the journal dropped leave gaps the operator should
+      know about; nothing else is constrained.
+    consequence: >-
+      Some operation records could not be written to the journal and were
+      dropped. History and the previous-session report have gaps from that
+      moment. This alone does not stop motion. If the disk is full or not
+      taking records, a separate alarm stops operation.
+    operator_response: >-
+      The alarm clears when the journal writes again; if it stays, check the
+      disk.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.kernel.runtime_fault_condition
+    clear_authority: manyforge.kernel.runtime_fault_condition
+    adapter_id: manyforge.alarm_adapter.runtime_fault_condition
+    runtime_modes:
+      - program
+      - direct_control
+    acknowledgement_required: false
+    acknowledgement_reason_required: false
+    requires_motion_attention: false
+    max_evidence_refs: 1
+
+  - definition_id: manyforge.runtime.disk_cannot_keep_records
     version: 1
-    title: Operation history write failed
-    message_template: "Operation history write failed; new motion is inhibited"
+    title: "Disk cannot keep ManyForge's records"
+    message_template: "Operation stopped: the disk cannot keep ManyForge's records. Running Programs were halted, and new motion is refused until the disk takes records again."
     alarm_class: runtime_health
     priority: high
     priority_rationale: >-
-      An unrecoverable Workbench runtime fault requires prompt operator
-      attention and a Workbench restart.
+      Operation stays stopped until the disk takes records again; the operator
+      must free space on the disk or check it to continue.
     consequence: >-
-      The operation journal has failed and admission remains closed.
-      Unresolved write outcomes remain retained; no automatic write retry or
-      in-app Reset clears this fault. Acknowledgement never gates motion.
+      Running Programs were halted and new motion is refused while the disk
+      cannot keep records. Without records, the event history and the
+      previous-session report would have gaps.
     operator_response: >-
-      Review the fault details and containment status, then restart the
-      Workbench. Acknowledge the alarm to move it to History. Acknowledgement
+      Free space on that disk, or check the disk if it is not full. The alarm
+      clears by itself when the disk takes records again. Then press Execute
+      to continue the halted Program, and Resume or Run to restart its
+      motion. Stop, Reset and History stay available, and you can stop
+      ManyForge normally.
+    scope_fields: [subject_kind, subject_id, resource_ids]
+    set_authority: manyforge.headless.disk_records_condition
+    clear_authority: manyforge.headless.disk_records_condition
+    adapter_id: manyforge.alarm_adapter.runtime_health_condition
+    runtime_modes:
+      - all
+    acknowledgement_required: false
+    acknowledgement_reason_required: false
+    requires_motion_attention: true
+    max_evidence_refs: 1
+
+  - definition_id: manyforge.runtime.kernel_internal_fault
+    version: 1
+    title: Internal fault
+    message_template: "Internal fault; new motion is inhibited until restart"
+    alarm_class: runtime_health
+    priority: high
+    priority_rationale: >-
+      An unrecoverable ManyForge runtime fault requires prompt operator
+      attention and a ManyForge restart.
+    consequence: >-
+      A callback on the Stop or safety path failed. The Kernel requested one
+      Full Stop, not retried, and new motion stays blocked until the execution
+      host restarts; Execute's readiness shows it as
+      execution_host_internal_fault. The details name the first typed cause,
+      whether that Full Stop was accepted (or its refusal code) and how many
+      later failures followed. Acknowledgement never gates motion.
+    operator_response: >-
+      Review the fault details and containment status, then restart
+      ManyForge. Acknowledge the alarm to move it to History. Acknowledgement
       does not clear the fault.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.kernel.runtime_fault_condition
@@ -317,33 +438,30 @@ definitions:
     requires_motion_attention: false
     max_evidence_refs: 1
 
-  - definition_id: manyforge.runtime.kernel_internal_fault
+  - definition_id: manyforge.runtime.component_fault
     version: 1
-    title: Internal fault
-    message_template: "Internal fault; new motion is inhibited until restart"
+    title: Component fault
+    message_template: "Fault on component {subject_id}"
     alarm_class: runtime_health
     priority: high
     priority_rationale: >-
-      An unrecoverable Workbench runtime fault requires prompt operator
-      attention and a Workbench restart.
+      A component in fault cannot work until its cause is fixed, so it needs
+      prompt operator attention. Priority does not imply a safety-rated
+      annunciator.
     consequence: >-
-      A callback on the Stop or safety path failed. The Kernel requested one
-      Full Stop, not retried, and new motion stays blocked until the execution
-      host restarts; Execute's readiness shows it as
-      execution_host_internal_fault. The details name the first typed cause,
-      whether that Full Stop was accepted (or its refusal code) and how many
-      later failures followed. Acknowledgement never gates motion.
+      The component cannot be used and Execute is blocked while the fault
+      lasts. A fault while something is executing also latches the cell until
+      every component is healthy and idle.
     operator_response: >-
-      Review the fault details and containment status, then restart the
-      Workbench. Acknowledge the alarm to move it to History. Acknowledgement
-      does not clear the fault.
+      Read the fault on the component and use the action it names. Some faults
+      clear by themselves. The alarm stays listed until you acknowledge it;
+      acknowledging clears nothing.
     scope_fields: [subject_kind, subject_id, resource_ids]
-    set_authority: manyforge.kernel.runtime_fault_condition
-    clear_authority: manyforge.kernel.runtime_fault_condition
-    adapter_id: manyforge.alarm_adapter.runtime_fault_condition
+    set_authority: manyforge.component_coordinator.fault_condition
+    clear_authority: manyforge.component_coordinator.fault_condition
+    adapter_id: manyforge.alarm_adapter.runtime_health_condition
     runtime_modes:
-      - program
-      - direct_control
+      - all
     acknowledgement_required: true
     acknowledgement_reason_required: false
     requires_motion_attention: false

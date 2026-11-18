@@ -583,42 +583,13 @@ class IsaacLauncher:
     def _remote_native_shell(self, operation: str) -> str:
         config = self._require_config()
         remote = config.remote
-        global_args = [
+        args = [
             remote.python_executable, "-m", "manyforge_operator",
             "--state-root", remote.state_root,
             "--instance-id", config.instance_id,
             "--json",
+            operation,
         ]
-        if operation == "start":
-            args = [
-                *global_args, "start", "--profile", "standard",
-                "--source-root", remote.source_root,
-                "--manager-executable", remote.manager_executable,
-                "--install-root", remote.install_root,
-                "--node-catalog-path", remote.node_catalog_path,
-                "--alarm-catalog-path", remote.alarm_catalog_path,
-                "--canonical-empty-admission-filename", remote.canonical_empty_admission_filename,
-                "--cell-id", remote.cell_id,
-                "--advertised-host", remote.advertised_host,
-                "--package-aggregate-sha256", remote.package_aggregate_sha256,
-                "--compiler-build-manifest-sha256", remote.compiler_build_manifest_sha256,
-                "--node-environment-sha256", remote.node_environment_sha256,
-                "--readiness-timeout-s", str(config.readiness_timeout_seconds),
-                "--poll-interval-s", str(config.poll_interval_seconds),
-                "--manager-timeout-s", str(config.manager_timeout_seconds),
-                "--simulation-control-config", remote.simulation_control_config,
-            ]
-            for option, value in (
-                ("--expected-source-fingerprint", getattr(config, "expected_source_fingerprint", None)),
-                ("--expected-head-commit", getattr(config, "expected_head_commit", None)),
-                ("--expected-head-tree", getattr(config, "expected_head_tree", None)),
-            ):
-                if value:
-                    args.extend((option, value))
-            if remote.composer_static_dir:
-                args.extend(("--composer-static-dir", remote.composer_static_dir))
-        else:
-            args = [*global_args, operation]
         return self._remote_source_prefix() + shlex.join(args)
 
     def _remote_boot_id(self) -> str:
@@ -732,7 +703,6 @@ class IsaacLauncher:
             "MANYFORGE_DEV_LAUNCH_INPUT_DIGEST": digest or "",
             "MANYFORGE_DEV_OPERATOR_INSTALL_ROOT": remote.install_root,
             "MANYFORGE_DEV_OPERATOR_CELL_ID": remote.cell_id,
-            "MANYFORGE_DEV_OPERATOR_READINESS_TIMEOUT": str(config.readiness_timeout_seconds),
             "MANYFORGE_DEV_OPERATOR_ADMISSION": remote.canonical_empty_admission_filename,
             "MANYFORGE_DEV_OPERATOR_PACKAGE_SHA256": remote.package_aggregate_sha256,
             "MANYFORGE_DEV_OPERATOR_NODE_CATALOG": remote.node_catalog_path,
@@ -813,9 +783,10 @@ class IsaacLauncher:
                     component_id=component, authority=ReadinessAuthority.OWNER_ISSUED,
                     state=ReadinessState.READY if ready else ReadinessState.UNAVAILABLE,
                     source_schema={"manager": "manyforge.manager_status.v1", "headless": "manyforge.headless_health.v1",
-                                   "program_runner": "manyforge.program_runner_health.v1", "composer": "manyforge.composer_health.v1"}[component],
+                                   "program_runner": "manyforge.program_runner_health.v2", "composer": "manyforge.composer_health.v1"}[component],
                     owner_id=str(payload.get("owner_id", component)),
-                    owner_epoch=str(payload["owner_epoch"]) if payload.get("owner_epoch") is not None else None,
+                    application_start_id=(str(payload["application_start_id"])
+                                          if payload.get("application_start_id") is not None else None),
                     payload_sha256=_sha256_json(payload), observed_at_unix_ns=now,
                     reason_code=None if ready else "owner_not_ready").model_dump(mode="json"))
         ready = result.get("running") is True and len(rows) == 4 and all(row["state"] == ReadinessState.READY.value for row in rows)
@@ -857,39 +828,22 @@ class IsaacLauncher:
         self._ssh(self._container_shell("build-native"), timeout=2700)
 
     def _remote_native_start(self) -> dict[str, Any]:
-        if getattr(self._require_config().remote, "container_image_id", ""):
-            # Nothing has started yet: a failed build leaves no container.
-            self._remote_native_build()
-            try:
-                status = self._remote_container_operation("start")
-            except LauncherError:
-                try:
-                    self._remote_status = self._remote_container_operation("status")
-                except LauncherError:
-                    pass
-                raise
-            self._remote_status = status
-            if status["state"] != LaunchInstanceState.READY.value:
-                raise LauncherError("runtime_container_unready", "owned ROS workbench did not report ready", exit_code=73)
-            return status
+        # The split profile starts the runtime only through the owned
+        # container (compose-dev.sh start, then status readback); start()
+        # refuses a configuration without it.
+        # Nothing has started yet: a failed build leaves no container.
+        self._remote_native_build()
         try:
-            result = self._ssh_json(f"bash -lc {shlex.quote(self._remote_native_shell('start'))}", timeout=self.config.readiness_timeout_seconds + 30)
-        except LauncherError as error:
+            status = self._remote_container_operation("start")
+        except LauncherError:
             try:
-                recovered = self._remote_native_status()
+                self._remote_status = self._remote_container_operation("status")
             except LauncherError:
-                raise error
-            if recovered is not None:
-                self._remote_status = recovered
-            raise error
-        status = result.get("status")
-        if isinstance(status, dict):
-            self._remote_status = status
-        if result.get("outcome") not in {"started", "already_running"}:
-            error = result.get("error") if isinstance(result.get("error"), dict) else {}
-            raise LauncherError(str(error.get("code", "runtime_native_start_failed")), str(error.get("message", "remote native operator start failed")), exit_code=73)
-        if not isinstance(status, dict):
-            raise LauncherError("remote_protocol_invalid", "remote native start omitted status", exit_code=75)
+                pass
+            raise
+        self._remote_status = status
+        if status["state"] != LaunchInstanceState.READY.value:
+            raise LauncherError("runtime_container_unready", "owned ManyForge ROS runtime did not report ready", exit_code=73)
         return status
 
     def _remote_native_status(self) -> dict[str, Any] | None:
@@ -1193,7 +1147,7 @@ class IsaacLauncher:
                 if any(row.presence is not ResourcePresence.ABSENT for row in old_status.resource_observations):
                     raise LauncherError("stale_launch_record", "stopped Isaac record is not proven absent", exit_code=70, status=old_status)
             if not getattr(self._require_config().remote, "container_image_id", ""):
-                raise LauncherError("container_configuration_required", "Isaac start requires the explicit full ROS container configuration", exit_code=64)
+                raise LauncherError("container_configuration_required", "Isaac start requires the explicit full ROS container configuration: the split profile starts the runtime only with compose-dev.sh start inside the owned container (--remote-container-image-id, --remote-container-name, --remote-cache-root, --remote-runtime-root, --remote-evidence-root)", exit_code=64)
             runtime_boot_id = self._remote_boot_id()
             configuration = self._configuration(runtime_boot_id)
             self._verify_remote_source(configuration.source)

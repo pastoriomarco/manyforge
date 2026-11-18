@@ -1,10 +1,43 @@
 #include "resource_addressed_execution_kernel_internal.hpp"
 
 namespace manyforge::core {
+namespace {
+
+/// The Stop control executor token of a participant that is stopping: its
+/// Stop lane index and generation (§2.2). Absent when it holds no lane.
+[[nodiscard]] std::optional<StopControlWorkToken> stopping_participant_token(
+    const ActiveOperationParticipant& participant) noexcept {
+  if (participant.stop.phase != StopPhase::kStopping || participant.stop.lane_index == kNoStopLane)
+    return std::nullopt;
+  return StopControlWorkToken{participant.stop.lane_index, participant.stop.lane_generation};
+}
+
+/// A Kernel-internal Stop of one whole operation (S14 and the lost final
+/// dispatch admission): operator attribution, as today's acceptance gave
+/// these Stops (none is the Program's own request). `target` must outlive the
+/// call that consumes the request.
+[[nodiscard]] StopRequest internal_operation_stop(const RequestKey& key, StopKind kind,
+                                                  const StopOperationTargetDTO& target,
+                                                  std::string_view source_label,
+                                                  std::string_view reason,
+                                                  std::optional<StopMode> mode = std::nullopt) {
+  StopRequest request;
+  request.request_key = key;
+  request.kind = kind;
+  request.selector = StopSelectorKind::kOperations;
+  request.operations = std::span<const StopOperationTargetDTO>(&target, 1U);
+  request.source_label = source_label;
+  request.reason = reason;
+  request.attribution_rank = StopAttribution{StopAttributionClass::kOperator, 0, 0U};
+  request.mode = mode;
+  return request;
+}
+
+}  // namespace
 
 ResourceAddressedExecutionKernel::ActiveOperation*
 ResourceAddressedExecutionKernel::find_pending_motion_operation_locked(
-    const OperationId& operation_id) noexcept {
+    const OperationNumber& operation_id) noexcept {
   for (auto& [id, operation] : active_operations_) {
     static_cast<void>(id);
     for (auto* slot : {&operation->pending_motion_takeover, &operation->next_motion_takeover})
@@ -15,7 +48,7 @@ ResourceAddressedExecutionKernel::find_pending_motion_operation_locked(
 
 const ResourceAddressedExecutionKernel::ActiveOperation*
 ResourceAddressedExecutionKernel::find_pending_motion_operation_locked(
-    const OperationId& operation_id) const noexcept {
+    const OperationNumber& operation_id) const noexcept {
   for (const auto& [id, operation] : active_operations_) {
     static_cast<void>(id);
     for (const auto* slot : {&operation->pending_motion_takeover, &operation->next_motion_takeover})
@@ -24,15 +57,15 @@ ResourceAddressedExecutionKernel::find_pending_motion_operation_locked(
   return nullptr;
 }
 
-std::optional<OperationId> ResourceAddressedExecutionKernel::find_event_operation_locked(
+std::optional<OperationNumber> ResourceAddressedExecutionKernel::find_event_operation_locked(
     const IResolvedParticipantExecutionEngine* engine, const std::uint64_t subordinate_id,
     const std::optional<std::uint64_t> subscription_id) const {
   if (engine == nullptr || subordinate_id == 0U) {
     return std::nullopt;
   }
-  std::optional<OperationId> result;
+  std::optional<OperationNumber> result;
   bool ambiguous = false;
-  const auto consider = [&](const OperationId& id, const ActiveOperation& operation) {
+  const auto consider = [&](const OperationNumber& id, const ActiveOperation& operation) {
     const ActiveOperationParticipant* participant = nullptr;
     if (subscription_id) {
       const auto found = std::find_if(operation.participants.begin(), operation.participants.end(),
@@ -56,9 +89,9 @@ std::optional<OperationId> ResourceAddressedExecutionKernel::find_event_operatio
 
 Result<void> ResourceAddressedExecutionKernel::record_late_cancel_uncertain(
     IResolvedParticipantExecutionEngine* engine, const std::uint64_t execution_id) {
-  std::optional<OperationId> operation_id;
+  std::optional<OperationNumber> operation_id;
   double progress = 0.0;
-  std::optional<OperationId> takeover_owner;
+  std::optional<OperationNumber> takeover_owner;
   const auto exact_uncertain = [&](const ActiveOperation& operation) {
     const auto* participant = operation.participant_for(engine);
     if (!participant || participant->subordinate_id != execution_id ||
@@ -111,9 +144,8 @@ Result<void> ResourceAddressedExecutionKernel::record_late_cancel_uncertain(
     progress = row->progress;
   }
   if (takeover_owner) {
-    // Serialize against the incumbent's existing takeover journal writer.
-    // Re-journal the exact candidate snapshot; observing its in-memory state
-    // alone cannot acknowledge a concurrent or failed journal write.
+    // Serialized with the incumbent's takeover commits; the exact uncertain
+    // candidate snapshot is recorded again.
     OperationCommitGuard commit(*this, *takeover_owner);
     std::unique_lock lock(state_mutex_);
     auto* owner = find_active_operation_locked(*takeover_owner);
@@ -128,28 +160,14 @@ Result<void> ResourceAddressedExecutionKernel::record_late_cancel_uncertain(
     if (!owned_by_original() || !exact_uncertain(*operation))
       return reject<void>("Takeover uncertainty awaits durable reconciliation",
                           "late_cancel_projection_pending", ErrorCode::kExecutionRejected);
-    const auto prior = operation->state;
-    auto capture = prior;
+    auto capture = operation->state;
     stamp_operation_capture_locked(*operation, capture);
-    lock.unlock();
-    const auto written = attempt_journal_write([&] {
-      return journal_.RecordOperationState(config_.request_owner_epoch, capture, nullptr,
-                                           "late_cancel_uncertainty_confirmed");
-    });
-    lock.lock();
-    if (!written.ok()) {
-      retain_operation_journal_write_fault_locked("late_cancel_uncertainty_confirmed",
-                                                  written.error(), &capture);
-      return Result<void>::Err(written.error());
-    }
-    owner = find_active_operation_locked(*takeover_owner);
-    operation = find_pending_motion_operation_locked(*operation_id);
-    if (!owned_by_original() || operation->state != prior ||
-        operation->last_capture_order != capture.journal_capture_order ||
-        !exact_uncertain(*operation))
-      return reject<void>("Takeover uncertainty changed during journal projection",
-                          "late_cancel_projection_pending", ErrorCode::kExecutionRejected);
     operation->state.journal_capture_order = capture.journal_capture_order;
+    post_operation_state_locked(
+        *operation,
+        JournalOperationState{std::move(capture), std::nullopt,
+                              "late_cancel_uncertainty_confirmed", {}},
+        "late_cancel_uncertainty_confirmed");
     return Result<void>::Ok();
   }
   const auto failure = error("execution_aborted", "Late goal cancellation outcome is uncertain",
@@ -178,7 +196,7 @@ Result<void> ResourceAddressedExecutionKernel::record_late_cancel_uncertain(
   if (!engine || preparation_id == 0U || command_id == 0U || generation == 0U || target.empty())
     return reject<void>("Late gripper cancel identity is incomplete",
                         "late_cancel_execution_unmapped", ErrorCode::kInvariantViolation);
-  std::optional<OperationId> operation_id;
+  std::optional<OperationNumber> operation_id;
   double progress = 0.0;
   std::optional<ErrorDTO> prior_owner_loss;
   std::optional<ParticipantExecutionFact> prior_owner_loss_fact;
@@ -251,7 +269,7 @@ Result<void> ResourceAddressedExecutionKernel::record_late_cancel_uncertain(
 }
 
 Result<bool> ResourceAddressedExecutionKernel::confirm_prepared_command_no_effect(
-    const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
+    const OperationNumber& operation_id, IResolvedParticipantExecutionEngine* engine,
     const std::uint64_t preparation_id) {
   OperationCommitGuard commit(*this, operation_id);
   IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
@@ -325,7 +343,7 @@ Result<bool> ResourceAddressedExecutionKernel::confirm_prepared_command_no_effec
 }
 
 Result<void> ResourceAddressedExecutionKernel::discard_uncommitted_ordinary_preparations(
-    const OperationId& operation_id, IResolvedParticipantExecutionEngine* failing_engine,
+    const OperationNumber& operation_id, IResolvedParticipantExecutionEngine* failing_engine,
     std::optional<ErrorDTO> failure) {
   struct Target final {
     IResolvedParticipantExecutionEngine* engine{};
@@ -416,7 +434,7 @@ Result<void> ResourceAddressedExecutionKernel::discard_uncommitted_ordinary_prep
 }
 
 Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
-    const OperationId& operation_id, IResolvedParticipantExecutionEngine* failing_engine,
+    const OperationNumber& operation_id, IResolvedParticipantExecutionEngine* failing_engine,
     ErrorDTO failure) {
   struct Cancellation final {
     IResolvedPreparedParticipantExecutionEngine* engine{};
@@ -432,32 +450,27 @@ Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
         (!admission_refusal &&
          operation->intent.coordination_policy != OperationCoordinationPolicy::kCoordinatedAll))
       return FailureRoute::kDone;
-    if (!operation->state.active_stop_id) return FailureRoute::kCoordinated;
+    if (!operation->state.stop_event_id) return FailureRoute::kCoordinated;
     const auto* failing = operation->participant_for(failing_engine);
     if (admission_refusal || (failing && !failing->stop_owns_reconciliation())) {
       // This decision belongs to EACH locked ownership check. Stop can win
-      // while an ordinary failure is waiting for its journal writer.
+      // while an ordinary failure is waiting for its commit gate.
       return FailureRoute::kOrdinary;
     }
     if (auto* participant = operation->participant_for(failing_engine))
       participant->last_subordinate_error = failure;
-    if (operation->state.active_stop_generation) {
-      const auto transaction = std::find_if(
-          stop_transactions_.begin(), stop_transactions_.end(), [&](const auto& candidate) {
-            return candidate && candidate->active &&
-                   candidate->stop_id == operation->state.active_stop_id &&
-                   candidate->stop_generation == *operation->state.active_stop_generation;
-          });
-      if (transaction != stop_transactions_.end()) {
-        stop_control_executor_->ArmDeadline((*transaction)->token, clock_.now());
-        stop_control_executor_->Publish((*transaction)->token);
+    // Wake every stopping participant of the operation on its Stop lane.
+    for (const auto& participant : operation->participants) {
+      if (const auto token = stopping_participant_token(participant)) {
+        stop_control_executor_->ArmDeadline(*token, clock_.now());
+        stop_control_executor_->Publish(*token);
       }
     }
     return FailureRoute::kDone;
   };
   FailureRoute route;
   {
-    // A Stop-owned cancellation callback must not wait for ordinary storage.
+    // A Stop-owned cancellation callback must not wait for the ordinary gate.
     std::lock_guard state_lock(state_mutex_);
     route = failure_route_locked(find_active_operation_locked(operation_id));
   }
@@ -521,6 +534,8 @@ Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
     operation->state.state = OperationStateKind::kInterventionRequired;
     operation->state.updated_at_ns = clock_.now();
     stamp_operation_capture_locked(*operation, operation->state);
+    // No row in this section: the stream learns it from memory.
+    note_operation_change_locked();
   }
 
   std::optional<ErrorDTO> cancellation_failure;
@@ -539,7 +554,7 @@ Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
     operation->coordinated_cancellation_in_flight = false;
   }
   if (operation == nullptr) return Result<void>::Ok();
-  if (operation->state.active_stop_id) {
+  if (operation->state.stop_event_id) {
     // Stop may also arrive while the original coordinated abort's provider
     // cancellations are out. Finish only the ordinary rows through their
     // actual owner proof/slot transition; moving rows remain Stop-owned.
@@ -564,8 +579,7 @@ Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
     }
   }
   auto captured = operation->state;
-  auto durable = record_operation_state_locked(
-      state_lock, captured, nullptr,
+  auto durable = record_operation_state_locked(captured, nullptr,
       cancellation_failure.has_value() ? "coordinated_prepare_cancel_failed"
       : admission_refusal              ? "admission_refused_before_dispatch"
                                        : "coordinated_prepare_failed_before_dispatch");
@@ -595,13 +609,20 @@ Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
   for (auto& participant : operation->participants) {
     participant.slot_state = ResourceSlotState::kTerminal;
   }
-  retain_historical_operation_locked(operation->state);
+  for (const auto& participant : operation->participants)
+    if (participant.stop.phase == StopPhase::kFailed)
+      count_participant_phase_locked(participant, StopPhase::kFailed, std::nullopt);
+  {
+    auto retained = operation->state;
+    fill_participant_stop_observations(operation->participants, retained);
+    retain_historical_operation_locked(std::move(retained));
+  }
   active_operations_.erase(operation_id);
   return Result<void>::Ok();
 }
 
 Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
-    const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine) {
+    const OperationNumber& operation_id, IResolvedParticipantExecutionEngine* engine) {
   struct Target final {
     IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
     IResolvedParticipantExecutionEngine* engine{};
@@ -624,7 +645,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
         participant->subordinate_id == 0U || participant->prepared_dispatch_released ||
         participant->prepared_advance_in_flight || participant->prepared_participant.has_value() ||
         operation->coordinated_dispatch_barrier_released ||
-        (terminal(operation->state.state) && !operation->state.active_stop_id.has_value())) {
+        (terminal(operation->state.state) && !operation->state.stop_event_id.has_value())) {
       return Result<void>::Ok();
     }
     if (!operation->pending_motion_takeover.empty() && operation->state.preemption &&
@@ -732,7 +753,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_motion(
 }
 
 void ResourceAddressedExecutionKernel::settle_deferred_capability_stop(
-    const OperationId& operation_id, IResolvedParticipantExecutionEngine* participant_engine,
+    const OperationNumber& operation_id, IResolvedParticipantExecutionEngine* participant_engine,
     IResolvedParticipantExecutionEngine* settlement_engine,
     const AddressedParticipantStopSettlementRequestDTO& request) {
   // The same exact settlement the Stop would have requested had the command
@@ -751,7 +772,7 @@ void ResourceAddressedExecutionKernel::settle_deferred_capability_stop(
         const auto& value = settled.value();
         const auto& recovery = value.recovery_assessment;
         if (value.execution_id != request.execution_id ||
-            !(value.aggregate_stop_certificate == request.aggregate_stop_certificate) ||
+            value.stop_event_id != request.stop_event_id ||
             recovery.execution_id != request.execution_id ||
             (recovery.status != RecoveryAssessmentStatus::kRetryReady &&
              !stopped_awaiting_terminal_cleanup(recovery))) {
@@ -779,7 +800,7 @@ void ResourceAddressedExecutionKernel::settle_deferred_capability_stop(
 
 void ResourceAddressedExecutionKernel::settle_deferred_pre_dispatch_cancellations() noexcept {
   struct ReturnedCancellation final {
-    OperationId operation_id;
+    OperationNumber operation_id;
     IResolvedParticipantExecutionEngine* engine{};
     AddressedParticipantStopSettlementRequestDTO request;
     OperationStateKind state{OperationStateKind::kStopped};
@@ -835,7 +856,7 @@ void ResourceAddressedExecutionKernel::settle_deferred_pre_dispatch_cancellation
 }
 
 Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier(
-    const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
+    const OperationNumber& operation_id, IResolvedParticipantExecutionEngine* engine,
     std::uint64_t preparation_id, const PreparedOperationParticipantDTO& participant_product) {
   struct DispatchTarget final {
     OperationParticipantId participant_id;
@@ -845,7 +866,6 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
     std::uint64_t preparation_id{};
     ContentDigest contract_digest;
     ControllerGoalId controller_goal_id;
-    ControllerGoalGeneration controller_goal_generation{0U};
   };
   struct CancellationTarget final {
     IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
@@ -853,8 +873,10 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
     std::uint64_t preparation_id{};
   };
 
-  StopWorkHandoff io_stop_handoff;
-  const ScopeExit publish_io_stop([&] { publish_stop_work(io_stop_handoff); });
+  // Obtained before any Kernel lock (it may allocate on the thread's first
+  // Stop); completed after every lock of this function is released.
+  StopHandoff& io_stop_handoff = thread_stop_handoff();
+  const ScopeExit publish_io_stop([&] { complete_stop_handoff(io_stop_handoff); });
   bool cancel_instead = false;
   bool non_motion_cancel = false;
   std::optional<CancellationTarget> cancellation_target;
@@ -897,19 +919,10 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
       commit.release();
       return discard_uncommitted_ordinary_preparations(operation_id);
     }
-    fence_held_prepared_program_commands_locked(operation->state.program_run_id);
-    if (participant->stop_owns_reconciliation() && operation->state.active_stop_id.has_value() &&
-        operation->state.active_stop_generation.has_value()) {
-      const auto transaction = std::find_if(
-          stop_transactions_.begin(), stop_transactions_.end(), [&](const auto& candidate) {
-            return candidate != nullptr && candidate->active &&
-                   candidate->stop_id == operation->state.active_stop_id &&
-                   candidate->stop_generation == *operation->state.active_stop_generation;
-          });
-      if (transaction != stop_transactions_.end()) {
-        stop_wakeup = (*transaction)->token;
-        stop_control_executor_->ArmDeadline(*stop_wakeup, clock_.now());
-      }
+    fence_held_prepared_program_commands_locked(operation->state.program_run_id, io_stop_handoff);
+    if (participant->stop_owns_reconciliation() && operation->state.stop_event_id.has_value()) {
+      stop_wakeup = stopping_participant_token(*participant);
+      if (stop_wakeup) stop_control_executor_->ArmDeadline(*stop_wakeup, clock_.now());
     } else if (participant->stop_cancelled_pre_dispatch &&
                operation->intent.coordination_policy ==
                    OperationCoordinationPolicy::kCoordinatedAll &&
@@ -946,7 +959,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           operation->participants.begin(), operation->participants.end(),
           [](const auto& candidate) { return candidate.prepared_participant.has_value(); });
       if (!all_prepared) {
-        auto durable = record_operation_state_locked(state_lock, prepared_state,
+        auto durable = record_operation_state_locked(prepared_state,
                                                      operation->runtime_scale_status.has_value()
                                                          ? &*operation->runtime_scale_status
                                                          : nullptr,
@@ -988,8 +1001,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
                   [](const auto& left, const auto& right) {
                     return left.participant_id < right.participant_id;
                   });
-        auto durable = record_operation_state_locked(
-            state_lock, prepared_state,
+        auto durable = record_operation_state_locked(prepared_state,
             operation->runtime_scale_status.has_value() ? &*operation->runtime_scale_status
                                                         : nullptr,
             operation->participants.size() == 1U ? (operation->participants.front().payload_kind ==
@@ -1008,7 +1020,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           commit.release();
           return discard_uncommitted_ordinary_preparations(operation_id);
         }
-        fence_held_prepared_program_commands_locked(operation->state.program_run_id);
+        fence_held_prepared_program_commands_locked(operation->state.program_run_id, io_stop_handoff);
         const auto cancelled_command = std::find_if(operation->participants.begin(),
             operation->participants.end(), [](const auto& candidate) {
               return candidate.non_motion_transaction() && candidate.stop_cancelled_pre_dispatch;
@@ -1046,16 +1058,21 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         // evaluated only here, in the same lock hold that transitions the
         // slots and releases dispatch: an alarm published or a projection
         // aged out at any earlier instant is observed. Dispatch none; the
-        // shared pre-dispatch path cancels every prepared participant.
+        // shared pre-dispatch path cancels every prepared participant. Every
+        // refusal here ends this advance's borrow first, so the failure is
+        // not kept resident behind it (OD-258).
+        const auto refuse_before_dispatch = [&](ErrorDTO refusal) {
+          participant = operation->participant_for(engine);
+          if (participant != nullptr) participant->prepared_advance_in_flight = false;
+          state_lock.unlock();
+          commit.release();
+          return fail_pre_dispatch(operation_id, nullptr, std::move(refusal));
+        };
         if (!operation->manual) {
           if (auto refusal = operator_alarm_attention_refusal_locked(
                   operation_resources(operation->participants))) {
             operation->state = std::move(prepared_state);
-            participant = operation->participant_for(engine);
-            if (participant != nullptr) participant->prepared_advance_in_flight = false;
-            state_lock.unlock();
-            commit.release();
-            return fail_pre_dispatch(operation_id, nullptr, std::move(*refusal));
+            return refuse_before_dispatch(std::move(*refusal));
           }
         }
 
@@ -1068,9 +1085,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           for (const auto& candidate : operation->participants) {
             if (const auto refusal =
                     global_io_rule_command_refusal_locked(candidate.binding.value(), operation)) {
-              state_lock.unlock();
-              commit.release();
-              return fail_pre_dispatch(operation_id, nullptr, *refusal);
+              return refuse_before_dispatch(*refusal);
             }
           }
         }
@@ -1080,22 +1095,18 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           if (!retired.ok()) {
             return retired;
           }
-          state_lock.unlock();
-          commit.release();
-          return fail_pre_dispatch(operation_id, nullptr, armed.error());
+          return refuse_before_dispatch(armed.error());
         }
         auto response = process_io_rule_evidence_locked(io_stop_handoff, &operation_id);
-        if (response.ok() && !io_stop_handoff.control && !io_stop_handoff.projection)
+        if (response.ok())
           response = process_global_io_rule_evidence_locked(io_stop_handoff, &operation_id);
         if (!response.ok()) {
           return response;
         }
-        if (operation->state.active_stop_id) return Result<void>::Ok();
+        if (operation->state.stop_event_id) return Result<void>::Ok();
         for (const auto& candidate : operation->participants) {
           if (const auto refusal = global_io_rule_command_refusal_locked(candidate.binding.value(), operation)) {
-            state_lock.unlock();
-            commit.release();
-            return fail_pre_dispatch(operation_id, nullptr, *refusal);
+            return refuse_before_dispatch(*refusal);
           }
         }
         // The durable Prepared copy predates arm/evidence evaluation. Preserve
@@ -1159,7 +1170,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
               candidate.slot_owner.participant_id, candidate.payload_kind,
               candidate.prepared_motion_engine, candidate.engine, candidate.subordinate_id,
               candidate.prepared_participant->prepared_contract_digest,
-              public_row->command_id, public_row->command_generation});
+              public_row->command_id});
         }
         std::sort(dispatch_targets.begin(), dispatch_targets.end(),
                   [](const auto& left, const auto& right) {
@@ -1206,7 +1217,12 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
 
   std::vector<OperationParticipantId> attempted_participants;
   for (const auto& dispatch_target : dispatch_targets) {
-    std::optional<StopIntentDTO> admission_stop;
+    struct AdmissionStop final {
+      RequestKey key;
+      StopOperationTargetDTO target;
+      bool handover_stale{};
+    };
+    std::optional<AdmissionStop> admission_stop;
     std::optional<AddressedParticipantStopSettlementRequestDTO> deferred_settlement;
     IResolvedParticipantExecutionEngine* deferred_settlement_engine{};
     bool cancelled_before_provider = false;
@@ -1229,7 +1245,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         global_dispatch_refusal = global_io_rule_command_refusal_locked(participant->binding.value(), operation);
         if (!global_dispatch_refusal) {
           auto response = process_io_rule_evidence_locked(io_stop_handoff, &operation_id);
-          if (response.ok() && !io_stop_handoff.control && !io_stop_handoff.projection)
+          if (response.ok())
             response = process_global_io_rule_evidence_locked(io_stop_handoff, &operation_id);
           if (!response.ok()) return response;
           if (participant->stop_owns_reconciliation()) continue;
@@ -1237,7 +1253,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         }
       }
       if (!global_dispatch_refusal) {
-        fence_held_prepared_program_commands_locked(operation->state.program_run_id);
+        fence_held_prepared_program_commands_locked(operation->state.program_run_id, io_stop_handoff);
         cancelled_before_provider = participant->non_motion_transaction() &&
                                     participant->stop_cancelled_pre_dispatch;
         const bool handover_stale =
@@ -1255,13 +1271,10 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           // Reuse exact Stop settlement for an admitted operation whose final
           // dispatch lost to a cell fault. Unreleased products are cancelled;
           // any already-released coordinated participant is physically stopped.
-          admission_stop = StopIntentDTO{
-              PublicRequestContextDTO{RequestId("stop.admission-closed." + operation_id.value()),
-                                      config_.request_owner_epoch, "kernel.admission", std::nullopt},
-              std::vector<StopOperationTargetDTO>{
-                  {operation_id, operation->state.operation_revision, StopGeneration(0U)}},
-              std::string(handover_stale ? "manual_handover_scope_stale"
-                                         : "motion_admission_closed")};
+          admission_stop = AdmissionStop{
+              owned_kernel_request_key(operation->admission_closed_stop_key),
+              StopOperationTargetDTO{operation_id, operation->state.operation_revision},
+              handover_stale};
         } else if (!cancelled_before_provider) {
           participant->prepared_dispatch_released = true;
           participant->dispatch_effect_in_flight = true;
@@ -1273,8 +1286,13 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
     if (global_dispatch_refusal)
       return fail_pre_dispatch(operation_id, dispatch_target.engine, *global_dispatch_refusal);
     if (admission_stop.has_value()) {
-      const auto contained = stop(*admission_stop);
-      return contained.ok() ? Result<void>::Ok() : Result<void>::Err(contained.error());
+      // Never refused (§5.3): the operation's participants are stopped.
+      (void)submit_stop(internal_operation_stop(
+          admission_stop->key, StopKind::kPreparedDispatchInvalid, admission_stop->target,
+          "kernel.admission",
+          admission_stop->handover_stale ? "manual_handover_scope_stale"
+                                         : "motion_admission_closed"));
+      return Result<void>::Ok();
     }
 
     if (cancelled_before_provider) {
@@ -1327,7 +1345,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
     } else {
       auto command = dispatch_target.prepared_engine->DispatchPreparedCapabilityCommand(
           dispatch_target.preparation_id, dispatch_target.contract_digest,
-          dispatch_target.controller_goal_id, dispatch_target.controller_goal_generation);
+          dispatch_target.controller_goal_id);
       if (!command.ok()) {
         dispatched = Result<void>::Err(command.error());
       } else if (!command.value().accepted || command.value().error.has_value() ||
@@ -1342,8 +1360,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
     }
     {
       // Returning from the provider ends the dispatch borrow, independently of
-      // ordinary journal publication. Stop must be able to settle even when a
-      // sibling participant's ordinary capture is blocked in storage.
+      // the ordinary state capture, so Stop can settle this participant.
       std::lock_guard state_lock(state_mutex_);
       auto* operation = find_active_operation_locked(operation_id);
       auto* participant =
@@ -1361,17 +1378,9 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           participant->subordinate_id = command_result->command_id;
           participant->subordinate_generation = command_result->generation;
         }
-        if (participant->stop_owns_reconciliation() && operation->state.active_stop_id.has_value()) {
-          const auto transaction = std::find_if(
-              stop_transactions_.begin(), stop_transactions_.end(), [&](const auto& candidate) {
-                return candidate && candidate->active &&
-                       candidate->stop_id == operation->state.active_stop_id &&
-                       candidate->stop_generation == operation->state.active_stop_generation;
-              });
-          if (transaction != stop_transactions_.end()) {
-            stop_wakeup = (*transaction)->token;
-            stop_control_executor_->ArmDeadline(*stop_wakeup, clock_.now());
-          }
+        if (participant->stop_owns_reconciliation() && operation->state.stop_event_id.has_value()) {
+          stop_wakeup = stopping_participant_token(*participant);
+          if (stop_wakeup) stop_control_executor_->ArmDeadline(*stop_wakeup, clock_.now());
         }
       }
     }
@@ -1408,7 +1417,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           if (operation->state.state != OperationStateKind::kInterventionRequired)
             executing_state.state = aggregate_participant_state(executing_state.participants);
           executing_state.updated_at_ns = clock_.now();
-          auto durable = record_operation_state_locked(state_lock, executing_state,
+          auto durable = record_operation_state_locked(executing_state,
                                                        operation->runtime_scale_status.has_value()
                                                            ? &*operation->runtime_scale_status
                                                            : nullptr,
@@ -1445,8 +1454,8 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           std::atomic<bool>& running;
           ~ReleaseHandoff() { running.store(false, std::memory_order_release); }
         } release_handoff{slot->handoff_running};
-        // The session stays pinned across this unlocked journal call. A failed
-        // projection remains visible to teardown and can be retried safely.
+        // The session stays pinned across this unlocked call. A refused
+        // hand-off remains visible to teardown and can be retried safely.
         const auto handed_off = record_late_cancel_uncertain(dispatch_target.engine,
             dispatch_target.preparation_id, command_result->command_id,
             command_result->generation, *failed_target);
@@ -1526,15 +1535,14 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
                                 : dispatched.error().code}}};
     std::vector<CancellationTarget> cancellations;
     std::vector<OperationParticipantId> undispatched_participants;
-    OperationRevision current_revision(0U);
     std::optional<OperationStateDTO> partial_state;
+    RequestKey partial_stop_key;
     {
       std::lock_guard state_lock(state_mutex_);
       auto* operation = find_active_operation_locked(operation_id);
-      if (operation == nullptr || operation->state.active_stop_id.has_value()) {
+      if (operation == nullptr || operation->state.stop_event_id.has_value()) {
         return Result<void>::Ok();
       }
-      current_revision = operation->state.operation_revision;
       for (auto& candidate : operation->participants) {
         const bool attempted =
             std::find(attempted_participants.begin(), attempted_participants.end(),
@@ -1567,19 +1575,29 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
       operation->state.updated_at_ns = clock_.now();
       operation->coordinated_cancellation_in_flight = !cancellations.empty();
       partial_state = operation->state;
+      post_operation_state_locked(*operation,
+                                  JournalOperationState{*partial_state, std::nullopt,
+                                                        "operation_partial_dispatch", {}},
+                                  "operation_partial_dispatch");
+      partial_stop_key = owned_kernel_request_key(operation->partial_dispatch_stop_key);
     }
     std::sort(attempted_participants.begin(), attempted_participants.end());
-    const PartialDispatchStopScope partial_scope{operation_id, current_revision,
-                                                 attempted_participants};
-    StopIntentDTO containment{
-        PublicRequestContextDTO{RequestId("stop.partial-dispatch." + operation_id.value()),
-                                config_.request_owner_epoch, "kernel.partial_dispatch",
-                                std::nullopt},
-        std::vector<StopOperationTargetDTO>{
-            StopOperationTargetDTO{operation_id, current_revision, StopGeneration(0U)}},
-        std::string("operation_partial_dispatch")};
-    static_cast<void>(
-        accept_stop(EmergencyStopProjectedIntentDTO{std::move(containment)}, &partial_scope));
+    // S13: exactly the released participants are stopped; the undispatched
+    // ones are cancelled below by the operation's own failure path. Built
+    // before the Stop takes the Kernel lock.
+    std::vector<StopParticipantRef> released;
+    released.reserve(attempted_participants.size());
+    for (const auto& id : attempted_participants)
+      released.push_back(StopParticipantRef{id.operation_id, id.ordinal - 1U});
+    StopRequest containment;
+    containment.request_key = partial_stop_key;
+    containment.kind = StopKind::kPartialDispatch;
+    containment.selector = StopSelectorKind::kParticipants;
+    containment.participants = released;
+    containment.source_label = "kernel.partial_dispatch";
+    containment.reason = "operation_partial_dispatch";
+    containment.attribution_rank = StopAttribution{StopAttributionClass::kOperator, 0, 0U};
+    (void)submit_stop(containment);
 
     if (!undispatched_participants.empty()) {
       std::lock_guard state_lock(state_mutex_);
@@ -1622,28 +1640,10 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
     }
     {
       std::lock_guard state_lock(state_mutex_);
-      if (auto* operation = find_active_operation_locked(operation_id); operation != nullptr) {
-        stamp_operation_capture_locked(*operation, operation->state);
-        partial_state = operation->state;
-      }
-    }
-    if (!partial_state.has_value()) {
-      std::lock_guard state_lock(state_mutex_);
-      return Result<void>::Ok();
-    }
-    const auto durable = attempt_journal_write([&] {
-      return journal_.RecordOperationState(config_.request_owner_epoch, *partial_state, nullptr,
-                                           "operation_partial_dispatch");
-    });
-    {
-      std::lock_guard state_lock(state_mutex_);
-      if (!durable.ok())
-        retain_operation_journal_write_fault_locked(
-            "operation_partial_dispatch", durable.error(), &*partial_state);
-      if (auto* operation = find_active_operation_locked(operation_id); operation != nullptr) {
-        operation->coordinated_cancellation_in_flight = false;
-        settle_completed_control_locked(operation_id);
-      }
+      auto* operation = find_active_operation_locked(operation_id);
+      if (operation == nullptr) return Result<void>::Ok();
+      operation->coordinated_cancellation_in_flight = false;
+      settle_completed_control_locked(operation_id);
     }
     return Result<void>::Ok();
   }
@@ -1651,7 +1651,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
 }
 
 Result<void> ResourceAddressedExecutionKernel::advance_prepared_capability_command(
-    const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine) {
+    const OperationNumber& operation_id, IResolvedParticipantExecutionEngine* engine) {
   std::optional<std::uint64_t> cancelled_preparation;
   IResolvedPreparedParticipantExecutionEngine* cancelled_engine{};
   std::shared_ptr<std::mutex> cancelled_resident;
@@ -1722,7 +1722,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_capability_comma
         participant->subordinate_id == 0U || participant->prepared_dispatch_released ||
         participant->prepared_advance_in_flight || participant->prepared_participant.has_value() ||
         operation->coordinated_dispatch_barrier_released ||
-        (terminal(operation->state.state) && !operation->state.active_stop_id.has_value())) {
+        (terminal(operation->state.state) && !operation->state.stop_event_id.has_value())) {
       return Result<void>::Ok();
     }
     const auto state_row =
@@ -1836,7 +1836,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_capability_comma
 }
 
 Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
-    const OperationId& operation_id, IResolvedParticipantExecutionEngine* engine,
+    const OperationNumber& operation_id, IResolvedParticipantExecutionEngine* engine,
     std::uint64_t subordinate_id, OperationStateKind state, double progress,
     std::optional<ErrorDTO> terminal_error, const bool observe_current_motion,
     std::optional<ParticipantExecutionFact> terminal_fact, const bool require_unfinalized_motion,
@@ -1849,8 +1849,8 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     auto* operation = find_active_operation_locked(operation_id);
     auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
     if (participant != nullptr && participant->stop_owns_reconciliation()) {
-      // The exact Stop certificate owns this participant's terminal. A
-      // synchronous Stop callback must never wait behind ordinary storage.
+      // The participant's Stop attempt owns its terminal. A
+      // synchronous Stop callback must never wait behind the ordinary gate.
       // Unaffected siblings of a partial Stop still follow the ordinary path.
       if (terminal_error.has_value() && participant->subordinate_id == subordinate_id)
         participant->last_subordinate_error = terminal_error;
@@ -1963,7 +1963,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
        active_participant->dispatch_effect_in_flight))
     return Result<void>::Ok();
   // Stop may have won while this ordinary callback waited for its writer
-  // gate or sampled the subordinate. Its certificate still owns settlement.
+  // gate or sampled the subordinate. Its Stop attempt still owns settlement.
   if (active_participant->stop_owns_reconciliation()) {
     return Result<void>::Ok();
   }
@@ -2059,10 +2059,10 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
         terminal_error.has_value() && terminal_error->details.contains("reason") &&
         terminal_error->details.at("reason") == "subordinate_terminal_error";
     if (!active_participant->finishes_current_gripper_transaction() &&
-        active_operation->state.active_stop_id.has_value() &&
+        active_operation->state.stop_event_id.has_value() &&
         participant.terminal_error.has_value()) {
       // Stop feedback cannot erase a cleanup fault already owned by this
-      // participant. Its containment evidence has a separate certificate.
+      // participant. Its containment outcome is on its Stop state.
       terminal_error = participant.terminal_error;
     } else if ((!terminal_error.has_value() || generic_subordinate_error) &&
                active_participant->last_subordinate_error.has_value()) {
@@ -2120,9 +2120,9 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
     }
     observed_participant.io_rule_outcomes = participant_iterator->io_rule_outcomes;
     for (auto& outcome : observed_participant.io_rule_outcomes) {
-      if (outcome.stop_id) {
+      if (outcome.stop_event_id) {
         // Cleanup can finish after a broader logical Stop response. Preserve
-        // its actual/pending certificate and winning operation fault cause.
+        // its actual/pending Stop result and winning operation fault cause.
         continue;
       }
       if (outcome.terminal_cause) continue;
@@ -2138,7 +2138,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
         outcome.terminal_cause = MotionExecutionTerminalCause::kFailed;
         outcome.error = outcome.evidence.evaluation_error.value_or(
             error(kErrorMotionInterruptBackendStopFailed,
-                  "Matched interrupt has no nominal Stop certificate",
+                  "Matched interrupt has no nominal Stop response",
                   "io_rule_terminal_without_response_certificate"));
         if (state == OperationStateKind::kCompleted) {
           state = OperationStateKind::kFailed;
@@ -2158,7 +2158,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
   }
   if (terminal(state) && state != OperationStateKind::kInterventionRequired) {
     for (const auto& outcome : observed_participant.io_rule_outcomes) {
-      if (!outcome.stop_certificate_id || !outcome.error || !outcome.evidence.trip ||
+      if (!outcome.stop_result || !outcome.error || !outcome.evidence.trip ||
           outcome.terminal_cause != MotionExecutionTerminalCause::kFailed ||
           outcome.arbitration_disposition != IoRuleArbitrationDispositionDTO::kActive)
         continue;
@@ -2194,8 +2194,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
       active_operation->has_pending_io_rule_response())
     observed_state.state = OperationStateKind::kStopping;
   observed_state.updated_at_ns = clock_.now();
-  auto durable_state = record_operation_state_locked(
-      state_lock, observed_state,
+  auto durable_state = record_operation_state_locked(observed_state,
       active_operation->runtime_scale_status.has_value() ? &*active_operation->runtime_scale_status
                                                          : nullptr,
       "subordinate_state_observed");
@@ -2218,7 +2217,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
       failed_participant.terminal_error = transition.error();
       intervention.updated_at_ns = clock_.now();
       auto durable_failure =
-          record_operation_state_locked(state_lock, intervention,
+          record_operation_state_locked(intervention,
                                         active_operation->runtime_scale_status.has_value()
                                             ? &*active_operation->runtime_scale_status
                                             : nullptr,
@@ -2234,7 +2233,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
   if (durable_applied) *durable_applied = true;
   state_lock.unlock();
   if (journaled_gripper_owner_loss) {
-    // Only a committed owner-loss fact authorizes retiring this command.
+    // Only the applied owner-loss fact authorizes retiring this command.
     try { engine->notify_gripper_owner_loss_recorded(*sampled_command_target, subordinate_id,
                                                       *sampled_command_generation); }
     catch (...) { /* The exact command remains unknown. */ }
@@ -2245,7 +2244,34 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
 void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecutionEngine* engine,
                                                        const std::uint64_t subscription_id,
                                                        const KernelEvent& event) {
-  std::optional<OperationId> pending_owner;
+  if (event.type == KernelEventType::kParticipantDispatchOutcome) {
+    // The participant's report of a committed send that a Stop found still
+    // in flight. Records the outcome for that Stop and wakes its lane; the
+    // Stop lane settles (never here, inside the participant's call).
+    std::optional<StopControlWorkToken> stop_wakeup;
+    {
+      std::lock_guard state_lock(state_mutex_);
+      const auto operation_id =
+          find_event_operation_locked(engine, event.execution_id, subscription_id);
+      auto* operation =
+          operation_id.has_value() ? find_active_operation_locked(*operation_id) : nullptr;
+      auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
+      if (participant != nullptr &&
+          participant->motion_send_outcome_awaited == event.execution_id) {
+        participant->motion_send_outcome_awaited = 0U;
+        const auto dispatched = event.details.find("dispatched");
+        const bool sent = dispatched != event.details.end() && dispatched->second == "true";
+        if (!sent && event.participant_fact.has_value() &&
+            event.participant_fact->kind == ParticipantExecutionFactKind::kCancelledBeforeDispatch)
+          participant->motion_send_refused_by_stop = event.execution_id;
+        stop_wakeup = stopping_participant_token(*participant);
+        if (stop_wakeup.has_value()) stop_control_executor_->ArmDeadline(*stop_wakeup, clock_.now());
+      }
+    }
+    if (stop_wakeup.has_value()) stop_control_executor_->Publish(*stop_wakeup);
+    return;
+  }
+  std::optional<OperationNumber> pending_owner;
   {
     std::lock_guard lock(state_mutex_);
     for (const auto& [id, operation] : active_operations_) {
@@ -2263,78 +2289,93 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     (void)advance_motion_takeover(*pending_owner);
     return;
   }
+  // S14: a Kernel-internal Stop of one whole operation, made after the lock
+  // below is released.
+  struct OperationStop final {
+    RequestKey key;
+    StopOperationTargetDTO target;
+    std::string_view reason;
+  };
   if (event.type == KernelEventType::kCollisionDetected) {
-    std::optional<StopIntentDTO> containment;
+    std::optional<OperationStop> containment;
     std::optional<StopControlWorkToken> escalation_wakeup;
     {
       std::lock_guard state_lock(state_mutex_);
-      const auto operation_id = find_event_operation_locked(engine, event.execution_id, subscription_id);
+      auto operation_id = find_event_operation_locked(engine, event.execution_id, subscription_id);
+      if (!operation_id.has_value() && event.execution_id != 0U) {
+        // OD-175 D4: between a hand-over's "decide" and "apply" steps the
+        // engine still names the old motion's execution; a collision report
+        // naming it counts for the candidate that carries the mark with that
+        // source id (collision reports only; no other event is aliased).
+        for (const auto& [id, candidate] : active_operations_) {
+          const auto marked = std::find_if(
+              candidate->participants.begin(), candidate->participants.end(),
+              [&](const auto& row) {
+                return row.engine_subscription_id == subscription_id &&
+                       row.handover_source_execution_id == event.execution_id;
+              });
+          if (marked != candidate->participants.end()) {
+            operation_id = id;
+            break;
+          }
+        }
+      }
       auto* operation =
           operation_id.has_value() ? find_active_operation_locked(*operation_id) : nullptr;
       auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
       if (operation != nullptr && participant != nullptr && !terminal(operation->state.state)) {
         auto collision_details = event.details;
-        // Lost or stale measured robot state stops motion through the same
-        // containment, under its own typed reason: nothing was found in contact.
-        const bool observation_lost = runtime_monitor_observation_lost(event.details);
-        const std::string stop_reason =
-            observation_lost ? std::string(error_codes::kRuntimeMonitorObservationLost)
-                             : std::string("runtime_collision_fault");
+        // Lost or stale measured robot state, and (OD-217) collision checks
+        // that did not run in time, stop motion through the same containment,
+        // each under its own typed reason: nothing was found in contact.
+        const auto monitor_reason = event.details.find("reason");
+        const bool checks_stopped =
+            monitor_reason != event.details.end() &&
+            monitor_reason->second == error_codes::kRuntimeMonitorChecksStopped;
+        const bool observation_lost =
+            !checks_stopped && runtime_monitor_observation_lost(event.details);
+        const std::string_view stop_reason =
+            checks_stopped     ? std::string_view(error_codes::kRuntimeMonitorChecksStopped)
+            : observation_lost ? std::string_view(error_codes::kRuntimeMonitorObservationLost)
+                               : std::string_view("runtime_collision_fault");
         std::string collision_message =
-            observation_lost
+            checks_stopped
+                ? "Runtime monitor stopped the operation: its collision checks did not run in "
+                  "time"
+            : observation_lost
                 ? "Runtime monitor stopped the operation: measured robot state was lost"
                 : "Runtime collision containment stopped the operation";
         if (const auto reason = collision_details.find("reason");
             reason != collision_details.end()) {
           collision_details["runtime_collision_reason"] = reason->second;
         }
-        collision_details["reason"] = stop_reason;
+        collision_details["reason"] = std::string(stop_reason);
         ErrorDTO collision_error{
-            observation_lost ? stop_reason : std::string(to_string(ErrorCode::kExecutionAborted)),
+            checks_stopped || observation_lost
+                ? std::string(stop_reason)
+                : std::string(to_string(ErrorCode::kExecutionAborted)),
             std::move(collision_message), std::move(collision_details)};
         // A collision fact during an active Stop is escalation input for that
         // Stop's participant work, never dropped and never a second Stop.
         bool stop_owns_collision = false;
-        if (operation->state.active_stop_id.has_value() &&
-            operation->state.active_stop_generation.has_value()) {
-          const auto transaction = std::find_if(
-              stop_transactions_.begin(), stop_transactions_.end(), [&](const auto& candidate) {
-                return candidate != nullptr && candidate->active && !candidate->terminal &&
-                       candidate->stop_id == operation->state.active_stop_id &&
-                       candidate->stop_generation == *operation->state.active_stop_generation;
-              });
-          if (transaction != stop_transactions_.end()) {
-            const auto work = std::find_if(
-                (*transaction)->participants.begin(), (*transaction)->participants.end(),
-                [&](const auto& candidate) {
-                  return candidate.operation_id == operation->state.operation_id &&
-                         candidate.plan.participant_id == participant->slot_owner.participant_id;
-                });
-            const auto contact = event.details.find("in_collision");
-            if (contact != event.details.end() && contact->second == "true") {
-              auto stop_error = std::move(collision_error);
-              stop_error.message =
-                  "Collision detected on the Stop path; strongest Stop stage engaged";
-              stop_error.details["reason"] = "stop_path_collision";
-              stop_error.details["stop_id"] = operation->state.active_stop_id->value();
-              if (work != (*transaction)->participants.end()) {
-                if (!work->terminal) {
-                  if (!work->collision_escalation_error.has_value()) {
-                    work->collision_escalation_error = std::move(stop_error);
-                  }
-                  work->collision_escalation_pending = true;
-                  escalation_wakeup = (*transaction)->token;
-                }
-              } else if (!(*transaction)->participant_work_initialized) {
-                (*transaction)
-                    ->pending_stop_path_collisions.emplace_back(
-                        operation->state.operation_id, participant->slot_owner.participant_id,
-                        std::move(stop_error));
-                escalation_wakeup = (*transaction)->token;
-              }
-              if (escalation_wakeup.has_value()) {
+        if (operation->state.stop_event_id.has_value()) {
+          const auto contact = event.details.find("in_collision");
+          if (contact != event.details.end() && contact->second == "true") {
+            auto stop_error = std::move(collision_error);
+            stop_error.message =
+                "Collision detected on the Stop path; strongest Stop stage engaged";
+            stop_error.details["reason"] = "stop_path_collision";
+            stop_error.details["stop_event_id"] =
+                std::to_string(operation->state.stop_event_id->value());
+            // The participant's own Stop work consumes it as escalation input.
+            auto& work = participant->stop_work;
+            if (participant->stop.phase == StopPhase::kStopping && !work.terminal) {
+              if (!work.collision_escalation_error.has_value())
+                work.collision_escalation_error = std::move(stop_error);
+              work.collision_escalation_pending = true;
+              escalation_wakeup = stopping_participant_token(*participant);
+              if (escalation_wakeup.has_value())
                 stop_control_executor_->ArmDeadline(*escalation_wakeup, clock_.now());
-              }
             }
           }
           // During an active Stop a collision fact is escalation input (on
@@ -2345,21 +2386,12 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
         if (!stop_owns_collision) {
           participant->last_subordinate_error = collision_error;
           participant->runtime_collision_error = collision_error;
-          const auto material = config_.request_owner_epoch.value() + "\nruntime-collision\n" +
-                                operation->state.operation_id.value() + "\n" +
-                                std::to_string(operation->state.operation_revision.value()) + "\n" +
-                                participant->slot_owner.participant_id.value();
-          containment = StopIntentDTO{
-              PublicRequestContextDTO{
-                  RequestId(manyforge::content_identity::sha256_digest(material)),
-                  config_.request_owner_epoch, "kernel.runtime_collision",
-                  participant->slot_owner.participant_id.value()},
-              std::vector<StopOperationTargetDTO>{StopOperationTargetDTO{
-                  operation->state.operation_id, operation->state.operation_revision,
-                  operation->state.active_stop_generation.value_or(StopGeneration(0U))}},
-              stop_reason,
-              RequestAttributionDTO{RequestTransportDTO::kInternal,
-                                    RequestAssuranceDTO::kUnverified, std::nullopt}};
+          containment = OperationStop{
+              owned_kernel_request_key(participant->runtime_collision_stop_key,
+                                       operation->state.operation_revision),
+              StopOperationTargetDTO{operation->state.operation_id,
+                                     operation->state.operation_revision},
+              stop_reason};
         }
       }
     }
@@ -2367,20 +2399,20 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
       stop_control_executor_->Publish(*escalation_wakeup);
     }
     if (containment.has_value()) {
-      static_cast<void>(accept_stop(EmergencyStopProjectedIntentDTO{std::move(*containment)}));
+      (void)submit_stop(internal_operation_stop(containment->key, StopKind::kRuntimeCollision,
+                                                containment->target, "kernel.runtime_collision",
+                                                containment->reason, StopMode::kFault));
     }
     return;
   }
   if (event.type == KernelEventType::kStopRequested) {
     // The participant held its motion at zero speed for the user-set hold
-    // timeout. Like an operator Stop, the Kernel ends the operation
-    // Stopped (no error) through its own Stop, which issues the lane's hard
-    // stop; an operation already owned by a Stop or ended is left alone.
+    // timeout. Like an operator Stop, the Kernel ends the operation Stopped
+    // (no error) through its own Stop, which issues the lane's hard stop; an
+    // operation already owned by a Stop or ended is left alone.
     const auto reason = event.details.find("reason");
-    if (reason == event.details.end() || reason->second != kZeroSpeedHoldStopReason) {
-      return;
-    }
-    std::optional<StopIntentDTO> hold_stop;
+    if (reason == event.details.end() || reason->second != kZeroSpeedHoldStopReason) return;
+    std::optional<OperationStop> hold_stop;
     {
       std::lock_guard state_lock(state_mutex_);
       const auto operation_id = find_event_operation_locked(engine, event.execution_id, subscription_id);
@@ -2388,31 +2420,24 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
           operation_id.has_value() ? find_active_operation_locked(*operation_id) : nullptr;
       auto* participant = operation == nullptr ? nullptr : operation->participant_for(engine);
       if (operation != nullptr && participant != nullptr && !terminal(operation->state.state) &&
-          !operation->state.active_stop_id.has_value()) {
-        const auto material = config_.request_owner_epoch.value() + "\nzero-speed-hold\n" +
-                              operation->state.operation_id.value() + "\n" +
-                              std::to_string(operation->state.operation_revision.value()) + "\n" +
-                              participant->slot_owner.participant_id.value();
-        hold_stop = StopIntentDTO{
-            PublicRequestContextDTO{RequestId(manyforge::content_identity::sha256_digest(material)),
-                                    config_.request_owner_epoch,
-                                    std::string(kZeroSpeedHoldStopSource),
-                                    participant->slot_owner.participant_id.value()},
-            std::vector<StopOperationTargetDTO>{StopOperationTargetDTO{
-                operation->state.operation_id, operation->state.operation_revision,
-                operation->state.active_stop_generation.value_or(StopGeneration(0U))}},
-            std::string(kZeroSpeedHoldStopReason),
-            RequestAttributionDTO{RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified,
-                                  std::nullopt}};
+          !operation->state.stop_event_id.has_value()) {
+        hold_stop = OperationStop{
+            owned_kernel_request_key(participant->zero_speed_hold_stop_key,
+                                     operation->state.operation_revision),
+            StopOperationTargetDTO{operation->state.operation_id,
+                                   operation->state.operation_revision},
+            kZeroSpeedHoldStopReason};
       }
     }
     if (hold_stop.has_value()) {
-      static_cast<void>(accept_stop(EmergencyStopProjectedIntentDTO{std::move(*hold_stop)}));
+      (void)submit_stop(internal_operation_stop(hold_stop->key, StopKind::kHoldTimeout,
+                                                hold_stop->target, kZeroSpeedHoldStopSource,
+                                                hold_stop->reason, StopMode::kHard));
     }
     return;
   }
   if (event.type == KernelEventType::kParticipantPrepared) {
-    std::optional<OperationId> operation_id;
+    std::optional<OperationNumber> operation_id;
     {
       std::lock_guard state_lock(state_mutex_);
       operation_id = find_event_operation_locked(engine, event.execution_id, subscription_id);
@@ -2426,8 +2451,8 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     if (!event.error.has_value()) {
       return;
     }
-    std::optional<OperationId> operation_id;
-    std::optional<StopIntentDTO> containment;
+    std::optional<OperationNumber> operation_id;
+    std::optional<OperationStop> containment;
     {
       std::lock_guard state_lock(state_mutex_);
       operation_id = find_event_operation_locked(engine, event.execution_id, subscription_id);
@@ -2442,30 +2467,24 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
                 reason != event.error->details.end() &&
                 reason->second.starts_with("prepared_execution_handle_");
             if (invalid_prepared_dispatch && participant->prepared_dispatch_released &&
-                !active_operation->state.active_stop_id.has_value()) {
-              const auto material =
-                  config_.request_owner_epoch.value() + "\nprepared-dispatch-handle\n" +
-                  active_operation->state.operation_id.value() + "\n" +
-                  std::to_string(active_operation->state.operation_revision.value());
-              containment = StopIntentDTO{
-                  PublicRequestContextDTO{
-                      RequestId(manyforge::content_identity::sha256_digest(material)),
-                      config_.request_owner_epoch, "kernel.prepared_dispatch_validation",
-                      std::nullopt},
-                  std::vector<StopOperationTargetDTO>{StopOperationTargetDTO{
-                      active_operation->state.operation_id,
-                      active_operation->state.operation_revision,
-                      active_operation->state.active_stop_generation.value_or(StopGeneration(0U))}},
-                  std::string("prepared_dispatch_membership_invalid"),
-                  RequestAttributionDTO{RequestTransportDTO::kInternal,
-                                        RequestAssuranceDTO::kUnverified, std::nullopt}};
+                !active_operation->state.stop_event_id.has_value()) {
+              containment = OperationStop{
+                  owned_kernel_request_key(active_operation->prepared_dispatch_stop_key,
+                                           active_operation->state.operation_revision),
+                  StopOperationTargetDTO{active_operation->state.operation_id,
+                                         active_operation->state.operation_revision},
+                  "prepared_dispatch_membership_invalid"};
             }
           }
         }
       }
     }
     if (containment.has_value()) {
-      static_cast<void>(accept_stop(EmergencyStopProjectedIntentDTO{std::move(*containment)}));
+      (void)submit_stop(internal_operation_stop(containment->key,
+                                                StopKind::kPreparedDispatchInvalid,
+                                                containment->target,
+                                                "kernel.prepared_dispatch_validation",
+                                                containment->reason));
     }
     if (operation_id.has_value()) {
       (void)advance_prepared_motion(*operation_id, engine);
@@ -2486,7 +2505,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
                : event.type == KernelEventType::kParticipantSettled
                    ? participant_outcome(*event.participant_fact)
                    : operation_state(event.to_state);
-  std::optional<OperationId> operation_id;
+  std::optional<OperationNumber> operation_id;
   std::optional<StopControlWorkToken> stop_wakeup;
   bool aggregate_stop_owns_terminal = false;
   std::optional<ErrorDTO> coordinated_pre_dispatch_failure;
@@ -2506,18 +2525,13 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
       if (terminal(state) && !deferred.returned_state.has_value()) {
         deferred.returned_state = state;
         deferred.returned_error = event.error;
-        auto wake = deferred.stop_token;
-        if (wake.slot < stop_transactions_.size() && stop_transactions_[wake.slot] != nullptr &&
-            stop_transactions_[wake.slot]->token.generation > wake.generation) {
-          wake = stop_transactions_[wake.slot]->token;
-        }
-        stop_control_executor_->ArmDeadline(wake, clock_.now());
+        stop_control_executor_->ArmDeadline(deferred.stop_token, clock_.now());
       }
       return;
     }
     if (operation != nullptr && terminal(state) && state != OperationStateKind::kCompleted &&
         operation->intent.coordination_policy == OperationCoordinationPolicy::kCoordinatedAll &&
-        !operation->state.active_stop_id.has_value() &&
+        !operation->state.stop_event_id.has_value() &&
         !operation->coordinated_dispatch_barrier_released &&
         std::none_of(
             operation->participants.begin(), operation->participants.end(),
@@ -2535,29 +2549,15 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     const auto* stop_participant =
         operation == nullptr ? nullptr : operation->participant_for(engine);
     if (stop_participant != nullptr && stop_participant->stop_owns_reconciliation() &&
-        operation->state.active_stop_id.has_value() &&
-        operation->state.active_stop_generation.has_value() && operation->stop_effect_in_flight) {
-      const auto transaction = std::find_if(
-          stop_transactions_.begin(), stop_transactions_.end(), [&](const auto& candidate) {
-            return candidate != nullptr && candidate->active && !candidate->terminal &&
-                   candidate->stop_id == operation->state.active_stop_id &&
-                   candidate->stop_generation == *operation->state.active_stop_generation;
-          });
-      if (transaction != stop_transactions_.end()) {
-        stop_wakeup = (*transaction)->token;
-        const auto* participant = operation->participant_for(engine);
-        if (participant != nullptr) {
-          const auto work = std::find_if(
-              (*transaction)->participants.begin(), (*transaction)->participants.end(),
-              [&](const auto& candidate) {
-                return candidate.operation_id == operation->state.operation_id &&
-                       candidate.plan.participant_id == participant->slot_owner.participant_id;
-              });
-          aggregate_stop_owns_terminal = participant->stop_owns_reconciliation();
-          if (work != (*transaction)->participants.end()) {
-            observe_prepared_cancellation_terminal(*work, event.execution_id, state, event.error);
-          }
-        }
+        operation->state.stop_event_id.has_value() && operation->stop_effect_in_flight) {
+      // The participant's own Stop attempt owns its terminal; its Stop work
+      // observes the prepared cancellation's terminal.
+      auto* participant = operation->participant_for(engine);
+      stop_wakeup = stopping_participant_token(*participant);
+      if (stop_wakeup.has_value()) {
+        aggregate_stop_owns_terminal = true;
+        observe_prepared_cancellation_terminal(participant->stop_work, event.execution_id, state,
+                                               event.error);
         stop_control_executor_->ArmDeadline(*stop_wakeup, clock_.now());
       }
     }
@@ -2566,8 +2566,8 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
     stop_control_executor_->Publish(*stop_wakeup);
   }
   if (aggregate_stop_owns_terminal) {
-    // The aggregate Stop reducer is the only public terminal owner while its
-    // exact participant settlements are in flight. Subordinate feedback is a
+    // The participant's Stop attempt is the only public terminal owner while
+    // its exact settlement is in flight. Subordinate feedback is a
     // wake-up/evidence fact, not a competing operation transition.
     return;
   }
@@ -2586,11 +2586,16 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
 }
 
 Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
-  std::vector<OperationId> takeover_owners;
+  std::vector<OperationNumber> takeover_owners;
+  // OD-149: speed steps the speed-scale thread left pending (busy commit
+  // guard) or failures it left to record. Empty: no further work.
+  std::vector<OperationNumber> runtime_scale_steps;
   {
     std::lock_guard lock(state_mutex_);
-    for (const auto& [id, operation] : active_operations_)
+    for (const auto& [id, operation] : active_operations_) {
       if (!operation->pending_motion_takeover.empty()) takeover_owners.push_back(id);
+      if (operation->pending_runtime_scale.has_value()) runtime_scale_steps.push_back(id);
+    }
   }
   std::optional<ErrorDTO> takeover_error;
   for (const auto& id : takeover_owners) {
@@ -2599,8 +2604,11 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
   }
   const auto retired_preempted = retire_preempted_motion_operations();
   if (!retired_preempted.ok() && !takeover_error) takeover_error = retired_preempted.error();
+  // After the takeovers, before this pass reads the speed status below, so a
+  // step run here reads "applied" in this same pass. Never waits for a guard.
+  for (const auto& id : runtime_scale_steps) run_runtime_scale_step(id);
   struct ReconcileTarget final {
-    OperationId operation_id;
+    OperationNumber operation_id;
     IResolvedParticipantExecutionEngine* engine{};
     IResolvedPreparedParticipantExecutionEngine* prepared_motion_engine{};
     OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
@@ -2612,7 +2620,7 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
     bool cancelled_preparation_pending{};
     std::optional<ControlBindingId> runtime_scale_control_binding_id;
   };
-  std::vector<OperationId> interrupted_barriers;
+  std::vector<OperationNumber> interrupted_barriers;
   {
     std::lock_guard lock(state_mutex_);
     for (const auto& [id, operation] : active_operations_)
@@ -2642,8 +2650,12 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
         continue;
       }
       for (auto& participant : operation->participants) {
+        // A candidate between its hand-over's "decide" and "close" steps
+        // (OD-175 D3, gate 1): its engine is not adopted yet; the next pass
+        // reads it.
         if (participant.stop_owns_reconciliation() || participant.reconciliation_in_flight || participant.prepare_in_flight ||
-            participant.dispatch_effect_in_flight || participant.subordinate_id == 0U) {
+            participant.dispatch_effect_in_flight || participant.subordinate_id == 0U ||
+            participant.handover_source_execution_id != 0U) {
           continue;
         }
         const auto public_participant =
@@ -2678,7 +2690,7 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
     if (target.public_state == OperationStateKind::kStopping || terminal(target.public_state)) {
       // StopControl and terminal settlement own these states. Nominal
       // subordinate polling must not reinterpret the backend's deliberate
-      // cancellation/idle transition before the Stop certificate commits.
+      // cancellation/idle transition before the participant's Stop ends.
     } else if (target.payload_kind == OperationParticipantPayloadKind::kMotion) {
       bool dispatch_released = target.prepared_dispatch_released;
       if (target.prepared_motion_engine != nullptr && !dispatch_released) {
@@ -2720,8 +2732,7 @@ Result<void> ResourceAddressedExecutionKernel::reconcile_subordinate_state() {
                 row->state = RuntimeScaleApplicationState::kFailed;
                 row->error = scale_status.error();
               }
-              applied = retain_runtime_scale_observation_locked(
-                  state_lock, *active_operation, std::move(public_status),
+              applied = retain_runtime_scale_observation_locked(*active_operation, std::move(public_status),
                   "runtime_scale_reconcile_unavailable");
             }
           }

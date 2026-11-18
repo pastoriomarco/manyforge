@@ -42,6 +42,7 @@ _PREPARED_CLOSURE = {
 
 def test_activation_request_contains_no_role_assignment() -> None:
     request = {
+        "request_key": "0" * 31 + "1",
         "source_document_digest": _DIGEST, "scenario_id": "scenario_a",
         "project_path": "/projects/scenario_a.scenario", "captured_input_digest": _DIGEST,
         "deployment": {"component": "robot"}, "model_source_closure": _CLOSURE,
@@ -75,16 +76,16 @@ def test_headless_config_accepts_source_owned_activation_preparer(
     root = tmp_path.resolve()
 
     config = HeadlessApiConfig(
-        projection_root=root / "projection",
         install_root=root / "install",
         artifact_root=root / "artifacts",
         node_catalog_path=root / "node-catalog.yaml",
         node_environment_manifest_path=root / "node-environment.yaml",
         alarm_catalog_path=root / "alarm-catalog.yaml",
-        historian_database_path=root / "history.sqlite3",
+        historian_directory=root / "history",
         manager_run_root=root / "manager-run",
         execution_run_root=root / "execution-run",
         cell_id="cell_a",
+        application_start_id="3f9a0000000000a1",
         activation_preparer_path=root / "preparer",
         activation_preparer_capability_root=root / "capabilities",
         activation_preparer_activation_root=root / "artifacts",

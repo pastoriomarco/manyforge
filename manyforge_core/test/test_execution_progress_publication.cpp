@@ -141,6 +141,60 @@ TEST(ExecutionProgressPublicationTest, HazardObservationDoesNotClaimClearOrCross
   EXPECT_EQ(publication.hazard_authority_claimed(8), false);
 }
 
+// OD-175 D2 (design test 13): a lookahead claim and the take-over's close of
+// one generation linearise on the hazard word; exactly one wins, in both
+// scripted orders.
+TEST(ExecutionProgressPublicationTest, HazardClaimAndHandoverCloseLineariseInBothOrders) {
+  ExecutionProgressPublication claim_first(ExecutionProgressSourceKind::kBackendCommanded,
+                                           ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                           "claim_first", 0);
+  ASSERT_TRUE(claim_first.publish(40, 100, 1, 1).published);
+  EXPECT_EQ(claim_first.claim_hazard_authority(40), ExecutionProgressHazardClaimResult::kClaimed);
+  EXPECT_FALSE(claim_first.close_hazard_authority(40));
+  EXPECT_EQ(claim_first.hazard_authority_claimed(40), true);
+  // The claim stays idempotent after the failed close.
+  EXPECT_EQ(claim_first.claim_hazard_authority(40), ExecutionProgressHazardClaimResult::kClaimed);
+
+  ExecutionProgressPublication close_first(ExecutionProgressSourceKind::kBackendCommanded,
+                                           ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                           "close_first", 0);
+  ASSERT_TRUE(close_first.publish(50, 100, 1, 1).published);
+  EXPECT_TRUE(close_first.close_hazard_authority(50));
+  // A claim after the close is stale, as for another generation.
+  EXPECT_EQ(close_first.claim_hazard_authority(50),
+            ExecutionProgressHazardClaimResult::kGenerationMismatch);
+  EXPECT_EQ(close_first.hazard_authority_claimed(50), false);
+  // Closing again, or another generation, fails.
+  EXPECT_FALSE(close_first.close_hazard_authority(50));
+  EXPECT_FALSE(close_first.close_hazard_authority(51));
+  EXPECT_FALSE(close_first.close_hazard_authority(0));
+}
+
+TEST(ExecutionProgressPublicationTest,
+     ClosedHazardSurvivesSameGenerationPublishAndInvalidateAndANewGenerationOpens) {
+  ExecutionProgressPublication publication(ExecutionProgressSourceKind::kBackendCommanded,
+                                           ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                           "closed", 0);
+  ASSERT_TRUE(publication.publish(60, 100, 1, 1).published);
+  ASSERT_TRUE(publication.close_hazard_authority(60));
+  // A same-generation publication publishes the cursor and keeps "closed".
+  ASSERT_TRUE(publication.publish(60, 150, 2, 2).published);
+  EXPECT_EQ(publication.claim_hazard_authority(60),
+            ExecutionProgressHazardClaimResult::kGenerationMismatch);
+  // invalidate() keeps "closed" (only a claim is returned to open).
+  publication.invalidate();
+  EXPECT_EQ(publication.hazard_authority_claimed(60), false);
+  EXPECT_FALSE(publication.close_hazard_authority(60));
+  // The candidate's newer generation opens its own word.
+  ASSERT_TRUE(publication.publish(61, 0, 3, 3).published);
+  EXPECT_FALSE(publication.hazard_authority_claimed(60).has_value());
+  EXPECT_EQ(publication.hazard_authority_claimed(61), false);
+  EXPECT_EQ(publication.claim_hazard_authority(61), ExecutionProgressHazardClaimResult::kClaimed);
+  // invalidate() returns a claim to open, as before.
+  publication.invalidate();
+  EXPECT_EQ(publication.hazard_authority_claimed(61), false);
+}
+
 TEST(ExecutionProgressPublicationTest,
      MeasuredAuthorityRequiresFreshnessAndRejectsSourceConfusion) {
   EXPECT_THROW(ExecutionProgressPublication(ExecutionProgressSourceKind::kMeasuredProjection,

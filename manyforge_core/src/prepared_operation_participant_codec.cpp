@@ -7,6 +7,7 @@
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/prepared_planning_codec.hpp>
+#include <manyforge_core/types/operation_member_id_json.hpp>
 #include <manyforge_core/program_frame_identity.hpp>
 #include <stdexcept>
 #include <tuple>
@@ -50,10 +51,6 @@ template <class Value>
     return alphanumeric(static_cast<unsigned char>(character)) || character == '.' ||
            character == '_' || character == '-';
   });
-}
-
-void require_portable(std::string_view value, std::string reason) {
-  if (!portable(value)) fail(std::move(reason));
 }
 
 [[nodiscard]] CanonicalValue embedded(const Result<std::string>& encoded,
@@ -436,13 +433,15 @@ template <class Id>
                                                bool include_digest) {
   CanonicalValue::Object fields{
       {"api_version", CanonicalValue(std::string(kPreparedOperationParticipantApiVersion))},
-      {"operation_id", CanonicalValue(value.operation_id.value())},
+      {"operation_id", CanonicalValue(static_cast<double>(value.operation_id.value()))},
       {"operation_revision", CanonicalValue(static_cast<double>(value.operation_revision.value()))},
-      {"participant_id", CanonicalValue(value.participant_id.value())},
+      {"participant_id", OperationParticipantIdValue(value.participant_id)},
       {"program_id", CanonicalValue(value.program_id.value())},
       {"program_revision", CanonicalValue(value.program_revision.value())},
       {"program_binding_id", CanonicalValue(value.program_binding_id.value())},
-      {"program_run_id", CanonicalValue(value.program_run_id.value())},
+      {"program_run_id", value.program_run_id
+                             ? CanonicalValue(static_cast<double>(value.program_run_id->value()))
+                             : CanonicalValue(nullptr)},
       {"retained_bundle_id", CanonicalValue(value.retained_bundle_id.value())},
       {"graph_revision", CanonicalValue(value.graph_revision.value())},
       {"controllable_component_id", CanonicalValue(value.controllable_component_id.value())},
@@ -928,12 +927,19 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
     const auto& readiness = sealed_readiness.value();
     if (!binding.control_path) fail("control_path_required");
     const auto& path = *binding.control_path;
-    require_portable(candidate.operation_id.value(), "operation_id_invalid");
+    if (!candidate.operation_id.nonzero() ||
+        static_cast<double>(candidate.operation_id.value()) > kMaximumSafeInteger)
+      fail("operation_id_invalid");
     if (!candidate.operation_revision.nonzero() ||
         static_cast<double>(candidate.operation_revision.value()) > kMaximumSafeInteger)
       fail("operation_revision_invalid");
-    require_portable(candidate.participant_id.value(), "participant_id_invalid");
-    require_portable(candidate.program_run_id.value(), "program_run_id_invalid");
+    if (!candidate.participant_id.nonzero() ||
+        static_cast<double>(candidate.participant_id.operation_id.value()) > kMaximumSafeInteger)
+      fail("participant_id_invalid");
+    if (candidate.program_run_id &&
+        (!candidate.program_run_id->nonzero() ||
+         static_cast<double>(candidate.program_run_id->value()) > kMaximumSafeInteger))
+      fail("program_run_id_invalid");
 
     candidate.program_id = binding.program_id;
     candidate.program_revision = binding.program_revision;

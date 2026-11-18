@@ -31,7 +31,7 @@ ManagerSceneAuthorityProxy::ManagerSceneAuthorityProxy(
             {"transaction",
              CanonicalCodecValue(encoded, "scene transaction request")},
         }));
-    RequireExactObjectSize(response, 10U, "Manager scene commit response");
+    RequireExactObjectSize(response, 9U, "Manager scene commit response");
     std::optional<core::ErrorDTO> error;
     const auto &encoded_error = Member(response, "error");
     if (!std::holds_alternative<std::nullptr_t>(encoded_error.storage())) {
@@ -59,7 +59,7 @@ ManagerSceneAuthorityProxy::ManagerSceneAuthorityProxy(
       update_status = DecodeSceneUpdateStatus(encoded_update);
     }
     core::SceneCommitResultDTO result{
-        request.request_context.request_id,
+        request.request_context.request_key,
         DecodeRequestReplayStatus(response, "replay_status"),
         Boolean(response, "ok"),
         std::move(error),
@@ -87,11 +87,6 @@ ManagerSceneAuthorityProxy::PreviewResolvedSceneCandidate(
         return projection_->ProjectEffectiveCollisionPolicy(candidate, candidate.revision.revision_id);
       });
 }
-
-[[nodiscard]] core::RequestOwnerEpoch
-  ManagerSceneAuthorityProxy::CurrentRequestOwnerEpoch() const {
-    return Read().request_owner_epoch;
-  }
 
 [[nodiscard]] core::ProjectionRevisionDTO
   ManagerSceneAuthorityProxy::CurrentProjectionRevision() const {
@@ -204,7 +199,7 @@ ManagerSceneAuthorityProxy::PreviewResolvedSceneCandidate(
       const auto error = DecodeManagerError(Member(response, "error"));
       Fail("Manager scene read failed: " + error.code + ": " + error.message);
     }
-    RequireExactObjectSize(response, 5U, "Manager scene owner response");
+    RequireExactObjectSize(response, 4U, "Manager scene owner response");
     auto snapshot = std::make_shared<const core::LogicalSceneSnapshotDTO>(
         scene::DecodeLogicalSceneSnapshot(content_identity::canonical_json(
             Member(response, "logical_scene"))));
@@ -212,8 +207,7 @@ ManagerSceneAuthorityProxy::PreviewResolvedSceneCandidate(
         DecodeProjectionRevision(Member(response, "projection_revision"));
     Require(snapshot->revision == projection.scene_revision,
             "Manager scene owner response crossed a projection revision");
-    return {core::RequestOwnerEpoch(Text(response, "request_owner_epoch")),
-            std::move(projection), std::move(snapshot)};
+    return {std::move(projection), std::move(snapshot)};
   }
 
 ManagerPlanningSceneSynchronizer::ManagerPlanningSceneSynchronizer(

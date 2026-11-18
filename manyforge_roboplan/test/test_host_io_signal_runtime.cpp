@@ -34,7 +34,8 @@ public:
   core::TimePoint now() const override {
     {
       std::unique_lock lock(mutex_);
-      if (armed_ && std::this_thread::get_id() == selected_thread_) {
+      if (armed_ && std::this_thread::get_id() == selected_thread_ &&
+          skipped_reads_-- == 0U) {
         armed_ = false;
         entered_ = true;
         condition_.notify_all();
@@ -44,9 +45,11 @@ public:
     return clock_.now();
   }
   void set(core::TimePoint value) { clock_.set(value); }
-  void GateNextReadOnThisThread() {
+  // Gates the read after `skipped_reads` further reads on this thread.
+  void GateNextReadOnThisThread(std::size_t skipped_reads = 0U) {
     std::lock_guard lock(mutex_);
     selected_thread_ = std::this_thread::get_id();
+    skipped_reads_ = skipped_reads;
     armed_ = true;
     entered_ = false;
     released_ = false;
@@ -65,6 +68,7 @@ private:
   mutable std::mutex mutex_;
   mutable std::condition_variable condition_;
   mutable std::thread::id selected_thread_;
+  mutable std::size_t skipped_reads_{};
   mutable bool armed_{};
   mutable bool entered_{};
   mutable bool released_{};
@@ -101,34 +105,32 @@ TEST(HostBoundChangedOutsideTest, ReadsEligibleAndRefusesIneligibleOutputs) {
   owned.signal_id.name = "owned";
   owned.output_resource = core::ResourceId("output.owned");
   owned.controller_owned = true;
-  const core::RequestOwnerEpoch owner("host.owner");
   auto made = core::IoSignalSubsystem::Create(
-      {owner, 7U, {output, no_readback, owned}}, {3U, 4U, 4U, 8U, 512U, 1024U}, clock);
+      {7U, {output, no_readback, owned}}, {3U, 4U, 4U, 8U, 512U, 1024U}, clock);
   ASSERT_TRUE(made.ok()) << made.error().message;
   auto &service = *made.value();
   const auto base = service.ReadSignal(output.signal_id);
   ASSERT_TRUE(base.ok()) << base.error().message;
-  const auto derived = ReadBoundChangedOutside(service, base.value(), owner, 7U);
+  const auto derived = ReadBoundChangedOutside(service, base.value(), 7U);
   ASSERT_TRUE(derived.ok()) << derived.error().message;
   ASSERT_TRUE(derived.value().latest_sample);
   EXPECT_EQ(derived.value().latest_sample->publication.value, std::optional(false));
   for (const auto &id : {no_readback.signal_id, owned.signal_id}) {
     const auto ineligible = service.ReadSignal(id);
     ASSERT_TRUE(ineligible.ok()) << ineligible.error().message;
-    const auto result = ReadBoundChangedOutside(service, ineligible.value(), owner, 7U);
+    const auto result = ReadBoundChangedOutside(service, ineligible.value(), 7U);
     ASSERT_FALSE(result.ok());
     EXPECT_EQ(result.error().code, "invalid_request");
     EXPECT_EQ(result.error().details.at("reason"), "io_signal_changed_outside_unavailable");
   }
-  const auto stale = ReadBoundChangedOutside(service, base.value(), owner, 8U);
+  const auto stale = ReadBoundChangedOutside(service, base.value(), 8U);
   ASSERT_FALSE(stale.ok());
   EXPECT_EQ(stale.error().code, "io_signal_catalog_stale");
 }
 core::IoLevelWatchRequestDTO watch(std::string node, bool expected = true,
-                                   std::string run = "run") {
-  return {{core::RequestOwnerEpoch("runner"),
-           core::ProgramRunId(std::move(run)),
-           {core::ProgramNodeInstanceId(std::move(node)), "attempt"}},
+                                   std::uint64_t run = 107U) {
+  return {{core::ProgramRunNumber(run),
+           {core::ProgramNodeInstanceId(std::move(node)), core::NodeAttemptNumber(1U)}},
           signal(),
           expected};
 }
@@ -148,12 +150,25 @@ protected:
         core::RuntimeUnitId("runtime.io"), core::CommandTargetId("inputs"),
         core::ResourceRoleId("ready"), descriptor(),
         std::move(provider_config)};
-    driver = MakeDriver(row, std::move(occurrence), bool(mixed_owner));
+    // Further Mock inputs of the same source and driver.
+    std::vector<deployment::RetainedIoSignalConfiguration> rows{row};
+    std::vector<std::string> extra_names;
+    for (const auto &name : extra_mock_signals) {
+      auto extra = row;
+      extra.resource_role_id = core::ResourceRoleId(name);
+      extra.descriptor.signal_id.name = name;
+      rows.push_back(std::move(extra));
+      extra_names.push_back(name);
+    }
+    driver = MakeDriver(row, std::move(occurrence), bool(mixed_owner),
+                        "io.provider", extra_names);
     std::map<core::InterruptSourceId, HostIoSignalRuntime::SourceInput> sources;
     sources.emplace(
         kSource,
         HostIoSignalRuntime::SourceInput{
-            {row}, {}, driver->runtime_unit_epoch(), std::nullopt, driver});
+            rows, {}, driver->runtime_unit_epoch(), std::nullopt, driver});
+    for (const auto &[source, input] : extra_sources)
+      sources.emplace(source, input);
     if (mixed_owner) {
       auto ros_descriptor = descriptor();
       ros_descriptor.signal_id.name = "ros";
@@ -175,7 +190,7 @@ protected:
                                            driver});
     }
     runtime = HostIoSignalRuntime::Create(
-        core::RequestOwnerEpoch("host"), 1, std::move(sources), clock,
+        1, std::move(sources), clock,
         runtime_scheduler ? std::move(runtime_scheduler) : scheduler);
     if (with_echo) {
       auto made = MockBooleanOutputProvider::Create(
@@ -236,7 +251,8 @@ protected:
   std::shared_ptr<IoProviderDriverRecord>
   MakeDriver(const deployment::RetainedIoSignalConfiguration &row,
              std::string epoch, bool mixed = false,
-             std::string provider_id = "io.provider") {
+             std::string provider_id = "io.provider",
+             std::vector<std::string> extra_names = {}) {
     const core::ContentDigest digest("sha256:" + std::string(64U, 'a'));
     const core::ProviderManifestId id{std::string(kIoProviderManifestId)};
     const core::ProviderManifestDTO manifest{
@@ -249,18 +265,20 @@ protected:
     const core::ControlDomainRevision revision(digest.value());
     const core::ProviderInstanceId instance(std::move(provider_id));
     const core::RuntimeEpoch runtime_epoch(std::move(epoch));
+    auto names = mixed ? std::vector<std::string>{row.descriptor.signal_id.name,
+                                                  "ros"}
+                       : std::vector<std::string>{row.descriptor.signal_id.name};
+    names.insert(names.end(), extra_names.begin(), extra_names.end());
+    std::sort(names.begin(), names.end());
     core::ResolvedLifecycleControlDomainScopeDTO scope{
         domain, revision,
         core::ResolvedProviderDomainScopeDTO{
             {row.descriptor.signal_id.controllable_component_id,
              row.runtime_unit_id, instance, id,
              manifest.provider_manifest_revision, digest, digest,
-             mixed ? std::vector<std::string>{row.descriptor.signal_id.name,
-                                              "ros"}
-                   : std::vector<std::string>{row.descriptor.signal_id.name},
+             std::move(names),
              30'000'000'000LL},
             runtime_epoch,
-            std::nullopt,
             {}}};
     core::ResolvedLifecycleProviderOccurrenceDTO actual{
         domain,
@@ -288,6 +306,12 @@ protected:
     clock->set(now);
     scheduler->advance_to(now, core::SchedulerPriority::RuntimeSafety);
   }
+  // A timed change is handed over at its deadline, like a device sample, and
+  // recorded by the I/O lane's next step: its drain, queued by the hand-over.
+  void AdvanceAndRecord(core::TimePoint now) {
+    Advance(now);
+    scheduler->advance_to(now, core::SchedulerPriority::RuntimeSafety);
+  }
   core::IoSignalObservationDTO Observe() {
     return runtime->ReadSignal(signal()).value();
   }
@@ -297,16 +321,15 @@ protected:
   }
   core::ProgramNodeMockSimulationRequestDTO
   Simulation(std::string node = "node", std::uint64_t index = 1U,
-             std::string attempt = "attempt", bool start = false,
+             core::NodeAttemptNumber attempt = core::NodeAttemptNumber(1U),
+             bool start = false,
              std::optional<core::ProgramMockSimulationChangeDTO> change =
                  core::ProgramMockSimulationChangeDTO{250U, true},
-             std::string run = "run") {
-    return {{core::RequestOwnerEpoch("host"),
-             core::ProgramBindingId("binding"),
-             core::RequestOwnerEpoch("runner"),
+             std::uint64_t run = 107U) {
+    return {{core::ProgramBindingId("binding"),
              core::CellAdmissionClaimGeneration(1U),
-             core::ProgramRunId(std::move(run)),
-             {core::ProgramNodeInstanceId(std::move(node)), std::move(attempt)},
+             core::ProgramRunNumber(run),
+             {core::ProgramNodeInstanceId(std::move(node)), attempt},
              index},
             {{{core::ControllableComponentId("inputs"), "ready"},
               start, change}}};
@@ -316,8 +339,7 @@ protected:
                std::uint64_t revision, bool paused,
                std::vector<core::ProgramNodeInstanceId> held = {}) {
     return runtime->SetProgramRunMockSimulationPaused(
-        {{scope.request_owner_epoch, scope.program_binding_id,
-          scope.program_runner_owner_epoch, scope.claim_generation,
+        {{scope.program_binding_id, scope.claim_generation,
           scope.program_run_id},
          revision,
          paused,
@@ -325,8 +347,7 @@ protected:
   }
   core::Result<void> InitializeSimulationRun(
       const core::ProgramNodeMockSimulationScopeDTO &scope) {
-    const auto key = std::make_pair(scope.program_runner_owner_epoch.value(),
-                                    scope.program_run_id.value());
+    const auto key = scope.program_run_id.value();
     if (initialized_simulation_runs.contains(key))
       return core::Result<void>::Ok();
     const auto initialized = SetRunPaused(scope, 1U, false);
@@ -334,7 +355,7 @@ protected:
       initialized_simulation_runs.insert(key);
     return initialized;
   }
-  std::set<std::pair<std::string, std::string>> initialized_simulation_runs;
+  std::set<std::uint64_t> initialized_simulation_runs;
   core::Result<core::ProgramNodeMockSimulationAcknowledgementDTO>
   StartSimulation(const core::ProgramNodeMockSimulationRequestDTO &request,
                   std::size_t maximum_nodes = core::kMaxProgramTreeNodes,
@@ -385,13 +406,12 @@ protected:
         {}};
     if (search) {
       request.scope = core::IoOperationRuleScopeDTO{
-          core::OperationId("operation"),
+          core::OperationNumber(1001U),
           core::OperationRevision(1U),
-          core::OperationParticipantId("participant"),
+          core::OperationParticipantId{core::OperationNumber(902U), 1U},
           core::ControllableComponentId("io"),
           core::CommandTargetId("inputs"),
-          core::ControllerGoalId("goal"),
-          core::ControllerGoalGeneration(1U),
+          core::ControllerGoalId{core::OperationNumber(901U), 1U, 1U},
           1U,
           core::ContentDigest(std::string(64U, 'a')),
           core::MotionInterruptScopeId("search")};
@@ -406,6 +426,11 @@ protected:
   std::shared_ptr<HostIoSignalRuntime> runtime;
   std::shared_ptr<IoProviderDriverRecord> driver;
   std::shared_ptr<MockBooleanOutputProvider> echo_output;
+  // Read by Build: further Mock inputs on the fixture's driver, and further
+  // sources with their own drivers.
+  std::vector<std::string> extra_mock_signals;
+  std::vector<std::pair<core::InterruptSourceId, HostIoSignalRuntime::SourceInput>>
+      extra_sources;
 };
 
 TEST_F(HostIoSignalRuntimeTest, MockOutputEchoIsDelayedAndNewerWriteReplacesIt) {
@@ -419,6 +444,7 @@ TEST_F(HostIoSignalRuntimeTest, MockOutputEchoIsDelayedAndNewerWriteReplacesIt) 
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 1U);
   clock->set(100'000'000 + kDelay);
   scheduler->advance_to(clock->now(), core::SchedulerPriority::Monitoring);
+  Advance(clock->now()); // the I/O lane records the handed-over echo
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 2U);
 }
@@ -429,6 +455,7 @@ TEST_F(HostIoSignalRuntimeTest, MockOutputEchoStopsWithItsRuntime) {
   runtime->Shutdown();
   clock->set(kDelay);
   scheduler->advance_to(clock->now(), core::SchedulerPriority::Monitoring);
+  Advance(clock->now());
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
 }
 
@@ -464,6 +491,7 @@ TEST_F(HostIoSignalRuntimeTest,
   const auto accepted = newer_write.get();
   EXPECT_EQ(during_echo, std::future_status::timeout);
   EXPECT_EQ(accepted.outcome, core::ActionOutcome::kSucceeded);
+  Advance(clock->now()); // the I/O lane records the handed-over echo
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
 
   // A manual input write after that actual echo remains the latest change.
@@ -471,6 +499,7 @@ TEST_F(HostIoSignalRuntimeTest,
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
   clock->set(2 * kDelay);
   scheduler->advance_to(clock->now(), core::SchedulerPriority::Monitoring);
+  Advance(clock->now());
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 4U);
 }
@@ -579,7 +608,7 @@ TEST_F(HostIoSignalRuntimeTest,
       core::ResourceRoleId("ready"), periodic, std::move(periodic_config)};
   driver = MakeDriver(row, "periodic.installation.1");
   runtime = HostIoSignalRuntime::Create(
-      core::RequestOwnerEpoch("host"), 1U,
+      1U,
       {{kSource,
         HostIoSignalRuntime::SourceInput{
             {row}, node, driver->runtime_unit_epoch(), std::nullopt, driver}}},
@@ -762,7 +791,7 @@ TEST_F(HostIoSignalRuntimeTest,
   const auto ordinary_retired = runtime->RetireRule(ordinary.value());
   ASSERT_TRUE(ordinary_retired.ok());
   EXPECT_TRUE(ordinary_retired.value().source_losses.empty());
-  EXPECT_EQ(calls, 7U); // never invoke the processor inline under delivery lock
+  EXPECT_EQ(calls, 7U); // never invoke the processor inline in a retire
   Advance(clock->now());
   ASSERT_EQ(calls, 8U);
   EXPECT_EQ(scheduler->pending_count(core::SchedulerPriority::RuntimeSafety),
@@ -821,7 +850,7 @@ TEST_F(HostIoSignalRuntimeTest,
   const auto before = Observe().latest_sample;
   ASSERT_TRUE(before);
   ASSERT_EQ(before->publication.value, false);
-  Advance(kDelay);
+  AdvanceAndRecord(kDelay);
   EXPECT_EQ(Observe().latest_sample, before);
   runtime->Shutdown();
   driver->Shutdown();
@@ -854,7 +883,7 @@ TEST_F(HostIoSignalRuntimeTest,
   Advance(2 * kDelay - 1);
   EXPECT_EQ(runtime->ReadWatch(token.value()).value().state,
             core::IoWatchState::kPending);
-  Advance(2 * kDelay);
+  AdvanceAndRecord(2 * kDelay);
   const auto result = runtime->ReadWatch(token.value()).value();
   ASSERT_EQ(result.state, core::IoWatchState::kMatched);
   ASSERT_TRUE(result.matched_sample);
@@ -876,13 +905,13 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_TRUE(replay.ok());
   EXPECT_EQ(replay.value(), first.value());
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 2U);
-  Advance(kDelay);
+  AdvanceAndRecord(kDelay);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 3U);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   const auto completed = StartSimulation(request);
   ASSERT_TRUE(completed.ok());
   EXPECT_EQ(completed.value(), first.value());
-  Advance(3 * kDelay);
+  AdvanceAndRecord(3 * kDelay);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 3U);
 }
 
@@ -891,10 +920,10 @@ TEST_F(HostIoSignalRuntimeTest,
   Build();
   const auto original = Simulation("one");
   ASSERT_TRUE(StartSimulation(original).ok());
-  ASSERT_TRUE(StartSimulation(Simulation("two", 1U, "second")).ok());
+  ASSERT_TRUE(StartSimulation(Simulation("two", 1U, core::NodeAttemptNumber(2U))).ok());
   Advance(kDelay / 2);
   const auto replacement =
-      Simulation("one", 2U, "replacement", true,
+      Simulation("one", 2U, core::NodeAttemptNumber(3U), true,
                  core::ProgramMockSimulationChangeDTO{250U, false});
   const auto replaced = StartSimulation(replacement);
   ASSERT_TRUE(replaced.ok());
@@ -907,10 +936,10 @@ TEST_F(HostIoSignalRuntimeTest,
   ++reused_attempt.scope.node_start_index;
   EXPECT_FALSE(StartSimulation(reused_attempt).ok());
   EXPECT_EQ(Observe().cursor, cursor);
-  Advance(kDelay); // node two's original timeline remains independent
+  AdvanceAndRecord(kDelay); // node two's original timeline remains independent
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 5U);
-  Advance(kDelay + kDelay / 2);
+  AdvanceAndRecord(kDelay + kDelay / 2);
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 6U);
 }
@@ -925,7 +954,7 @@ TEST_F(HostIoSignalRuntimeTest, ManualToggleNeverCancelsTheLaterNodeChange) {
   ASSERT_TRUE(runtime->ReleaseWatch(first.value()).ok());
   ASSERT_TRUE(Set(false).ok());
   const auto sequence = Observe().latest_sample->publication.source_sequence;
-  Advance(kDelay);
+  AdvanceAndRecord(kDelay);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence,
             sequence + 1U);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
@@ -938,23 +967,22 @@ TEST_F(HostIoSignalRuntimeTest, ManualToggleNeverCancelsTheLaterNodeChange) {
 TEST_F(HostIoSignalRuntimeTest, RunTeardownCancelsOnlyItsOwnTimers) {
   Build();
   ASSERT_TRUE(StartSimulation(
-                  Simulation("one", 1U, "first", false,
+                  Simulation("one", 1U, core::NodeAttemptNumber(4U), false,
                              core::ProgramMockSimulationChangeDTO{250U, false},
-                             "run.one"))
+                             120U))
                   .ok());
   ASSERT_TRUE(StartSimulation(
-                  Simulation("two", 1U, "second", false,
+                  Simulation("two", 1U, core::NodeAttemptNumber(2U), false,
                              core::ProgramMockSimulationChangeDTO{250U, true},
-                             "run.two"))
+                             153U))
                   .ok());
   const auto other =
-      runtime->RegisterLevelWatch(watch("wait", true, "run.two"));
+      runtime->RegisterLevelWatch(watch("wait", true, 153U));
   ASSERT_TRUE(other.ok());
   ASSERT_TRUE(runtime
-                  ->ReleaseRunWatches(core::RequestOwnerEpoch("runner"),
-                                      core::ProgramRunId("run.one"))
+                  ->ReleaseRunWatches(core::ProgramRunNumber(120U))
                   .ok());
-  Advance(kDelay);
+  AdvanceAndRecord(kDelay);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 4U);
   EXPECT_EQ(runtime->ReadWatch(other.value()).value().state,
             core::IoWatchState::kMatched);
@@ -966,7 +994,7 @@ TEST_F(HostIoSignalRuntimeTest,
   const auto request = watch("same_node");
   const auto first = runtime->RegisterLevelWatch(request);
   auto next_request = request;
-  next_request.scope.node.node_attempt_id = "next_attempt";
+  next_request.scope.node.node_attempt_id = core::NodeAttemptNumber(2U);
   const auto second = runtime->RegisterLevelWatch(next_request);
   ASSERT_TRUE(first.ok());
   ASSERT_TRUE(second.ok());
@@ -1010,7 +1038,7 @@ TEST_F(HostIoSignalRuntimeTest, GuardAndSearchUseOnlyActualExplicitChanges) {
   EXPECT_FALSE(runtime->ReadRuleEvidence(search.value()).value().trip);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 1U);
   ASSERT_TRUE(StartSimulation(Simulation()).ok());
-  Advance(2 * kDelay);
+  AdvanceAndRecord(2 * kDelay);
   ASSERT_TRUE(runtime->ReadRuleEvidence(search.value()).value().trip);
   const auto seq = Observe().latest_sample->publication.source_sequence;
   const auto fresh = runtime->ArmRule(
@@ -1021,7 +1049,7 @@ TEST_F(HostIoSignalRuntimeTest, GuardAndSearchUseOnlyActualExplicitChanges) {
           ->ArmRule(Rule(
               core::MotionInterruptActivationMode::kRequireInactiveAtArm, true))
           .ok());
-  Advance(3 * kDelay);
+  AdvanceAndRecord(3 * kDelay);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, seq);
   EXPECT_FALSE(runtime->ReadRuleEvidence(fresh.value()).value().trip);
 }
@@ -1047,6 +1075,284 @@ TEST_F(HostIoSignalRuntimeTest,
   EXPECT_TRUE(runtime->RetireRule(guard.value()).ok());
 }
 
+// A motion's rule is registered and removed under the I/O service's own lock
+// only: a driver's delivery lock held elsewhere (a Mock step, an Apply's
+// installation) never holds them, so the Kernel's lock a Stop needs is not
+// held behind a delivery.
+TEST_F(HostIoSignalRuntimeTest,
+       MotionRuleRegistrationAndRemovalDoNotWaitForADeliveryLock) {
+  Build();
+  auto request =
+      Rule(core::MotionInterruptActivationMode::kRequireInactiveAtArm, true);
+  request.search_expectation.reset();
+  auto delivery = driver->AcquireDelivery();
+  auto registered_and_removed = std::async(std::launch::async, [&] {
+    const auto armed = runtime->ArmRule(request);
+    if (!armed.ok())
+      return std::make_pair(
+          armed, core::Result<core::IoRuleEvidenceDTO>::Err(armed.error()));
+    return std::make_pair(armed, runtime->RetireRule(armed.value()));
+  });
+  // Only a regression bound: neither call takes a delivery lock.
+  const bool finished_during_hold =
+      registered_and_removed.wait_for(std::chrono::seconds(10)) ==
+      std::future_status::ready;
+  EXPECT_TRUE(finished_during_hold);
+  delivery.unlock();
+  const auto [armed, retired] = registered_and_removed.get();
+  ASSERT_TRUE(armed.ok()) << armed.error().message;
+  ASSERT_TRUE(retired.ok()) << retired.error().message;
+  EXPECT_EQ(retired.value().state, core::IoRuleRegistrationState::kRetired);
+  EXPECT_EQ(runtime->ReadRuleEvidence(armed.value()).value().state,
+            core::IoRuleRegistrationState::kRetired);
+}
+
+// A timed change is handed over at its deadline, as a device callback hands
+// over a sample, and recorded by the I/O lane's next drain step on the same
+// lane. Its time stamp is the moment of the hand-over.
+TEST_F(HostIoSignalRuntimeTest,
+       TimedChangeIsHandedOverAtItsDeadlineAndRecordedByTheLaneDrain) {
+  Build();
+  ASSERT_TRUE(StartSimulation(Simulation()).ok());
+  const auto started = Observe();
+  ASSERT_EQ(started.latest_sample->publication.source_sequence, 2U);
+  Advance(kDelay);
+  EXPECT_EQ(Observe().cursor, started.cursor); // handed over, not recorded
+  EXPECT_EQ(scheduler->pending_count(core::SchedulerPriority::RuntimeSafety),
+            1U); // the drain the hand-over queued
+  Advance(kDelay + 1'000);
+  const auto recorded = Observe();
+  ASSERT_TRUE(recorded.latest_sample);
+  EXPECT_EQ(recorded.latest_sample->publication.value, true);
+  EXPECT_EQ(recorded.latest_sample->publication.source_sequence, 3U);
+  EXPECT_EQ(recorded.latest_sample->received_at_ns, kDelay);
+  EXPECT_EQ(scheduler->pending_count(core::SchedulerPriority::RuntimeSafety),
+            0U);
+}
+
+// The output echo is handed over on the monitoring lane and recorded by the
+// I/O lane's drain, stamped at the hand-over.
+TEST_F(HostIoSignalRuntimeTest,
+       EchoIsHandedOverOnTheMonitoringLaneAndRecordedByTheIoLane) {
+  Build(false, "installation.1", {}, true);
+  ASSERT_EQ(Write(true).outcome, core::ActionOutcome::kSucceeded);
+  const auto written = Observe();
+  clock->set(kDelay);
+  scheduler->advance_to(kDelay, core::SchedulerPriority::Monitoring);
+  EXPECT_EQ(Observe().cursor, written.cursor); // handed over, not recorded
+  EXPECT_EQ(scheduler->pending_count(core::SchedulerPriority::RuntimeSafety),
+            1U);
+  Advance(kDelay + 1'000);
+  const auto recorded = Observe();
+  ASSERT_TRUE(recorded.latest_sample);
+  EXPECT_EQ(recorded.latest_sample->publication.value, true);
+  EXPECT_EQ(recorded.latest_sample->publication.source_sequence, 2U);
+  EXPECT_EQ(recorded.latest_sample->received_at_ns, kDelay);
+}
+
+// A due change already picked when the node's End arrives is set before the
+// End returns; nothing of that node lands afterwards.
+TEST_F(HostIoSignalRuntimeTest, NoTimedChangeOfANodeLandsAfterItsEndReturned) {
+  using namespace std::chrono_literals;
+  Build();
+  const auto request = Simulation(); // false now, true after kDelay
+  ASSERT_TRUE(StartSimulation(request).ok());
+  Advance(0); // the start's own queued drain, so only the timer is due
+  const auto started = Observe();
+  clock->set(kDelay);
+  auto lane = std::async(std::launch::async, [&] {
+    // Hold the lane inside the hand-over, under the change's driver lock:
+    // its first two clock reads are the look for a due change and the pick.
+    clock->GateNextReadOnThisThread(2U);
+    scheduler->advance_to(kDelay, core::SchedulerPriority::RuntimeSafety);
+  });
+  if (!clock->WaitUntilGated()) {
+    clock->Release();
+    lane.wait();
+    FAIL() << "the timed change did not reach its hand-over";
+  }
+  auto ended = std::async(std::launch::async, [&] {
+    return runtime->EndProgramNodeMockSimulation(request.scope, 1U);
+  });
+  const auto during_hand_over = ended.wait_for(100ms);
+  clock->Release();
+  ASSERT_EQ(lane.wait_for(2s), std::future_status::ready);
+  lane.get();
+  ASSERT_EQ(ended.wait_for(2s), std::future_status::ready);
+  const auto end = ended.get();
+  ASSERT_TRUE(end.ok()) << end.error().message;
+  EXPECT_EQ(during_hand_over, std::future_status::timeout);
+  ASSERT_TRUE(runtime->DrainPending().ok());
+  const auto at_end = Observe();
+  EXPECT_EQ(at_end.latest_sample->publication.value, true);
+  EXPECT_EQ(at_end.latest_sample->publication.source_sequence,
+            started.latest_sample->publication.source_sequence + 1U);
+  AdvanceAndRecord(3 * kDelay);
+  EXPECT_EQ(Observe().cursor, at_end.cursor);
+}
+
+class HookedScheduler final : public core::IScheduler {
+public:
+  explicit HookedScheduler(std::shared_ptr<core::ManualScheduler> actual)
+      : actual_(std::move(actual)) {}
+  core::ScheduleHandle schedule(core::TimePoint at,
+                                std::function<void()> callback,
+                                core::SchedulerPriority priority) override {
+    if (on_schedule)
+      on_schedule();
+    return actual_->schedule(at, std::move(callback), priority);
+  }
+  void cancel(core::ScheduleHandle handle) override { actual_->cancel(handle); }
+  std::function<void()> on_schedule;
+
+private:
+  std::shared_ptr<core::ManualScheduler> actual_;
+};
+
+// A node starting several simulated signals sets them one after the other,
+// as separate device samples: a wait on them that begins in that instant may
+// see some set and others not yet. The node's own read, after its start
+// acknowledgement, sees all of them.
+TEST_F(HostIoSignalRuntimeTest,
+       WatchBeginningDuringAMultiSignalStartMaySeeItPartlyAppliedNodeReadsAll) {
+  using namespace std::chrono_literals;
+  auto hooked = std::make_shared<HookedScheduler>(scheduler);
+  extra_mock_signals = {"second"};
+  Build(false, "installation.1", hooked);
+  runtime->SetRuleEvidenceProcessor([] { return core::Result<bool>::Ok(true); });
+  const core::IoSignalId second{core::ControllableComponentId("io"), "second"};
+  const auto value_of = [&](const core::IoSignalId &id) -> std::optional<bool> {
+    const auto observed = runtime->ReadSignal(id);
+    if (!observed.ok() || !observed.value().latest_sample)
+      return std::nullopt;
+    return observed.value().latest_sample->publication.value;
+  };
+  auto request = Simulation("node", 1U, core::NodeAttemptNumber(32U), true,
+                            std::nullopt);
+  request.signals.push_back(
+      {{core::ControllableComponentId("inputs"), "second"}, true, std::nullopt});
+  ASSERT_TRUE(InitializeSimulationRun(request.scope).ok());
+  std::vector<core::ResolvedProgramMockSimulationSignalDTO> proof;
+  for (const auto &id : {signal(), second}) {
+    const auto observed = runtime->ReadSignal(id);
+    ASSERT_TRUE(observed.ok());
+    const auto digest =
+        core::ComputeIoSignalDescriptorDigest(observed.value().descriptor);
+    ASSERT_TRUE(digest.ok());
+    proof.push_back({id, digest.value(),
+                     observed.value().cursor.catalog_generation,
+                     observed.value().installed_incarnation});
+  }
+  // Once `ready` is recorded (its rule-evidence wake), a wait on `second`
+  // begins on another thread. The start holds no delivery lock there.
+  bool fired = false;
+  bool registered_in_time = false;
+  std::optional<core::Result<core::IoWatchRegistrationDTO>> token;
+  std::optional<core::IoWatchState> state_at_registration;
+  std::optional<bool> ready_then;
+  std::optional<bool> second_then;
+  hooked->on_schedule = [&] {
+    if (fired || value_of(signal()) != std::optional<bool>(true))
+      return;
+    fired = true;
+    auto concurrent = std::async(std::launch::async, [&] {
+      token.emplace(runtime->RegisterLevelWatch(
+          {{core::ProgramRunNumber(107U),
+            {core::ProgramNodeInstanceId("wait"), core::NodeAttemptNumber(1U)}},
+           second,
+           true}));
+      if (token->ok())
+        state_at_registration =
+            runtime->ReadWatch(token->value()).value().state;
+      ready_then = value_of(signal());
+      second_then = value_of(second);
+    });
+    // Only a regression bound: the wait needs no lock the start holds.
+    registered_in_time =
+        concurrent.wait_for(10s) == std::future_status::ready;
+  };
+  const auto started =
+      runtime->StartProgramNodeMockSimulation(request, proof, 1U);
+  hooked->on_schedule = {};
+  ASSERT_TRUE(started.ok()) << started.error().message;
+  ASSERT_TRUE(fired);
+  EXPECT_TRUE(registered_in_time);
+  ASSERT_TRUE(token && token->ok());
+  EXPECT_EQ(ready_then, std::optional<bool>(true));
+  EXPECT_EQ(second_then, std::optional<bool>(false));
+  EXPECT_EQ(state_at_registration, core::IoWatchState::kPending);
+  // The node's own read after its acknowledgement is complete.
+  EXPECT_EQ(value_of(signal()), std::optional<bool>(true));
+  EXPECT_EQ(value_of(second), std::optional<bool>(true));
+  EXPECT_EQ(runtime->ReadWatch(token->value()).value().state,
+            core::IoWatchState::kMatched);
+}
+
+// In a cell with a ROS I/O device, Mock steps take only their own driver's
+// delivery lock: the Set button, a node start, a timed change, the echo and
+// their recording never wait for the ROS driver.
+TEST_F(HostIoSignalRuntimeTest,
+       MockStepsDoNotWaitForAnotherDriversDeliveryLockInAMixedCell) {
+  using namespace std::chrono_literals;
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  rclcpp::NodeOptions options;
+  options.context(context);
+  options.use_global_arguments(false);
+  auto node = std::make_shared<rclcpp::Node>("mixed_cell_ros_input", options);
+  auto ros_descriptor = descriptor();
+  ros_descriptor.signal_id = {core::ControllableComponentId("plc"), "ros"};
+  ros_descriptor.source_id = core::InterruptSourceId("ros.inputs");
+  ros_descriptor.liveness = core::IoSignalLivenessMode::kChangeOnly;
+  deployment::IoSignalProviderConfiguration ros_provider;
+  ros_provider.profile = "ros_bool";
+  ros_provider.topic = "/test/mixed_cell_ros_input";
+  ros_provider.ingress_depth = 8U;
+  deployment::RetainedIoSignalConfiguration ros_row{
+      core::RuntimeUnitId("runtime.plc"), core::CommandTargetId("inputs"),
+      core::ResourceRoleId("ros"), ros_descriptor, std::move(ros_provider)};
+  const auto ros_driver =
+      MakeDriver(ros_row, "ros.installation.1", false, "plc.provider");
+  extra_sources.push_back(
+      {ros_descriptor.source_id,
+       HostIoSignalRuntime::SourceInput{{ros_row},
+                                        node,
+                                        ros_driver->runtime_unit_epoch(),
+                                        std::nullopt,
+                                        ros_driver}});
+  Build(false, "installation.1", {}, true);
+  const auto request =
+      Simulation("node", 1U, core::NodeAttemptNumber(33U), true,
+                 core::ProgramMockSimulationChangeDTO{250U, false});
+  ASSERT_TRUE(InitializeSimulationRun(request.scope).ok());
+  auto ros_delivery = ros_driver->AcquireDelivery();
+  auto steps = std::async(std::launch::async, [&] {
+    const bool set = Set(false).ok();
+    const bool started = StartSimulation(request).ok();
+    const bool written =
+        Write(true).outcome == core::ActionOutcome::kSucceeded;
+    clock->set(kDelay);
+    scheduler->advance_to(kDelay, core::SchedulerPriority::Monitoring); // echo
+    AdvanceAndRecord(kDelay); // timed change, then both recorded
+    return set && started && written;
+  });
+  // Only a regression bound: no Mock step takes the ROS driver's lock.
+  const bool finished_during_hold =
+      steps.wait_for(10s) == std::future_status::ready;
+  EXPECT_TRUE(finished_during_hold);
+  ros_delivery.unlock();
+  EXPECT_TRUE(steps.get());
+  // Initial 1, Set 2, start value 3, echo 4, timed change 5.
+  const auto observed = Observe();
+  ASSERT_TRUE(observed.latest_sample);
+  EXPECT_EQ(observed.latest_sample->publication.value, false);
+  EXPECT_EQ(observed.latest_sample->publication.source_sequence, 5U);
+  EXPECT_EQ(observed.latest_sample->received_at_ns, kDelay);
+  runtime->Shutdown();
+  ros_driver->Shutdown();
+  context->shutdown("mixed cell test complete");
+}
+
 TEST_F(HostIoSignalRuntimeTest, RetiredInstallationCannotApplyItsLateScript) {
   Build();
   const auto request = Simulation();
@@ -1064,7 +1370,7 @@ TEST_F(HostIoSignalRuntimeTest, RetiredInstallationCannotApplyItsLateScript) {
   Build(false, "installation.2");
   EXPECT_NE(Observe().installed_incarnation, old_epoch);
   EXPECT_FALSE(runtime->SetMockInput(signal(), old_epoch, true).ok());
-  Advance(2 * kDelay);
+  AdvanceAndRecord(2 * kDelay);
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 1U);
   const auto after_retirement = old->ReadSignal(signal());
@@ -1090,7 +1396,6 @@ TEST_F(HostIoSignalRuntimeTest,
   EXPECT_FALSE(changed.value().publication_error);
   ASSERT_TRUE(changed.value().published_cursor);
   const auto &cursor = *changed.value().published_cursor;
-  EXPECT_EQ(cursor.owner_epoch, before.cursor.owner_epoch);
   EXPECT_EQ(cursor.catalog_generation, before.cursor.catalog_generation);
   EXPECT_EQ(cursor.source_id, kSource);
   EXPECT_GT(cursor.record_sequence, before.cursor.record_sequence);
@@ -1109,7 +1414,7 @@ public:
   core::ScheduleHandle schedule(core::TimePoint at,
                                 std::function<void()> callback,
                                 core::SchedulerPriority priority) override {
-    if (fail_next) {
+    if (fail_next && (!fail_at || *fail_at == at)) {
       fail_next = false;
       throw std::runtime_error("injected schedule allocation failure");
     }
@@ -1117,6 +1422,8 @@ public:
   }
   void cancel(core::ScheduleHandle handle) override { actual_->cancel(handle); }
   bool fail_next{};
+  // Only the schedule for this deadline fails (a timer, not the drain).
+  std::optional<core::TimePoint> fail_at;
 
 private:
   std::shared_ptr<core::ManualScheduler> actual_;
@@ -1138,7 +1445,7 @@ public:
   core::ScheduleHandle schedule(core::TimePoint at,
                                 std::function<void()> callback,
                                 core::SchedulerPriority priority) override {
-    if (!fail_dequeued)
+    if (!fail_dequeued || (fail_at && *fail_at != at))
       return manual_->schedule(at, std::move(callback), priority);
     fail_dequeued = false;
     const auto gate = completion;
@@ -1164,6 +1471,9 @@ public:
   }
   void cancel(core::ScheduleHandle handle) override { manual_->cancel(handle); }
   bool fail_dequeued{};
+  // Only the schedule for this deadline is intercepted (a timer, not the
+  // drain a hand-over queues).
+  std::optional<core::TimePoint> fail_at;
 
 private:
   std::shared_ptr<core::ManualScheduler> manual_;
@@ -1175,17 +1485,21 @@ public:
   std::future<void> completed;
 };
 
+// The timers are scheduled at the start's commit, after its start values: a
+// failure there comes after those values were applied (they are not rolled
+// back), and a timer callback already dequeued finds the failed entry.
 TEST_F(HostIoSignalRuntimeTest,
-       DequeuedRealWorkerChecksFailedEntryBeforeAnyModelPublication) {
+       DequeuedRealWorkerChecksFailedEntryBeforeAnyTimedPublication) {
   auto injected =
       std::make_shared<DequeuedFailureNodeScriptScheduler>(scheduler);
   Build(false, "installation.1", injected);
   const auto before = Observe();
   injected->fail_dequeued = true;
+  injected->fail_at = 1'000'000; // the timed change's deadline
   // Fake host time starts at zero; the real monotonic scheduler sees this
   // positive deadline already due, with no wall-clock sleeps or tight cap.
   const auto request =
-      Simulation("node", 1U, "dequeued", true,
+      Simulation("node", 1U, core::NodeAttemptNumber(5U), true,
                  core::ProgramMockSimulationChangeDTO{1U, false});
   const auto failed = StartSimulation(request);
   ASSERT_FALSE(failed.ok());
@@ -1193,36 +1507,49 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_EQ(injected->completed.wait_for(std::chrono::seconds(2)),
             std::future_status::ready);
   EXPECT_NO_THROW(injected->completed.get());
-  EXPECT_EQ(Observe().cursor, before.cursor);
-  EXPECT_EQ(Observe().latest_sample, before.latest_sample);
+  const auto started = Observe();
+  ASSERT_TRUE(started.latest_sample);
+  EXPECT_EQ(started.latest_sample->publication.value, true);
+  EXPECT_EQ(started.latest_sample->publication.source_sequence,
+            before.latest_sample->publication.source_sequence + 1U);
+  AdvanceAndRecord(2 * kDelay);
+  EXPECT_EQ(Observe().cursor, started.cursor); // the change never landed
   const auto replay = StartSimulation(request);
   ASSERT_FALSE(replay.ok());
   EXPECT_EQ(replay.error().code, failed.error().code);
-  EXPECT_EQ(Observe().cursor, before.cursor);
+  EXPECT_EQ(Observe().cursor, started.cursor);
 }
 
 TEST_F(HostIoSignalRuntimeTest,
-       SchedulingFailureHasNoInitialEffectAndItsReplayRemainsFailed) {
+       SchedulingFailureKeepsAppliedStartValueAndItsReplayRemainsFailed) {
   auto failing = std::make_shared<FailingNodeScriptScheduler>(scheduler);
   Build(false, "installation.1", failing);
   const auto before = Observe();
-  const auto request = Simulation("node", 1U, "failed", true);
+  const auto request = Simulation("node", 1U, core::NodeAttemptNumber(6U), true);
   failing->fail_next = true;
+  failing->fail_at = kDelay; // the timed change's deadline
   const auto failed = StartSimulation(request);
   ASSERT_FALSE(failed.ok());
   EXPECT_EQ(failed.error().code, "mock_simulation_start_failed");
-  EXPECT_EQ(Observe().latest_sample, before.latest_sample);
-  EXPECT_EQ(Observe().cursor, before.cursor);
+  // The timer is scheduled at the commit, after the start value was applied;
+  // that value is not rolled back.
+  const auto started = Observe();
+  ASSERT_TRUE(started.latest_sample);
+  EXPECT_EQ(started.latest_sample->publication.value, true);
+  EXPECT_EQ(started.latest_sample->publication.source_sequence,
+            before.latest_sample->publication.source_sequence + 1U);
   ASSERT_TRUE(runtime->EndProgramNodeMockSimulation(request.scope, 1U).ok());
   const auto replay = StartSimulation(request);
   ASSERT_FALSE(replay.ok());
   EXPECT_EQ(replay.error().code, failed.error().code);
   EXPECT_EQ(replay.error().message, failed.error().message);
-  Advance(2 * kDelay);
-  EXPECT_EQ(Observe().latest_sample, before.latest_sample);
-  const auto fresh = StartSimulation(Simulation("node", 2U, "fresh", true));
+  AdvanceAndRecord(2 * kDelay);
+  EXPECT_EQ(Observe().latest_sample, started.latest_sample);
+  const auto fresh = StartSimulation(Simulation("node", 2U, core::NodeAttemptNumber(7U), true));
   ASSERT_TRUE(fresh.ok()) << fresh.error().message;
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
+  EXPECT_EQ(Observe().latest_sample->publication.source_sequence,
+            started.latest_sample->publication.source_sequence + 1U);
 }
 
 TEST_F(HostIoSignalRuntimeTest,
@@ -1235,7 +1562,7 @@ TEST_F(HostIoSignalRuntimeTest,
     for (std::size_t i = 0U; i < 65U; ++i)
       ASSERT_TRUE(driver->SetMockValueLocked(signal(), true).ok());
   }
-  const auto request = Simulation("node", 1U, "overflow", false);
+  const auto request = Simulation("node", 1U, core::NodeAttemptNumber(8U), false);
   const auto failed = StartSimulation(request);
   ASSERT_FALSE(failed.ok());
   const auto manual = Set(true);
@@ -1247,7 +1574,7 @@ TEST_F(HostIoSignalRuntimeTest,
   EXPECT_EQ(replay.error().code, failed.error().code);
   EXPECT_EQ(replay.error().message, failed.error().message);
   EXPECT_EQ(replay.error().details, failed.error().details);
-  Advance(2 * kDelay);
+  AdvanceAndRecord(2 * kDelay);
   EXPECT_EQ(Observe().cursor, after_manual.cursor);
   EXPECT_EQ(Observe().latest_sample, after_manual.latest_sample);
 }
@@ -1266,11 +1593,11 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_TRUE(started.ok()) << started.error().message;
   ASSERT_EQ(started.value().signals.size(), 17U);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 2U);
-  Advance(kDelay);
+  AdvanceAndRecord(kDelay);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 3U);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   auto conflicting = request;
-  conflicting.scope.node.node_attempt_id = "conflict";
+  conflicting.scope.node.node_attempt_id = core::NodeAttemptNumber(2U);
   conflicting.scope.node_start_index = 2U;
   conflicting.signals.back().start_value = true;
   const auto before = Observe();
@@ -1285,7 +1612,7 @@ TEST_F(HostIoSignalRuntimeTest,
        ZeroOffsetPublishesInitialThenChangeAndFullWidthIndexDoesNotWrap) {
   Build();
   const auto request =
-      Simulation("node", std::numeric_limits<std::uint64_t>::max(), "last",
+      Simulation("node", std::numeric_limits<std::uint64_t>::max(), core::NodeAttemptNumber(9U),
                  false, core::ProgramMockSimulationChangeDTO{0U, true});
   const auto started = StartSimulation(request, 1U);
   ASSERT_TRUE(started.ok());
@@ -1296,7 +1623,7 @@ TEST_F(HostIoSignalRuntimeTest,
   EXPECT_EQ(replay.value(), started.value());
   auto wrapped = request;
   wrapped.scope.node_start_index = 0U;
-  wrapped.scope.node.node_attempt_id = "wrapped";
+  wrapped.scope.node.node_attempt_id = core::NodeAttemptNumber(2U);
   EXPECT_FALSE(StartSimulation(wrapped, 1U).ok());
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 3U);
 }
@@ -1304,7 +1631,7 @@ TEST_F(HostIoSignalRuntimeTest,
 TEST_F(HostIoSignalRuntimeTest,
        BadProofAndClockOverflowRejectAllRowsBeforeAnyEffect) {
   Build();
-  const auto request = Simulation("node", 1U, "valid", true);
+  const auto request = Simulation("node", 1U, core::NodeAttemptNumber(10U), true);
   ASSERT_TRUE(InitializeSimulationRun(request.scope).ok());
   const auto observed = Observe();
   std::vector<core::ResolvedProgramMockSimulationSignalDTO> wrong{
@@ -1342,17 +1669,17 @@ TEST_F(HostIoSignalRuntimeTest,
   const auto replay = StartSimulation(request);
   ASSERT_TRUE(replay.ok());
   EXPECT_EQ(replay.value(), first.value());
-  Advance(2 * kDelay);
+  AdvanceAndRecord(2 * kDelay);
   EXPECT_EQ(Observe().latest_sample, before.latest_sample);
   EXPECT_EQ(Observe().cursor, before.cursor);
-  EXPECT_FALSE(StartSimulation(Simulation("node", 2U, "new-attempt")).ok());
+  EXPECT_FALSE(StartSimulation(Simulation("node", 2U, core::NodeAttemptNumber(11U))).ok());
 }
 
 TEST_F(HostIoSignalRuntimeTest,
        NodeEndCancelsPendingChangeKeepsAppliedValueAndOriginalReplay) {
   Build();
   const auto request =
-      Simulation("node", 1U, "running", true,
+      Simulation("node", 1U, core::NodeAttemptNumber(12U), true,
                  core::ProgramMockSimulationChangeDTO{250U, false});
   const auto started = StartSimulation(request, 1U);
   ASSERT_TRUE(started.ok());
@@ -1360,30 +1687,30 @@ TEST_F(HostIoSignalRuntimeTest,
   const auto applied = Observe();
   ASSERT_TRUE(runtime->EndProgramNodeMockSimulation(request.scope, 1U).ok());
   ASSERT_TRUE(runtime->EndProgramNodeMockSimulation(request.scope, 1U).ok());
-  Advance(2 * kDelay);
+  AdvanceAndRecord(2 * kDelay);
   EXPECT_EQ(Observe().latest_sample, applied.latest_sample);
   EXPECT_EQ(Observe().cursor, applied.cursor);
   const auto replay = StartSimulation(request, 1U);
   ASSERT_TRUE(replay.ok());
   EXPECT_EQ(replay.value(), started.value());
-  Advance(3 * kDelay);
+  AdvanceAndRecord(3 * kDelay);
   EXPECT_EQ(Observe().cursor, applied.cursor);
 }
 
 TEST_F(HostIoSignalRuntimeTest,
        OlderNodeEndIsInertAndConflictingAttemptCannotCancelNewerWork) {
   Build();
-  const auto old = Simulation("node", 1U, "old", false);
+  const auto old = Simulation("node", 1U, core::NodeAttemptNumber(13U), false);
   ASSERT_TRUE(StartSimulation(old, 1U).ok());
   const auto current =
-      Simulation("node", 2U, "current", true,
+      Simulation("node", 2U, core::NodeAttemptNumber(14U), true,
                  core::ProgramMockSimulationChangeDTO{250U, false});
   const auto started = StartSimulation(current, 1U);
   ASSERT_TRUE(started.ok());
   const auto before_end = Observe();
   ASSERT_TRUE(runtime->EndProgramNodeMockSimulation(old.scope, 1U).ok());
   auto conflict = current.scope;
-  conflict.node.node_attempt_id = "foreign-attempt";
+  conflict.node.node_attempt_id = core::NodeAttemptNumber(99U);
   const auto rejected = runtime->EndProgramNodeMockSimulation(conflict, 1U);
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().code, "mock_simulation_stale");
@@ -1393,7 +1720,7 @@ TEST_F(HostIoSignalRuntimeTest,
   EXPECT_FALSE(
       runtime->EndProgramNodeMockSimulation(foreign_authority, 1U).ok());
   EXPECT_EQ(Observe().cursor, before_end.cursor);
-  Advance(kDelay);
+  AdvanceAndRecord(kDelay);
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence,
             before_end.latest_sample->publication.source_sequence + 1U);
@@ -1407,7 +1734,7 @@ TEST_F(HostIoSignalRuntimeTest,
        EndBeforeStartRetainsOnlyRealScopeAndPreventsLateResurrection) {
   Build();
   const auto never_started =
-      Simulation("never-started", 3U, "ended-unseen", true);
+      Simulation("never-started", 3U, core::NodeAttemptNumber(15U), true);
   const auto untouched = Observe();
   ASSERT_TRUE(
       runtime->EndProgramNodeMockSimulation(never_started.scope, 2U).ok());
@@ -1415,9 +1742,9 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_FALSE(first_delayed.ok());
   EXPECT_EQ(first_delayed.error().code, "mock_simulation_ended");
   EXPECT_EQ(Observe().cursor, untouched.cursor);
-  const auto earlier = Simulation("node", 1U, "earlier", false);
+  const auto earlier = Simulation("node", 1U, core::NodeAttemptNumber(16U), false);
   ASSERT_TRUE(StartSimulation(earlier, 2U).ok());
-  const auto unseen = Simulation("node", 3U, "ended-before-start", true);
+  const auto unseen = Simulation("node", 3U, core::NodeAttemptNumber(17U), true);
   const auto before_end = Observe();
   ASSERT_TRUE(runtime->EndProgramNodeMockSimulation(unseen.scope, 2U).ok());
   ASSERT_TRUE(runtime->EndProgramNodeMockSimulation(unseen.scope, 2U).ok());
@@ -1425,14 +1752,14 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_FALSE(delayed_start.ok());
   EXPECT_EQ(delayed_start.error().code, "mock_simulation_ended");
   EXPECT_FALSE(StartSimulation(earlier, 2U).ok());
-  const auto another_node = Simulation("other", 1U, "other-attempt");
+  const auto another_node = Simulation("other", 1U, core::NodeAttemptNumber(18U));
   EXPECT_FALSE(
       runtime->EndProgramNodeMockSimulation(another_node.scope, 2U).ok());
-  Advance(2 * kDelay);
+  AdvanceAndRecord(2 * kDelay);
   EXPECT_EQ(Observe().cursor, before_end.cursor);
   EXPECT_EQ(Observe().latest_sample, before_end.latest_sample);
   const auto next = StartSimulation(
-      Simulation("node", 4U, "new-start", true, std::nullopt), 2U);
+      Simulation("node", 4U, core::NodeAttemptNumber(19U), true, std::nullopt), 2U);
   ASSERT_TRUE(next.ok());
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence,
@@ -1461,7 +1788,7 @@ TEST_F(HostIoSignalRuntimeTest,
   foreign.program_binding_id = core::ProgramBindingId("foreign-binding");
   EXPECT_FALSE(SetRunPaused(foreign, maximum, false).ok());
   EXPECT_FALSE(SetRunPaused(request.scope, 0U, false).ok());
-  Advance(kDelay);
+  AdvanceAndRecord(kDelay);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 3U);
 }
@@ -1474,7 +1801,7 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_TRUE(started.ok());
   Advance(100'000'000);
   ASSERT_TRUE(SetRunPaused(request.scope, 2U, true).ok());
-  Advance(1'000'000'000);
+  AdvanceAndRecord(1'000'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
   ASSERT_TRUE(Set(true).ok()); // manual toggle is still live while halted
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
@@ -1492,9 +1819,9 @@ TEST_F(HostIoSignalRuntimeTest,
   const auto replay = StartSimulation(request, 1U);
   ASSERT_TRUE(replay.ok());
   EXPECT_EQ(replay.value(), started.value());
-  Advance(1'149'999'999);
+  AdvanceAndRecord(1'149'999'999);
   EXPECT_EQ(Observe().cursor, paused.cursor);
-  Advance(1'150'000'000);
+  AdvanceAndRecord(1'150'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence,
             paused.latest_sample->publication.source_sequence + 1U);
@@ -1505,7 +1832,7 @@ TEST_F(HostIoSignalRuntimeTest,
        EndAndActualDisableClearPausedChangesWithoutResumeResurrection) {
   Build();
   const auto ended =
-      Simulation("ended", 1U, "ended-attempt", true,
+      Simulation("ended", 1U, core::NodeAttemptNumber(20U), true,
                  core::ProgramMockSimulationChangeDTO{250U, false});
   const auto original = StartSimulation(ended);
   ASSERT_TRUE(original.ok());
@@ -1515,13 +1842,13 @@ TEST_F(HostIoSignalRuntimeTest,
   const auto applied = Observe();
   Advance(1'000'000'000);
   ASSERT_TRUE(SetRunPaused(ended.scope, 3U, false).ok());
-  Advance(2'000'000'000);
+  AdvanceAndRecord(2'000'000'000);
   EXPECT_EQ(Observe().cursor, applied.cursor);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   const auto replay = StartSimulation(ended);
   ASSERT_TRUE(replay.ok());
   EXPECT_EQ(replay.value(), original.value());
-  const auto disabled = Simulation("disabled", 1U, "disabled-attempt", false);
+  const auto disabled = Simulation("disabled", 1U, core::NodeAttemptNumber(21U), false);
   ASSERT_TRUE(StartSimulation(disabled).ok());
   Advance(2'100'000'000);
   ASSERT_TRUE(SetRunPaused(disabled.scope, 4U, true).ok());
@@ -1530,7 +1857,7 @@ TEST_F(HostIoSignalRuntimeTest,
   const auto closed = Observe();
   EXPECT_EQ(closed.availability, core::IoSignalAvailability::kUnavailable);
   ASSERT_TRUE(SetRunPaused(disabled.scope, 5U, false).ok());
-  Advance(3'000'000'000);
+  AdvanceAndRecord(3'000'000'000);
   EXPECT_EQ(Observe().availability, core::IoSignalAvailability::kUnavailable);
   EXPECT_EQ(Observe().cursor, closed.cursor);
   EXPECT_EQ(Observe().latest_sample, closed.latest_sample);
@@ -1554,7 +1881,7 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_EQ(injected->completed.wait_for(std::chrono::seconds(2)),
             std::future_status::ready);
   EXPECT_NO_THROW(injected->completed.get());
-  Advance(1'000'000'000);
+  AdvanceAndRecord(1'000'000'000);
   EXPECT_EQ(Observe().cursor, before.cursor);
   // The exact failed packet was never accepted. Same revision/body may retry;
   // the old accepted pause and remaining 150 ms were preserved, not refreshed.
@@ -1562,9 +1889,9 @@ TEST_F(HostIoSignalRuntimeTest,
   Advance(1'100'000'000);
   ASSERT_TRUE(SetRunPaused(request.scope, 3U, false).ok());
   EXPECT_FALSE(SetRunPaused(request.scope, 3U, true).ok());
-  Advance(1'149'999'999);
+  AdvanceAndRecord(1'149'999'999);
   EXPECT_EQ(Observe().cursor, before.cursor);
-  Advance(1'150'000'000);
+  AdvanceAndRecord(1'150'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence,
             before.latest_sample->publication.source_sequence + 1U);
@@ -1577,7 +1904,7 @@ TEST_F(HostIoSignalRuntimeTest,
        NewPausedStartAppliesInitialAndHoldsAllChangesIncludingZeroUntilResume) {
   Build();
   const auto positive =
-      Simulation("positive", 1U, "new-paused", true,
+      Simulation("positive", 1U, core::NodeAttemptNumber(22U), true,
                  core::ProgramMockSimulationChangeDTO{250U, false});
   ASSERT_TRUE(InitializeSimulationRun(positive.scope).ok());
   Advance(100'000'000);
@@ -1594,24 +1921,24 @@ TEST_F(HostIoSignalRuntimeTest,
   EXPECT_EQ(replay_while_paused.value(), started.value());
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 2U);
   ASSERT_TRUE(SetRunPaused(positive.scope, 3U, false).ok());
-  Advance(1'249'999'999);
+  AdvanceAndRecord(1'249'999'999);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
-  Advance(1'250'000'000);
+  AdvanceAndRecord(1'250'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 3U);
 
   ASSERT_TRUE(SetRunPaused(positive.scope, 4U, true).ok());
-  const auto zero = Simulation("zero", 1U, "new-zero-paused", false,
+  const auto zero = Simulation("zero", 1U, core::NodeAttemptNumber(23U), false,
                                core::ProgramMockSimulationChangeDTO{0U, true});
   const auto zero_started = StartSimulation(zero, 2U);
   ASSERT_TRUE(zero_started.ok());
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 4U);
-  Advance(2'000'000'000);
+  AdvanceAndRecord(2'000'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 4U);
   ASSERT_TRUE(SetRunPaused(zero.scope, 5U, false).ok());
   // The actual queued scheduler runs zero remaining delay only after Resume.
-  Advance(2'000'000'000);
+  AdvanceAndRecord(2'000'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 5U);
   const auto zero_replay = StartSimulation(zero, 2U);
@@ -1624,7 +1951,7 @@ TEST_F(HostIoSignalRuntimeTest,
        FirstActualPausedContextHoldsNewZeroChangeUntilResume) {
   Build();
   const auto request =
-      Simulation("first-paused", 1U, "actual-paused-at-first-participation",
+      Simulation("first-paused", 1U, core::NodeAttemptNumber(24U),
                  false, core::ProgramMockSimulationChangeDTO{0U, true});
   const auto before = Observe();
   ASSERT_TRUE(SetRunPaused(request.scope, 7U, true).ok());
@@ -1634,13 +1961,13 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_TRUE(started.ok());
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 2U);
-  Advance(1'000'000'000);
+  AdvanceAndRecord(1'000'000'000);
   const auto replay = StartSimulation(request, 1U, false);
   ASSERT_TRUE(replay.ok());
   EXPECT_EQ(replay.value(), started.value());
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 2U);
   ASSERT_TRUE(SetRunPaused(request.scope, 8U, false).ok());
-  Advance(1'000'000'000);
+  AdvanceAndRecord(1'000'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 3U);
 }
@@ -1673,9 +2000,9 @@ TEST_F(HostIoSignalRuntimeTest,
   EXPECT_EQ(Observe().cursor, held.cursor);
   Advance(1'100'000'000);
   ASSERT_TRUE(SetRunPaused(request.scope, 7U, false, {}).ok());
-  Advance(1'249'999'999);
+  AdvanceAndRecord(1'249'999'999);
   EXPECT_EQ(Observe().cursor, held.cursor);
-  Advance(1'250'000'000);
+  AdvanceAndRecord(1'250'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence,
             held.latest_sample->publication.source_sequence + 1U);
@@ -1695,7 +2022,7 @@ TEST_F(HostIoSignalRuntimeTest,
        FreshStartsSampleCompleteHeldMaskAndEndNeverRearmsChanges) {
   Build();
   const auto request =
-      Simulation("future", 1U, "first-held", true,
+      Simulation("future", 1U, core::NodeAttemptNumber(25U), true,
                  core::ProgramMockSimulationChangeDTO{0U, false});
   ASSERT_TRUE(SetRunPaused(request.scope, 1U, false,
                            {core::ProgramNodeInstanceId("future"),
@@ -1706,11 +2033,11 @@ TEST_F(HostIoSignalRuntimeTest,
   const auto first = StartSimulation(request, 2U, false);
   ASSERT_TRUE(first.ok());
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
-  Advance(1'000'000'000);
+  AdvanceAndRecord(1'000'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 2U);
   ASSERT_TRUE(runtime->EndProgramNodeMockSimulation(request.scope, 2U).ok());
   ASSERT_TRUE(SetRunPaused(request.scope, 2U, false, {}).ok());
-  Advance(2'000'000'000);
+  AdvanceAndRecord(2'000'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 2U);
   const auto historical = StartSimulation(request, 2U, false);
   ASSERT_TRUE(historical.ok());
@@ -1719,15 +2046,15 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_TRUE(SetRunPaused(request.scope, 3U, false,
                            {core::ProgramNodeInstanceId("future")})
                   .ok());
-  const auto newer = Simulation("future", 2U, "fresh-held-attempt", false,
+  const auto newer = Simulation("future", 2U, core::NodeAttemptNumber(26U), false,
                                 core::ProgramMockSimulationChangeDTO{0U, true});
   const auto started = StartSimulation(newer, 2U, false);
   ASSERT_TRUE(started.ok());
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
-  Advance(3'000'000'000);
+  AdvanceAndRecord(3'000'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 3U);
   ASSERT_TRUE(SetRunPaused(newer.scope, 4U, false, {}).ok());
-  Advance(3'000'000'000);
+  AdvanceAndRecord(3'000'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence, 4U);
 }
@@ -1767,7 +2094,7 @@ TEST_F(HostIoSignalRuntimeTest,
       {core::ProgramNodeInstanceId(std::string("node\0suffix", 11U))});
   ASSERT_FALSE(embedded_nul.ok());
   EXPECT_EQ(embedded_nul.error().code, "mock_simulation_invalid");
-  Advance(1'000'000'000);
+  AdvanceAndRecord(1'000'000'000);
   EXPECT_EQ(Observe().cursor, held.cursor);
   ASSERT_TRUE(SetRunPaused(request.scope, 4U, false, {}).ok());
   Advance(1'100'000'000);
@@ -1775,9 +2102,9 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_TRUE(SetRunPaused(request.scope, 3U, true,
                            {core::ProgramNodeInstanceId("node")})
                   .ok());
-  Advance(1'249'999'999);
+  AdvanceAndRecord(1'249'999'999);
   EXPECT_EQ(Observe().cursor, held.cursor);
-  Advance(1'250'000'000);
+  AdvanceAndRecord(1'250'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence,
             held.latest_sample->publication.source_sequence + 1U);
@@ -1788,9 +2115,9 @@ TEST_F(HostIoSignalRuntimeTest,
   auto injected =
       std::make_shared<DequeuedFailureNodeScriptScheduler>(scheduler);
   Build(false, "installation.1", injected);
-  const auto left = Simulation("left", 1U, "left-attempt", false);
+  const auto left = Simulation("left", 1U, core::NodeAttemptNumber(27U), false);
   const auto right =
-      Simulation("right", 1U, "right-attempt", true,
+      Simulation("right", 1U, core::NodeAttemptNumber(28U), true,
                  core::ProgramMockSimulationChangeDTO{400U, false});
   ASSERT_TRUE(
       SetRunPaused(left.scope, 1U, false, {core::ProgramNodeInstanceId("left")})
@@ -1810,9 +2137,9 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_EQ(injected->completed.wait_for(std::chrono::seconds(2)),
             std::future_status::ready);
   EXPECT_NO_THROW(injected->completed.get());
-  Advance(399'999'999);
+  AdvanceAndRecord(399'999'999);
   EXPECT_EQ(Observe().cursor, before.cursor);
-  Advance(400'000'000);
+  AdvanceAndRecord(400'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence,
             before.latest_sample->publication.source_sequence + 1U);
@@ -1821,9 +2148,9 @@ TEST_F(HostIoSignalRuntimeTest,
                            {core::ProgramNodeInstanceId("right")})
                   .ok());
   const auto right_completed = Observe();
-  Advance(749'999'999);
+  AdvanceAndRecord(749'999'999);
   EXPECT_EQ(Observe().cursor, right_completed.cursor);
-  Advance(750'000'000);
+  AdvanceAndRecord(750'000'000);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
   EXPECT_EQ(Observe().latest_sample->publication.source_sequence,
             right_completed.latest_sample->publication.source_sequence + 1U);

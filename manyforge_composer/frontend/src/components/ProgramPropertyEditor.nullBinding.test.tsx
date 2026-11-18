@@ -156,7 +156,7 @@ describe('ProgramPropertyEditor without a compiled binding', () => {
     expect(resolved).toContain('station_io · clamp · This node requires an input signal.');
     expect(resolved).toContain(IO_LIVENESS_UNPROVEN_WARNING.slice(0, 40));
     const missing = render(node, wait);
-    expect(missing).toContain('unavailable in the current Draft candidate');
+    expect(missing).toContain('not checked yet');
     expect(missing).not.toContain(IO_LIVENESS_UNPROVEN_WARNING.slice(0, 40));
     const clear = { ...node, node_id: 'io.clear_outside_change', parameters: {} };
     const clearCatalog = entry(clear.node_id, [param('signal', { type: 'object', 'x-manyforge-semantic-type': 'signal_reference' })]);

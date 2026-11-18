@@ -71,6 +71,42 @@ std::vector<core::Capability> Ros2ControlComponentAdapter::capabilities() const 
   return {};
 }
 
+Ros2ControlDriverRestartAdapter::Ros2ControlDriverRestartAdapter(
+    std::shared_ptr<core::IComponentAdapter> lane, std::function<bool()> launch_exited,
+    std::function<core::Result<void>(std::stop_token)> restart_driver)
+    : lane_(std::move(lane)), launch_exited_(std::move(launch_exited)),
+      restart_driver_(std::move(restart_driver)) {}
+
+core::ComponentState Ros2ControlDriverRestartAdapter::State(const std::int64_t now_ns) const {
+  return lane_->State(now_ns);
+}
+
+core::ActionResult Ros2ControlDriverRestartAdapter::Run(const core::ComponentAction action,
+                                                        const std::stop_token stop) {
+  using Action = core::ComponentAction;
+  if ((action != Action::kPrepare && action != Action::kRecover) || !restart_driver_ ||
+      !launch_exited_ || !launch_exited_())
+    return lane_->Run(action, stop);
+  if (auto restarted = restart_driver_(stop); !restarted.ok()) {
+    core::ActionResult failed;
+    failed.action = action;
+    failed.outcome = core::ActionOutcome::kFailed;
+    failed.error = core::ActionError{restarted.error().code, restarted.error().message,
+                                     std::nullopt, std::nullopt};
+    return failed;
+  }
+  // The new launch: Prepare's wait for its controllers, then Recover's step.
+  auto prepared = lane_->Run(Action::kPrepare, stop);
+  prepared.action = action;
+  if (action == Action::kPrepare || prepared.outcome != core::ActionOutcome::kSucceeded)
+    return prepared;
+  return lane_->Run(Action::kRecover, stop);
+}
+
+std::vector<core::Capability> Ros2ControlDriverRestartAdapter::capabilities() const {
+  return lane_->capabilities();
+}
+
 core::ActionResult ros2_control_action_result(const core::ComponentAction action,
                                               const RetainedRos2ControlSwitchResult &result) {
   core::ActionResult out;

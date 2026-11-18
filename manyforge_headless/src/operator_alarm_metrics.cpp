@@ -213,7 +213,6 @@ OperatorAlarmMetrics AlarmLifecycleOwner::Metrics() const {
   }
   return {
       owner_id_,
-      owner_epoch_,
       generation_,
       state_revision_,
       std::move(totals),
@@ -315,7 +314,6 @@ CanonicalValue OperatorAlarmMetricsValue(const OperatorAlarmMetrics &metrics) {
             Number(static_cast<std::uint64_t>(metrics.unknown_quality_sources),
                    "unknown_quality_sources")},
        })},
-      {"owner_epoch", CanonicalValue(metrics.owner_epoch)},
       {"owner_id", CanonicalValue(metrics.owner_id)},
       {"schema_version",
        CanonicalValue(std::string(kOperatorAlarmMetricsApiVersion))},

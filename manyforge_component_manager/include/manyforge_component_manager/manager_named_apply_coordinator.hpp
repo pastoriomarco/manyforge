@@ -9,7 +9,10 @@
 #include <manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp>
 #include <manyforge_core/ports/ikernel_cell_admission_port.hpp>
 #include <manyforge_core/types/scene_transaction.hpp>
+#include <manyforge_core/types/typed_error.hpp>
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -143,7 +146,6 @@ public:
       IRuntimeUnitProcessPort &process_port,
       IRuntimeUnitProgressPort &progress_port,
       ManagerPlannedMaintenanceCoordinator &planned_maintenance,
-      manyforge::core::RuntimeEpoch manager_runtime_epoch,
       std::string operating_system,
       std::vector<std::string> launch_environment_contracts,
       RuntimeObservationReducer::Clock clock_ns,
@@ -157,7 +159,10 @@ public:
   /// Validate and durably accept one exact request without advancing any
   /// runtime effect. Exact replay returns terminal evidence when it already
   /// exists; otherwise the sole progression owner resumes it through
-  /// RecoverIncompleteApply().
+  /// RecoverIncompleteApply(). Never waits behind an Apply step (OD-270):
+  /// while one runs, a replay is answered from the journal when the pending
+  /// settlement cannot change it, and anything else is refused `apply_busy`
+  /// with `effect: none`.
   [[nodiscard]] ManagerNamedApplyResult
   AcceptOrReplay(const ManagerNamedApplyRequestDTO &request,
                  OriginalPrepareAcknowledgement original_prepare_acknowledgement = {});
@@ -165,7 +170,10 @@ public:
   /// Resume the sole nonterminal Apply, if any. More than one nonterminal
   /// transaction is an integrity failure because this coordinator owns one
   /// serialized progression lane. An Apply progresses only with this
-  /// process's captured original claim and inputs.
+  /// process's captured original claim and inputs. A step that fails
+  /// unexpectedly ends the Apply `apply_progression_failed` with unknown
+  /// effect (OD-188 P1). An Apply has no overall time limit: a step ends only
+  /// on its own events (OD-270).
   [[nodiscard]] std::optional<ManagerNamedApplyResult> RecoverIncompleteApply();
 
   /// Advisory availability of acknowledgement for a failed, before-effect
@@ -175,18 +183,20 @@ public:
       manyforge::core::ApplyGeneration apply_generation);
 
   /// Release only this acknowledged, proven-before-effect Apply's held fence
-  /// and claim. The original terminal failure is retained.
+  /// and claim. The original terminal failure is retained. While an Apply
+  /// step is in progress it is refused at once, `apply_busy` with
+  /// `effect: none` (OD-145); so is ReleaseFailedApplyForNew.
   void AcknowledgeFailedApply(const manyforge::core::ApplyId &apply_id,
                               manyforge::core::ApplyGeneration apply_generation,
-                              const manyforge::core::RequestId &request_id,
+                              const manyforge::core::RequestKey &request_key,
                               const std::string &source_label);
 
-  /// New: release the fence and claim that a failed Apply still
+  /// New: release the fence and claim that every ended, failed Apply still
   /// holds, whatever it changed in the cell; New's own Apply then stops and
-  /// removes everything the host has. Returns the released Apply, or none
-  /// when no failed Apply holds the cell. The original failure is retained.
+  /// removes everything the host has. Returns the last released Apply, or
+  /// none when no failed Apply holds the cell. The original failures are retained.
   [[nodiscard]] std::optional<manyforge::core::NamedApplyPublicationTransactionDTO>
-  ReleaseFailedApplyForNew(const manyforge::core::RequestId &request_id,
+  ReleaseFailedApplyForNew(const manyforge::core::RequestKey &request_key,
                            const std::string &source_label);
 
   /// Nonblocking metadata read by the ordinary heartbeat. An earlier beat
@@ -195,6 +205,7 @@ public:
   PendingSettlementForHeartbeat();
   /// The existing Apply progress lane consumes this exact heartbeat tag. It
   /// reuses the journal/claim replay protocol without repeating Apply effects.
+  /// A release that fails stays pending for the next heartbeat (OD-188 P1).
   [[nodiscard]] std::optional<ManagerNamedApplyResult>
   RetryPendingSettlementOnHeartbeat(
       const manyforge::core::NamedApplyPublicationTransactionDTO &expected);
@@ -220,6 +231,9 @@ private:
     bool original_scene_begin_consumed{};
     bool original_scene_complete_consumed{};
     std::optional<manyforge::core::ProjectionMaintenanceInitializationStatusDTO> original_scene_completed{};
+    // The fence is held and the admission close posted; its result is picked
+    // up on the next drive (OD-295 (3)(a)).
+    bool maintenance_close_pending{};
   };
 
   [[nodiscard]] ManagerNamedApplyResult
@@ -234,11 +248,12 @@ private:
       const PersistedManagerApplyIntent &intent, bool request_replayed);
   [[nodiscard]] manyforge::core::ApplyId MintApplyId();
   /// The release of AcknowledgeFailedApply (before effect) or of
-  /// ReleaseFailedApplyForNew (`for_new`, any failure that holds its fence),
-  /// for a caller holding operation_mutex_.
-  void ReleaseFailedApply(const manyforge::core::ApplyId &apply_id,
+  /// ReleaseFailedApplyForNew (`for_new`, whatever the Kernel still holds for
+  /// any ended failure), for a caller holding operation_mutex_. False: New
+  /// found nothing held and recorded nothing.
+  bool ReleaseFailedApply(const manyforge::core::ApplyId &apply_id,
                           manyforge::core::ApplyGeneration apply_generation,
-                          const manyforge::core::RequestId &request_id,
+                          const manyforge::core::RequestKey &request_key,
                           const std::string &source_label, bool for_new);
   [[nodiscard]] bool SettleSuccessfulAdmission(
       const PersistedManagerApplyIntent &intent,
@@ -246,6 +261,30 @@ private:
       ManagerApplySettlementAttempt attempt);
   [[nodiscard]] ManagerNamedApplyResult PendingSettlementResult(
       const ManagerApplyIntentDTO &intent, bool replayed) const;
+  /// A claim release after the terminal outcome was written failed: keep it
+  /// as the pending settlement the heartbeat retries (OD-188 P1).
+  void DeferSettlement(const ManagerApplyIntentDTO &intent, const std::exception &error);
+  /// Retain a terminal failure; a known one also releases this Apply's own
+  /// admission claim (or defers that release to the heartbeat).
+  [[nodiscard]] ManagerNamedApplyResult RetainPreEffectFailure(
+      const PersistedManagerApplyIntent &durable, const std::string &code,
+      const manyforge::core::TypedCause &cause, ManagerApplyEffectDisposition disposition,
+      ManagerApplyEffectBoundary boundary, bool request_replayed);
+  /// The Manager ends this Apply itself (OD-188 P1, P2): before a fence
+  /// attempt nothing outside the Manager's records changed, so it is a known
+  /// before-effect failure that releases its claim; from the fence attempt
+  /// on its effect is unknown.
+  [[nodiscard]] ManagerNamedApplyResult EndApplyByManager(
+      const PersistedManagerApplyIntent &durable, const std::string &code,
+      const manyforge::core::TypedCause &cause);
+  /// Log a failed settlement retry once per distinct error.
+  std::optional<std::string> last_settlement_retry_error_;
+  /// For a command that would wait for operation_mutex_: refused at once,
+  /// `apply_busy` with `effect: none`, while an Apply step holds it (OD-145).
+  [[nodiscard]] std::unique_lock<std::mutex> LockUnlessStepInProgress();
+  /// The same single look, without the refusal: the lock is not owned while
+  /// an Apply step holds it.
+  [[nodiscard]] std::unique_lock<std::mutex> TryLockUnlessStepInProgress();
 
   SqliteManagerApplyJournal &apply_journal_;
   IManagerActiveRuntimePlanSource &active_plan_source_;
@@ -260,7 +299,6 @@ private:
   manyforge::core::IManagerKernelApplyFencePort &kernel_fence_;
   manyforge::core::IKernelCellAdmissionPort &cell_admission_;
   IManagerSelectedRuntimeCompositionPort &runtime_composition_port_;
-  manyforge::core::RuntimeEpoch manager_runtime_epoch_;
   ApplyIdFactory apply_id_factory_;
   InitialSceneSource initial_scene_source_;
   ApplyProgressObserver apply_progress_observer_;
@@ -280,6 +318,9 @@ private:
   std::optional<manyforge::core::NamedApplyPublicationTransactionDTO>
       pending_settlement_;
   std::mutex operation_mutex_;
+  /// Memory-only: true while the Apply lane runs a step or a settlement
+  /// retry, from before it takes operation_mutex_ until after it releases it.
+  std::atomic<bool> step_in_progress_{false};
 };
 
 } // namespace manyforge::component_manager

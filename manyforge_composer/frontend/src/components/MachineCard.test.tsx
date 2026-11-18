@@ -52,10 +52,10 @@ function state(patch: Partial<ComponentState>): ComponentState {
 
 const owner = state({
   component_id: 'lite6', lifecycle: 'fault', capabilities: ['power_off', 'reboot'],
-  fault: { code: 'fault_estop', message: 'C2', clearable: true, operator_action: 'recover',
+  fault: { code: 'fault_protective_stop', message: 'C31', clearable: true, operator_action: 'recover',
     concerns: ['lite6_robot_controller_io'], since_ns: 1 },
 });
-const unavailable = { code: 'owner_unavailable', message: 'through lite6: C2' };
+const unavailable = { code: 'owner_unavailable', message: 'through lite6: C31' };
 const states: ComponentState[] = [
   owner,
   state({ component_id: 'lite6_robot', owner_id: 'lite6', role: 'arm', lifecycle: 'offline', reason: unavailable }),
@@ -107,7 +107,7 @@ describe('MachineCard', () => {
     const html = renderToStaticMarkup(card().element);
     const io = html.slice(html.indexOf('aria-label="lite6_robot_controller_io member"'));
     expect(io).toContain('Operator action: Recover on lite6');
-    expect(html).toContain('through lite6: Emergency stop active');
+    expect(html).toContain('through lite6: Robot stopped itself');
     const arm = html.slice(html.indexOf('aria-label="lite6_robot member"'), html.indexOf('aria-label="lite6_robot_controller_io member"'));
     expect(arm).not.toContain('Recover on lite6');
   });
@@ -132,7 +132,7 @@ describe('MachineCard', () => {
     expect(arm).toContain('<strong>lite6_robot</strong><span><small>');
     // Offline through its owner: a yellow badge and the owner's reason inline.
     expect(arm).toContain('<span class="status-pill status-pill-danger">Offline</span>');
-    expect(arm).toContain('<p class="inline-message severity-warning">through lite6: Emergency stop active</p>');
+    expect(arm).toContain('<p class="inline-message severity-warning">through lite6: Robot stopped itself</p>');
     for (const label of ['Prepare', 'Enable', 'Disable', 'Recover']) expect(arm).toContain(`>${label}</button>`);
     expect(arm).toContain('class="dactions machine-member-actions"');
   });

@@ -595,7 +595,10 @@ void write_dynamics(Encoder& encoder,
 void write_action_span(Encoder& encoder, const core::ActionSpanDTO& value) {
   encoder.u8(static_cast<std::uint8_t>(value.action_source));
   encoder.string(value.action_span_id);
-  encoder.string(value.program_run_id);
+  // Manual work has no run.
+  encoder.optional(value.program_run_id, [](Encoder& out, const core::ProgramRunNumber& run) {
+    out.u64(run.value());
+  });
   encoder.string(value.node_instance_id);
   encoder.string(value.node_attempt_id);
   encoder.string(value.parent_node_attempt_id);
@@ -606,9 +609,14 @@ void write_action_span(Encoder& encoder, const core::ActionSpanDTO& value) {
   if (source > static_cast<std::uint8_t>(core::ActionSource::kSystem)) {
     fail("action-source tag is invalid");
   }
-  return core::ActionSpanDTO{
-      static_cast<core::ActionSource>(source), decoder.string(),
-      decoder.string(), decoder.string(), decoder.string(), decoder.string()};
+  auto action_span_id = decoder.string();
+  auto program_run_id = decoder.optional<core::ProgramRunNumber>(
+      [](Decoder& input) { return core::ProgramRunNumber(input.u64()); });
+  auto node_instance_id = decoder.string();
+  auto node_attempt_id = decoder.string();
+  return core::ActionSpanDTO{static_cast<core::ActionSource>(source), std::move(action_span_id),
+                             std::move(program_run_id), std::move(node_instance_id),
+                             std::move(node_attempt_id), decoder.string()};
 }
 
 void write_binding(Encoder& encoder,
@@ -952,8 +960,9 @@ std::string encode_candidate_request(
   if (value.moving_replacement) {
     encoder.boolean(true);
     const auto &moving = *value.moving_replacement;
-    write_strong(encoder, moving.source_goal.controller_goal_id);
-    encoder.u64(moving.source_goal.controller_goal_generation.value());
+    encoder.u64(moving.source_goal.operation_id.value());
+    encoder.u32(moving.source_goal.ordinal);
+    encoder.u32(moving.source_goal.generation);
     encoder.u64(moving.source_binding_epoch.value());
     encoder.floating(moving.source_cursor_s);
     write_trajectory(encoder, moving.source_prefix_trajectory);
@@ -1040,8 +1049,8 @@ RoboPlanCandidateRequestDTO decode_candidate_request(
       fail("absent moving-replacement extension must be omitted");
     }
     value.moving_replacement = core::MovingReplacementInputDTO{
-        core::ExecutionGoalKey{read_strong<core::ControllerGoalId>(decoder),
-                               core::ControllerGoalGeneration(decoder.u64())},
+        core::ControllerGoalId{core::OperationNumber(decoder.u64()), decoder.u32(),
+                               decoder.u32()},
         core::ExecutionBindingEpoch(decoder.u64()),
         decoder.floating(),
         read_trajectory(decoder),

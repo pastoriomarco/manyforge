@@ -5,6 +5,10 @@ qualified Manager, Headless API, Program runner, and Composer processes.  It
 does not own graph, Apply, execution, scene, alarm, or health truth.  The
 standard profile is the only live profile; Isaac is kept behind the
 explicit unavailable gate.
+
+``start`` prepares the session (cell layout, a fresh ``current/``, ports, the
+process list), starts the Manager, the application's one supervisor, and
+waits on it for life while holding ``instance.lock`` (spec 3.3, 3.5, S3).
 """
 
 from __future__ import annotations
@@ -26,7 +30,8 @@ import subprocess
 import sys
 import time
 from types import SimpleNamespace
-from typing import Any, BinaryIO, Iterator, Mapping, Sequence
+import uuid
+from typing import Any, Callable, Iterator, Mapping, Sequence
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -61,24 +66,34 @@ from .package_aggregate import (
     PackageAggregateUnavailable,
     package_aggregate_sha256,
 )
+from .application_processes import (
+    MANAGER_STOP_INCOMPLETE,
+    MANAGER_STOPPED,
+    START_AFTER_BASELINE,
+    ApplicationProcess,
+    parent_death_preexec,
+    write_document as write_application_processes,
+)
 from .cell_layout import (
+    CELL_LAYOUT_MARKER,
     CellInstanceLayout,
     CellLayoutError,
     portable_path_identity,
 )
+from . import run_session
+
+# Kept top-level entries of a cell root besides the session entries.
+_CELL_ROOT_ENTRIES = frozenset({CELL_LAYOUT_MARKER, "data", "history", "operator"})
 
 
-STATUS_ENVELOPE_SCHEMA = "manyforge.native_operator_instance.v1"
+STATUS_ENVELOPE_SCHEMA = "manyforge.native_operator_instance.v2"
 STATUS_RECORD_MAX_BYTES = 4 * 1024 * 1024
 DEFAULT_STATE_ROOT = Path(".manyforge-var/operator")
 DEFAULT_TIMEOUT_SECONDS = 60.0
+# Bound on each wait for the Manager to end the application on stop: it stops
+# every application process in turn, each with its own bounded wait.
+MANAGER_STOP_TIMEOUT_SECONDS = 60.0
 DEFAULT_POLL_SECONDS = 0.25
-_PROCESS_COMPONENTS = (
-    "manager",
-    "headless",
-    "program_runner",
-    "composer",
-)
 
 
 def _safe_unix_timestamp() -> int:
@@ -131,10 +146,12 @@ class NativeLauncherConfig:
     expected_source_fingerprint: str | None = None
     expected_head_commit: str | None = None
     expected_head_tree: str | None = None
-    readiness_timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
     poll_interval_seconds: float = DEFAULT_POLL_SECONDS
     reconciliation_period_ms: int = 500
     manager_timeout_seconds: float = 60.0
+    # The disk limits (their starting values): pruning, the start floor and
+    # the floor passed to the Headless API.
+    disk_limits: run_session.DiskLimits = run_session.DiskLimits()
 
     def __post_init__(self) -> None:
         path_fields = (
@@ -243,8 +260,6 @@ class NativeLauncherConfig:
             or any(c not in "0123456789abcdef" for c in self.expected_source_fingerprint)
         ):
             raise ValueError("expected_source_fingerprint must be a lowercase SHA-256")
-        if not 0 < self.readiness_timeout_seconds <= 300:
-            raise ValueError("readiness_timeout_seconds must be in (0, 300]")
         if not 0.01 <= self.poll_interval_seconds <= 5:
             raise ValueError("poll_interval_seconds must be in [0.01, 5]")
         if not 10 <= self.reconciliation_period_ms <= 60_000:
@@ -256,57 +271,66 @@ class NativeLauncherConfig:
     def instance_root(self) -> Path:
         return self.state_root / self.instance_id
 
+    # Saved user data, kept across starts (cell layout v2, spec 4.2).
+    @property
+    def data_root(self) -> Path:
+        return self.instance_root / "data"
+
     @property
     def program_workspace(self) -> Path:
-        return self.authoring_state_root / "program-workspace"
+        return self.data_root / "program-workspace"
+
+    @property
+    def persistent_key_register_directory(self) -> Path:
+        # The Program runner names its register file in here by format version.
+        return self.data_root / "program-runner"
+
+    @property
+    def historian_directory(self) -> Path:
+        return self.instance_root / "history"
+
+    @property
+    def session_reports_root(self) -> Path:
+        return self.instance_root / "session-reports"
+
+    # Running state of one start: a fresh, empty current/ every start. Its
+    # inner layout is the development workbench's, so the shared previous-run
+    # report reads both the same way.
+    @property
+    def current_root(self) -> Path:
+        return self.instance_root / "current"
+
+    @property
+    def application_processes_document(self) -> Path:
+        return self.current_root / "application-processes.json"
 
     @property
     def program_cycle_journal(self) -> Path:
-        return self.program_runner_state_root / "program-cycle.sqlite3"
-
-    @property
-    def persistent_key_register(self) -> Path:
-        return self.program_runner_state_root / "persistent-keys.json"
+        return self.current_root / "program-cycle.sqlite3"
 
     @property
     def artifact_root(self) -> Path:
-        return self.instance_root / "artifacts"
-
-    @property
-    def projection_root(self) -> Path:
-        return self.instance_root / "projections"
+        return self.current_root / "artifacts"
 
     @property
     def manager_state_root(self) -> Path:
-        return self.instance_root / "state" / "manager"
+        return self.current_root / "manager"
 
     @property
     def manager_run_root(self) -> Path:
-        return self.instance_root / "run" / "manager"
+        return self.current_root / "manager-run"
 
     @property
     def execution_state_root(self) -> Path:
-        return self.instance_root / "state" / "execution-host"
+        return self.current_root / "execution-state"
 
     @property
     def execution_run_root(self) -> Path:
-        return self.instance_root / "run" / "execution-host"
-
-    @property
-    def program_runner_state_root(self) -> Path:
-        return self.instance_root / "state" / "program-runner"
+        return self.current_root / "execution-run"
 
     @property
     def logical_scene_database(self) -> Path:
-        return self.instance_root / "state" / "logical-scene" / "scene.sqlite3"
-
-    @property
-    def historian_database_path(self) -> Path:
-        return self.instance_root / "state" / "alarm-history" / "history.sqlite3"
-
-    @property
-    def authoring_state_root(self) -> Path:
-        return self.instance_root / "state" / "composer-authoring"
+        return self.current_root / "logical-scene.sqlite3"
 
     @property
     def headless_url(self) -> str:
@@ -319,6 +343,20 @@ class NativeLauncherConfig:
     @property
     def composer_url(self) -> str:
         return f"http://{self.advertised_host}:{SERVICE_PORTS['composer']}/"
+
+
+# Running-state directories of current/ the launcher creates before the
+# Manager starts (the Manager requires private, existing roots).
+CURRENT_DIRECTORIES = (
+    "artifacts",
+    "execution-run",
+    "execution-state",
+    "manager",
+    "manager-run",
+)
+# Kept saved-data directories under data/ (the Program workspace is prepared
+# by its own checked step).
+DATA_DIRECTORIES = ("composer", "program-runner")
 
 
 @dataclass(frozen=True, slots=True)
@@ -342,20 +380,30 @@ class _ManagedProcess:
 
 
 def _journal_command(instance_id: str, component_id: str, argv: Sequence[str]) -> tuple[list[str], str]:
-    """Route one detached child's output through the operating system journal."""
+    """Route one process's output to the operating system journal, own tag each."""
     systemd_cat = shutil.which("systemd-cat")
     if systemd_cat is None or not Path("/run/systemd/journal/stdout").is_socket():
         raise LauncherError(
             "journald_unavailable",
-            "detached startup requires systemd-cat and the journald stream socket /run/systemd/journal/stdout",
+            "startup requires systemd-cat and the journald stream socket /run/systemd/journal/stdout",
             exit_code=70,
         )
     identifier = f"manyforge-{instance_id}-{component_id}"
     return [systemd_cat, "-t", identifier, "--", *argv], f"journalctl -t {shlex.quote(identifier)}"
 
 
-def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
-    """Return the exact five native process specifications, without I/O."""
+def native_commands(
+    config: NativeLauncherConfig,
+    *,
+    previous_session_id: str | None = None,
+) -> tuple[ProcessSpec, tuple[ApplicationProcess, ...]]:
+    """Return the Manager's own specification and its application processes.
+
+    The Manager is the one process this launcher starts; it starts, watches
+    and stops Headless, the Program runner and Composer from the returned list
+    (spec 3.3, S3), in list order, and stops them in reverse. Each keeps its
+    own journald tag. No I/O besides locating systemd-cat.
+    """
 
     package_env = {"MANYFORGE_FS_ROOTS": str(config.install_root)}
     program_runner_liveness_socket = (
@@ -381,12 +429,10 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
                 config.execution_run_root,
                 "--logical-scene-database",
                 config.logical_scene_database,
-                "--program-cycle-journal",
-                config.program_cycle_journal,
-                "--projection-root",
-                config.projection_root,
                 "--program-runner-liveness-socket",
                 program_runner_liveness_socket,
+                "--application-processes",
+                config.application_processes_document,
                 "--reconciliation-period-ms",
                 config.reconciliation_period_ms,
             )
@@ -401,90 +447,87 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
         },
         config.source_root,
     )
-    headless = ProcessSpec(
-        "headless",
-        (
-            sys.executable,
-            "-m",
-            "manyforge_headless_api",
-            "serve",
-            "--host",
-            SERVICE_BIND_HOSTS["headless"],
-            "--port",
-            str(SERVICE_PORTS["headless"]),
-            "--projection-root",
-            str(config.projection_root),
-            "--install-root",
-            str(config.install_root),
-            "--artifact-root",
-            str(config.artifact_root),
-            "--node-catalog-path",
-            str(config.node_catalog_path),
-            "--node-environment-manifest-path",
-            str(
-                config.source_root
-                / "manyforge_behavior/resources/node_environment_manifest.yaml"
-            ),
-            "--alarm-catalog-path",
-            str(config.alarm_catalog_path),
-            "--historian-database-path",
-            str(config.historian_database_path),
-            "--manager-run-root",
-            str(config.manager_run_root),
-            "--execution-run-root",
-            str(config.execution_run_root),
-            "--cell-id",
-            config.cell_id,
-            "--owner-id",
-            f"headless-api.{config.instance_id}",
-            "--freshness-ms",
-            "2000",
-            "--manager-timeout-s",
-            str(config.manager_timeout_seconds),
-            "--program-runner-url",
-            config.program_runner_url,
-        ),
-        package_env,
-        config.source_root,
+    previous_session_arguments: tuple[str, ...] = (
+        "--workbench-previous-session-reports-root",
+        str(config.session_reports_root),
     )
-    program_argv = [
-            sys.executable,
-            "-m",
-            "manyforge_program_runner",
-            "--host",
-            SERVICE_BIND_HOSTS["program_runner"],
-            "--port",
-            str(SERVICE_PORTS["program_runner"]),
-            "--headless-url",
-            config.headless_url,
-            "--snapshot-url",
-            f"http://127.0.0.1:{SERVICE_PORTS['composer']}/api/scene/snapshot/render",
-            "--owner-id",
-            f"program-runner.{config.instance_id}",
-            "--headless-timeout-s",
-            "30",
-            "--execution-run-root",
-            str(config.execution_run_root),
-            "--cycle-journal-path",
-            str(config.program_cycle_journal),
-            "--persistent-key-register-path",
-            str(config.persistent_key_register),
-            "--manager-liveness-socket",
-            str(program_runner_liveness_socket),
-            "--cell-id",
-            config.cell_id,
+    if previous_session_id is not None:
+        previous_session_arguments += ("--workbench-previous-session-id", previous_session_id)
+    headless = (
+        sys.executable,
+        "-m",
+        "manyforge_headless_api",
+        "serve",
+        "--host",
+        SERVICE_BIND_HOSTS["headless"],
+        "--port",
+        str(SERVICE_PORTS["headless"]),
+        "--install-root",
+        str(config.install_root),
+        "--artifact-root",
+        str(config.artifact_root),
+        "--node-catalog-path",
+        str(config.node_catalog_path),
+        "--node-environment-manifest-path",
+        str(
+            config.source_root
+            / "manyforge_behavior/resources/node_environment_manifest.yaml"
+        ),
+        "--alarm-catalog-path",
+        str(config.alarm_catalog_path),
+        "--historian-directory",
+        str(config.historian_directory),
+        *previous_session_arguments,
+        "--manager-run-root",
+        str(config.manager_run_root),
+        "--execution-run-root",
+        str(config.execution_run_root),
+        # The disk check's floor and the margin above it at which it clears;
+        # the record folders are --historian-directory and the parent of
+        # --execution-run-root (current/).
+        "--disk-free-floor-bytes",
+        str(config.disk_limits.floor_bytes),
+        "--disk-free-margin-bytes",
+        str(run_session.DISK_FLOOR_CLEAR_MARGIN_BYTES),
+        "--cell-id",
+        config.cell_id,
+        "--freshness-ms",
+        "2000",
+        "--manager-timeout-s",
+        str(config.manager_timeout_seconds),
+        "--program-runner-url",
+        config.program_runner_url,
+    )
+    program_runner = [
+        sys.executable,
+        "-m",
+        "manyforge_program_runner",
+        "--host",
+        SERVICE_BIND_HOSTS["program_runner"],
+        "--port",
+        str(SERVICE_PORTS["program_runner"]),
+        "--headless-url",
+        config.headless_url,
+        "--snapshot-url",
+        f"http://127.0.0.1:{SERVICE_PORTS['composer']}/api/scene/snapshot/render",
+        "--headless-timeout-s",
+        "30",
+        "--execution-run-root",
+        str(config.execution_run_root),
+        "--cycle-journal-path",
+        str(config.program_cycle_journal),
+        "--persistent-key-register-directory",
+        str(config.persistent_key_register_directory),
+        "--manager-liveness-socket",
+        str(program_runner_liveness_socket),
+        "--cell-id",
+        config.cell_id,
     ]
     if config.simulation_control_config is not None:
-        program_argv.extend(
+        program_runner.extend(
             ("--simulation-control-config", str(config.simulation_control_config))
         )
-    program_runner = ProcessSpec(
-        "program_runner",
-        tuple(program_argv),
-        package_env,
-        config.source_root,
-    )
-    composer_argv = (
+    composer = (
         sys.executable,
         "-m",
         "manyforge_composer",
@@ -498,21 +541,31 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
         "30",
     )
     if config.composer_static_dir is not None:
-        composer_argv += ("--static-dir", str(config.composer_static_dir))
-    composer = ProcessSpec(
-        "composer",
-        composer_argv,
-        {
-            "MANYFORGE_FS_ROOTS": (
-                f"{config.source_root / 'examples'},"
-                f"{config.install_root},{config.program_workspace}"
-            ),
-            "MANYFORGE_PROGRAM_WRITE_ROOTS": str(config.program_workspace),
-            "MANYFORGE_DEPLOYMENT_WRITE_ROOTS": str(config.program_workspace),
-        },
-        config.source_root,
+        composer += ("--static-dir", str(config.composer_static_dir))
+    composer_environment = {
+        "MANYFORGE_FS_ROOTS": (
+            f"{config.source_root / 'examples'},"
+            f"{config.install_root},{config.program_workspace}"
+        ),
+        "MANYFORGE_PROGRAM_WRITE_ROOTS": str(config.program_workspace),
+        "MANYFORGE_DEPLOYMENT_WRITE_ROOTS": str(config.program_workspace),
+        # Composer installation settings are saved data: data/composer/ (F1).
+        "MANYFORGE_STATE_DIR": str(config.data_root),
+    }
+
+    def journaled(component_id: str, argv: Sequence[str]) -> tuple[str, ...]:
+        return tuple(_journal_command(config.instance_id, component_id, argv)[0])
+
+    return manager, (
+        ApplicationProcess("headless", journaled("headless", headless)),
+        ApplicationProcess("program_runner", journaled("program_runner", program_runner)),
+        ApplicationProcess(
+            "composer",
+            journaled("composer", composer),
+            composer_environment,
+            START_AFTER_BASELINE,
+        ),
     )
-    return (manager, headless, program_runner, composer)
 
 
 def _boot_id() -> str:
@@ -683,6 +736,10 @@ def _configuration(config: NativeLauncherConfig) -> LaunchConfiguration:
     )
 
 
+class _InstanceBusy(Exception):
+    """``instance.lock`` is held: a resident ``start`` owns the instance."""
+
+
 class _StateStore:
     def __init__(
         self,
@@ -810,7 +867,12 @@ class _StateStore:
         )
 
     @contextmanager
-    def lock(self) -> Iterator[None]:
+    def lock(self, *, blocking: bool = True) -> Iterator[None]:
+        """Hold ``instance.lock``; a running ``start`` holds it for life.
+
+        With ``blocking=False`` a held lock raises :class:`_InstanceBusy`
+        at once instead of waiting.
+        """
         with self._open_directory(
             self.lock_root,
             expected_identity=self._lock_root_identity,
@@ -840,7 +902,13 @@ class _StateStore:
                         "operator lock is not one safe owner-held file",
                         exit_code=71,
                     )
-                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                try:
+                    fcntl.flock(
+                        descriptor,
+                        fcntl.LOCK_EX if blocking else fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
+                except BlockingIOError as error:
+                    raise _InstanceBusy() from error
                 current = os.stat(
                     "instance.lock",
                     dir_fd=root_descriptor,
@@ -1083,99 +1151,6 @@ class _StateStore:
                     except FileNotFoundError:
                         pass
 
-    def open_log(self, filename: str) -> tuple[BinaryIO, Path]:
-        if not portable_path_identity(filename):
-            raise LauncherError(
-                "log_path_invalid",
-                "log filename is not one path-safe identity",
-                exit_code=70,
-            )
-        with self._open_directory(
-            self.lock_root,
-            expected_identity=self._lock_root_identity,
-            label="operator run root",
-        ) as root_descriptor:
-            try:
-                os.mkdir("logs", mode=0o700, dir_fd=root_descriptor)
-            except FileExistsError:
-                pass
-            try:
-                before = os.stat(
-                    "logs",
-                    dir_fd=root_descriptor,
-                    follow_symlinks=False,
-                )
-                logs_descriptor = os.open(
-                    "logs",
-                    os.O_RDONLY
-                    | os.O_DIRECTORY
-                    | os.O_CLOEXEC
-                    | os.O_NOFOLLOW,
-                    dir_fd=root_descriptor,
-                )
-            except OSError as error:
-                raise LauncherError(
-                    "log_path_invalid",
-                    f"operator log root cannot be opened safely: {error}",
-                    exit_code=70,
-                ) from error
-            try:
-                opened = os.fstat(logs_descriptor)
-                required = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
-                if (
-                    not stat.S_ISDIR(before.st_mode)
-                    or not stat.S_ISDIR(opened.st_mode)
-                    or before.st_uid != os.geteuid()
-                    or opened.st_uid != os.geteuid()
-                    or before.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                    or opened.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
-                    or before.st_mode & required != required
-                    or opened.st_mode & required != required
-                    or (before.st_dev, before.st_ino)
-                    != (opened.st_dev, opened.st_ino)
-                ):
-                    raise LauncherError(
-                        "log_path_invalid",
-                        "operator log root is unsafe",
-                        exit_code=70,
-                    )
-                descriptor = os.open(
-                    filename,
-                    os.O_WRONLY
-                    | os.O_APPEND
-                    | os.O_CREAT
-                    | os.O_CLOEXEC
-                    | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=logs_descriptor,
-                )
-                metadata = os.fstat(descriptor)
-                current = os.stat(
-                    filename,
-                    dir_fd=logs_descriptor,
-                    follow_symlinks=False,
-                )
-                if (
-                    not self._safe_file(metadata)
-                    or not self._safe_file(current)
-                    or (metadata.st_dev, metadata.st_ino)
-                    != (current.st_dev, current.st_ino)
-                ):
-                    os.close(descriptor)
-                    raise LauncherError(
-                        "log_path_invalid",
-                        "operator log is not one safe owner-held file",
-                        exit_code=70,
-                    )
-                try:
-                    stream = os.fdopen(descriptor, "ab")
-                except Exception:
-                    os.close(descriptor)
-                    raise
-                return stream, self.lock_root / "logs" / filename
-            finally:
-                os.close(logs_descriptor)
-
 
 def _status(
     configuration: LaunchConfiguration,
@@ -1214,7 +1189,7 @@ def _status(
         readiness, key=lambda item: (item.component_id, item.authority, item.source_schema)
     )
     return LaunchInstanceStatus(
-        schema_version="manyforge.launch_instance_status.v1",
+        schema_version="manyforge.launch_instance_status.v2",
         launch_instance_id=instance_id,
         record_generation=generation,
         configuration=configuration,
@@ -1261,8 +1236,8 @@ class NativeLauncher:
                 "cell_layout_invalid", str(error), exit_code=71
             ) from error
         self.store = _StateStore(
-            root=config.instance_root / "state" / "operator",
-            lock_root=config.instance_root / "run" / "operator",
+            root=self.layout.operator_root,
+            lock_root=self.layout.operator_root,
         )
         self._managed: dict[str, _ManagedProcess] = {}
         self.last_start_idempotent = False
@@ -1299,14 +1274,13 @@ class NativeLauncher:
             headless_url="http://127.0.0.1:9010/",
             program_runner_url="http://127.0.0.1:9011/",
             composer_url="http://localhost:9000/",
-            manager_state_root=root / "state" / "manager",
-            manager_run_root=root / "run" / "manager",
-            readiness_timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
+            manager_state_root=root / "current" / "manager",
+            manager_run_root=root / "current" / "manager-run",
             poll_interval_seconds=DEFAULT_POLL_SECONDS,
         )
         launcher.store = _StateStore(
-            root=root / "state" / "operator",
-            lock_root=root / "run" / "operator",
+            root=launcher.layout.operator_root,
+            lock_root=launcher.layout.operator_root,
         )
         launcher._managed = {}
         launcher.last_start_idempotent = False
@@ -1340,7 +1314,10 @@ class NativeLauncher:
                 "node_catalog_path": str(self.config.node_catalog_path),
                 "alarm_catalog_path": str(self.config.alarm_catalog_path),
                 "logical_scene_database": str(self.config.logical_scene_database),
-                "historian_database_path": str(self.config.historian_database_path),
+                "historian_directory": str(self.config.historian_directory),
+                "persistent_key_register_directory": str(
+                    self.config.persistent_key_register_directory
+                ),
                 "manager_state_root": str(self.config.manager_state_root),
                 "manager_run_root": str(self.config.manager_run_root),
                 "execution_state_root": str(self.config.execution_state_root),
@@ -1372,12 +1349,12 @@ class NativeLauncher:
     def _prepare_program_workspace(self) -> None:
         """Create or validate the one instance-owned Composer write root."""
 
-        root = self.config.authoring_state_root
+        root = self.config.data_root
         required = stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR
         try:
             before_root = root.lstat()
             if root.resolve(strict=True) != root:
-                raise OSError("authoring state root is not canonical")
+                raise OSError("saved-data root is not canonical")
             instance_fd = os.open(
                 root,
                 os.O_RDONLY
@@ -1388,7 +1365,7 @@ class NativeLauncher:
         except OSError as error:
             raise LauncherError(
                 "program_workspace_invalid",
-                f"authoring state root cannot safely contain the Program workspace: {error}",
+                f"saved-data root cannot safely contain the Program workspace: {error}",
                 exit_code=70,
             ) from error
         try:
@@ -1404,7 +1381,7 @@ class NativeLauncher:
             ):
                 raise LauncherError(
                     "program_workspace_invalid",
-                    "authoring state root is not one safe retained capability",
+                    "saved-data root is not one safe retained capability",
                     exit_code=70,
                 )
             try:
@@ -1468,7 +1445,7 @@ class NativeLauncher:
             ):
                 raise LauncherError(
                     "program_workspace_invalid",
-                    "authoring state root changed while preparing the workspace",
+                    "saved-data root changed while preparing the workspace",
                     exit_code=70,
                 )
         except LauncherError:
@@ -1575,7 +1552,7 @@ class NativeLauncher:
                     schema = "manyforge.headless_health.v1"
                 elif component == "program_runner":
                     ready = payload.get("started") is True and payload.get("closed") is False
-                    schema = "manyforge.program_runner_health.v1"
+                    schema = "manyforge.program_runner_health.v2"
                 else:
                     ready = payload.get("status") == "ready"
                     schema = "manyforge.composer_health.v1"
@@ -1590,7 +1567,11 @@ class NativeLauncher:
                         state=state,
                         source_schema=schema,
                         owner_id=str(payload.get("owner_id", component)),
-                        owner_epoch=(str(payload["owner_epoch"]) if payload.get("owner_epoch") is not None else None),
+                        application_start_id=(
+                            str(payload["application_start_id"])
+                            if payload.get("application_start_id") is not None
+                            else None
+                        ),
                         payload_sha256=_sha256_json(payload),
                         observed_at_unix_ns=now,
                         reason_code=None if ready else "owner_not_ready",
@@ -1625,6 +1606,8 @@ class NativeLauncher:
         ]
 
     def _spawn(self, spec: ProcessSpec) -> _ManagedProcess:
+        """Start the Manager; it ends with this launcher (spec 3.3 point 6)."""
+
         argv, log_path = _journal_command(self.config.instance_id, spec.component_id, spec.argv)
         environment = os.environ.copy()
         environment.update(spec.environment)
@@ -1636,6 +1619,7 @@ class NativeLauncher:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             start_new_session=True,
+            preexec_fn=parent_death_preexec(),
         )
         deadline = time.monotonic() + 2.0
         while time.monotonic() < deadline:
@@ -1746,8 +1730,13 @@ class NativeLauncher:
         self,
         old_status: LaunchInstanceStatus,
         mechanical: Mapping[str, Any],
+        *,
+        persist: bool = True,
     ) -> LaunchInstanceStatus:
-        """Reconcile recorded processes and owner readiness without restarting."""
+        """Reconcile recorded processes and owner readiness without restarting.
+
+        ``persist=False`` observes a record a resident start owns.
+        """
 
         processes = mechanical.get("processes", {})
         resources = self._resource_records_from_mechanical(processes)
@@ -1800,7 +1789,8 @@ class NativeLauncher:
             old_status.record_generation + 1,
             failure,
         )
-        self.store.write(status, mechanical)
+        if persist:
+            self.store.write(status, mechanical)
         return status
 
     def _finish_failed_start(
@@ -1845,7 +1835,16 @@ class NativeLauncher:
             status=degraded,
         )
 
-    def start(self) -> LaunchInstanceStatus:
+    def start(
+        self,
+        on_ready: Callable[[LaunchInstanceStatus], None] | None = None,
+    ) -> LaunchInstanceStatus:
+        """Prepare the session, start the Manager and wait on it for life.
+
+        Returns the final STOPPED record after an orderly stop; ``on_ready``
+        is called once with the READY record. A start that meets a running
+        launcher returns its current status (``already_running``).
+        """
         self.last_start_idempotent = False
         if not self.config.instance_id:
             raise LauncherError("invalid_instance_id", "instance id is empty", exit_code=64)
@@ -1853,221 +1852,343 @@ class NativeLauncher:
             self.layout.validate()
         except CellLayoutError as error:
             raise LauncherError("cell_layout_invalid", str(error), exit_code=71) from error
-        with self.store.lock():
-            configuration = _configuration(self.config)
-            self._prepare_program_workspace()
-            existing = self.store.read()
-            if existing is not None:
-                old_status, mechanical = existing
-                mechanical = dict(mechanical)
-                paths = mechanical.get("paths")
-                if paths is None:
-                    paths = {}
-                if not isinstance(paths, dict):
+        configuration = _configuration(self.config)
+        try:
+            with self.store.lock(blocking=False):
+                return self._start_locked(configuration, on_ready)
+        except _InstanceBusy:
+            return self._running_instance(configuration)
+
+    def _start_locked(
+        self,
+        configuration: LaunchConfiguration,
+        on_ready: Callable[[LaunchInstanceStatus], None] | None,
+    ) -> LaunchInstanceStatus:
+        self._prepare_disk()
+        self._prepare_program_workspace()
+        existing = self.store.read()
+        if existing is not None:
+            old_status, mechanical = existing
+            mechanical = dict(mechanical)
+            paths = mechanical.get("paths")
+            if paths is None:
+                paths = {}
+            if not isinstance(paths, dict):
+                raise LauncherError(
+                    "status_record_invalid",
+                    "stored mechanical paths record is not an object",
+                    exit_code=70,
+                    status=old_status,
+                )
+            mechanical["paths"] = {
+                **paths,
+                "program_workspace": str(self.config.program_workspace),
+            }
+            if old_status.configuration.profile is not LaunchProfile.STANDARD:
+                raise LauncherError(
+                    "incompatible_owner",
+                    "stored launch has a different standard configuration",
+                    exit_code=70,
+                    status=old_status,
+                )
+            if mechanical.get("launch_input_digest") != _launch_input_digest(
+                self.config
+            ):
+                raise LauncherError(
+                    "incompatible_owner",
+                    "stored launch has different cell, admission, or Composer static inputs",
+                    exit_code=70,
+                    status=old_status,
+                )
+            disposition = decide_start(
+                old_status, configuration.configuration_digest
+            )
+            # instance.lock is free, so the launcher that wrote a starting,
+            # ready or degraded record has ended; its Manager ended with it
+            # (PR_SET_PDEATHSIG) unless it ignored SIGTERM: prove it absent.
+            if disposition in (StartDisposition.IDEMPOTENT, StartDisposition.RECOVER):
+                processes = mechanical.get("processes", {})
+                if not isinstance(processes, dict):
                     raise LauncherError(
                         "status_record_invalid",
-                        "stored mechanical paths record is not an object",
+                        "stored mechanical process record is not an object",
                         exit_code=70,
                         status=old_status,
                     )
-                mechanical["paths"] = {
-                    **paths,
-                    "program_workspace": str(self.config.program_workspace),
-                }
-                if old_status.configuration.profile is not LaunchProfile.STANDARD:
-                    raise LauncherError(
-                        "incompatible_owner",
-                        "stored launch has a different standard configuration",
-                        exit_code=70,
-                        status=old_status,
+                if old_status.state is not LaunchInstanceState.UNAVAILABLE:
+                    resources = self._resource_records_from_mechanical(processes)
+                    previous_observations = self._resource_observations(resources)
+                    stopping = _status(
+                        old_status.configuration,
+                        old_status.launch_instance_id,
+                        LaunchInstanceState.STOPPING,
+                        resources,
+                        (),
+                        previous_observations,
+                        old_status.record_generation + 1,
+                        old_status.last_failure,
                     )
-                if mechanical.get("launch_input_digest") != _launch_input_digest(
-                    self.config
-                ):
-                    raise LauncherError(
-                        "incompatible_owner",
-                        "stored launch has different cell, admission, or Composer static inputs",
-                        exit_code=70,
-                        status=old_status,
-                    )
-                disposition = decide_start(
-                    old_status, configuration.configuration_digest
-                )
-                if disposition is StartDisposition.IDEMPOTENT:
-                    self.last_start_idempotent = True
-                    return self._refresh_status(old_status, mechanical)
-                if disposition is StartDisposition.RECOVER:
-                    processes = mechanical.get("processes", {})
-                    if not isinstance(processes, dict):
-                        raise LauncherError(
-                            "status_record_invalid",
-                            "stored mechanical process record is not an object",
-                            exit_code=70,
-                            status=old_status,
+                    self.store.write(stopping, mechanical)
+                    clean = self._cleanup_authenticated(processes)
+                    observations = self._resource_observations(resources)
+                    if not clean or any(
+                        observation.presence is not ResourcePresence.ABSENT
+                        for observation in observations
+                    ):
+                        failure = FailureRecord(
+                            reason_code="cleanup_deadline_exceeded",
+                            component_id="launcher",
+                            detail=(
+                                "degraded recovery could not prove prior "
+                                "owned resources absent"
+                            ),
+                            occurred_at_unix_ns=_safe_unix_timestamp(),
                         )
-                    if old_status.state is not LaunchInstanceState.UNAVAILABLE:
-                        resources = self._resource_records_from_mechanical(processes)
-                        previous_observations = self._resource_observations(resources)
-                        stopping = _status(
+                        degraded = _status(
                             old_status.configuration,
                             old_status.launch_instance_id,
-                            LaunchInstanceState.STOPPING,
-                            resources,
-                            (),
-                            previous_observations,
-                            old_status.record_generation + 1,
-                            old_status.last_failure,
-                        )
-                        self.store.write(stopping, mechanical)
-                        paths = mechanical.get("paths")
-                        manager_root = (
-                            Path(paths["manager_run_root"])
-                            if isinstance(paths, dict)
-                            and isinstance(paths.get("manager_run_root"), str)
-                            else self.config.manager_run_root
-                        )
-                        clean = self._cleanup_authenticated(
-                            processes,
-                            manager_run_root=manager_root,
-                        )
-                        observations = self._resource_observations(resources)
-                        if not clean or any(
-                            observation.presence is not ResourcePresence.ABSENT
-                            for observation in observations
-                        ):
-                            failure = FailureRecord(
-                                reason_code="cleanup_deadline_exceeded",
-                                component_id="launcher",
-                                detail=(
-                                    "degraded recovery could not prove prior "
-                                    "owned resources absent"
-                                ),
-                                occurred_at_unix_ns=_safe_unix_timestamp(),
-                            )
-                            degraded = _status(
-                                old_status.configuration,
-                                old_status.launch_instance_id,
-                                LaunchInstanceState.DEGRADED,
-                                resources,
-                                (),
-                                observations,
-                                stopping.record_generation + 1,
-                                failure,
-                            )
-                            self.store.write(degraded, mechanical)
-                            raise LauncherError(
-                                "cleanup_deadline_exceeded",
-                                str(failure.detail),
-                                exit_code=74,
-                                status=degraded,
-                            )
-                        stopped = _status(
-                            old_status.configuration,
-                            old_status.launch_instance_id,
-                            LaunchInstanceState.STOPPED,
+                            LaunchInstanceState.DEGRADED,
                             resources,
                             (),
                             observations,
                             stopping.record_generation + 1,
+                            failure,
                         )
-                        self.store.write(stopped, mechanical)
-                    self._managed = {}
-                if disposition is StartDisposition.CONFLICT:
-                    raise LauncherError(
-                        "incompatible_owner",
-                        "stored launch is stopping or has a different configuration",
-                        exit_code=70,
-                        status=old_status,
+                        self.store.write(degraded, mechanical)
+                        raise LauncherError(
+                            "cleanup_deadline_exceeded",
+                            str(failure.detail),
+                            exit_code=74,
+                            status=degraded,
+                        )
+                    stopped = _status(
+                        old_status.configuration,
+                        old_status.launch_instance_id,
+                        LaunchInstanceState.STOPPED,
+                        resources,
+                        (),
+                        observations,
+                        stopping.record_generation + 1,
                     )
-                processes = mechanical.get("processes", {})
-                resources = self._resource_records_from_mechanical(processes)
-                if any(
-                    observation.presence is ResourcePresence.PRESENT
-                    for observation in self._resource_observations(resources)
-                ):
-                    raise LauncherError(
-                        "incompatible_owner",
-                        "stored launch still owns an authenticated process",
-                        exit_code=70,
-                        status=old_status,
-                    )
-            self._port_available()
-            self._write_live(configuration, LaunchInstanceState.STARTING)
-            try:
-                for spec in native_commands(self.config):
-                    self._managed[spec.component_id] = self._spawn(spec)
-                    self._write_live(configuration, LaunchInstanceState.STARTING)
-                deadline = time.monotonic() + self.config.readiness_timeout_seconds
-                last_rows: list[ReadinessObservation] = []
-                while time.monotonic() < deadline:
-                    ready, last_rows, reason = self._readiness()
-                    if ready:
-                        return self._write_live(configuration, LaunchInstanceState.READY, last_rows)
-                    time.sleep(self.config.poll_interval_seconds)
-                failure = FailureRecord(
-                    reason_code="readiness_timeout",
-                    component_id="launcher",
-                    detail=(reason or "native owner readiness timed out")[:4096],
-                    occurred_at_unix_ns=_safe_unix_timestamp(),
-                )
-                stopped_readiness = [
-                    ReadinessObservation(
-                        component_id=row.component_id,
-                        authority=row.authority,
-                        state=ReadinessState.STOPPED,
-                        source_schema=row.source_schema,
-                        owner_id=row.owner_id,
-                        owner_epoch=row.owner_epoch,
-                        payload_sha256=row.payload_sha256,
-                        observed_at_unix_ns=_safe_unix_timestamp(),
-                        reason_code="startup_failed",
-                    )
-                    for row in last_rows
-                ]
-                stopped = self._finish_failed_start(
-                    configuration,
-                    failure,
-                    stopped_readiness,
-                )
+                    self.store.write(stopped, mechanical)
+                self._managed = {}
+            if disposition is StartDisposition.CONFLICT:
                 raise LauncherError(
-                    "readiness_timeout",
-                    str(failure.detail),
-                    exit_code=73,
-                    status=stopped,
-                )
-            except LauncherError as error:
-                if error.code == "cleanup_deadline_exceeded" or error.status is not None:
-                    raise
-                failure = FailureRecord(
-                    reason_code=error.code,
-                    component_id="launcher",
-                    detail=str(error)[:4096],
-                    occurred_at_unix_ns=_safe_unix_timestamp(),
-                )
-                stopped = self._finish_failed_start(configuration, failure)
-                error.status = stopped
-                raise
-            except Exception as error:
-                failure = FailureRecord(
-                    reason_code="native_start_failed",
-                    component_id="launcher",
-                    detail=str(error)[:4096],
-                    occurred_at_unix_ns=_safe_unix_timestamp(),
-                )
-                stopped = self._finish_failed_start(configuration, failure)
-                raise LauncherError(
-                    "native_start_failed",
-                    str(error),
+                    "incompatible_owner",
+                    "stored launch is stopping or has a different configuration",
                     exit_code=70,
-                    status=stopped,
+                    status=old_status,
+                )
+            processes = mechanical.get("processes", {})
+            resources = self._resource_records_from_mechanical(processes)
+            if any(
+                observation.presence is ResourcePresence.PRESENT
+                for observation in self._resource_observations(resources)
+            ):
+                raise LauncherError(
+                    "incompatible_owner",
+                    "stored launch still owns an authenticated process",
+                    exit_code=70,
+                    status=old_status,
+                )
+        self._port_available()
+        root = self.config.instance_root
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            # The same run selection as the development workbench (spec 4.2):
+            # the previous current/ is archived and a fresh one created before
+            # any process starts; nothing reads a previous run's state.
+            try:
+                marker = run_session.claim_selected(root, run_session.prepare_session(
+                    root, uuid.uuid4().hex, lock_fd=root_fd, stable_entries=_CELL_ROOT_ENTRIES,
+                ))
+            except (OSError, ValueError) as error:
+                # The instance folder names the disk; an OS text alone may not.
+                raise LauncherError(
+                    "session_selection_unavailable", f"{root}: {error}"[:1024], exit_code=71,
                 ) from error
+            # The bounded retention pass (five runs and 2 GiB of archives and
+            # older History files, contract 1.14, and the disk limits) ran
+            # before the selection, in _prepare_disk.
+            for name in CURRENT_DIRECTORIES:
+                (self.config.current_root / name).mkdir(mode=0o700)
+            for name in DATA_DIRECTORIES:
+                (self.config.data_root / name).mkdir(mode=0o700, exist_ok=True)
+            previous = marker.get("previous_session")
+            manager_spec, processes = native_commands(
+                self.config,
+                previous_session_id=previous["session_id"] if isinstance(previous, dict) else None,
+            )
+            write_application_processes(self.config.application_processes_document, processes)
+            exit_status: int | None = None
+            try:
+                self._write_live(configuration, LaunchInstanceState.STARTING)
+                try:
+                    self._managed[manager_spec.component_id] = self._spawn(manager_spec)
+                    self._write_live(configuration, LaunchInstanceState.STARTING)
+                except LauncherError as error:
+                    if error.code == "cleanup_deadline_exceeded" or error.status is not None:
+                        raise
+                    failure = FailureRecord(
+                        reason_code=error.code,
+                        component_id="launcher",
+                        detail=str(error)[:4096],
+                        occurred_at_unix_ns=_safe_unix_timestamp(),
+                    )
+                    error.status = self._finish_failed_start(configuration, failure)
+                    raise
+                except Exception as error:
+                    failure = FailureRecord(
+                        reason_code="native_start_failed",
+                        component_id="launcher",
+                        detail=str(error)[:4096],
+                        occurred_at_unix_ns=_safe_unix_timestamp(),
+                    )
+                    stopped = self._finish_failed_start(configuration, failure)
+                    raise LauncherError(
+                        "native_start_failed",
+                        str(error),
+                        exit_code=70,
+                        status=stopped,
+                    ) from error
+                exit_status = self._wait_on_manager(configuration, on_ready, root_fd)
+            finally:
+                # The session marker closes on every end, failed starts too.
+                # A failed write leaves the run "started": the next start
+                # treats it as ended uncleanly (OD-229).
+                try:
+                    run_session.record_stopped(root, root_fd, marker, verified=exit_status == MANAGER_STOPPED)
+                except OSError as error:
+                    raise LauncherError(
+                        "run_end_not_recorded", f"{root}: {error}"[:1024], exit_code=71,
+                    ) from error
+        finally:
+            os.close(root_fd)
+        # A stop in which a step was forced or did not complete (OD-187 (2))
+        # has its own code; any other status is an application exit.
+        incomplete = exit_status == MANAGER_STOP_INCOMPLETE
+        failure = None if exit_status == MANAGER_STOPPED else FailureRecord(
+            reason_code="application_stop_incomplete" if incomplete else "application_exited",
+            component_id="manager",
+            detail=(
+                f"the Manager's stop of the application did not complete (status {exit_status}); "
+                "its log names the step"
+                if incomplete else
+                f"the Manager ended the application with status {exit_status}; "
+                "its log names the process that exited"
+            ),
+            occurred_at_unix_ns=_safe_unix_timestamp(),
+        )
+        self._write_live(configuration, LaunchInstanceState.STOPPING, (), failure)
+        stopped = self._write_live(configuration, LaunchInstanceState.STOPPED, (), failure)
+        if failure is not None:
+            raise LauncherError(failure.reason_code, str(failure.detail), exit_code=73, status=stopped)
+        return stopped
+
+    def _prepare_disk(self) -> None:
+        """Before anything is written: prune ManyForge's own obsolete files, check the floor."""
+
+        root = self.config.instance_root
+        root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            run_session.prepare_disk(root, root_fd, self.config.disk_limits)
+        except run_session.DiskBelowFloor as error:
+            raise LauncherError(error.code, str(error), exit_code=71) from error
+        finally:
+            os.close(root_fd)
+
+    def _wait_on_manager(
+        self,
+        configuration: LaunchConfiguration,
+        on_ready: Callable[[LaunchInstanceStatus], None] | None,
+        root_fd: int,
+    ) -> int:
+        """Wait on the Manager for its whole life; return its exit status.
+
+        Readiness is only reported: the first time every owner reports ready
+        the record becomes READY. Nothing here stops a process; SIGTERM or
+        SIGINT to this launcher asks the Manager to end the application.
+        Each stop request is passed on as one SIGTERM: the Manager's stop has
+        no time limit, and a second request (a second Ctrl-C) forces it.
+        Every ``DISK_PRUNE_PERIOD_SECONDS`` ManyForge's own obsolete files
+        are pruned, only when they are above their limits.
+        """
+
+        manager = self._managed["manager"].process
+        stop_requests = 0
+
+        def request_stop(_signum: int, _frame: Any) -> None:
+            nonlocal stop_requests
+            stop_requests += 1
+
+        previous = {
+            number: signal.signal(number, request_stop)
+            for number in (signal.SIGTERM, signal.SIGINT)
+        }
+        signalled = 0
+        reported = False
+        next_prune = time.monotonic() + run_session.DISK_PRUNE_PERIOD_SECONDS
+        try:
+            while True:
+                try:
+                    return manager.wait(timeout=self.config.poll_interval_seconds)
+                except subprocess.TimeoutExpired:
+                    pass
+                if time.monotonic() >= next_prune:
+                    next_prune = time.monotonic() + run_session.DISK_PRUNE_PERIOD_SECONDS
+                    run_session.prune_while_running(
+                        self.config.instance_root, root_fd, self.config.disk_limits)
+                while signalled < stop_requests:
+                    manager.send_signal(signal.SIGTERM)
+                    signalled += 1
+                if not reported:
+                    ready, rows, _reason = self._readiness(configuration)
+                    if ready:
+                        status = self._write_live(configuration, LaunchInstanceState.READY, rows)
+                        reported = True
+                        if on_ready is not None:
+                            on_ready(status)
+        finally:
+            for number, handler in previous.items():
+                signal.signal(number, handler)
+
+    def _running_instance(self, configuration: LaunchConfiguration) -> LaunchInstanceStatus:
+        """A resident start holds instance.lock: report it, never start twice."""
+
+        existing = self.store.read()
+        if existing is None:
+            raise LauncherError(
+                "incompatible_owner",
+                "another launcher holds this instance and has not recorded it yet",
+                exit_code=70,
+            )
+        old_status, mechanical = existing
+        if decide_start(old_status, configuration.configuration_digest) is not StartDisposition.IDEMPOTENT:
+            raise LauncherError(
+                "incompatible_owner",
+                "a running launcher owns this instance with another state or configuration",
+                exit_code=70,
+                status=old_status,
+            )
+        self.last_start_idempotent = True
+        return self._refresh_status(old_status, mechanical, persist=False)
 
     def status(self) -> LaunchInstanceStatus | None:
         try:
             self.layout.validate()
         except CellLayoutError as error:
             raise LauncherError("cell_layout_invalid", str(error), exit_code=71) from error
-        with self.store.lock():
+        try:
+            return self._status_locked()
+        except _InstanceBusy:
+            # A resident start owns the record; observe it without writing.
+            existing = self.store.read()
+            if existing is None:
+                return None
+            return self._refresh_status(*existing, persist=False)
+
+    def _status_locked(self) -> LaunchInstanceStatus | None:
+        with self.store.lock(blocking=False):
             existing = self.store.read()
             if existing is None:
                 return None
@@ -2094,50 +2215,46 @@ class NativeLauncher:
     def _cleanup_authenticated(
         self,
         process_records: Mapping[str, Mapping[str, Any]] | None = None,
-        *,
-        manager_run_root: Path | None = None,
     ) -> bool:
+        """One stop request to a live recorded Manager, then follow it, without
+        a time limit, until it has ended (a further `stop` is one more request
+        and forces it). The launcher starts only the Manager; its children end
+        with it. Returns whether every recorded process has ended."""
+
         processes = (
             dict(process_records)
             if process_records is not None
             else self._mechanical().get("processes", {})
         )
         manager = processes.get("manager")
-        if manager is not None and _safe_process_is_authenticated(manager):
-            socket_path = (manager_run_root or self.config.manager_run_root) / "manager-command.sock"
-            try:
-                with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
-                    client.settimeout(2.0)
-                    client.connect(str(socket_path))
-                    client.sendall(b'{"api_version":"manyforge.manager_command.v1","command":"shutdown_runtime"}')
-                    client.recv(64 * 1024)
-            except OSError:
-                pass
-        deadline = time.monotonic() + min(10.0, self.config.readiness_timeout_seconds)
-        for component in ("composer", "program_runner", "headless", "manager"):
-            item = processes.get(component)
-            if item is None or not _safe_process_is_authenticated(item):
-                continue
-            pgid = int(item["process_group_id"])
-            if pgid > 1 and pgid != os.getpgrp():
-                try:
-                    os.killpg(pgid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-        while time.monotonic() < deadline:
-            if not any(_safe_process_is_authenticated(item) for item in processes.values()):
-                return True
-            time.sleep(0.05)
-        for item in processes.values():
-            if _safe_process_is_authenticated(item):
-                pgid = int(item["process_group_id"])
-                if pgid > 1 and pgid != os.getpgrp():
-                    try:
-                        os.killpg(pgid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-        time.sleep(0.05)
+        if self._request_manager_stop(manager):
+            while _safe_process_is_authenticated(manager):
+                time.sleep(self.config.poll_interval_seconds)
         return not any(_safe_process_is_authenticated(item) for item in processes.values())
+
+    def _request_manager_stop(self, manager: Mapping[str, Any] | None) -> bool:
+        """One stop request: one SIGTERM to the recorded, live Manager (OD-187).
+
+        The Manager counts the requests: the first starts its orderly stop, a
+        second forces it. Returns False when no live, authenticated Manager is
+        recorded.
+        """
+
+        if manager is None or not _safe_process_is_authenticated(manager):
+            return False
+        pid = int(manager["pid"])
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            return False
+        print(
+            f"stop: asked the Manager (pid {pid}) to stop the application; waiting "
+            "for it to end. Its log shows each step; a second stop request forces "
+            "the stop.",
+            file=sys.stderr,
+            flush=True,
+        )
+        return True
 
     def stop(self) -> LaunchInstanceStatus | None:
         self.last_stop_already_stopped = False
@@ -2145,7 +2262,23 @@ class NativeLauncher:
             self.layout.validate()
         except CellLayoutError as error:
             raise LauncherError("cell_layout_invalid", str(error), exit_code=71) from error
+        try:
+            return self._stop_locked()
+        except _InstanceBusy:
+            pass
+        # A resident start, or another `stop`, owns the instance: this stop is
+        # one more stop request to its Manager; then wait, without a time
+        # limit, until the owner has closed the record (instance.lock).
+        existing = self.store.read()
+        if existing is not None:
+            self._request_manager_stop((existing[1].get("processes") or {}).get("manager"))
         with self.store.lock():
+            existing = self.store.read()
+        return None if existing is None else existing[0]
+
+    def _stop_locked(self) -> LaunchInstanceStatus | None:
+        """Close a record whose launcher has ended (instance.lock was free)."""
+        with self.store.lock(blocking=False):
             existing = self.store.read()
             if existing is None:
                 return None
@@ -2184,12 +2317,8 @@ class NativeLauncher:
                 old_status.record_generation + 1,
             )
             self.store.write(stopping, mechanical)
-            clean = self._cleanup_authenticated(
-                processes,
-                manager_run_root=Path(
-                    mechanical["paths"]["manager_run_root"]
-                ),
-            )
+            # A live Manager whose launcher has ended: stop it and wait for it.
+            clean = self._cleanup_authenticated(processes)
             observations = [
                 ResourceObservation(
                     resource_id=str(item.get("resource_id", component)),

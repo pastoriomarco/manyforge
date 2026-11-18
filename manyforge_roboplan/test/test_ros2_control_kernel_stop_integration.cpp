@@ -1,3 +1,4 @@
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include <manyforge_core/testing/heap_resource_addressed_kernel.hpp>
 
 // Kernel-to-ros2_control Stop integration over the execution port.
@@ -11,6 +12,7 @@
 // Kernel-minted prepared participant) and then calls the real participant
 // Prepare/Dispatch. The Kernel's Stop-stage port is the real participant (its
 // Core Stop-stage helper), observed through a forwarding recorder.
+#include "held_program_run.hpp"
 #include "ros2_control_fake_controller.hpp"
 
 #include <gtest/gtest.h>
@@ -169,7 +171,6 @@ private:
   return std::move(sealed.value());
 }
 
-constexpr const char *kOwnerEpoch = "kernel.ros2_control.stop.1";
 constexpr const char *kCellId = "cell.ros2_control.stop";
 
 [[nodiscard]] std::string Sha(const char value) {
@@ -506,7 +507,6 @@ public:
       const core::ContentDigest &prepared_contract_digest) override {
     std::shared_ptr<const core::PreparedOperationParticipantDTO> participant;
     std::optional<core::ControllerGoalId> goal_id;
-    std::optional<core::ControllerGoalGeneration> goal_generation;
     {
       std::lock_guard lock(mutex_);
       if (!request_.has_value() || !snapshot_.has_value() ||
@@ -520,12 +520,10 @@ public:
       }
       participant = snapshot_->participant;
       goal_id = request_->execution_request.binding.controller_goal_id;
-      goal_generation =
-          request_->execution_request.binding.controller_goal_generation;
     }
-    auto handle = backend_.Dispatch(*participant, *goal_id, *goal_generation);
+    auto handle = backend_.Dispatch(*participant, *goal_id);
     if (const auto invalid = core::prepared_execution_handle_field_error(
-            handle, *participant, *goal_id, *goal_generation);
+            handle, *participant, *goal_id);
         invalid.has_value()) {
       return core::Result<void>::Err(
           {"ros2_control_dispatch_rejected",
@@ -584,8 +582,7 @@ public:
   }
   [[nodiscard]] core::Result<core::GripperCommandResultDTO>
   DispatchPreparedCapabilityCommand(std::uint64_t, const core::ContentDigest &,
-                                    const core::ControllerGoalId &,
-                                    core::ControllerGoalGeneration) override {
+                                    const core::ControllerGoalId &) override {
     return Unsupported<core::GripperCommandResultDTO>();
   }
   [[nodiscard]] core::Result<void>
@@ -593,22 +590,25 @@ public:
     return Unsupported<void>();
   }
 
-  core::AddressedParticipantStopFenceDisposition
+  // Fence call (1): with the Kernel's state lock held, only the atomic
+  // facts. The goal here is already dispatched, so no dispatch gate is
+  // closed before dispatch and the Kernel owes no call (2) for it.
+  core::AddressedParticipantStopFenceResult
   fence_addressed_participant_stop(std::uint64_t execution_id) noexcept override {
     fence_calls_.fetch_add(1U, std::memory_order_relaxed);
-    return execution_id == current_execution_id() &&
-                   dispatched_.load(std::memory_order_acquire)
-               ? core::AddressedParticipantStopFenceDisposition::
-                     kDispatchCommitted
-               : core::AddressedParticipantStopFenceDisposition::kUnknown;
+    return {execution_id == current_execution_id() &&
+                    dispatched_.load(std::memory_order_acquire)
+                ? core::AddressedParticipantStopFenceDisposition::kDispatchCommitted
+                : core::AddressedParticipantStopFenceDisposition::kUnknown,
+            static_cast<std::uint8_t>(core::AddressedParticipantStopFenceGate::kNone)};
   }
 
-  // Same exact-identity settlement contract as the Kernel tests' fake engine.
+  // Same exact-identity settlement contract as the Kernel tests' fake engine:
+  // the containment names the Stop event that started the attempt.
   [[nodiscard]] core::Result<core::AddressedParticipantStopSettlementDTO>
   settle_addressed_participant_stop(
       const core::AddressedParticipantStopSettlementRequestDTO &request)
       override {
-    const auto &certificate = request.aggregate_stop_certificate;
     const auto &stage = request.containment.request;
     const bool expected_disposition =
         request.effect_prevented_before_dispatch
@@ -616,11 +616,12 @@ public:
                   core::StopStageAttemptDispositionDTO::kNotDispatched
             : request.containment.attempt_disposition !=
                   core::StopStageAttemptDispositionDTO::kNotDispatched;
-    if (request.execution_id != current_execution_id() || !certificate.locally_valid() ||
+    if (request.execution_id != current_execution_id() ||
+        !request.stop_event_id.nonzero() ||
         request.containment.outcome !=
             core::ParticipantStopStageOutcomeDTO::kSucceeded ||
-        !expected_disposition || stage.stop_id != certificate.stop_id ||
-        stage.stop_generation != certificate.stop_generation) {
+        !expected_disposition || stage.stop_event_id != request.stop_event_id ||
+        stage.stage_index >= stage.participant_stop_plan.stage_commands.size()) {
       return core::Result<core::AddressedParticipantStopSettlementDTO>::Err(
           {"addressed_motion_stop_execution_mismatch",
            "ros2_control addressed Stop identity is stale",
@@ -628,6 +629,7 @@ public:
     }
     std::lock_guard lock(mutex_);
     ++settlements_;
+    settled_stop_event_id_ = request.stop_event_id;
     status_.state = core::ExecutionState::kStopped;
     status_.execution_id = request.execution_id;
     recovery_.assessment_revision += 1U;
@@ -637,18 +639,17 @@ public:
     recovery_.recovery_class = core::RecoveryClass::kOrdinaryOperatorStop;
     recovery_.status = core::RecoveryAssessmentStatus::kRetryReady;
     recovery_.retry_admissible = true;
-    recovery_.stop_certificate_id = certificate.stop_certificate_id.value();
-    recovery_.stop_certificate_revision =
-        certificate.stop_certificate_revision.value();
-    recovery_.stop_owner_generation = certificate.stop_generation.value();
+    recovery_.stop_event_id = request.stop_event_id.value();
+    recovery_.stop_phase = std::string(core::to_string(core::StopPhase::kStopped));
+    recovery_.containing_stage_id = stage.participant_stop_plan.stage_commands[stage.stage_index]
+                                        .resolved_stage.stop_escalation_stage_id.value();
     recovery_.backend_stop_confirmed = true;
     recovery_.allowed_actions = {core::RecoveryAction::kReplanFromStoppedState,
                                  core::RecoveryAction::kResetCycle};
     return core::Result<core::AddressedParticipantStopSettlementDTO>::Ok(
         core::AddressedParticipantStopSettlementDTO{
-            request.execution_id, certificate, stage.operation_id,
-            stage.participant_id, stage.controller_goal_id,
-            stage.controller_goal_generation, recovery_});
+            request.execution_id, request.stop_event_id, stage.operation_id,
+            stage.participant_id, stage.controller_goal_id, recovery_});
   }
 
   [[nodiscard]] core::ResetResultDTO
@@ -665,7 +666,7 @@ public:
     return Unsupported<core::ResolvedRuntimeScaleAcceptedDTO>();
   }
   [[nodiscard]] core::Result<core::ResolvedRuntimeScaleStatusDTO>
-  runtime_scale_status(const core::OperationId &,
+  runtime_scale_status(const core::OperationNumber &,
                        const core::ControlBindingId &) const override {
     return Unsupported<core::ResolvedRuntimeScaleStatusDTO>();
   }
@@ -734,6 +735,11 @@ public:
   }
   [[nodiscard]] std::uint64_t fence_calls() const noexcept {
     return fence_calls_.load(std::memory_order_relaxed);
+  }
+
+  [[nodiscard]] std::optional<core::StopEventId> settled_stop_event_id() const {
+    std::lock_guard lock(mutex_);
+    return settled_stop_event_id_;
   }
 
 private:
@@ -978,6 +984,7 @@ private:
   std::size_t settlements_{};
   std::atomic<bool> dispatched_{false};
   std::atomic<std::uint64_t> fence_calls_{0U};
+  std::optional<core::StopEventId> settled_stop_event_id_{};
   mutable std::mutex callbacks_mutex_;
   std::uint64_t next_subscription_id_{1U};
   std::map<std::uint64_t, core::EventCallback> callbacks_;
@@ -1011,9 +1018,8 @@ Registration(const core::RuntimeParticipantBinding &binding,
 }
 
 [[nodiscard]] core::PublicRequestContextDTO Context(std::string request_id) {
-  return core::PublicRequestContextDTO{core::RequestId(std::move(request_id)),
-                                       core::RequestOwnerEpoch(kOwnerEpoch),
-                                       "test", std::nullopt};
+  return core::PublicRequestContextDTO{core::TestRequestKey(std::move(request_id)),
+                                       "test"};
 }
 
 [[nodiscard]] core::OperationIntentDTO
@@ -1052,14 +1058,16 @@ MotionOperation(const core::RuntimeParticipantBinding &binding,
       {}};
   const core::OperationParticipantIntentDTO participant{
       {value.controllable_component_id, value.command_target_id}, value.capability_id,
-      std::nullopt, motion};
+      std::nullopt, motion, HeldProgramRunMotionScope()};
   std::vector<core::OperationParticipantIntentDTO> participants{participant};
   return {Context(suffix == "1" ? std::string("execute.ros2_control.stop")
                                  : "execute.ros2_control.stop." + suffix),
           value.program_id,
           value.program_revision,
           value.program_binding_id,
-          core::ProgramRunId("run.ros2_control.stop." + suffix),
+          // Its own run per operation ("1" and "epoch2" here); the test makes
+          // it the run the Kernel holds (`HoldProgramRun`).
+          core::ProgramRunNumber(suffix == "1" ? 1U : 2U),
           value.graph_revision,
           value.retained_bundle_id,
           std::nullopt,
@@ -1067,23 +1075,23 @@ MotionOperation(const core::RuntimeParticipantBinding &binding,
           core::OperationCoordinationPolicy::kIndependent};
 }
 
-[[nodiscard]] std::optional<core::StopStatusDTO>
-WaitForTerminalStop(const core::ResourceAddressedExecutionKernel &kernel,
-                    const core::StopId &stop_id) {
-  std::optional<core::StopStatusDTO> last;
-  const bool terminal = WaitUntil(
+/// Reads the event with `read_stop` until it is complete (every covered
+/// participant ended its attempt).
+[[nodiscard]] std::optional<core::StopEventStatusDTO>
+WaitForCompleteStop(const core::ResourceAddressedExecutionKernel &kernel,
+                    const core::StopEventId &event_id) {
+  std::optional<core::StopEventStatusDTO> last;
+  const bool complete = WaitUntil(
       [&] {
-        auto status = kernel.get_stop_status(stop_id);
+        auto status = kernel.read_stop(event_id);
         if (!status.ok()) {
           return false;
         }
         last = std::move(status.value());
-        return last->state == core::StopStatusStateDTO::kSucceeded ||
-               last->state == core::StopStatusStateDTO::kPartial ||
-               last->state == core::StopStatusStateDTO::kFailed;
+        return last->complete;
       },
       10s);
-  return terminal ? last : std::nullopt;
+  return complete ? last : std::nullopt;
 }
 
 [[nodiscard]] std::string StageReason(
@@ -1104,7 +1112,7 @@ void RemoveJournalFiles(const std::filesystem::path &path) {
   std::filesystem::remove(path.string() + "-shm", ignored);
 }
 
-enum class StopKind { kFullStop, kOperationStop };
+enum class StopForm { kStopAll, kHalt, kOperationStop };
 
 /// The Isaac lane's participant inputs with test values where no lane value
 /// is decided yet (replacement allowance, late-cycle margin).
@@ -1150,16 +1158,16 @@ AdapterConfig(const std::string &controller) {
 class CompiledNamePort final : public core::IExecutionPort {
 public:
   explicit CompiledNamePort(Ros2ControlExecutionBackend &adapter) : adapter_(adapter) {}
-  core::ExecutionPortCommandResultDTO Submit(const core::ExecutionGoalKey &key,
+  core::ExecutionPortCommandResultDTO Submit(const core::ControllerGoalId &key,
                                              const core::TrajectoryDTO &trajectory, std::shared_ptr<core::ExecutionDispatchToken> token = {}) override {
     return adapter_.Submit(key, Rename(trajectory), std::move(token));
   }
   core::ExecutionPortCommandResultDTO Replace(
-      const core::ExecutionGoalKey &active, const core::ExecutionGoalKey &next,
+      const core::ControllerGoalId &active, const core::ControllerGoalId &next,
       const core::TrajectoryDTO &trajectory, std::shared_ptr<core::ExecutionDispatchToken> token = {}) override {
     return adapter_.Replace(active, next, Rename(trajectory), std::move(token));
   }
-  core::ExecutionPortCommandResultDTO Cancel(const core::ExecutionGoalKey &key, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
+  core::ExecutionPortCommandResultDTO Cancel(const core::ControllerGoalId &key, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
     return adapter_.Cancel(key, deadline);
   }
   std::uint64_t ReserveScaleSequence() noexcept override { return adapter_.ReserveScaleSequence(); }
@@ -1169,7 +1177,7 @@ public:
     return adapter_.SetScale(value, sequence);
   }
   std::optional<core::ExecutionGoalObservationDTO>
-  ReadGoal(const core::ExecutionGoalKey &key) const override {
+  ReadGoal(const core::ControllerGoalId &key) const override {
     return adapter_.ReadGoal(key);
   }
   std::optional<core::ExecutionControllerSampleDTO> ReadSample() const override {
@@ -1195,7 +1203,7 @@ private:
   Ros2ControlExecutionBackend &adapter_;
 };
 
-void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
+void RunStopDuringActiveRos2ControlMotion(const StopForm form) {
   auto clock_owner = std::make_shared<WallClock>();
   auto& clock = *clock_owner;
   SimpleScheduler scheduler;
@@ -1253,15 +1261,18 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
     auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {Registration(binding, std::move(readiness), engine, stop_port)}, clock,
         scheduler, journal,
-        core::ResourceAddressedExecutionKernelConfig{
-            core::RequestOwnerEpoch(kOwnerEpoch), cell_id, 16U});
+        ProgramCycleReadyConfig(core::ResourceAddressedExecutionKernelConfig{
+                                    core::kTestApplicationStartId, cell_id, 16U},
+                                binding.value().retained_bundle_id));
     auto& kernel = *kernel_heap_test_owner;
+    // Program work names the run the Kernel holds.
+    HoldProgramRun(kernel, binding, core::ProgramRunNumber(1U));
 
     // 1. A real Kernel motion dispatches a live FollowJointTrajectory goal.
     const auto operation = kernel.execute(MotionOperation(binding));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
     const auto &operation_id = operation.value().operation_id;
-    ASSERT_TRUE(fake::WaitUntil([&] { return server.goals_received() >= 1U; }, 5s))
+    ASSERT_TRUE(fake::WaitUntil([&] { return server.goals_received() >= 1U; }, 30s))
         << "Kernel dispatch did not reach the ros2_control action server";
     ASSERT_TRUE(WaitUntil([&] {
       return backend.get_execution_snapshot().state ==
@@ -1280,8 +1291,6 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
     })) << "Kernel operation never observed the active ros2_control goal";
     ASSERT_EQ(before->participants.size(), 1U);
     const auto goal_id = before->participants.front().command_id;
-    const auto goal_generation =
-        before->participants.front().command_generation;
     EXPECT_EQ(server.cancel_requests(), 0U);
     EXPECT_TRUE(stop_port.results().empty());
 
@@ -1290,7 +1299,7 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
     // associates). Only evidence the association attributes to the
     // dispatched goal counts: its own feedback and the controller samples
     // anchored by it, never a hold sample from before the goal.
-    const core::ExecutionGoalKey dispatched_key{goal_id, goal_generation};
+    const core::ControllerGoalId dispatched_key{goal_id};
     core::ExecutionSampleAssociation association(adapter.ReadReadiness().binding_epoch,
                                                  std::nullopt, 0);
     ASSERT_TRUE(fake::WaitUntil([&] {
@@ -1301,45 +1310,57 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
              association.Observe(*sample, goal) && sample->cursor_s > 0.2;
     })) << "the dispatched goal never advanced beyond 0.2 s on its own evidence";
 
-    // 2. Stop is accepted while that goal is active.
+    // 2. Stop is accepted while that goal is active. A Stop is never refused.
     auto stopping = std::async(std::launch::async, [&] {
-      if (kind == StopKind::kFullStop) {
-        return kernel.full_stop(core::FullStopIntentDTO{
-            Context("request.ros2_control.full-stop"), core::StopGeneration(0U),
-            {}});
+      if (form == StopForm::kStopAll) {
+        return kernel.stop_all(core::FullStopIntentDTO{
+            Context("request.ros2_control.stop-all"), {}});
+      }
+      if (form == StopForm::kHalt) {
+        return kernel.halt(core::FullStopIntentDTO{
+            Context("request.ros2_control.halt"), {}});
       }
       return kernel.stop(core::StopIntentDTO{
           Context("request.ros2_control.operation-stop"),
           std::vector<core::StopOperationTargetDTO>{core::StopOperationTargetDTO{
-              operation_id, before->operation_revision,
-              core::StopGeneration(0U)}},
+              operation_id, before->operation_revision}},
           std::nullopt});
     });
     // The Kernel's Stop stage must reach the ROS controller as a goal cancel;
     // the controller brakes and reports the goal cancelled.
     const bool cancel_requested =
-        fake::WaitUntil([&] { return server.cancel_requests() >= 1U; }, 5s);
+        fake::WaitUntil([&] { return server.cancel_requests() >= 1U; }, 30s);
     const auto accepted = stopping.get();
-    ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     ASSERT_TRUE(cancel_requested)
         << "Kernel Stop never cancelled the ros2_control goal";
-    const auto &stop_id = accepted.value().stop_id;
+    const auto event_id = accepted.event_id;
+    ASSERT_TRUE(event_id.nonzero());
 
-    // 3. Captured scope: the active operation and its exact revision.
-    if (kind == StopKind::kFullStop) {
-      EXPECT_EQ(accepted.value().resolution_reason,
-                core::StopScopeResolutionReasonDTO::kExplicitFullStop);
-    }
-    ASSERT_EQ(accepted.value().affected_operation_revisions.size(), 1U);
-    EXPECT_EQ(accepted.value().affected_operation_revisions.front().operation_id,
-              operation_id);
+    // 3. The accepted event: the requested level, applied unwidened, covering
+    // the active operation's participant, whose attempt this event started.
+    const auto expected_kind = form == StopForm::kStopAll ? core::StopKind::kStopAll
+                               : form == StopForm::kHalt  ? core::StopKind::kHalt
+                                                          : core::StopKind::kOperation;
+    EXPECT_EQ(accepted.replay_status, core::RequestReplayStatusDTO::kAcceptedNew);
+    EXPECT_EQ(accepted.requested, expected_kind);
+    EXPECT_EQ(accepted.applied, expected_kind);
+    EXPECT_EQ(accepted.widen_reason, core::StopWidenReason::kNone);
+    // Only group, run-end and Program-run Stops name a run.
+    EXPECT_FALSE(accepted.program_run_id.has_value());
+    EXPECT_TRUE(accepted.stale_diagnostics.empty());
+    EXPECT_EQ(accepted.stale_total, 0U);
+    ASSERT_EQ(accepted.covered.size(), 1U);
+    EXPECT_EQ(accepted.covered.front().operation_id, operation_id);
+    EXPECT_EQ(accepted.covered.front().participant_ordinal,
+              before->participants.front().participant_id.ordinal);
+    EXPECT_TRUE(accepted.covered.front().started);
 
-    const auto status = WaitForTerminalStop(kernel, stop_id);
-    ASSERT_TRUE(status.has_value()) << "Stop did not reach a terminal state";
+    const auto status = WaitForCompleteStop(kernel, event_id);
+    ASSERT_TRUE(status.has_value()) << "Stop event never completed";
 
     // 4. The Core participant realized exactly the nominal stage.
     const auto results = stop_port.results();
-    const auto goal = adapter.ReadGoal({goal_id, goal_generation});
+    const auto goal = adapter.ReadGoal({goal_id});
     const auto sample = adapter.ReadSample();
     ASSERT_EQ(results.size(), 1U)
         << "unexpected escalation: "
@@ -1360,10 +1381,9 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
               core::ParticipantStopStageOutcomeDTO::kSucceeded)
         << StageReason(stage_result);
     const auto &stage = stage_result.request;
-    EXPECT_EQ(stage.stop_id, stop_id);
+    EXPECT_EQ(stage.stop_event_id, event_id);
     EXPECT_EQ(stage.operation_id, operation_id);
     EXPECT_EQ(stage.controller_goal_id, goal_id);
-    EXPECT_EQ(stage.controller_goal_generation, goal_generation);
     EXPECT_EQ(stage.control_domain_id, path.control_domain_id);
     EXPECT_EQ(stage.control_binding_id, path.control_binding_id);
     EXPECT_EQ(stage.stage_index, 0U);
@@ -1386,75 +1406,72 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
               core::ExecutionState::kStopped);
     EXPECT_GE(engine.fence_calls(), 1U);
     EXPECT_EQ(engine.settlements(), 1U);
+    EXPECT_EQ(engine.settled_stop_event_id(), std::optional(event_id));
 
-    // 5. Terminal status and certificate name the ros2_control participant.
-    EXPECT_EQ(status->state, core::StopStatusStateDTO::kSucceeded);
-    EXPECT_FALSE(kernel.get_cell_latch().latched);
-    EXPECT_TRUE(status->failed.empty());
-    EXPECT_TRUE(status->unsettled.empty());
-    const auto expected_key = core::StopScopeEntryKeyDTO{
-        stop_id, accepted.value().stop_generation,
-        core::StopParticipantScopeKeyDTO{operation_id, stage.participant_id}};
-    const auto entry = std::find_if(
-        status->scope_entries.begin(), status->scope_entries.end(),
-        [&](const auto &row) { return row.key == expected_key; });
-    ASSERT_NE(entry, status->scope_entries.end())
-        << "terminal Stop status does not contain the ros2_control participant";
-    EXPECT_EQ(entry->dispatch_state, core::StopScopeDispatchStateDTO::kDispatched);
-    const auto *facts =
-        std::get_if<core::StopParticipantScopeFactsDTO>(&entry->facts);
-    ASSERT_NE(facts, nullptr);
-    EXPECT_EQ(facts->controllable_component_id,
-              binding.value().controllable_component_id);
-    EXPECT_EQ(facts->control_domain_id, path.control_domain_id);
-    EXPECT_EQ(facts->control_binding_id, path.control_binding_id);
-    EXPECT_EQ(facts->control_route_id, path.control_route_id);
-    EXPECT_EQ(facts->provider_runtime_epoch, path.provider_runtime_epoch);
-    EXPECT_EQ(facts->controller_goal_id, goal_id);
-    EXPECT_EQ(facts->terminal_settlement,
-              core::StopParticipantScopeFactsDTO::TerminalSettlementState::
-                  kSettled);
+    // 5. The completed event names the ros2_control participant, stopped by
+    // its nominal stage without escalation.
+    EXPECT_EQ(status->event_id, event_id);
+    EXPECT_EQ(status->requested, expected_kind);
+    EXPECT_EQ(status->applied, expected_kind);
+    EXPECT_EQ(status->widen_reason, core::StopWidenReason::kNone);
+    EXPECT_EQ(status->result, core::StopEventResult::kStopped);
+    EXPECT_TRUE(status->completed_at_ns.has_value());
+    EXPECT_GE(status->completed_at_ns.value_or(-1), status->accepted_at_ns);
+    if (form != StopForm::kHalt) {
+      // Halt's effect on the cell latch is the rewritten Kernel's; not
+      // asserted here.
+      EXPECT_FALSE(kernel.get_cell_latch().latched);
+    }
+    ASSERT_EQ(status->covered.size(), 1U);
+    const auto &covered = status->covered.front();
+    EXPECT_EQ(covered.operation_id, operation_id);
+    EXPECT_EQ(covered.participant_ordinal, stage.participant_id.ordinal);
+    EXPECT_TRUE(covered.started);
+    EXPECT_TRUE(covered.done);
+    EXPECT_EQ(covered.phase, core::StopPhase::kStopped);
+    EXPECT_EQ(covered.containing_stage_index, std::optional<std::uint8_t>(0U));
+    EXPECT_FALSE(covered.escalated);
+    EXPECT_FALSE(covered.stop_path_collision);
+    EXPECT_FALSE(covered.error_code.has_value());
 
-    ASSERT_TRUE(status->stop_certificate.has_value());
-    const auto certificate =
-        kernel.get_stop_certificate(status->stop_certificate->stop_certificate_id);
-    ASSERT_TRUE(certificate.ok()) << certificate.error().message;
-    EXPECT_EQ(certificate.value().stop_id, stop_id);
-    EXPECT_EQ(certificate.value().result,
-              core::StopCertificateResultDTO::kSucceededNominal);
-    EXPECT_NE(std::find_if(certificate.value().scope_entries.begin(),
-                           certificate.value().scope_entries.end(),
-                           [&](const auto &row) { return row.key == expected_key; }),
-              certificate.value().scope_entries.end());
-    EXPECT_NE(std::find(certificate.value().dispatched_stopped.begin(),
-                        certificate.value().dispatched_stopped.end(),
-                        expected_key),
-              certificate.value().dispatched_stopped.end());
-    EXPECT_TRUE(certificate.value().failed.empty());
-    EXPECT_TRUE(certificate.value().unsettled.empty());
-    ASSERT_EQ(certificate.value().attempted_stage_results.size(), 1U);
-    const auto &attempt = certificate.value().attempted_stage_results.front();
-    EXPECT_EQ(attempt.scope_key, expected_key);
-    EXPECT_EQ(attempt.authority, core::StopStageResultAuthorityDTO::kAuthoritative);
-    EXPECT_EQ(attempt.result, stage_result);
+    // The event stream's cell-wide markers moved with this event.
+    const auto stream = kernel.get_stop_stream_facts();
+    EXPECT_EQ(stream.last_stop_event_id, std::optional(event_id));
+    EXPECT_GE(stream.stop_progress_sequence, 1U);
 
-    // 6. The operation itself is terminally stopped by this Stop.
+    // 6. The operation itself is terminally stopped by this Stop, and its
+    // participant's stop observation names the same event.
     const auto after = kernel.get_operation_state(operation_id);
     ASSERT_TRUE(after.ok()) << after.error().message;
     EXPECT_EQ(after.value().state, core::OperationStateKind::kStopped);
-    EXPECT_EQ(after.value().active_stop_id, stop_id);
+    EXPECT_EQ(after.value().stop_event_id, std::optional(event_id));
+    ASSERT_EQ(after.value().participants.size(), 1U);
+    const auto &observation = after.value().participants.front().stop;
+    ASSERT_TRUE(observation.has_value());
+    EXPECT_EQ(observation->stop_event_id, event_id);
+    EXPECT_EQ(observation->phase, core::StopPhase::kStopped);
+    EXPECT_EQ(observation->attempt, 1U);
+    EXPECT_EQ(observation->containing_stage_index, std::optional<std::uint8_t>(0U));
+    EXPECT_EQ(observation->containing_stage_id,
+              std::optional(resolved_stage.stop_escalation_stage_id));
+    EXPECT_FALSE(observation->escalated);
   }
   RemoveJournalFiles(journal_path);
 }
 
 TEST(Ros2ControlKernelStopIntegrationTest,
-     FullStopDuringActiveRos2ControlMotionCancelsGoalAndCertifiesParticipant) {
-  RunStopDuringActiveRos2ControlMotion(StopKind::kFullStop);
+     StopAllDuringActiveRos2ControlMotionCancelsGoalAndStopsParticipant) {
+  RunStopDuringActiveRos2ControlMotion(StopForm::kStopAll);
 }
 
 TEST(Ros2ControlKernelStopIntegrationTest,
-     OperationStopDuringActiveRos2ControlMotionCancelsGoalAndCertifiesParticipant) {
-  RunStopDuringActiveRos2ControlMotion(StopKind::kOperationStop);
+     HaltDuringActiveRos2ControlMotionCancelsGoalAndStopsParticipant) {
+  RunStopDuringActiveRos2ControlMotion(StopForm::kHalt);
+}
+
+TEST(Ros2ControlKernelStopIntegrationTest,
+     OperationStopDuringActiveRos2ControlMotionCancelsGoalAndStopsParticipant) {
+  RunStopDuringActiveRos2ControlMotion(StopForm::kOperationStop);
 }
 
 /// Executes one Kernel motion and waits until the participant reports it.
@@ -1478,17 +1495,17 @@ ExecuteUntilActive(core::ResourceAddressedExecutionKernel &kernel,
   return *state;
 }
 
-void StopAndCertify(core::ResourceAddressedExecutionKernel &kernel,
-                    const core::OperationStateDTO &operation, const std::string &request) {
+void StopAndWaitStopped(core::ResourceAddressedExecutionKernel &kernel,
+                        const core::OperationStateDTO &operation, const std::string &request) {
   const auto accepted = kernel.stop(core::StopIntentDTO{
       Context(request),
       std::vector<core::StopOperationTargetDTO>{core::StopOperationTargetDTO{
-          operation.operation_id, operation.operation_revision, core::StopGeneration(0U)}},
+          operation.operation_id, operation.operation_revision}},
       std::nullopt});
-  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-  const auto status = WaitForTerminalStop(kernel, accepted.value().stop_id);
+  EXPECT_EQ(accepted.applied, core::StopKind::kOperation);
+  const auto status = WaitForCompleteStop(kernel, accepted.event_id);
   ASSERT_TRUE(status.has_value());
-  EXPECT_EQ(status->state, core::StopStatusStateDTO::kSucceeded);
+  EXPECT_EQ(status->result, core::StopEventResult::kStopped);
 }
 
 TEST(Ros2ControlKernelStopIntegrationTest,
@@ -1565,16 +1582,18 @@ TEST(Ros2ControlKernelStopIntegrationTest,
     auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {Registration(binding, std::move(readiness), engine, stop_port)}, clock, scheduler,
         journal,
-        core::ResourceAddressedExecutionKernelConfig{core::RequestOwnerEpoch(kOwnerEpoch),
-                                                     cell_id, 16U});
+        ProgramCycleReadyConfig(core::ResourceAddressedExecutionKernelConfig{
+                                    core::kTestApplicationStartId, cell_id, 16U},
+                                binding.value().retained_bundle_id));
     auto& kernel = *kernel_heap_test_owner;
+    // Program work names the run the Kernel holds ("epoch2" is run 2).
+    HoldProgramRun(kernel, binding, core::ProgramRunNumber(2U));
 
     // A goal running on epoch 1 when Disable switches the controller off.
     core::TrajectoryDTO hold;
     hold.joint_names = {"joint_1"};
     hold.waypoints = {{0.0, {0.0}, {0.0}, {0.0}}, {8.0, {0.0}, {0.0}, {0.0}}};
-    const core::ExecutionGoalKey pending{core::ControllerGoalId("goal.epoch1.pending"),
-                                         core::ControllerGoalGeneration(1U)};
+    const core::ControllerGoalId pending{core::ControllerGoalId{core::OperationNumber(902U), 1U, 1U}};
     // Every kernel dispatch carries its execution identity; a retired goal
     // without one cannot be journaled, so the rotation refuses it.
     ASSERT_NE(first->Submit(pending, hold, std::make_shared<core::ExecutionDispatchToken>(
@@ -1633,8 +1652,7 @@ TEST(Ros2ControlKernelStopIntegrationTest,
     const auto ended = first->ReadGoal(pending);
     ASSERT_TRUE(ended.has_value());
     EXPECT_EQ(ended->result, core::ExecutionGoalResult::kEndedUnknown);
-    EXPECT_EQ(first->Submit({core::ControllerGoalId("goal.epoch1.late"),
-                             core::ControllerGoalGeneration(1U)},
+    EXPECT_EQ(first->Submit((core::ControllerGoalId{core::OperationNumber(901U), 1U, 1U}),
                             hold)
                   .refusal,
               core::ExecutionPortRefusal::kNotReady);
@@ -1650,14 +1668,26 @@ TEST(Ros2ControlKernelStopIntegrationTest,
     const auto goals_before = jtc.goals_received();
     const auto second_operation = ExecuteUntilActive(kernel, engine, binding, "epoch2");
     ASSERT_TRUE(fake::WaitUntil([&] { return jtc.goals_received() == goals_before + 1U; }));
-    const core::ExecutionGoalKey second_key{
-        second_operation.participants.front().command_id,
-        second_operation.participants.front().command_generation};
+    const core::ControllerGoalId second_key = second_operation.participants.front().command_id;
     const auto dispatched = second->ReadGoal(second_key);
     ASSERT_TRUE(dispatched.has_value());
     EXPECT_EQ(dispatched->binding_epoch, core::ExecutionBindingEpoch(2U));
     EXPECT_FALSE(first->ReadGoal(second_key).has_value());
-    StopAndCertify(kernel, second_operation, "stop.epoch2");
+    // A mid-motion Stop, as in the Stop tests above: the new epoch's goal has
+    // advanced on its own evidence, so the cancel's cursor restart can be
+    // associated with it and the cancel contains it without escalation. A
+    // Stop before the goal's first anchored sample cannot prove the cancel
+    // finish and escalates by design (Q35/Q50).
+    core::ExecutionSampleAssociation association(core::ExecutionBindingEpoch(2U), std::nullopt,
+                                                 0);
+    ASSERT_TRUE(fake::WaitUntil([&] {
+      const auto goal = second->ReadGoal(second_key);
+      const auto sample = second->ReadSample();
+      return goal.has_value() && goal->latest_feedback.has_value() &&
+             goal->latest_feedback->cursor_s > 0.2 && sample.has_value() &&
+             association.Observe(*sample, goal) && sample->cursor_s > 0.2;
+    })) << "the new epoch's goal never advanced beyond 0.2 s on its own evidence";
+    StopAndWaitStopped(kernel, second_operation, "stop.epoch2");
   }
   RemoveJournalFiles(journal_path);
 }

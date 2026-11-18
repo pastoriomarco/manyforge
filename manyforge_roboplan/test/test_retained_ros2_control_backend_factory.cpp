@@ -291,7 +291,7 @@ test_factory_config(bool measured_lane) {
         config.node_namespace + "/joint_states", 250'000'000,
         core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
         std::string(kMeasuredJointStateProfileId), core::StreamSeverityDTO::kFault,
-        core::StreamRecoveryDTO::kAck, std::nullopt};
+        std::nullopt};
   }
   return config;
 }
@@ -916,7 +916,7 @@ TEST(RetainedCompositionReleaseTest, SharedBackendDistinctEnginesRefuseInUseAndA
   core::SqliteOperationJournal journal(database, core::CellId("discard-engine"), 16U);
   const auto discarded_registration = discarded_runtime->registration();
   core::ResourceAddressedExecutionKernelConfig registered_config{
-      core::RequestOwnerEpoch("discard-registered"), core::CellId("discard-engine"), 16U};
+      core::ApplicationStartId{1U}, core::CellId("discard-engine"), 16U};
   // A participant-backed Kernel must carry the bootstrap graph of its registrations.
   registered_config.graph_revision = discarded_registration.binding.value().graph_revision;
   auto registered_kernel = core::testing::make_heap_resource_addressed_kernel(
@@ -945,7 +945,7 @@ TEST(RetainedCompositionReleaseTest, SharedBackendDistinctEnginesRefuseInUseAndA
   // the helper's typed absent-subscription case is accepted as a no-op.
   registered_kernel.reset();
   core::ResourceAddressedExecutionKernelConfig empty_config{
-      core::RequestOwnerEpoch("discard-empty"), core::CellId("discard-engine"), 16U};
+      core::ApplicationStartId{1U}, core::CellId("discard-engine"), 16U};
   empty_config.empty_runtime_retained_bundle_id = core::RetainedBundleId("discard-bundle");
   empty_config.empty_runtime_graph_revision = core::GraphRevision("discard-graph");
   auto empty_kernel = core::testing::make_heap_resource_addressed_kernel(
@@ -1005,7 +1005,7 @@ TEST(RetainedCompositionReleaseTest, FailedHandleKeepsSharedBackendGroupPending)
   core::SqliteOperationJournal journal(database, core::CellId("pending-group"), 16U);
   const auto first_registration = first_runtime->registration();
   core::ResourceAddressedExecutionKernelConfig pending_config{
-      core::RequestOwnerEpoch("pending-group-epoch"), core::CellId("pending-group"), 16U};
+      core::ApplicationStartId{1U}, core::CellId("pending-group"), 16U};
   pending_config.graph_revision = first_registration.binding.value().graph_revision;
   auto kernel = core::testing::make_heap_resource_addressed_kernel(
       {first_registration}, first.clock, first.scheduler, journal, pending_config);
@@ -1025,7 +1025,7 @@ TEST(RetainedCompositionReleaseTest, FailedHandleKeepsSharedBackendGroupPending)
       ++first_calls;
       return fail_first
           ? Handle::HostQuiesceResult{Handle::HostQuiesceOutcome::kUnresolved,
-                                      "leaf", "component_owner_stalled"}
+                                      "leaf", "component_quiesce_not_drained"}
           : Handle::HostQuiesceResult{Handle::HostQuiesceOutcome::kSettled, "", ""};
     }
     if (handle == second.handle) {
@@ -1049,7 +1049,7 @@ TEST(RetainedCompositionReleaseTest, FailedHandleKeepsSharedBackendGroupPending)
   ASSERT_EQ(pending.size(), 2U);
   EXPECT_EQ(pending[0].snapshots.front().gripper_runtime.get(), first_runtime.get());
   EXPECT_EQ(pending[1].snapshots.front().gripper_runtime.get(), second_runtime.get());
-  EXPECT_NE(logs.find("component_owner_stalled"), std::string::npos);
+  EXPECT_NE(logs.find("component_quiesce_not_drained"), std::string::npos);
   const auto still_registered = kernel->release_retired_engine(first_runtime->participant_engine());
   ASSERT_FALSE(still_registered.ok());
   EXPECT_EQ(still_registered.error().details.at("reason"), "retired_participant_engine_in_use");
@@ -1079,7 +1079,7 @@ TEST(RetainedCompositionReleaseTest, FailedHandleKeepsSharedBackendGroupPending)
   // Empty Kernel covers injected success + typed absent no-op only.
   kernel.reset();
   core::ResourceAddressedExecutionKernelConfig empty_runtime_config{
-      core::RequestOwnerEpoch("pending-empty-epoch"), core::CellId("pending-group"), 16U};
+      core::ApplicationStartId{1U}, core::CellId("pending-group"), 16U};
   empty_runtime_config.empty_runtime_retained_bundle_id = core::RetainedBundleId("pending-empty-bundle");
   empty_runtime_config.empty_runtime_graph_revision = core::GraphRevision("pending-empty-graph");
   auto empty_kernel = core::testing::make_heap_resource_addressed_kernel(
@@ -1135,7 +1135,7 @@ TEST(RetainedCompositionReleaseTest, SyntheticTwoHopProtectsThirdRealHandle) {
       ("manyforge-retired-alias-" + std::to_string(::getpid()) + ".sqlite");
   core::SqliteOperationJournal journal(path, core::CellId("retired-alias"), 16U);
   core::ResourceAddressedExecutionKernelConfig alias_config{
-      core::RequestOwnerEpoch("alias-epoch"), core::CellId("retired-alias"), 16U};
+      core::ApplicationStartId{1U}, core::CellId("retired-alias"), 16U};
   alias_config.empty_runtime_retained_bundle_id = core::RetainedBundleId("alias-empty-bundle");
   alias_config.empty_runtime_graph_revision = core::GraphRevision("alias-empty-graph");
   auto kernel = core::testing::make_heap_resource_addressed_kernel(
@@ -1187,7 +1187,7 @@ TEST(RetainedCompositionReleaseTest, SyntheticTwoHopProtectsThirdRealHandle) {
       config.node_namespace + "/joint_states", 1'000'000'000,
       core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
       std::string(kMeasuredJointStateProfileId), core::StreamSeverityDTO::kFault,
-      core::StreamRecoveryDTO::kAck, std::nullopt};
+      std::nullopt};
   return config;
 }
 

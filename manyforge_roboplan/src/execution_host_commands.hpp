@@ -29,6 +29,10 @@ double Number(const CanonicalValue &root, std::string_view name);
 
 bool Boolean(const CanonicalValue &root, std::string_view name);
 
+/// A request key member: exactly 32 hex characters (contract 1.4).
+core::RequestKey RequestKeyMember(const CanonicalValue &root, std::string_view name);
+core::ApplicationStartId ApplicationStartIdMember(const CanonicalValue &root,
+                                                  std::string_view name);
 std::uint64_t Counter(const CanonicalValue &root, std::string_view name,
                       std::uint64_t minimum);
 
@@ -129,9 +133,9 @@ DecodeOperationControlRequest(const CanonicalValue &value,
 DecodeStopIntent(const CanonicalValue &value,
                  const core::RequestAttributionDTO &attribution);
 
-[[nodiscard]] core::StopIntentDTO
-DecodeProgramRunStopIntent(const CanonicalValue &value,
-                           const core::RequestAttributionDTO &attribution);
+[[nodiscard]] core::ProgramRunEndIntentDTO
+DecodeProgramRunEndIntent(const CanonicalValue &value,
+                          const core::RequestAttributionDTO &attribution);
 
 [[nodiscard]] core::FullStopIntentDTO
 DecodeFullStopIntent(const CanonicalValue &value,
@@ -190,14 +194,16 @@ enum class CommandKind {
   kStartProgramSelection,
   kReleaseProgramSelection,
   kCheckProgramNodeMotionAttention,
-  kReleaseProgramRunStopFence,
-  kFullStop,
-  kMalformedStop,
-  /// The published component model (control
+  kReleaseHalt,
+  kStopAll,
+  kHalt,
+  kCellStop,
+  kRecognizedStop,
+  /// The published component model (component
   /// socket, in-memory).
   kReadComponentModel,
   kComponentRecoveryPreflight,
-  /// One component action (control socket).
+  /// One component action (component socket).
   kComponentAction,
   /// Node `rules.set_active`.
   kSetRuleActive,
@@ -209,8 +215,14 @@ enum class CommandKind {
   kSetIoOutput,
   kSetRuntimeScaleControl,
   kGetRuntimeScaleControl,
+  /// Pick/place planning: accepted at once as a planning job, planned on the
+  /// submission-ordered lane (OD-213 (1)).
   kPlanPick,
   kPlanPlace,
+  /// Planning-job read, cancel and release (control socket); memory only.
+  kReadPlanningJob,
+  kCancelPlanningJob,
+  kReleasePlanningJob,
   /// Active TCP: every robot's Active TCP (the Runner's baseline).
   kReadActiveTcp,
   kResolveAttachActiveTcp,
@@ -225,14 +237,14 @@ enum class CommandLane {
   kOrdinary,
   kStop,
   kObservation,
+  kComponent,
 };
 
 /// Commands whose addressed-Kernel entry takes its submission ordering. A
 /// motion-preview session (and pick/place planning built on one) retains that
 /// ordering for its whole planning transaction, so these commands run on the
 /// submission-ordered lane, FIFO in host enqueue order, and never occupy the
-/// ordinary lane that serves Stop status, Reset, events, cell admission and
-/// operator-alarm attention.
+/// ordinary lane that serves Reset, events and cell admission.
 /// Shared closed row decoder, also used after normalizing actual sealed
 /// Program authoring omission/order. This never resolves/authorizes inputs.
 [[nodiscard]] std::vector<core::ProgramMockSimulationSignalDTO>
@@ -245,14 +257,27 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows);
 /// on the Scene-read lane and never occupies the ordinary lane.
 [[nodiscard]] bool ReadsManagerScene(const CommandKind kind) noexcept;
 
-/// In-memory Stop-progression reads of the stable Kernel. They are served
+/// The in-memory Stop-progression read of the stable Kernel. It is served
 /// beside Stop on the independent control socket, never on the ordinary one.
 [[nodiscard]] bool IsStopLaneRead(const CommandKind kind) noexcept;
 
+/// Component actions (plain and recover-enable), their recovery preflight and
+/// the component model read. Served only on the independent component socket.
+[[nodiscard]] bool IsComponentLaneCommand(const CommandKind kind) noexcept;
+
+/// `plan_pick` and `plan_place`: answered at once with a planning job.
+[[nodiscard]] bool IsPlanningJobCommand(const CommandKind kind) noexcept;
+
+/// `read_planning_job`, `cancel_planning_job`, `release_planning_job`: memory
+/// only, served on the control socket.
+[[nodiscard]] bool IsPlanningJobControl(const CommandKind kind) noexcept;
+
 /// Every Stop form preempts advisory planning before it is dispatched: a
 /// preview is effect-free and re-requestable, and containment never waits
-/// for one. An accepted Reset preempts it after acceptance (a refused Reset
-/// changed nothing a preview depends on).
+/// for one. A pick/place planning job is not preempted by a Stop: only its
+/// own cancel stops it (OD-213 (1)). A reset-position move preempts planning
+/// jobs too, and an accepted Reset preempts both after acceptance (a refused
+/// Reset changed nothing a preview depends on).
 [[nodiscard]] bool PreemptsPlanning(const CommandKind kind) noexcept;
 
 /// A component-lifecycle claim is a whole-cell configuration mutation: the
@@ -264,11 +289,15 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows);
     const component_manager::detail::KernelCellAdmissionRpcPacket
         &packet) noexcept;
 
-struct MalformedStopCommand final {
-  core::RequestId request_id;
+/// `recognized_stop`: a Stop the transport recognized but does not forward as
+/// asked (its body cannot be read, or it names another application start or
+/// none); `source_label` is the caller's label where the transport has one.
+struct RecognizedStopCommand final {
+  core::RequestKey request_key;
   core::RequestAttributionDTO attribution;
   std::string recognized_route;
   std::string reason;
+  std::optional<std::string> source_label;
 };
 
 /// `frame_transform`: express `pose` (given in `source_frame`) in
@@ -284,7 +313,6 @@ struct FrameTransformQuery final {
 };
 
 struct TargetObservationQuery final {
-  core::RequestOwnerEpoch owner_epoch;
   core::ProgramBindingId program_binding_id;
   std::optional<core::ProgramTargetReferenceDTO> target;
   std::optional<core::ProgramFrameReferenceDTO> frame;
@@ -314,9 +342,8 @@ struct CarriedObjectLostSetRequest final {
 };
 
 struct ProgramOperationQuery final {
-  core::RequestOwnerEpoch owner_epoch;
   core::ProgramBindingId program_binding_id;
-  core::ProgramRunId program_run_id;
+  core::ProgramRunNumber program_run_id;
   core::ProgramTargetReferenceDTO target;
 };
 
@@ -350,18 +377,19 @@ struct Command final {
   std::optional<core::ProgramExecutionSelectionRequestDTO> program_selection;
   std::optional<core::ProgramNodeMotionAttentionCheckDTO> program_node_attention;
   std::optional<ProgramResetPositionRequest> reset_robot_position;
-  std::uint64_t expected_selection_revision{};
+  std::uint64_t expected_hold_revision{};
   std::optional<core::ContentDigest> operation_digest;
-  std::optional<core::OperationId> operation_id;
-  std::optional<core::StopId> stop_id;
-  std::optional<core::ProgramRunId> program_run_id;
-  std::optional<core::StopGeneration> stop_generation;
+  std::optional<core::OperationNumber> operation_id;
+  std::optional<core::StopEventId> stop_event_id;
+  std::optional<core::ProgramRunNumber> program_run_id;
   std::optional<core::OperationControlRequestDTO> control;
   std::optional<core::OperationRevision> expected_operation_revision;
   std::optional<core::KernelRecoveryActionRequestDTO> operation_recovery;
   std::optional<core::StopIntentDTO> stop;
-  std::optional<core::FullStopIntentDTO> full_stop;
-  std::optional<MalformedStopCommand> malformed_stop;
+  /// Body of `stop_all`, `halt` and `cell_stop`.
+  std::optional<core::FullStopIntentDTO> cell_wide_stop;
+  std::optional<core::ProgramRunEndIntentDTO> program_run_end;
+  std::optional<RecognizedStopCommand> recognized_stop;
   std::optional<std::string> component_id{};
   std::optional<core::ComponentAction> component_action{};
   std::optional<ComponentRecoveryConfirmation> recovery_preflight{};
@@ -376,16 +404,21 @@ struct Command final {
   std::optional<core::RuntimeScaleControlRequestDTO> runtime_scale_control;
   std::optional<core::RuntimeScaleControlSelectorDTO>
       runtime_scale_control_selector;
-  std::optional<core::RequestOwnerEpoch> event_owner_epoch{};
   std::uint64_t after_sequence{};
   std::size_t event_limit{};
   std::size_t trace_allowance_bytes{};
-  std::optional<core::RequestOwnerEpoch> observation_after_owner_epoch;
+  std::optional<core::ApplicationStartId> observation_after_application_start_id;
   std::optional<std::string> observation_after_source_epoch;
   std::optional<std::uint64_t> observation_after_source_sequence;
   bool observation_cursor_supplied{};
   std::optional<core::PickSequencePlanningIntentDTO> pick_planning;
   std::optional<core::PlaceSequencePlanningIntentDTO> place_planning;
+  /// `read_planning_job`, `cancel_planning_job`, `release_planning_job`: the
+  /// job's name (the planning request's `sequence_id`).
+  std::optional<std::string> planning_job_id;
+  /// Host-internal, never decoded: the ticket of the planning job a
+  /// submission-ordered lane entry runs.
+  std::uint64_t planning_job_ticket{};
 };
 
 [[nodiscard]] Command DecodeCommand(std::string_view bytes);

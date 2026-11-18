@@ -22,11 +22,11 @@ const payload = { kind: 'motion', base_frame: { component_id: 'robot', frame_id:
   per_joint_dynamics_limits: { joint1: { max_velocity_rad_s: 2 } },
   motion: { kind: 'joint_goal', joint_names: ['joint1'], positions_rad: [0.75] },
 };
-const receipt = { schemaVersion: 'manyforge.direct_control_motion_preview.v4',
+const receipt = { schemaVersion: 'manyforge.direct_control_motion_preview.v5',
   graphRevision: 'graph-1', retainedBundleId: 'bundle-1',
   resolvedTcp: { entry: { target: { componentId: 'tool', commandTargetId: 'gripper' },
     frame: { componentId: 'tool', frameId: 'tcp' } },
-  source: 'active_tcp', ownerEpoch: 'owner-1', registrationGeneration: 1, sequence: 1 },
+  source: 'active_tcp', registrationGeneration: 1, sequence: 1 },
 };
 const state = { ...initialRobotControlState, phase: 'ready', preview: receipt, status: {},
   intent: { participants: [{ payload }] },

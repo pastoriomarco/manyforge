@@ -156,10 +156,13 @@ def test_tracked_public_contracts_include_the_program_client_boundary() -> None:
     for contract in (composer, headless):
         assert "`GET` | `/api/program/runs`" in contract
         assert "`POST` | `/api/program/runs`" in contract
+        # The public Program Stop route is gone; a run's Stop is its motion
+        # Stop (the cell-wide forms are `/api/execution/stop-all` and `/halt`).
         assert (
-            "`POST` | `/api/program/runs/{program_run_id}/stop`"
+            "`POST` | `/api/program/runs/{program_run_id}/motion-stop`"
             in contract
         )
+        assert "`/api/program/runs/{program_run_id}/stop`" not in contract
     assert "without owning their state" in composer
     assert "never interpreted as idle" in headless
 

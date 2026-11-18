@@ -1,7 +1,7 @@
 const digest = `sha256:${'a'.repeat(64)}`;
 export function managerApplyRecord(phase = 'fence_held', terminal: string | null = null) {
   return {
-    apply_generation: 3, apply_id: 'apply-3', candidate_graph_revision: 'graph-2',
+    apply_generation: 3, apply_id: 3, candidate_graph_revision: 'graph-2',
     candidate_retained_bundle_id: 'bundle-2', committed: terminal === 'succeeded',
     expected_active_projection_revision: {
       retained_bundle_id: 'bundle-1', graph_revision: 'graph-1',
@@ -25,8 +25,7 @@ export function managerApplyRecord(phase = 'fence_held', terminal: string | null
       program_outcome: { kind: 'bound', program_binding_id: digest },
       node_environment_digest: digest, assistant_mode: 'forbidden',
     },
-    request: { correlation_id: null, request_id: 'request-3',
-      request_owner_epoch: 'browser-epoch-3', source_label: 'composer_ui' },
+    request: { request_key: `c0${'3'.repeat(30)}`, source_label: 'composer_ui' },
     terminal_state: terminal,
   };
 }

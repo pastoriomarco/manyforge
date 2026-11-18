@@ -6,25 +6,32 @@ and robot/scene/model semantics remain in their focused owners.
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 from collections.abc import Collection, Mapping
 from copy import deepcopy
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass, field, replace
+import logging
 from threading import Condition, RLock, Thread
 import time
-from typing import Final
+from typing import Any, Final
 
 from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
     ProgramInterventionSnapshot,
+    require_run_number,
 )
 from manyforge_behavior.program_run_owner import (
+    RUN_FROZEN_LEVELS,
     ProgramRunAdmission,
+    ProgramRunHoldFacts,
     ProgramRunOwner,
     ProgramRunOwnerOutcomeUnknownError,
     ProgramRunSnapshot,
     ProgramRunState,
+    RunIntent,
 )
 
 
@@ -32,10 +39,96 @@ _MAX_SCHEDULED_RUNS: Final = 4_096
 _MAX_TICK_WORKERS: Final = 32
 _MIN_TICK_INTERVAL_S: Final = 0.001
 _MAX_TICK_INTERVAL_S: Final = 1.0
+# Late ticks (OD-213): the typed log line of an episode of a run's late
+# ticks. While one episode lasts, a line is also written every
+# `_LATE_TICK_LINE_EVERY` late ticks; a run writes at most
+# `_MAX_LATE_TICK_LINES_PER_RUN` lines, after which its late ticks are only
+# counted.
+PROGRAM_TICKS_LATE_CODE: Final = "program_ticks_late"
+_LATE_TICK_LINE_EVERY: Final = 1_000
+_MAX_LATE_TICK_LINES_PER_RUN: Final = 64
+# OD-267: a failed tick worker latches the tick host for good; its typed
+# code is logged once and carried by every later refusal.
+PROGRAM_TICK_WORKER_FAILED_CODE: Final = "program_tick_worker_failed"
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ProgramSchedulingError(RuntimeError):
-    """The bounded scheduler or intervention registry is unavailable."""
+    """The bounded scheduler or intervention registry is unavailable.
+
+    ``code`` is the typed cause when it has one (a failed tick worker),
+    else None.
+    """
+
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class ProgramRunTickOverruns:
+    """A run's late ticks so far: ticks that ended after their period."""
+
+    late_ticks: int
+    longest_tick_ns: int
+    episodes: int
+
+
+@dataclass(slots=True)
+class _TickOverrunCounter:
+    """One run's late-tick counts; changed under the tick host's condition."""
+
+    late_ticks: int = 0
+    longest_tick_ns: int = 0
+    episodes: int = 0
+    lines_written: int = 0
+    # The open episode (consecutive late ticks); 0 late ticks = none open.
+    episode_late_ticks: int = 0
+    episode_longest_ns: int = 0
+
+    def line_locked(
+        self, program_run_id: int, period_ns: int, *, episode_ended: bool
+    ) -> tuple[object, ...] | None:
+        """The arguments of one episode line, or None when the run's lines are used up."""
+
+        if self.lines_written >= _MAX_LATE_TICK_LINES_PER_RUN:
+            return None
+        self.lines_written += 1
+        return (
+            PROGRAM_TICKS_LATE_CODE,
+            program_run_id,
+            period_ns,
+            self.episode_late_ticks,
+            self.episode_longest_ns,
+            int(episode_ended),
+            self.late_ticks,
+            self.longest_tick_ns,
+            self.episodes,
+            self.lines_written,
+            _MAX_LATE_TICK_LINES_PER_RUN,
+        )
+
+    def end_episode_locked(
+        self, program_run_id: int, period_ns: int
+    ) -> tuple[object, ...] | None:
+        if self.episode_late_ticks == 0:
+            return None
+        line = self.line_locked(program_run_id, period_ns, episode_ended=True)
+        self.episode_late_ticks = 0
+        self.episode_longest_ns = 0
+        return line
+
+
+def _write_late_tick_line(line: tuple[object, ...] | None) -> None:
+    if line is None:
+        return
+    _LOGGER.warning(
+        "manyforge_fault code=%s program_run_id=%d period_ns=%d late_ticks=%d "
+        "longest_tick_ns=%d episode_ended=%d late_ticks_total=%d "
+        "longest_tick_ns_total=%d episodes_total=%d line=%d max_lines=%d",
+        *line,
+    )
 
 
 @dataclass(slots=True)
@@ -64,10 +157,9 @@ class ProgramInterventionRegistry:
         self._lock = RLock()
 
     def register_run(
-        self, program_run_id: str, node_instance_ids: Collection[str]
+        self, program_run_id: int, node_instance_ids: Collection[str]
     ) -> None:
-        if not isinstance(program_run_id, str) or not program_run_id:
-            raise ValueError("program_run_id must be non-empty text")
+        require_run_number(program_run_id)
         if not node_instance_ids or any(
             not isinstance(node, str) or not node for node in node_instance_ids
         ):
@@ -104,7 +196,7 @@ class ProgramInterventionRegistry:
         message: str,
         policy_parameter: str,
         owner_port_name: str | None = None,
-        owner_task_id: str | None = None,
+        owner_task_id: int | str | None = None,
         owner_assessment: Mapping[str, object] | None = None,
         details: Mapping[str, object] | None = None,
         origin: Mapping[str, object] | None = None,
@@ -132,9 +224,8 @@ class ProgramInterventionRegistry:
             run.entries[identity.node_instance_id] = _InterventionEntry(record)
             return record
 
-    def read(self, program_run_id: str) -> ProgramInterventionSnapshot | None:
-        if not isinstance(program_run_id, str) or not program_run_id:
-            raise ValueError("program_run_id must be non-empty text")
+    def read(self, program_run_id: int) -> ProgramInterventionSnapshot | None:
+        require_run_number(program_run_id)
         with self._lock:
             run = self._runs.get(program_run_id)
             if run is None:
@@ -152,7 +243,7 @@ class ProgramInterventionRegistry:
             return first
 
     def read_holds(
-        self, program_run_id: str
+        self, program_run_id: int
     ) -> tuple[ProgramInterventionSnapshot, ...]:
         """Every unresolved failure hold of the run, in arrival order.
 
@@ -170,7 +261,7 @@ class ProgramInterventionRegistry:
                 and entry.record.policy_parameter != "operator_stop_policy"
             )
 
-    def has_operator_stop(self, program_run_id: str) -> bool:
+    def has_operator_stop(self, program_run_id: int) -> bool:
         """Scheduling query without allocating an all-entry projection."""
         with self._lock:
             run = self._runs.get(program_run_id)
@@ -179,7 +270,7 @@ class ProgramInterventionRegistry:
                 for entry in run.entries.values()
             )
 
-    def read_all(self, program_run_id: str) -> tuple[ProgramInterventionSnapshot, ...]:
+    def read_all(self, program_run_id: int) -> tuple[ProgramInterventionSnapshot, ...]:
         with self._lock:
             run = self._runs.get(program_run_id)
             return (
@@ -235,9 +326,8 @@ class ProgramInterventionRegistry:
             del run.entries[identity.node_instance_id]
             return action, deepcopy(result)
 
-    def release(self, program_run_id: str) -> None:
-        if not isinstance(program_run_id, str) or not program_run_id:
-            raise ValueError("program_run_id must be non-empty text")
+    def release(self, program_run_id: int) -> None:
+        require_run_number(program_run_id)
         with self._lock:
             self._runs.pop(program_run_id, None)
 
@@ -255,6 +345,7 @@ class ProgramRunTickHost:
         monotonic: Callable[[], float] = time.monotonic,
         terminal_observer: Callable[[ProgramRunSnapshot], None] | None = None,
         state_observer: Callable[[ProgramRunSnapshot], None] | None = None,
+        failure_observer: Callable[[Exception], None] | None = None,
     ) -> None:
         if not isinstance(owner, ProgramRunOwner):
             raise TypeError("tick host requires one ProgramRunOwner")
@@ -282,6 +373,8 @@ class ProgramRunTickHost:
             raise TypeError("terminal observer must be callable")
         if state_observer is not None and not callable(state_observer):
             raise TypeError("state observer must be callable")
+        if failure_observer is not None and not callable(failure_observer):
+            raise TypeError("failure observer must be callable")
         self._owner = owner
         self._tick_interval_s = float(tick_interval_s)
         self._maximum_scheduled_runs = maximum_scheduled_runs
@@ -289,6 +382,7 @@ class ProgramRunTickHost:
         self._monotonic = monotonic
         self._terminal_observer = terminal_observer
         self._state_observer = state_observer
+        self._failure_observer = failure_observer
         self._observed_revisions: dict[str, tuple[int, int]] = {}
         # The value is the latest command-side wake revision for this run.
         # A worker carries the revision it was submitted under, so its older
@@ -296,6 +390,22 @@ class ProgramRunTickHost:
         self._scheduled: dict[str, int] = {}
         self._inflight: dict[str, tuple[int, Future[ProgramRunSnapshot]]] = {}
         self._schedule_revision = 0
+        # Per run: the latest Kernel hold facts, applied on the run's next
+        # tick (the current run and at most one ending run).
+        self._hold_facts: dict[int, ProgramRunHoldFacts] = {}
+        # Runs whose ticks are enabled: scheduled at least once. Hold facts
+        # wake only these; a run started with `defer_ticks` keeps its facts
+        # for its first tick until its explicit `schedule`.
+        self._ticks_enabled: set[int] = set()
+        # Per run: its late ticks (OD-213), kept until the run is forgotten.
+        self._tick_period_ns = round(self._tick_interval_s * 1e9)
+        self._tick_overruns: dict[int, _TickOverrunCounter] = {}
+        # End-of-run work handed off by the scheduler thread: run one at a
+        # time on the tick pool, in hand-off order, by one drain job.
+        self._terminal_work: deque[ProgramRunSnapshot] = deque()
+        self._terminal_draining = False
+        # Per run: hand-offs whose end-of-run work has not completed yet.
+        self._terminal_pending: dict[int, int] = {}
         self._condition = Condition(RLock())
         self._thread: Thread | None = None
         self._shutdown = False
@@ -305,13 +415,34 @@ class ProgramRunTickHost:
             thread_name_prefix="manyforge-program-tick-worker",
         )
 
-    def _raise_if_unavailable(self) -> None:
+    def _unavailable_error(self) -> ProgramSchedulingError | None:
+        """Under the condition: why the tick host refuses work, if it does."""
+
         if self._shutdown:
-            raise ProgramSchedulingError("Program tick host is shut down")
+            return ProgramSchedulingError("Program tick host is shut down")
         if self._worker_failure is not None:
-            raise ProgramSchedulingError("Program tick worker failed") from (
-                self._worker_failure
+            error = ProgramSchedulingError(
+                "Program tick worker failed", code=PROGRAM_TICK_WORKER_FAILED_CODE
             )
+            error.__cause__ = self._worker_failure
+            return error
+        return None
+
+    def _raise_if_unavailable(self) -> None:
+        error = self._unavailable_error()
+        if error is not None:
+            raise error
+
+    def _report_worker_failure(self, error: Exception) -> None:
+        """Once, off the condition: the typed log line, then the observer."""
+
+        _LOGGER.error(
+            "manyforge_fault code=%s",
+            PROGRAM_TICK_WORKER_FAILED_CODE,
+            exc_info=error,
+        )
+        if self._failure_observer is not None:
+            self._failure_observer(error)
 
     def start(self) -> None:
         with self._condition:
@@ -332,14 +463,13 @@ class ProgramRunTickHost:
             self._raise_if_unavailable()
         return self._executor.submit(work)
 
-    def schedule(self, program_run_id: str) -> None:
-        if not isinstance(program_run_id, str) or not program_run_id:
-            raise ValueError("program_run_id must be non-empty text")
+    def schedule(self, program_run_id: int) -> None:
+        require_run_number(program_run_id)
         with self._condition:
             self._raise_if_unavailable()
             self._schedule_locked(program_run_id)
 
-    def _schedule_locked(self, program_run_id: str) -> None:
+    def _schedule_locked(self, program_run_id: int) -> None:
         if (
             program_run_id not in self._scheduled
             and len(self._scheduled) >= self._maximum_scheduled_runs
@@ -347,13 +477,14 @@ class ProgramRunTickHost:
             raise ProgramSchedulingError("scheduled Program-run set is full")
         self._schedule_revision += 1
         self._scheduled[program_run_id] = self._schedule_revision
+        self._ticks_enabled.add(program_run_id)
         self._condition.notify_all()
 
     def start_run(
         self,
         admission: ProgramRunAdmission,
         *,
-        program_run_id: str | None = None,
+        program_run_id: int | None = None,
         defer_ticks: bool = False,
     ) -> ProgramRunSnapshot:
         snapshot = self._owner.start(
@@ -373,10 +504,15 @@ class ProgramRunTickHost:
         except Exception as scheduling_error:
             # Admission already created an owner entry. Fail closed and prove
             # its exact cleanup before returning the scheduling failure.
+            # The run could not enter the scheduled set, so no tick takes it:
+            # its Stop, tree part included, runs here.
+            program_run_id = snapshot.capture.program_run_id
             try:
-                cleaned = self._owner.stop(
-                    snapshot.capture.program_run_id,
-                    reason="Program tick scheduling failed",
+                cleaned = self._owner.finish_stop(
+                    program_run_id,
+                    self._owner.send_stop(
+                        program_run_id, reason="Program tick scheduling failed"
+                    ),
                 )
             except Exception as cleanup_error:
                 raise ProgramSchedulingError(
@@ -395,15 +531,16 @@ class ProgramRunTickHost:
 
     def stop_run(
         self,
-        program_run_id: str,
+        program_run_id: int,
         *,
         reason: str | None = None,
-        stop_request_id: str | None = None,
+        stop_request_key: bytes | None = None,
     ) -> ProgramRunSnapshot:
-        snapshot = self._owner.stop(
-            program_run_id,
-            reason=reason,
-            stop_request_id=stop_request_id,
+        """Forced Program End (the runner's internal run-ending operation):
+        marked and sent at once, even while a tick is in progress; then its
+        tree part is applied by the run's tick."""
+        snapshot = self._stop_through_tick(
+            program_run_id, reason=reason, stop_request_key=stop_request_key
         )
         if snapshot.state in {
             ProgramRunState.STOPPING,
@@ -413,42 +550,63 @@ class ProgramRunTickHost:
         self._observe_state(snapshot)
         return snapshot
 
-    def stop_motion(
+    def _stop_through_tick(
         self,
-        program_run_id: str,
+        program_run_id: int,
         *,
-        group_id: str | list[str] = "all",
-        reason: str | None = None,
-        stop_request_id: str | None = None,
+        reason: str | None,
+        stop_request_key: bytes | None,
     ) -> ProgramRunSnapshot:
-        """Stop addressed work while leaving the Program tree observable."""
-
-        snapshot = self._owner.stop_motion(
-            program_run_id,
-            group_id=group_id,
-            reason=reason,
-            stop_request_id=stop_request_id,
+        sent = self._owner.send_stop(
+            program_run_id, reason=reason, stop_request_key=stop_request_key
         )
-        self.schedule(program_run_id)
-        self._observe_state(snapshot)
-        return snapshot
+        return self._through_tick(
+            program_run_id, lambda: self._owner.finish_stop(program_run_id, sent)
+        )
+
+    def _through_tick(self, program_run_id: int, apply: Callable[[], Any]) -> Any:
+        """Hand one command to the run's tick and wait for its result
+        (OD-146). Its refusal or error is raised here, as it was raised by
+        the command itself."""
+
+        intent = self._owner.post_to_tick(program_run_id, apply)
+        try:
+            self.schedule(program_run_id)
+        except Exception:
+            if self._owner.withdraw_from_tick(program_run_id, intent):
+                raise
+            # A tick in progress took it already: its result is the answer.
+        return self._await_tick_result(intent)
+
+    @staticmethod
+    def _await_tick_result(intent: RunIntent) -> Any:
+        """The one wait of a request for the run's tick (OD-146). It waits
+        without a limit, as the request waited for the run's lock before."""
+
+        intent.done.wait()
+        if intent.error is not None:
+            raise intent.error
+        return intent.result
 
     def resume_motion(
         self,
-        program_run_id: str,
+        program_run_id: int,
         *,
-        expected_selection_revision: int,
-        request_id: str,
+        expected_hold_revision: int,
+        request_key: bytes,
         group_id: str | list[str] = "all",
         reason: str | None = None,
     ) -> ProgramRunSnapshot:
         try:
-            return self._owner.resume_motion(
+            return self._through_tick(
                 program_run_id,
-                expected_selection_revision=expected_selection_revision,
-                request_id=request_id,
-                group_id=group_id,
-                reason=reason,
+                lambda: self._owner.resume_motion(
+                    program_run_id,
+                    expected_hold_revision=expected_hold_revision,
+                    request_key=request_key,
+                    group_id=group_id,
+                    reason=reason,
+                ),
             )
         finally:
             # Cleanup or an explicit reconciliation may have changed the
@@ -457,22 +615,25 @@ class ProgramRunTickHost:
 
     def start_motion(
         self,
-        program_run_id: str,
+        program_run_id: int,
         *,
-        expected_selection_revision: int,
-        request_id: str,
+        expected_hold_revision: int,
+        request_key: bytes,
         group_id: str | list[str] = "all",
         reason: str | None = None,
     ) -> ProgramRunSnapshot:
         """Release one initially Ready selection, then wake its Program."""
 
         try:
-            return self._owner.start_motion(
+            return self._through_tick(
                 program_run_id,
-                expected_selection_revision=expected_selection_revision,
-                request_id=request_id,
-                group_id=group_id,
-                reason=reason,
+                lambda: self._owner.start_motion(
+                    program_run_id,
+                    expected_hold_revision=expected_hold_revision,
+                    request_key=request_key,
+                    group_id=group_id,
+                    reason=reason,
+                ),
             )
         finally:
             # The release may have completed even if its reply was lost.
@@ -481,27 +642,72 @@ class ProgramRunTickHost:
 
     def prepare_manual_handover(
         self,
-        program_run_id: str,
+        program_run_id: int,
         *,
         node_indices: tuple[int, ...],
         expected_run_revision: int,
-        expected_selection_revision: int,
-        request_id: str,
+        expected_hold_revision: int,
+        request_key: bytes,
         reason: str | None = None,
     ) -> ProgramRunSnapshot:
         try:
-            return self._owner.prepare_manual_handover(
+            return self._through_tick(
                 program_run_id,
-                node_indices=node_indices,
-                expected_run_revision=expected_run_revision,
-                expected_selection_revision=expected_selection_revision,
-                request_id=request_id,
-                reason=reason,
+                lambda: self._owner.prepare_manual_handover(
+                    program_run_id,
+                    node_indices=node_indices,
+                    expected_run_revision=expected_run_revision,
+                    expected_hold_revision=expected_hold_revision,
+                    request_key=request_key,
+                    reason=reason,
+                ),
             )
         finally:
             self._observe_after_motion_control(program_run_id)
 
-    def _observe_after_motion_control(self, program_run_id: str) -> None:
+    def retry_failure_pause(
+        self,
+        program_run_id: int,
+        *,
+        node_attempt_id: int,
+        action: str | None,
+        request_key: bytes,
+        reason: str | None,
+    ) -> ProgramRunSnapshot:
+        """Retry of one failure hold, applied by the run's tick."""
+
+        return self._through_tick(
+            program_run_id,
+            lambda: self._owner.retry_failure_pause(
+                program_run_id,
+                node_attempt_id=node_attempt_id,
+                action=action,
+                request_key=request_key,
+                reason=reason,
+            ),
+        )
+
+    def continue_failure_pause(
+        self,
+        program_run_id: int,
+        *,
+        node_attempt_id: int,
+        request_key: bytes,
+        reason: str | None,
+    ) -> ProgramRunSnapshot:
+        """Continue of one failure hold, applied by the run's tick."""
+
+        return self._through_tick(
+            program_run_id,
+            lambda: self._owner.continue_failure_pause(
+                program_run_id,
+                node_attempt_id=node_attempt_id,
+                request_key=request_key,
+                reason=reason,
+            ),
+        )
+
+    def _observe_after_motion_control(self, program_run_id: int) -> None:
         snapshot = self._owner.read(program_run_id)
         if snapshot.state in {
             ProgramRunState.RUNNING,
@@ -510,33 +716,115 @@ class ProgramRunTickHost:
             self.schedule(program_run_id)
         self._observe_state(snapshot)
 
-    def full_stop(
-        self,
-        program_run_id: str,
-        *,
-        reason: str | None = None,
-        stop_request_id: str | None = None,
-    ) -> ProgramRunSnapshot:
-        """Contain the run and remove its preserved tree from scheduling."""
+    def apply_hold_facts(self, facts: ProgramRunHoldFacts) -> None:
+        """Keep the Kernel's latest hold facts for their run and wake it.
 
-        snapshot = self._owner.full_stop(
-            program_run_id,
-            reason=reason,
-            stop_request_id=stop_request_id,
-        )
-        if snapshot.state is ProgramRunState.FULL_STOPPING:
-            self.schedule(program_run_id)
-        self._observe_state(snapshot)
+        Called on the runner's event-stream follower thread; memory only (no
+        owner transition, no Kernel or journal call). The run's next tick
+        reconciles the owner against these facts (``advance_once``). Facts
+        for a run the owner does not hold yet, or holds but has not been
+        scheduled yet (started with ``defer_ticks``), are kept and applied on
+        its first tick; facts of earlier runs the owner no longer holds are
+        dropped.
+        """
+
+        if not isinstance(facts, ProgramRunHoldFacts):
+            raise TypeError("apply_hold_facts requires ProgramRunHoldFacts")
+        run_id = facts.program_run_id
+        with self._condition:
+            self._hold_facts[run_id] = facts
+            earlier = tuple(run for run in self._hold_facts if run != run_id)
+        retired = tuple(run for run in earlier if not self._owner.has_run(run))
+        held = self._owner.has_run(run_id)
+        with self._condition:
+            for run in retired:
+                self._hold_facts.pop(run, None)
+            # A run started with `defer_ticks` is not ticked before its
+            # explicit `schedule`; its first tick applies the kept facts.
+            enabled = run_id in self._ticks_enabled
+        if held and enabled:
+            self.schedule(run_id)
+
+    def _advance(self, program_run_id: int) -> ProgramRunSnapshot:
+        """One tick of the run with its latest Kernel hold facts.
+
+        The tick's start and end are measured against the tick period; a tick
+        that ends after its period is counted, never stopped or failed
+        (OD-213: its cause is removed, a tick is not limited by a timer).
+        """
+
+        with self._condition:
+            facts = self._hold_facts.get(program_run_id)
+        started = self._monotonic()
+        snapshot = self._owner.advance_once(program_run_id, hold_facts=facts)
+        self._count_tick(program_run_id, self._monotonic() - started)
         return snapshot
 
-    def resume_full_stop(
+    def _count_tick(self, program_run_id: int, duration_s: float) -> None:
+        """Count a late tick; one line per episode of consecutive late ticks."""
+
+        duration_ns = round(duration_s * 1e9)
+        late = duration_ns > self._tick_period_ns
+        with self._condition:
+            counter = self._tick_overruns.get(program_run_id)
+            if not late:
+                line = (
+                    None
+                    if counter is None
+                    else counter.end_episode_locked(
+                        program_run_id, self._tick_period_ns
+                    )
+                )
+            else:
+                if counter is None:
+                    counter = _TickOverrunCounter()
+                    self._tick_overruns[program_run_id] = counter
+                if counter.episode_late_ticks == 0:
+                    counter.episodes += 1
+                counter.late_ticks += 1
+                counter.longest_tick_ns = max(counter.longest_tick_ns, duration_ns)
+                counter.episode_late_ticks += 1
+                counter.episode_longest_ns = max(
+                    counter.episode_longest_ns, duration_ns
+                )
+                line = (
+                    counter.line_locked(
+                        program_run_id, self._tick_period_ns, episode_ended=False
+                    )
+                    if counter.episode_late_ticks % _LATE_TICK_LINE_EVERY == 0
+                    else None
+                )
+        _write_late_tick_line(line)
+
+    def _end_tick_episode_locked(
+        self, program_run_id: int
+    ) -> tuple[object, ...] | None:
+        """The run left the scheduled set: its open episode ends."""
+
+        counter = self._tick_overruns.get(program_run_id)
+        if counter is None:
+            return None
+        return counter.end_episode_locked(program_run_id, self._tick_period_ns)
+
+    def read_tick_overruns(self, program_run_id: int) -> ProgramRunTickOverruns:
+        """The run's late ticks so far (memory only)."""
+
+        with self._condition:
+            counter = self._tick_overruns.get(program_run_id)
+            if counter is None:
+                return ProgramRunTickOverruns(0, 0, 0)
+            return ProgramRunTickOverruns(
+                counter.late_ticks, counter.longest_tick_ns, counter.episodes
+            )
+
+    def resume_halt(
         self,
-        program_run_id: str,
+        program_run_id: int,
         *,
-        request_id: str,
         reason: str | None = None,
     ) -> ProgramRunSnapshot:
-        """Recover the frozen occurrence before making it schedulable."""
+        """Execute after Halt: release the Kernel's freeze, then make the run
+        schedulable."""
 
         with self._condition:
             self._raise_if_unavailable()
@@ -547,51 +835,51 @@ class ProgramRunTickHost:
         # Provider recovery may block; it must not hold the scheduler mutex
         # needed to publish/schedule a newer priority Stop. Admission and
         # Resume share the existing containment-on-scheduling-failure path.
-        snapshot = self._owner.resume_full_stop(
+        snapshot = self._through_tick(
             program_run_id,
-            request_id=request_id,
-            reason=reason,
+            lambda: self._owner.resume_halt(program_run_id, reason=reason),
         )
         self._schedule_or_stop(snapshot)
         self._observe_state(snapshot)
         return snapshot
 
     def contain_reset_run(
-        self, program_run_id: str, *, stop_request_id: str, timeout_s: float
+        self, program_run_id: int, *, stop_request_key: bytes
     ) -> ProgramRunSnapshot:
-        """Use existing workers/notifications to observe terminal Reset's Stop."""
-        if (
-            isinstance(timeout_s, bool)
-            or not isinstance(timeout_s, (int, float))
-            or not 0.0 < timeout_s <= 60.0
-        ):
-            raise ValueError("terminal wait timeout is outside (0, 60]")
-        self._owner.begin_reset_containment(
-            program_run_id, stop_request_id=stop_request_id
+        """Use existing workers/notifications to observe terminal Reset's Stop.
+        It waits until containment settles (see `wait_terminal`)."""
+        self._through_tick(
+            program_run_id,
+            lambda: self._owner.begin_reset_containment(
+                program_run_id, stop_request_key=stop_request_key
+            ),
         )
         try:
             self.schedule(program_run_id)
             return self.wait_terminal(
-                program_run_id, timeout_s=timeout_s, require_reset_containment=True
+                program_run_id, require_reset_containment=True
             )
         except ProgramSchedulingError as error:
             raise ProgramRunOwnerOutcomeUnknownError(
                 "Reset containment wait did not confirm settlement"
             ) from error
 
-    def reset_run(self, program_run_id: str) -> ProgramRunSnapshot:
+    def reset_run(self, program_run_id: int) -> ProgramRunSnapshot:
         """Release the exact terminal run's resident owner effects."""
 
+        # Not handed to the tick: it touches no tree, and a tick scheduled
+        # for it could make the ``forget_reset_run`` that follows refuse the
+        # run as still scheduled.
         snapshot = self._owner.reset_effects(program_run_id)
         self._observe_state(snapshot)
         return snapshot
 
-    def reset_retained_run(self, program_run_id: str) -> None:
+    def reset_retained_run(self, program_run_id: int) -> None:
         """Reset a proven terminal run whose behavior-tree owner rotated."""
 
         self._owner.reset_retained_effects(program_run_id)
 
-    def forget_reset_run(self, program_run_id: str) -> None:
+    def forget_reset_run(self, program_run_id: int) -> None:
         """Release scheduler presentation state and the reset resident tree."""
 
         with self._condition:
@@ -599,20 +887,31 @@ class ProgramRunTickHost:
                 raise ProgramSchedulingError(
                     "a scheduled Program run cannot be forgotten"
                 )
+            # The run's end-of-run work runs on the tick pool. It completes
+            # before its run is forgotten: Reset holds the runner's command
+            # slot until this returns, so no next run starts before that work
+            # (the run end, rules back to start, the journal's terminal fact)
+            # has run, as when the scheduler thread did it itself.
+            while program_run_id in self._terminal_pending:
+                if self._shutdown:
+                    raise ProgramSchedulingError("Program tick host is shut down")
+                self._condition.wait()
         self._owner.forget_reset_run(program_run_id)
         with self._condition:
             self._observed_revisions.pop(program_run_id, None)
+            self._hold_facts.pop(program_run_id, None)
+            self._ticks_enabled.discard(program_run_id)
+            self._tick_overruns.pop(program_run_id, None)
 
     def resume_recovery(
         self,
-        program_run_id: str,
+        program_run_id: int,
         *,
-        node_attempt_id: str,
+        node_attempt_id: int,
         action: str,
         result: object = None,
     ) -> ProgramRunSnapshot:
-        if not isinstance(program_run_id, str) or not program_run_id:
-            raise ValueError("program_run_id must be non-empty text")
+        require_run_number(program_run_id)
         with self._condition:
             self._raise_if_unavailable()
             if program_run_id not in self._scheduled and (
@@ -629,29 +928,44 @@ class ProgramRunTickHost:
         self._observe_state(snapshot)
         return snapshot
 
-    def read(self, program_run_id: str) -> ProgramRunSnapshot:
+    def read(self, program_run_id: int) -> ProgramRunSnapshot:
         return self._owner.read(program_run_id)
+
+    def retry_cleanup(self, program_run_id: int) -> None:
+        """Reset: one more cleanup attempt of a finalizing run whose cleanup
+        failed, on the run's next tick (OD-279); else nothing."""
+
+        if self._owner.retry_cleanup(program_run_id):
+            self.schedule(program_run_id)
 
     def wait_terminal(
         self,
-        program_run_id: str,
+        program_run_id: int,
         *,
-        timeout_s: float = 5.0,
         require_reset_containment: bool = False,
     ) -> ProgramRunSnapshot:
-        """Wait on owner progress notifications, never by polling its state."""
+        """Wait on owner progress notifications, never by polling its state.
 
-        if (
-            isinstance(timeout_s, bool)
-            or not isinstance(timeout_s, (int, float))
-            or not 0.0 < float(timeout_s) <= 60.0
-        ):
-            raise ValueError("terminal wait timeout is outside (0, 60]")
-        deadline = self._monotonic() + float(timeout_s)
+        No time limit (OD-214): the wait ends when the run settles, which a
+        Stop also brings about, when its cleanup failed (typed
+        ``program_run_cleanup_failed``; a Reset retries it, OD-279), or when
+        this host shuts down or a tick worker fails. A lost execution host
+        ends the application (its exit); a late one is not halted (OD-290),
+        the run waits for its answer.
+        """
+
         with self._condition:
             while True:
                 self._raise_if_unavailable()
                 snapshot = self._owner.read(program_run_id)
+                if (
+                    snapshot.state is ProgramRunState.FINALIZING
+                    and self._owner.cleanup_failed(program_run_id)
+                ):
+                    raise ProgramSchedulingError(
+                        snapshot.message or "Program-run cleanup failed",
+                        code="program_run_cleanup_failed",
+                    )
                 if snapshot.state in {
                     ProgramRunState.STOPPED,
                     ProgramRunState.SUCCEEDED,
@@ -666,19 +980,16 @@ class ProgramRunTickHost:
                         and program_run_id not in self._inflight
                     ):
                         return snapshot
-                remaining = deadline - self._monotonic()
-                if remaining <= 0.0:
-                    raise ProgramSchedulingError(
-                        "Program run did not settle before its terminal deadline"
-                    )
-                self._condition.wait(timeout=remaining)
+                self._condition.wait()
 
     def _requires_advance(self, snapshot: ProgramRunSnapshot) -> bool:
+        if snapshot.state is ProgramRunState.FINALIZING:
+            # A failed cleanup waits for a Reset's retry (OD-279).
+            return not self._owner.cleanup_failed(snapshot.capture.program_run_id)
         if snapshot.state in {
             ProgramRunState.RUNNING,
-            ProgramRunState.FULL_STOPPING,
+            ProgramRunState.HALTING,
             ProgramRunState.STOPPING,
-            ProgramRunState.FINALIZING,
         }:
             return True
         if snapshot.state in {
@@ -727,7 +1038,7 @@ class ProgramRunTickHost:
                 program_run_id,
                 schedule_revision,
                 self._executor.submit(
-                    self._owner.advance_once,
+                    self._advance,
                     program_run_id,
                 ),
             )
@@ -745,11 +1056,15 @@ class ProgramRunTickHost:
         ):
             if not self._requires_advance(snapshot):
                 remove.append((program_run_id, schedule_revision))
+        lines = []
         if remove:
             with self._condition:
                 for program_run_id, schedule_revision in remove:
                     if self._scheduled.get(program_run_id) == schedule_revision:
                         self._scheduled.pop(program_run_id, None)
+                        lines.append(self._end_tick_episode_locked(program_run_id))
+        for line in lines:
+            _write_late_tick_line(line)
         try:
             self._observe_terminals(snapshots)
         finally:
@@ -790,35 +1105,107 @@ class ProgramRunTickHost:
         for snapshot in snapshots:
             self._observe_state(snapshot)
 
+    def _observes_terminal(self, snapshot: ProgramRunSnapshot) -> bool:
+        return self._terminal_observer is not None and snapshot.state not in {
+            ProgramRunState.RUNNING,
+            ProgramRunState.INTERVENTION_REQUIRED,
+            ProgramRunState.HALTING,
+            ProgramRunState.HALTED,
+            ProgramRunState.STOPPING,
+            ProgramRunState.FINALIZING,
+        }
+
     def _observe_terminals(self, snapshots: list[ProgramRunSnapshot]) -> None:
         observer = self._terminal_observer
         if observer is None:
             return
         try:
             for snapshot in snapshots:
-                if snapshot.state not in {
-                    ProgramRunState.RUNNING,
-                    ProgramRunState.INTERVENTION_REQUIRED,
-                    ProgramRunState.FULL_STOPPING,
-                    ProgramRunState.FULL_STOPPED,
-                    ProgramRunState.STOPPING,
-                    ProgramRunState.FINALIZING,
-                }:
+                if self._observes_terminal(snapshot):
                     observer(snapshot)
         except Exception as error:
             with self._condition:
-                self._worker_failure = error
+                first = self._worker_failure is None
+                if first:
+                    self._worker_failure = error
                 self._condition.notify_all()
+            if first:
+                self._report_worker_failure(error)
             raise ProgramSchedulingError("Program terminal observer failed") from error
 
+    def _hand_off_terminal_locked(self, snapshot: ProgramRunSnapshot) -> None:
+        """Scheduler thread: queue one run's end-of-run work for the pool.
+
+        Memory only. One drain job runs the queue in hand-off order, so the
+        work runs once per hand-off and one at a time, as on this thread
+        before (OD-213).
+        """
+
+        program_run_id = snapshot.capture.program_run_id
+        self._terminal_work.append(snapshot)
+        self._terminal_pending[program_run_id] = (
+            self._terminal_pending.get(program_run_id, 0) + 1
+        )
+        if not self._terminal_draining:
+            self._terminal_draining = True
+            self._executor.submit(self._drain_terminal_work)
+
+    def _drain_terminal_work(self) -> None:
+        """Tick pool: run the queued end-of-run work, then its state wake."""
+
+        failed = False
+        while True:
+            with self._condition:
+                if not self._terminal_work:
+                    self._terminal_draining = False
+                    return
+                snapshot = self._terminal_work.popleft()
+            try:
+                if not failed:
+                    self._observe_terminals([snapshot])
+            except ProgramSchedulingError:
+                # Latched as the worker failure: the scheduler thread ends and
+                # no later end-of-run work runs, as when this thread was it.
+                failed = True
+            finally:
+                self._observe_state(snapshot)
+                program_run_id = snapshot.capture.program_run_id
+                with self._condition:
+                    remaining = self._terminal_pending[program_run_id] - 1
+                    if remaining:
+                        self._terminal_pending[program_run_id] = remaining
+                    else:
+                        del self._terminal_pending[program_run_id]
+                    self._condition.notify_all()
+
     def _run(self) -> None:
+        failure = self._tick_loop()
+        if failure is not None:
+            self._report_worker_failure(failure)
+        # No tick starts any more: once the ticks in flight have ended, every
+        # command still handed to a tick gets the host's typed refusal.
+        with self._condition:
+            inflight = [future for _, future in self._inflight.values()]
+        wait_futures(inflight)
+
+        def unavailable() -> ProgramSchedulingError | None:
+            # The loop ends only on shutdown or a worker failure.
+            with self._condition:
+                return self._unavailable_error()
+
+        self._owner.fail_tick_intents(unavailable)
+
+    def _tick_loop(self) -> Exception | None:
+        """The scheduler loop; returns the worker failure it latched, if any."""
+
         next_tick = self._monotonic()
         while True:
-            completed: list[ProgramRunSnapshot] = []
+            handed_off = False
             observed: list[ProgramRunSnapshot] = []
+            lines: list[tuple[object, ...] | None] = []
             with self._condition:
-                if self._shutdown:
-                    return
+                if self._shutdown or self._worker_failure is not None:
+                    return None
                 for program_run_id, inflight in tuple(self._inflight.items()):
                     schedule_revision, future = inflight
                     if not future.done():
@@ -829,22 +1216,27 @@ class ProgramRunTickHost:
                     except Exception as error:
                         self._worker_failure = error
                         self._condition.notify_all()
-                        return
-                    observed.append(snapshot)
+                        return error
                     if not self._requires_advance(snapshot):
                         removed = (
                             self._scheduled.get(program_run_id) == schedule_revision
                         )
                         if removed:
                             self._scheduled.pop(program_run_id, None)
-                        if removed and snapshot.state is not (
-                            ProgramRunState.INTERVENTION_REQUIRED
-                        ):
-                            completed.append(snapshot)
+                            lines.append(
+                                self._end_tick_episode_locked(program_run_id)
+                            )
+                        if removed and self._observes_terminal(snapshot):
+                            # Its end-of-run work and then its state wake
+                            # run on the pool; this thread only hands off.
+                            self._hand_off_terminal_locked(snapshot)
+                            handed_off = True
+                            continue
+                    observed.append(snapshot)
 
                 now = self._monotonic()
                 delay = next_tick - now
-                if observed:
+                if observed or handed_off:
                     self._condition.notify_all()
                 elif not self._scheduled:
                     self._condition.wait()
@@ -857,7 +1249,7 @@ class ProgramRunTickHost:
                         if program_run_id in self._inflight:
                             continue
                         future = self._executor.submit(
-                            self._owner.advance_once,
+                            self._advance,
                             program_run_id,
                         )
                         self._inflight[program_run_id] = (
@@ -868,40 +1260,31 @@ class ProgramRunTickHost:
                             lambda _future: self._notify_worker_completion()
                         )
                     next_tick = now + self._tick_interval_s
-            if completed:
-                try:
-                    self._observe_terminals(completed)
-                except ProgramSchedulingError:
-                    return
-                finally:
-                    self._observe_states(observed)
-            elif observed:
-                self._observe_states(observed)
+            for line in lines:
+                _write_late_tick_line(line)
+            self._observe_states(observed)
 
     def _notify_worker_completion(self) -> None:
         with self._condition:
             self._condition.notify_all()
 
-    def shutdown(self, *, timeout_s: float = 5.0) -> None:
-        if (
-            isinstance(timeout_s, bool)
-            or not isinstance(timeout_s, (int, float))
-            or not 0.0 < float(timeout_s) <= 60.0
-        ):
-            raise ValueError("shutdown timeout is outside its fixed bound")
+    def shutdown(self) -> None:
         with self._condition:
             thread = self._thread
             self._shutdown = True
             self._condition.notify_all()
         if thread is not None:
-            thread.join(timeout=float(timeout_s))
-            if thread.is_alive():
-                raise ProgramSchedulingError("Program tick worker did not stop")
+            thread.join()
         self._executor.shutdown(wait=True, cancel_futures=True)
+        # No tick runs any more: nothing still queued on a run's sender is sent.
+        self._owner.close_run_senders()
 
 
 __all__ = [
+    "PROGRAM_TICK_WORKER_FAILED_CODE",
     "ProgramInterventionRegistry",
+    "ProgramRunHoldFacts",
+    "RUN_FROZEN_LEVELS",
     "ProgramRunTickHost",
     "ProgramSchedulingError",
 ]

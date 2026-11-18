@@ -4,11 +4,11 @@
 #include <manyforge_core/types/io_rule.hpp>
 #include <manyforge_core/types/io_rule_stop_response.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
+#include <manyforge_core/types/stop_event.hpp>
 #include <set>
 
 namespace manyforge::core {
 
-enum class StopCertificateResultDTO : std::uint8_t;
 enum class OperationStateKind;
 enum class IoRuleStopScopeDTO { kAffectedResources, kFullCell };
 
@@ -59,17 +59,17 @@ enum class IoRuleArbitrationDispositionDTO {
   kSuperseded,
 };
 
-/// Typed facts remain separate: condition/source evidence, actual Stop
-/// acceptance, actual certificate, and terminal motion cause. Pending evidence
-/// and an accepted Stop alone can never populate signal_trip.
+/// Typed facts remain separate: condition/source evidence, the Stop event
+/// that covered the participant, that participant's stop result, and the
+/// terminal motion cause. Pending evidence and an accepted Stop alone can
+/// never populate signal_trip. `stop_result` is absent while the
+/// participant is stopping (the response is pending) and is then one of
+/// kStopped, kStoppedEscalated, kSomeFailed for this participant.
 struct IoMotionRuleOutcomeDTO final {
   IoRuleRegistrationDTO registration;
   IoRuleEvidenceDTO evidence;
-  std::optional<StopId> stop_id{};
-  std::optional<StopGeneration> stop_generation{};
-  std::optional<StopCertificateId> stop_certificate_id{};
-  std::optional<StopCertificateRevision> stop_certificate_revision{};
-  std::optional<StopCertificateResultDTO> stop_result{};
+  std::optional<StopEventId> stop_event_id{};
+  std::optional<StopEventResult> stop_result{};
   std::optional<MotionExecutionTerminalCause> terminal_cause{};
   std::optional<ErrorDTO> error{};
   std::optional<IoRuleArbitrationDispositionDTO> arbitration_disposition{};

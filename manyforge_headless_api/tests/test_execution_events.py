@@ -24,6 +24,7 @@ from manyforge_headless_api.models import (
     ProgramRunStopIntentRequest,
     StopIntentRequest,
     RecoveryPreflightConfirmation,
+    RuntimeScaleControlRequest,
 )
 from manyforge_headless_api.native import HeadlessApiError
 
@@ -42,7 +43,7 @@ def test_recover_enable_preflight_and_confirmation_forward_exact_native_values(m
         if command["command"] == "component_recovery_preflight":
             return {"ok": True, "command": command["command"], "preflight": preflight}
         return {"ok": True, "command": "component_action", "accepted": {"action": "enable"}}
-    monkeypatch.setattr(client, "_exchange_control", exchange)
+    monkeypatch.setattr(client, "_exchange_component", exchange)
     assert client.component_recovery_preflight("arm")["preflight"] == preflight
     confirmation = {"snapshot_id": "native-snapshot", "confirmed": [
         {"component_id": "machine", "cause_code": "estop", "vendor_code": "C2", "stop_code": "estop", "stop_vendor_code": "C2", "eligibility": "recover"},
@@ -51,9 +52,9 @@ def test_recover_enable_preflight_and_confirmation_forward_exact_native_values(m
     assert RecoveryPreflightConfirmation.model_validate(confirmation).model_dump(mode="json") == confirmation
     client.component_recover_enable("arm", confirmation)
     assert commands == [
-        {"api_version": "manyforge.execution_command.v3", "command": "component_recovery_preflight",
+        {"api_version": "manyforge.execution_command.v4", "command": "component_recovery_preflight",
          "request": {"component_id": "arm"}},
-        {"api_version": "manyforge.execution_command.v3", "command": "component_action", "request": {
+        {"api_version": "manyforge.execution_command.v4", "command": "component_action", "request": {
             "component_id": "arm", "action": "enable", "recovery_preflight": confirmation}},
     ]
 
@@ -83,7 +84,7 @@ def test_unknown_member_requires_a_confirmed_recoverable_owner():
 ])
 def test_recovery_preflight_rejects_wrong_or_malformed_native_projection(monkeypatch, tmp_path, component):
     client = ExecutionCommandClient(tmp_path)
-    monkeypatch.setattr(client, "_exchange_control", lambda command: {
+    monkeypatch.setattr(client, "_exchange_component", lambda command: {
         "ok": True, "command": "component_recovery_preflight",
         "preflight": {"snapshot_id": "native-snapshot", "components": [component]},
     })
@@ -98,7 +99,7 @@ def test_recovery_preflight_keeps_simultaneous_fault_and_stop(monkeypatch, tmp_p
         "code": "communication", "message": "Fault", "clearable": True,
         "operator_action": "recover", "concerns": [],
     }, "stop": {"code": "estop", "message": "Stopped", "since_ns": 3, "vendor_code": "C2"}}
-    monkeypatch.setattr(client, "_exchange_control", lambda _command: {
+    monkeypatch.setattr(client, "_exchange_component", lambda _command: {
         "ok": True, "command": "component_recovery_preflight",
         "preflight": {"snapshot_id": "native", "components": [row]},
     })
@@ -111,7 +112,7 @@ def test_recovery_preflight_rejects_stop_cause_without_stop_evidence(monkeypatch
         "code": "estop", "message": "Stopped", "clearable": True,
         "operator_action": "recover", "concerns": [],
     }}
-    monkeypatch.setattr(client, "_exchange_control", lambda _command: {
+    monkeypatch.setattr(client, "_exchange_component", lambda _command: {
         "ok": True, "command": "component_recovery_preflight",
         "preflight": {"snapshot_id": "native", "components": [row]},
     })
@@ -119,20 +120,31 @@ def test_recovery_preflight_rejects_stop_cause_without_stop_evidence(monkeypatch
         client.component_recovery_preflight("arm")
 
 
-def _event(owner_epoch: str, sequence: int) -> dict[str, Any]:
+# A runner key (class 1, minter 4, sequence 1).
+_RUNNER_KEY = "40" + "00000000000004" + "0000000000000001"
+# Headless's own key (class 1, minter 5, sequence 1).
+_HEADLESS_KEY = "40" + "00000000000005" + "0000000000000001"
+# Formed HTTP client keys (class 3) of two previews.
+_PREVIEW_KEY = "c0" + "01" * 15
+_GRIPPER_KEY = "c0" + "02" * 15
+# The Stop's key (a WebSocket key: session 1, sequence 1).
+_STOP_KEY = "00" + "00000000000001" + "0000000000000001"
+# The application start the pump fakes run under (16 hex, contract 1.12).
+_APPLICATION_START_ID = "3f9a0000000000a1"
+
+
+def _event(sequence: int) -> dict[str, Any]:
     payload = {
-        "api_version": "manyforge.operation_journal_record.v1",
-        "effect_pending": False,
+        "api_version": "manyforge.operation_journal_record.v10",
         "intent": {},
         "operation_state": {
-            "operation_id": "operation.1",
+            "operation_id": 1,
             "operation_revision": 1,
             "participants": [],
             "program_binding_id": "binding.1",
-            "program_run_id": "run.1",
+            "program_run_id": 1,
             "state": "completed",
         },
-        "owner_epoch": owner_epoch,
         "record_kind": "state_observed",
         "result": None,
         "runtime_scale_status": None,
@@ -141,16 +153,14 @@ def _event(owner_epoch: str, sequence: int) -> dict[str, Any]:
 
     canonical = rfc8785.dumps(payload)
     return {
-        "effect_pending": False,
         "occurred_at_ns": 100 + sequence,
         "occurred_at_wall": f"2026-08-07T10:00:00.00000000{sequence}Z",
-        "operation_id": "operation.1",
+        "operation_id": 1,
         "operation_revision": 1,
-        "owner_epoch": owner_epoch,
         "payload": payload,
         "payload_digest": f"sha256:{hashlib.sha256(canonical).hexdigest()}",
         "record_kind": "state_observed",
-        "request_id": None,
+        "request_key": None,
         "sequence": sequence,
     }
 
@@ -181,14 +191,13 @@ def test_execution_rpc_refusal_retains_optional_producer(
 
 
 def _progress_event(
-    owner_epoch: str,
     sequence: int,
     *,
     state: str,
     progress: float,
-    operation_id: str = "operation.1",
+    operation_id: int = 1,
 ) -> dict[str, Any]:
-    event = copy.deepcopy(_event(owner_epoch, sequence))
+    event = copy.deepcopy(_event(sequence))
     event["operation_id"] = operation_id
     operation = event["payload"]["operation_state"]
     operation["operation_id"] = operation_id
@@ -196,7 +205,7 @@ def _progress_event(
     operation["updated_at_ns"] = 100 + sequence
     operation["participants"] = [
         {
-            "participant_id": "operation.1.participant.1",
+            "participant_id": {"operation_id": operation_id, "ordinal": 1},
             "progress": progress,
             "state": state,
             "terminal_error": None,
@@ -207,96 +216,75 @@ def _progress_event(
     return event
 
 
-def _stop_projection_event(owner_epoch: str, sequence: int) -> dict[str, Any]:
-    payload = {
-        "acceptance": {
-            "entry_state": "active",
-            "owner_epoch": owner_epoch,
-            "request_id": "stop-request.1",
-            "stop_generation": 1,
-            "stop_id": "stop.1",
-        },
-        "accepted": {
-            "request_id": "stop-request.1",
-            "stop_generation": 1,
-            "stop_id": "stop.1",
-        },
-        "affected_state": {"operations": [], "resources": []},
-        "api_version": "manyforge.stop_acceptance_projection.v2",
-        "intent": {"intent_kind": "full_stop", "value": {}},
-        "record_kind": "stop_acceptance_projected",
-    }
+def _stop_row(sequence: int, payload: dict[str, Any]) -> dict[str, Any]:
+    """One Stop event row: no operation and no request key in its envelope
+    (contract §5.11); the payload is ``manyforge.stop_event.v1``."""
+
     canonical = rfc8785.dumps(payload)
     return {
-        "effect_pending": True,
         "occurred_at_ns": 100 + sequence,
         "occurred_at_wall": f"2026-08-07T10:00:00.00000000{sequence}Z",
         "operation_id": None,
         "operation_revision": None,
-        "owner_epoch": owner_epoch,
         "payload": payload,
         "payload_digest": f"sha256:{hashlib.sha256(canonical).hexdigest()}",
-        "record_kind": "stop_acceptance_projected",
-        "request_id": "stop-request.1",
+        "record_kind": f"stop_event_{payload['row']}",
+        "request_key": None,
         "sequence": sequence,
     }
 
 
-def _stop_terminal_event(owner_epoch: str, sequence: int) -> dict[str, Any]:
-    payload = {
-        "acceptance": {
-            "accepted_at_ns": 100,
-            "request_id": "stop-request.1",
-            "stop_generation": 1,
-            "stop_id": "stop.1",
-        },
-        "acceptance_to_terminal_latency_ns": 1_000_000_000,
-        "api_version": "manyforge.stop_terminal_projection.v1",
-        "attempted_stage_count": 1,
-        "attempted_stages": [],
-        "certificate_evidence": [],
-        "certificate_evidence_count": 1,
+def _stop_accepted_event(sequence: int) -> dict[str, Any]:
+    return _stop_row(sequence, {
+        "accepted_at_ns": 100,
+        "applied": "stop_all",
+        "attribution": {"assurance": "unverified", "principal_id": None,
+                        "transport": "http"},
+        "caused_by": None,
+        "covered": [{"operation_id": 4, "participant_ordinal": 1, "started": True}],
+        "event_id": 1,
+        "fence_degraded": None,
+        "group_count": 0,
+        "groups": [],
+        "hold_change": ["all_groups"],
+        "hold_revision_after": 2,
+        "program_run_id": None,
+        "reason": "",
+        "request_key": _STOP_KEY,
+        "requested": "stop_all",
+        "row": "accepted",
+        "schema_version": "manyforge.stop_event.v1",
+        "source_label": "operator_ui",
+        "stale_diagnostics": [],
+        "stale_total": 0,
+        "widen_reason": "none",
+    })
+
+
+def _stop_completed_event(sequence: int) -> dict[str, Any]:
+    return _stop_row(sequence, {
+        "accepted_at_ns": 100,
+        "applied": "stop_all",
         "completed_at_ns": 1_000_000_100,
-        "details_truncated": True,
-        "durable_projection_digest": "sha256:" + "8" * 64,
-        "escalated": False,
-        "fault_latch": None,
-        "hard_stop_floor_used": False,
-        "owner_epoch": owner_epoch,
-        "participant_settlement": [],
-        "participant_settlement_count": 1,
-        "record_kind": "stop_terminal_projected",
-        "request_id": "stop-request.1",
-        "result": "succeeded_nominal",
-        "state": "succeeded",
-        "stop_certificate_id": "stop-certificate.1",
-        "stop_certificate_revision": 1,
-        "stop_generation": 1,
-        "stop_id": "stop.1",
-    }
-    canonical = rfc8785.dumps(payload)
-    return {
-        "effect_pending": False,
-        "occurred_at_ns": 100 + sequence,
-        "occurred_at_wall": f"2026-08-07T10:00:01.00000000{sequence}Z",
-        "operation_id": None,
-        "operation_revision": None,
-        "owner_epoch": owner_epoch,
-        "payload": payload,
-        "payload_digest": f"sha256:{hashlib.sha256(canonical).hexdigest()}",
-        "record_kind": "stop_terminal_projected",
-        "request_id": None,
-        "sequence": sequence,
-    }
+        "covered": [{
+            "containing_stage_index": 0, "containing_stage_kind": "controlled",
+            "error_code": None, "escalated": False, "operation_id": 4,
+            "participant_ordinal": 1, "phase": "stopped", "started": True,
+            "stop_path_collision": False,
+        }],
+        "event_id": 1,
+        "result": "stopped",
+        "row": "completed",
+        "schema_version": "manyforge.stop_event.v1",
+    })
 
 
-def _page(owner_epoch: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+def _page(events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "operation_progress": [],
         "admission_generation": 1,
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "command": "events",
-        "owner_epoch": owner_epoch,
         "execution_owner_ready": True,
         "runtime_faults": {
             "operation_journal_write_fault": None,
@@ -307,8 +295,7 @@ def _page(owner_epoch: str, events: list[dict[str, Any]]) -> dict[str, Any]:
             "events": events,
             "has_more": False,
             "next_after_sequence": events[-1]["sequence"] if events else 0,
-            "owner_epoch": owner_epoch,
-            "schema_version": "manyforge.execution_event_page.v2",
+            "schema_version": "manyforge.execution_event_page.v3",
         },
         "ok": True,
     }
@@ -324,7 +311,7 @@ def test_execution_client_uses_exact_focused_projection_commands(
     def exchange(command: dict[str, Any]) -> dict[str, Any]:
         commands.append(command)
         return {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": command["command"],
             "ok": True,
         }
@@ -344,7 +331,7 @@ def test_execution_client_uses_exact_focused_projection_commands(
     client.diagnostics()
 
     assert commands == [
-        {"api_version": "manyforge.execution_command.v3", "command": command}
+        {"api_version": "manyforge.execution_command.v4", "command": command}
         for command in (
             "identity",
             "targets",
@@ -361,7 +348,7 @@ def test_execution_client_uses_exact_focused_projection_commands(
         client,
         "_exchange",
         lambda _command: {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": "status",
             "ok": True,
         },
@@ -371,87 +358,98 @@ def test_execution_client_uses_exact_focused_projection_commands(
     assert mismatched.value.code == "execution_command_response_invalid"
 
 
-def test_execution_client_validates_event_cursor_and_owner(
+def test_execution_client_validates_event_cursor(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = ExecutionCommandClient(tmp_path)
-    owner_epoch = "execution-host.epoch.1"
-    response = _page(owner_epoch, [_event(owner_epoch, 1)])
+    response = _page([_event(1)])
     monkeypatch.setattr(client, "_exchange", lambda _command: response)
-    page = client.events(owner_epoch, 0)
+    page = client.events(0)
     assert page["next_after_sequence"] == 1
     assert page["admission_generation"] == 1
 
     response["admission_generation"] = 0
     with pytest.raises(HeadlessApiError) as invalid_admission:
-        client.events(owner_epoch, 0)
+        client.events(0)
     assert invalid_admission.value.code == "execution_command_response_invalid"
     response["admission_generation"] = 1
 
     response["event_page"]["next_after_sequence"] = 2
     with pytest.raises(HeadlessApiError) as invalid:
-        client.events(owner_epoch, 0)
+        client.events(0)
     assert invalid.value.code == "execution_command_response_invalid"
 
-    response = _page(owner_epoch, [])
+    response = _page([])
     response["event_page"]["has_more"] = True
     with pytest.raises(HeadlessApiError) as stalled:
-        client.events(owner_epoch, 0)
+        client.events(0)
     assert stalled.value.code == "execution_command_response_invalid"
 
 
-def test_execution_client_accepts_only_paired_null_stop_projection_identity(
+def test_execution_client_accepts_only_paired_null_stop_event_identity(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = ExecutionCommandClient(tmp_path)
-    owner_epoch = "execution-host.epoch.stop"
-    stop_event = _stop_projection_event(owner_epoch, 1)
+    stop_event = _stop_accepted_event(1)
     monkeypatch.setattr(
-        client, "_exchange", lambda _command: _page(owner_epoch, [stop_event])
+        client, "_exchange", lambda _command: _page([stop_event])
     )
-    page = client.events(owner_epoch, 0)
+    page = client.events(0)
     assert page["events"][0]["operation_id"] is None
     assert page["events"][0]["operation_revision"] is None
 
     stop_event["operation_revision"] = 1
     with pytest.raises(HeadlessApiError) as mixed:
-        client.events(owner_epoch, 0)
+        client.events(0)
     assert mixed.value.code == "execution_command_response_invalid"
 
     stop_event["operation_revision"] = None
-    stop_event["request_id"] = None
-    with pytest.raises(HeadlessApiError) as uncorrelated:
-        client.events(owner_epoch, 0)
-    assert uncorrelated.value.code == "execution_command_response_invalid"
+    # The request key lives in the payload; the row's envelope names none.
+    for key in (_STOP_KEY, "stop-request.1", _STOP_KEY.upper()):
+        stop_event["request_key"] = key
+        with pytest.raises(HeadlessApiError) as keyed:
+            client.events(0)
+        assert keyed.value.code == "execution_command_response_invalid"
+    stop_event["request_key"] = None
 
-    ordinary = _event(owner_epoch, 1)
+    ordinary = _event(1)
     ordinary["operation_id"] = None
     ordinary["operation_revision"] = None
     monkeypatch.setattr(
-        client, "_exchange", lambda _command: _page(owner_epoch, [ordinary])
+        client, "_exchange", lambda _command: _page([ordinary])
     )
     with pytest.raises(HeadlessApiError) as unattributed:
-        client.events(owner_epoch, 0)
+        client.events(0)
     assert unattributed.value.code == "execution_command_response_invalid"
 
+    # Operation numbers are integers (contract 1.5): text is refused.
+    for operation_id in ("operation.1", "1", 0, True):
+        texted = _event(1)
+        texted["operation_id"] = operation_id
+        monkeypatch.setattr(
+            client, "_exchange", lambda _command, texted=texted: _page([texted])
+        )
+        with pytest.raises(HeadlessApiError) as text_identity:
+            client.events(0)
+        assert text_identity.value.code == "execution_command_response_invalid"
 
-def test_execution_client_accepts_stop_terminal_as_stop_scoped_fact(
+
+def test_execution_client_accepts_stop_completion_as_stop_scoped_fact(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = ExecutionCommandClient(tmp_path)
-    owner_epoch = "execution-host.epoch.stop"
-    terminal = _stop_terminal_event(owner_epoch, 1)
+    terminal = _stop_completed_event(1)
     monkeypatch.setattr(
-        client, "_exchange", lambda _command: _page(owner_epoch, [terminal])
+        client, "_exchange", lambda _command: _page([terminal])
     )
-    page = client.events(owner_epoch, 0)
-    assert page["events"][0]["record_kind"] == "stop_terminal_projected"
-    assert page["events"][0]["request_id"] is None
+    page = client.events(0)
+    assert page["events"][0]["record_kind"] == "stop_event_completed"
+    assert page["events"][0]["request_key"] is None
     assert page["events"][0]["operation_id"] is None
 
-    terminal["request_id"] = "stop-request.1"
+    terminal["request_key"] = _STOP_KEY
     with pytest.raises(HeadlessApiError) as invalid_request_identity:
-        client.events(owner_epoch, 0)
+        client.events(0)
     assert invalid_request_identity.value.code == ("execution_command_response_invalid")
 
 
@@ -460,23 +458,23 @@ def test_execution_client_requires_backend_residency_projection(
 ) -> None:
     client = ExecutionCommandClient(tmp_path)
     response = {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "command": "read",
         "ok": True,
-        "operation": {"operation_id": "operation.1"},
+        "operation": {"operation_id": 1},
         "resident": True,
     }
     monkeypatch.setattr(client, "_exchange", lambda _command: response)
-    assert client.read("operation.1")["resident"] is True
+    assert client.read(1)["resident"] is True
 
     response.pop("resident")
     with pytest.raises(HeadlessApiError) as missing:
-        client.read("operation.1")
+        client.read(1)
     assert missing.value.code == "execution_command_response_invalid"
 
     response["resident"] = 1
     with pytest.raises(HeadlessApiError) as non_boolean:
-        client.read("operation.1")
+        client.read(1)
     assert non_boolean.value.code == "execution_command_response_invalid"
 
 
@@ -486,13 +484,10 @@ def test_execution_client_uses_internal_attribution_for_program_run_stop(
     request = ProgramRunStopIntentRequest.model_validate(
         {
             "request_context": {
-                "request_id": "program-stop.1",
-                "request_owner_epoch": "execution.epoch.1",
+                "request_key": _RUNNER_KEY,
                 "source_label": "manyforge_behavior",
-                "correlation_id": "program-run.1",
             },
-            "program_run_id": "program-run.1",
-            "reason": "operator motion Stop",
+            "program_run_id": 1,
         }
     )
     client = ExecutionCommandClient(
@@ -504,25 +499,32 @@ def test_execution_client_uses_internal_attribution_for_program_run_stop(
     def exchange(command: dict[str, Any]) -> dict[str, Any]:
         captured.update(command)
         return {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": "stop_program_run",
             "ok": True,
             "accepted": {
-                "request_id": request.request_context.request_id,
+                "request_key": request.request_context.request_key,
             },
         }
 
     monkeypatch.setattr(client, "_exchange_control", exchange)
     assert client.stop_program_run(request)["ok"] is True
     assert captured == {
-        "api_version": "manyforge.execution_command.v3",
+        "api_version": "manyforge.execution_command.v4",
         "attribution": {
             "transport": "internal",
             "assurance": "unverified",
             "principal_id": None,
         },
         "command": "stop_program_run",
-        "request": request.model_dump(mode="json", exclude_none=True),
+        # The host's Program-run end body: exactly the context and the run.
+        "request": {
+            "program_run_id": 1,
+            "request_context": {
+                "request_key": _RUNNER_KEY,
+                "source_label": "manyforge_behavior",
+            },
+        },
     }
 
     public_client = ExecutionCommandClient(tmp_path)
@@ -535,76 +537,130 @@ def _ordinary_lane_forbidden(command: dict[str, Any]) -> dict[str, Any]:
     raise AssertionError(f"{command['command']} reached the ordinary socket")
 
 
-def test_execution_client_reads_one_exact_internal_stop_status(
+def test_execution_client_sends_runtime_scale_on_the_control_socket(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    captured: list[dict[str, Any]] = []
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        captured.append(command)
+        return {"ok": True, "command": "set_runtime_scale_control", "accepted": {}}
+
+    # Speed scaling travels beside Stop, never on the ordinary socket.
+    monkeypatch.setattr(client, "_exchange", _ordinary_lane_forbidden)
+    monkeypatch.setattr(client, "_exchange_control", exchange)
+    request = RuntimeScaleControlRequest.model_validate(
+        {
+            "request_context": {
+                "request_key": _RUNNER_KEY,
+                "source_label": "test",
+            },
+            "selector": {
+                "program_binding_id": "binding-1",
+                "component_id": "robot",
+                "command_target_id": "arm",
+            },
+            "expected_control_generation": 0,
+            "scale": 0.4,
+        }
+    )
+    assert client.set_runtime_scale_control(request, trusted_principal_id=None)["ok"] is True
+    assert [command["command"] for command in captured] == ["set_runtime_scale_control"]
+    assert captured[0]["request"] == request.model_dump(mode="json")
+
+
+def _stop_status(**changes: Any) -> dict[str, Any]:
+    return {
+        "accepted_at_ns": 100,
+        "applied": "halt",
+        "completed_at_ns": 200,
+        "covered": [{
+            "operation_id": 4, "participant_ordinal": 1, "started": True,
+            "done": True, "phase": "stopped", "containing_stage_index": 0,
+            "escalated": False, "stop_path_collision": False, "error_code": None,
+        }],
+        "event_id": 1,
+        "request_key": _RUNNER_KEY,
+        "requested": "halt",
+        "result": "stopped",
+        "schema_version": "manyforge.execution_stop_status.v2",
+        "state": "complete",
+        "widen_reason": "none",
+        **changes,
+    }
+
+
+def test_execution_client_reads_one_internal_stop_event(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = ExecutionCommandClient(tmp_path, attribution_transport="internal")
     captured: dict[str, Any] = {}
+    status = _stop_status()
 
     def exchange(command: dict[str, Any]) -> dict[str, Any]:
         captured.update(command)
         return {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": "read_stop",
             "ok": True,
-            "stop_status": {
-                "request_id": "program-stop.1",
-                "schema_version": "manyforge.execution_stop_status.v1",
-                "state": "succeeded",
-                "stop_generation": 4,
-                "stop_id": "stop.1",
-            },
+            "stop_status": copy.deepcopy(status),
         }
 
-    # Stop status is read beside Stop on the control socket, never on the
+    # A Stop event is read beside Stop on the control socket, never on the
     # ordinary one.
     monkeypatch.setattr(client, "_exchange", _ordinary_lane_forbidden)
     monkeypatch.setattr(client, "_exchange_control", exchange)
-    assert client.stop_status("stop.1")["stop_status"]["state"] == "succeeded"
+    assert client.read_stop(1)["stop_status"]["state"] == "complete"
     assert captured == {
-        "api_version": "manyforge.execution_command.v3",
+        "api_version": "manyforge.execution_command.v4",
         "attribution": {
             "transport": "internal",
             "assurance": "unverified",
             "principal_id": None,
         },
         "command": "read_stop",
-        "stop_id": "stop.1",
+        "event_id": 1,
     }
-
-    # The additive terminal_projection string, one of three values.
-    status: dict[str, Any] = {
-        "request_id": "program-stop.1",
-        "schema_version": "manyforge.execution_stop_status.v1",
-        "state": "succeeded",
-        "stop_generation": 4,
-        "stop_id": "stop.1",
-    }
-    reply = {
-        "api_version": "manyforge.execution_command_response.v4",
-        "command": "read_stop",
-        "ok": True,
-        "stop_status": status,
-    }
-    monkeypatch.setattr(client, "_exchange_control", lambda command: copy.deepcopy(reply))
-    for projection in ("pending", "recorded", "failed"):
-        status["terminal_projection"] = projection
-        assert client.stop_status("stop.1")["stop_status"]["terminal_projection"] == projection
-    for invalid in ("not_applicable", None, 1, {"state": "recorded"}):
-        status["terminal_projection"] = invalid
+    # A pending event has no completion time yet.
+    status.update(state="pending", result="pending", completed_at_ns=None)
+    assert client.read_stop(1)["stop_status"]["state"] == "pending"
+    for invalid in (
+        {"state": "complete", "completed_at_ns": None},
+        {"state": "pending", "completed_at_ns": 5},
+        {"event_id": 2},
+        {"result": "succeeded"},
+        {"state": "succeeded"},
+        {"schema_version": "manyforge.execution_stop_status.v1"},
+        {"request_key": "program-stop.1"},
+        # Removed Stop identity fields are not accepted beside the event id.
+        {"stop_id": 1},
+        {"stop_generation": 1},
+    ):
+        status.clear()
+        status.update(_stop_status(**invalid))
         with pytest.raises(HeadlessApiError):
-            client.stop_status("stop.1")
-    status.pop("terminal_projection")
-    status["extra"] = "x"
-    with pytest.raises(HeadlessApiError):
-        client.stop_status("stop.1")
+            client.read_stop(1)
+    # Overwritten in the ring: the Kernel's refusal passes through unchanged.
+    monkeypatch.setattr(
+        client,
+        "_exchange_control",
+        lambda command: {
+            "api_version": "manyforge.execution_command_response.v6",
+            "error": {"code": "stop_status_not_resident", "message": "gone"},
+            "ok": False,
+        },
+    )
+    assert client.read_stop(1)["error"]["code"] == "stop_status_not_resident"
+    with pytest.raises(ValueError):
+        client.read_stop("stop.1")  # type: ignore[arg-type]
 
     with pytest.raises(HeadlessApiError) as unavailable_publicly:
-        ExecutionCommandClient(tmp_path).stop_status("stop.1")
+        ExecutionCommandClient(tmp_path).read_stop(1)
     assert unavailable_publicly.value.code == ("execution_request_attribution_invalid")
 
 
-def test_execution_client_releases_one_exact_internal_program_run_fence(
+def test_execution_client_releases_a_halt_at_its_hold_revision(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = ExecutionCommandClient(tmp_path, attribution_transport="internal")
@@ -613,45 +669,52 @@ def test_execution_client_releases_one_exact_internal_program_run_fence(
     def exchange(command: dict[str, Any]) -> dict[str, Any]:
         captured.update(command)
         return {
-            "api_version": "manyforge.execution_command_response.v4",
-            "command": "release_program_run_stop_fence",
+            "api_version": "manyforge.execution_command_response.v6",
+            "command": "release_halt",
             "ok": True,
+            "scope": {"schema_version": "manyforge.program_execution_scope.v3"},
         }
 
     monkeypatch.setattr(client, "_exchange", exchange)
-    assert (
-        client.release_program_run_stop_fence("program-run.1", "stop.1", 4)["ok"]
-        is True
-    )
+    assert client.release_halt(1, 0)["ok"] is True
     assert captured == {
-        "api_version": "manyforge.execution_command.v3",
+        "api_version": "manyforge.execution_command.v4",
         "attribution": {
             "transport": "internal",
             "assurance": "unverified",
             "principal_id": None,
         },
-        "command": "release_program_run_stop_fence",
-        "program_run_id": "program-run.1",
-        "stop_generation": 4,
-        "stop_id": "stop.1",
+        "command": "release_halt",
+        "expected_hold_revision": 0,
+        "program_run_id": 1,
     }
+    for run, revision in (("program-run.1", 0), (0, 0), (1, -1), (1, True)):
+        with pytest.raises(ValueError):
+            client.release_halt(run, revision)  # type: ignore[arg-type]
+    monkeypatch.setattr(
+        client,
+        "_exchange",
+        lambda command: {
+            "api_version": "manyforge.execution_command_response.v6",
+            "command": "release_halt",
+            "ok": True,
+        },
+    )
+    with pytest.raises(HeadlessApiError):
+        client.release_halt(1, 0)
 
     with pytest.raises(HeadlessApiError) as unavailable_publicly:
-        ExecutionCommandClient(tmp_path).release_program_run_stop_fence(
-            "program-run.1", "stop.1", 4
-        )
+        ExecutionCommandClient(tmp_path).release_halt(1, 0)
     assert unavailable_publicly.value.code == ("execution_request_attribution_invalid")
 
 
-def test_execution_client_projects_scoped_and_full_stop_commands(
+def test_execution_client_projects_scoped_and_cell_wide_stop_commands(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = ExecutionCommandClient(tmp_path)
     context = {
-        "request_id": "request.stop.1",
-        "request_owner_epoch": "execution.epoch.1",
+        "request_key": _STOP_KEY,
         "source_label": "operator_ui",
-        "correlation_id": None,
     }
     stop = StopIntentRequest.model_validate(
         {
@@ -666,71 +729,138 @@ def test_execution_client_projects_scoped_and_full_stop_commands(
             "reason": None,
         }
     )
-    full = FullStopIntentRequest.model_validate(
-        {"request_context": context, "expected_stop_generation": 0}
-    )
+    cell_wide = FullStopIntentRequest.model_validate({"request_context": context})
     control_commands: list[dict[str, Any]] = []
 
     def control_exchange(command: dict[str, Any]) -> dict[str, Any]:
         control_commands.append(command)
-        malformed = command["command"] == "malformed_stop"
         return {
-            "api_version": "manyforge.execution_command_response.v4",
-            "accepted": {
-                "request_id": (
-                    command["request_id"] if malformed else context["request_id"]
-                ),
-                "resolution_disposition": (
-                    "promoted_to_full" if malformed else "exact"
-                ),
-                "resolution_reason": (
-                    "explicit_full_stop"
-                    if command["command"] == "full_stop"
-                    else (
-                        "malformed_ordinary_intent"
-                        if malformed
-                        else "exact_current_scope"
-                    )
-                ),
-            },
-            "command": "stop" if malformed else command["command"],
+            "api_version": "manyforge.execution_command_response.v6",
+            "accepted": {"event_id": len(control_commands)},
+            "command": command["command"],
             "ok": True,
         }
 
+    monkeypatch.setattr(client, "_exchange", _ordinary_lane_forbidden)
     monkeypatch.setattr(client, "_exchange_control", control_exchange)
     assert client.stop(stop, trusted_principal_id=None)["ok"] is True
-    assert client.full_stop(full, trusted_principal_id=None)["ok"] is True
-    assert (
-        client.recognized_malformed_stop(
-            request_id="malformed-stop.http.1",
-            recognized_route="/api/execution/stops",
-            reason="recognized_stop_payload_invalid",
-            trusted_principal_id=None,
-        )["ok"]
-        is True
-    )
+    assert client.stop_all(cell_wide, trusted_principal_id=None)["ok"] is True
+    assert client.halt(cell_wide, trusted_principal_id=None)["ok"] is True
+    for route in ("/api/execution/stops", "/api/execution/stop-all", "/api/execution/halt"):
+        assert (
+            client.recognized_stop(
+                request_key=_HEADLESS_KEY,
+                recognized_route=route,
+                reason="recognized_stop_payload_invalid",
+                source_label=None,
+                trusted_principal_id=None,
+            )["ok"]
+            is True
+        )
+    assert [command["command"] for command in control_commands] == [
+        "stop", "stop_all", "halt", "recognized_stop", "recognized_stop", "recognized_stop",
+    ]
     assert set(control_commands[0]["request"]) == {
         "components",
         "request_context",
     }
     assert control_commands[0]["request"]["request_context"] == context
-    assert control_commands[2]["command"] == "malformed_stop"
+    # Stop all and Halt carry the request context alone (no generation).
+    assert control_commands[1]["request"] == {"request_context": context}
+    assert control_commands[2]["request"] == {"request_context": context}
+    assert control_commands[3]["request_key"] == _HEADLESS_KEY
+    assert [command.get("recognized_route") for command in control_commands[3:]] == [
+        "/api/execution/stops", "/api/execution/stop-all", "/api/execution/halt",
+    ]
+    assert "request_id" not in control_commands[3]
+    assert [command["source_label"] for command in control_commands[3:]] == [None] * 3
+    assert client.recognized_stop(
+        request_key=_HEADLESS_KEY,
+        recognized_route="/api/execution/stops",
+        reason="recognized_stop_start_not_current",
+        source_label="operator_ui",
+        trusted_principal_id=None,
+    )["ok"] is True
+    assert {
+        key: control_commands[6][key]
+        for key in ("command", "reason", "recognized_route", "source_label")
+    } == {
+        "command": "recognized_stop",
+        "reason": "recognized_stop_start_not_current",
+        "recognized_route": "/api/execution/stops",
+        "source_label": "operator_ui",
+    }
 
+    # A reply naming another command is refused.
+    monkeypatch.setattr(
+        client,
+        "_exchange_control",
+        lambda command: {
+            "api_version": "manyforge.execution_command_response.v6",
+            "accepted": {},
+            "command": "stop",
+            "ok": True,
+        },
+    )
+    for call in (
+        lambda: client.stop_all(cell_wide, trusted_principal_id=None),
+        lambda: client.halt(cell_wide, trusted_principal_id=None),
+        lambda: client.recognized_stop(
+            request_key=_HEADLESS_KEY,
+            recognized_route="/api/execution/halt",
+            reason="recognized_stop_payload_invalid",
+            source_label=None,
+            trusted_principal_id=None,
+        ),
+    ):
+        with pytest.raises(HeadlessApiError):
+            call()
+
+
+def test_execution_client_cell_stop_is_internal_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Program node's cell Stop (``kernel.cell_stop``) is the runner's."""
+
+    context = {"request_key": _RUNNER_KEY, "source_label": "program_runner"}
+    request = FullStopIntentRequest.model_validate({"request_context": context})
+    client = ExecutionCommandClient(tmp_path, attribution_transport="internal")
+    captured: list[dict[str, Any]] = []
+
+    def control_exchange(command: dict[str, Any]) -> dict[str, Any]:
+        captured.append(command)
+        return {
+            "api_version": "manyforge.execution_command_response.v6",
+            "accepted": {"event_id": 3},
+            "command": "cell_stop",
+            "ok": True,
+        }
+
+    monkeypatch.setattr(client, "_exchange_control", control_exchange)
+    assert client.cell_stop(request)["accepted"]["event_id"] == 3
+    assert captured == [{
+        "api_version": "manyforge.execution_command.v4",
+        "attribution": {"transport": "internal", "assurance": "unverified",
+                        "principal_id": None},
+        "command": "cell_stop",
+        "request": {"request_context": context},
+    }]
+    with pytest.raises(HeadlessApiError) as public:
+        ExecutionCommandClient(tmp_path).cell_stop(request)
+    assert public.value.code == "execution_request_attribution_invalid"
 
 
 def _direct_motion_request() -> OperationIntentRequest:
     return OperationIntentRequest.model_validate(
         {
             "request_context": {
-                "request_id": "preview-request-1",
-                "request_owner_epoch": "owner-1",
+                "request_key": _PREVIEW_KEY,
                 "source_label": "composer_ui",
-                "correlation_id": None,
             },
             "program_id": "manyforge.direct_control.motion",
             "program_revision": "sha256:program",
             "program_binding_id": "sha256:binding",
-            "program_run_id": "direct-control-owner-1",
+            "program_run_id": None,
             "expected_graph_revision": "sha256:graph",
             "expected_retained_bundle_id": "sha256:bundle",
             "expected_scene_revision": None,
@@ -800,9 +930,8 @@ def _preview_response(operation: dict[str, Any]) -> dict[str, Any]:
         "program_binding_id": "sha256:binding",
         "program_id": "manyforge.direct_control.motion",
         "program_revision": "sha256:program",
-        "program_run_id": "direct-control-owner-1",
-        "request_id": "preview-request-1",
-        "request_owner_epoch": "owner-1",
+        "program_run_id": None,
+        "request_key": _PREVIEW_KEY,
         "required_capability_id": "execution.trajectory.execute",
         "retained_bundle_id": "sha256:bundle",
         "scene_revision": {
@@ -810,13 +939,13 @@ def _preview_response(operation: dict[str, Any]) -> dict[str, Any]:
             "revision_id": 3,
             "content_hash": "sha256:" + "2" * 64,
         },
-        "schema_version": "manyforge.direct_control_motion_preview.v4",
+        "schema_version": "manyforge.direct_control_motion_preview.v5",
         "resolved_tcp": {
             "entry": {
                 "target": {"component_id": "robot", "command_target_id": "arm"},
                 "frame": {"component_id": "robot", "frame_id": "flange"},
             },
-            "source": "active_tcp", "owner_epoch": "owner-1",
+            "source": "active_tcp",
             "registration_generation": 1, "sequence": 0,
         },
         "path_preview": _bounded_motion_path(),
@@ -827,7 +956,7 @@ def _preview_response(operation: dict[str, Any]) -> dict[str, Any]:
         "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
     )
     return {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "command": "preview_motion",
         "ok": True,
         "preview_receipt": receipt,
@@ -851,11 +980,10 @@ def test_motion_request_keeps_mounted_tcp_owner_and_direct_frame() -> None:
 
 def _direct_command_request() -> OperationIntentRequest:
     value = _direct_motion_request().model_dump(mode="json")
-    value["request_context"]["request_id"] = "preview-gripper-1"
+    value["request_context"]["request_key"] = _GRIPPER_KEY
     value["program_id"] = "manyforge.direct_control.gripper"
     value["program_revision"] = "sha256:gripper-program"
     value["program_binding_id"] = "sha256:gripper-binding"
-    value["program_run_id"] = "direct-control-gripper-owner-1"
     participant = value["participants"][0]
     participant["required_capability_id"] = "tool.gripper.command"
     participant["payload"] = {
@@ -889,12 +1017,11 @@ def _command_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
         "program_binding_id": "sha256:gripper-binding",
         "program_id": "manyforge.direct_control.gripper",
         "program_revision": "sha256:gripper-program",
-        "program_run_id": "direct-control-gripper-owner-1",
-        "request_id": "preview-gripper-1",
-        "request_owner_epoch": "owner-1",
+        "program_run_id": None,
+        "request_key": _GRIPPER_KEY,
         "required_capability_id": "tool.gripper.command",
         "retained_bundle_id": "sha256:bundle",
-        "schema_version": ("manyforge.direct_control_capability_command_preview.v2"),
+        "schema_version": ("manyforge.direct_control_capability_command_preview.v3"),
         "source_coordinate_name": "finger_joint",
         "source_kind": "model_role",
         "target_position": 0.03,
@@ -903,7 +1030,7 @@ def _command_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
         "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
     )
     return {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "command": "preview_capability_command",
         "ok": True,
         "preview_receipt": receipt,
@@ -937,7 +1064,7 @@ def test_manual_handover_query_is_one_bounded_shape_checked_read(
         captured.append(command)
         operation = command["operation"]
         result = {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": "read_manual_handover",
             "ok": True,
             "availability": {
@@ -945,8 +1072,7 @@ def test_manual_handover_query_is_one_bounded_shape_checked_read(
                 "cleanup_required": False,
                 "unavailable_reason": None,
             },
-            "request_id": request.request_context.request_id,
-            "request_owner_epoch": request.request_context.request_owner_epoch,
+            "request_key": request.request_context.request_key,
             "intent_digest": "sha256:"
             + hashlib.sha256(rfc8785.dumps(operation)).hexdigest(),
             "handover": (
@@ -954,10 +1080,9 @@ def test_manual_handover_query_is_one_bounded_shape_checked_read(
                 if case == "idle"
                 else {
                     "context": {
-                        "program_runner_owner_epoch": "runner.1",
-                        "program_run_id": "parent.1",
+                        "program_run_id": 3,
                         "claim_generation": 1,
-                        "selection_revision": 0 if case == "unused" else 3,
+                        "hold_revision": 0 if case == "unused" else 3,
                     },
                     "producer_node_indices": (
                         []
@@ -1206,6 +1331,8 @@ class _RecordingCore:
         self.unknown = threading.Event()
         self.alarm_refreshes = 0
         self.alarm_refresh_failure: Exception | None = None
+        self.operation_tables: list[dict[str, Any]] = []
+        self.component_faults: list[list[dict[str, Any]]] = []
 
     def refresh_alarm_sources(self) -> dict[str, Any]:
         self.alarm_refreshes += 1
@@ -1230,33 +1357,40 @@ class _RecordingCore:
         self.unknown.set()
         return {"status": "marked_unknown"}
 
+    def observe_operation_table(self, operations_json: str) -> dict[str, Any]:
+        self.operation_tables.append(json.loads(operations_json))
+        return {"changed": False, "fully_read": True,
+                "schema_version": "manyforge.operation_table_observation.v1"}
+
+    def observe_component_faults(self, faults_json: str) -> dict[str, Any]:
+        self.component_faults.append(json.loads(faults_json))
+        return {"status": "observed", "changed": False}
+
 
 class _PagedExecution:
-    def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
+    def subscribe_events(self, after_cursor: int):
         # The pump reads the subscription only.
-        return paged_subscription(self, after_cursor, owner_epoch)
+        return paged_subscription(self, after_cursor)
 
     def __init__(self) -> None:
-        self.owner_epoch = "execution-host.epoch.pump"
+        self.application_start_id = _APPLICATION_START_ID
         self.admission_generation = 1
         self.fail = False
-        self.event = _event(self.owner_epoch, 1)
+        self.event = _event(1)
         self.progress: list[dict[str, Any]] = []
 
     def identity(self) -> dict[str, Any]:
         return {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": "identity",
             "ok": True,
-            "identity": {"owner_epoch": self.owner_epoch},
+            "identity": {"application_start_id": self.application_start_id},
         }
 
-    def events(
-        self, owner_epoch: str, after_sequence: int, *, limit: int = 16
+    def events(self, after_sequence: int, *, limit: int = 16
     ) -> dict[str, Any]:
         if self.fail:
             raise HeadlessApiError("execution_command_unavailable", "host lost")
-        assert owner_epoch == self.owner_epoch
         assert limit == 1
         events = [] if after_sequence else [self.event]
         return {
@@ -1271,8 +1405,7 @@ class _PagedExecution:
             "events": events,
             "has_more": False,
             "next_after_sequence": after_sequence or 1,
-            "owner_epoch": owner_epoch,
-            "schema_version": "manyforge.execution_event_page.v2",
+            "schema_version": "manyforge.execution_event_page.v3",
         }
 
 
@@ -1281,22 +1414,30 @@ class _StreamingExecution(_PagedExecution):
         super().__init__()
         self._events: list[dict[str, Any]] = []
         self._lock = threading.Lock()
+        # Stream v3 memory facts (OD-205 (b)); absent when None.
+        self.operations: dict[str, Any] | None = None
+        self.active_tcp_baseline: list[dict[str, Any]] | None = None
 
     def append(self, event: dict[str, Any]) -> None:
         with self._lock:
             self._events.append(event)
 
-    def events(
-        self, owner_epoch: str, after_sequence: int, *, limit: int = 16
+    def events(self, after_sequence: int, *, limit: int = 16
     ) -> dict[str, Any]:
-        assert owner_epoch == self.owner_epoch
         with self._lock:
             available = [
                 event for event in self._events if event["sequence"] > after_sequence
             ]
             events = available[:limit]
         next_sequence = events[-1]["sequence"] if events else after_sequence
+        memory_facts = {
+            name: value
+            for name, value in (("operations", self.operations),
+                                ("active_tcp_baseline", self.active_tcp_baseline))
+            if value is not None
+        }
         return {
+            **memory_facts,
             "execution_owner_ready": True,
             "runtime_faults": {
                 "operation_journal_write_fault": None,
@@ -1308,33 +1449,27 @@ class _StreamingExecution(_PagedExecution):
             "events": events,
             "has_more": len(available) > len(events),
             "next_after_sequence": next_sequence,
-            "owner_epoch": owner_epoch,
-            "schema_version": "manyforge.execution_event_page.v2",
+            "schema_version": "manyforge.execution_event_page.v3",
         }
 
 
 class _IdleExecution:
-    def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
+    def subscribe_events(self, after_cursor: int):
         # The pump reads the subscription only.
-        return paged_subscription(self, after_cursor, owner_epoch)
+        return paged_subscription(self, after_cursor)
 
-    def __init__(
-        self,
-        *,
-        include_epoch: bool = True,
-    ) -> None:
-        self.owner_epoch = "kernel-owner.runtime-epoch"
+    def __init__(self) -> None:
+        self.application_start_id = _APPLICATION_START_ID
         self.admission_generation = 1
-        self.include_epoch = include_epoch
         self.status_calls = 0
         self.events_calls = 0
 
     def identity(self) -> dict[str, Any]:
         self.status_calls += 1
-        details = {"owner_epoch": self.owner_epoch} if self.include_epoch else {}
+        details = {"application_start_id": self.application_start_id}
         return {
             "admission_generation": self.admission_generation,
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": "identity",
             "error": {
                 "code": "execution_owner_not_ready",
@@ -1344,13 +1479,11 @@ class _IdleExecution:
             "ok": False,
         }
 
-    def events(
-        self, _owner_epoch: str, _after_sequence: int, *, limit: int = 16
+    def events(self, _after_sequence: int, *, limit: int = 16
     ) -> dict[str, Any]:
         self.events_calls += 1
-        assert _owner_epoch == self.owner_epoch
         return {
-            "owner_epoch": self.owner_epoch, "execution_owner_ready": False,
+            "execution_owner_ready": False,
             "runtime_faults": {
                 "operation_journal_write_fault": None,
                 "program_runner_loss": None,
@@ -1371,24 +1504,23 @@ class _RetiringExecution(_PagedExecution):
             return super().identity()
         return {
             "admission_generation": self.admission_generation,
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": "identity",
             "error": {
                 "code": "execution_owner_not_ready",
-                "details": {"owner_epoch": self.owner_epoch},
+                "details": {"application_start_id": self.application_start_id},
                 "message": "the managed execution owner has no active physical product",
             },
             "ok": False,
         }
 
-    def events(
-        self, owner_epoch: str, after_sequence: int, *, limit: int = 16
+    def events(self, after_sequence: int, *, limit: int = 16
     ) -> dict[str, Any]:
         if self.retired:
             self.fail = False
         elif self.fail:
             self.retired = True
-        page = super().events(owner_epoch, after_sequence, limit=limit)
+        page = super().events(after_sequence, limit=limit)
         page["execution_owner_ready"] = not self.retired
         if not after_sequence:
             self.fail = True
@@ -1399,7 +1531,8 @@ def test_event_pump_delivers_without_frontend_polling_and_stops_cleanly() -> Non
     core = _RecordingCore()
     execution = _PagedExecution()
     pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
     )
     pump.start()
     assert core.completed.wait(timeout=1.0)
@@ -1407,10 +1540,10 @@ def test_event_pump_delivers_without_frontend_polling_and_stops_cleanly() -> Non
 
     assert pump.last_error is None
     assert len(core.ingested) == 1
-    assert core.ingested[0]["source_owner_epoch"] == execution.owner_epoch
+    assert "source_owner_epoch" not in core.ingested[0]
     assert core.ingested[0]["source_sequence"] == 1
     assert core.ingested[0]["payload_json"] == rfc8785.dumps(
-        _event(execution.owner_epoch, 1)["payload"]
+        _event(1)["payload"]
     ).decode("utf-8")
 
 
@@ -1420,7 +1553,8 @@ def test_event_pump_wakes_cold_state_when_kernel_admission_advances() -> None:
     changed = threading.Event()
     wakes: list[None] = []
     pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
     )
 
     def observe() -> None:
@@ -1450,9 +1584,9 @@ def test_event_pump_wakes_cold_state_when_component_states_change() -> None:
             {"component_id": "gripper", "lifecycle": "enabled"}
         ]
 
-        def events(self, owner_epoch: str, after_sequence: int, *, limit: int = 16):
+        def events(self, after_sequence: int, *, limit: int = 16):
             return {
-                **super().events(owner_epoch, after_sequence, limit=limit),
+                **super().events(after_sequence, limit=limit),
                 "component_states": self.component_states,
             }
 
@@ -1461,7 +1595,8 @@ def test_event_pump_wakes_cold_state_when_component_states_change() -> None:
     changed = threading.Event()
     wakes: list[None] = []
     pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
     )
 
     def observe() -> None:
@@ -1489,9 +1624,9 @@ def test_event_pump_wakes_cold_state_on_a_signal_value_not_its_age() -> None:
         samples: list[dict[str, Any]] = [{"signal_id": "io/di0", "value": False,
                                           "source": "device", "age_ns": 1, "fresh": True}]
 
-        def events(self, owner_epoch: str, after_sequence: int, *, limit: int = 16):
+        def events(self, after_sequence: int, *, limit: int = 16):
             return {
-                **super().events(owner_epoch, after_sequence, limit=limit),
+                **super().events(after_sequence, limit=limit),
                 "signal_samples": [dict(sample) for sample in self.samples],
             }
 
@@ -1500,7 +1635,8 @@ def test_event_pump_wakes_cold_state_on_a_signal_value_not_its_age() -> None:
     changed = threading.Event()
     wakes: list[None] = []
     pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
     )
 
     def observe() -> None:
@@ -1530,14 +1666,13 @@ def test_event_pump_wakes_cold_state_for_active_tcp_change() -> None:
     core = _RecordingCore()
     execution = _StreamingExecution()
     changed = threading.Event()
-    pump = ExecutionEventPump(core, execution, poll_seconds=0.01, page_limit=1)  # type: ignore[arg-type]
+    pump = ExecutionEventPump(core, execution, application_start_id=_APPLICATION_START_ID, poll_seconds=0.01, page_limit=1)  # type: ignore[arg-type]
     pump.set_change_observer(changed.set)
     pump.start()
     assert changed.wait(timeout=1.0)
     changed.clear()
     payload = {
-        "api_version": "manyforge.active_tcp_change.v2",
-        "owner_epoch": execution.owner_epoch,
+        "api_version": "manyforge.active_tcp_change.v3",
         "component_id": "robot-a",
         "previous": None,
         "entry": {"target": {"component_id": "robot-a", "command_target_id": "arm"},
@@ -1547,19 +1682,29 @@ def test_event_pump_wakes_cold_state_for_active_tcp_change() -> None:
         "registration_generation": 1,
         "sequence": 1,
     }
-    event = _event(execution.owner_epoch, 1)
+    event = _event(1)
     event.update(record_kind="active_tcp_changed", operation_id=None, operation_revision=None,
                  payload=payload, payload_digest=f"sha256:{hashlib.sha256(rfc8785.dumps(payload)).hexdigest()}")
     try:
+        # The baseline in `state` wakes the panel; the row goes to History.
+        execution.active_tcp_baseline = [{
+            "component_id": "robot-a", "entry": payload["entry"],
+            "registration_generation": 1, "sequence": 1,
+        }]
         execution.append(event)
         assert changed.wait(timeout=1.0)
+        for _ in range(100):
+            if core.ingested:
+                break
+            threading.Event().wait(0.01)
         assert core.ingested[0]["record_kind"] == "active_tcp_changed"
         assert pump.last_error is None
     finally:
         pump.shutdown()
 
 def test_event_pump_logs_only_error_transitions(caplog) -> None:
-    pump = ExecutionEventPump(_RecordingCore(), _StreamingExecution())
+    pump = ExecutionEventPump(
+        _RecordingCore(), _StreamingExecution(), application_start_id=_APPLICATION_START_ID)
     error = HeadlessApiError("execution_command_unavailable", "host lost")
     logger = logging.getLogger("manyforge_headless_api.execution")
     previous_level, previous_propagate = logger.level, logger.propagate
@@ -1586,12 +1731,14 @@ def test_event_pump_progress_advances_without_journal_events_or_cold_rebuild() -
     execution = _StreamingExecution()
     wakes: list[None] = []
     samples: list[list[dict[str, Any]]] = []
-    execution.progress = [_progress_row(execution.owner_epoch, 0.1)]
+    execution.progress = [_progress_row(0.1)]
+    execution.operations = {"change": 1, "faulted": [], "faulted_total": 0, "resident": [], "resident_total": 0}
     execution.append(
-        _progress_event(execution.owner_epoch, 1, state="executing", progress=0.1)
+        _progress_event(1, state="executing", progress=0.1)
     )
     pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
     )
     pump.set_change_observer(lambda: wakes.append(None))
     pump.set_progress_observer(samples.append)
@@ -1602,7 +1749,7 @@ def test_event_pump_progress_advances_without_journal_events_or_cold_rebuild() -
         threading.Event().wait(0.01)
     first_wake_count = len(wakes)
 
-    execution.progress = [_progress_row(execution.owner_epoch, 0.8)]
+    execution.progress = [_progress_row(0.8)]
     for _ in range(100):
         if samples and samples[-1] == execution.progress:
             break
@@ -1613,8 +1760,11 @@ def test_event_pump_progress_advances_without_journal_events_or_cold_rebuild() -
     assert len(core.ingested) == 1
     assert len(wakes) == first_wake_count == 1
 
+    # The completion changes the Kernel's operations (the wake); its row is
+    # History only.
+    execution.operations = {"change": 2, "faulted": [], "faulted_total": 0, "resident": [], "resident_total": 0}
     execution.append(
-        _progress_event(execution.owner_epoch, 2, state="completed", progress=1.0)
+        _progress_event(2, state="completed", progress=1.0)
     )
     for _ in range(100):
         if len(core.ingested) >= 2 and len(wakes) > first_wake_count:
@@ -1626,44 +1776,47 @@ def test_event_pump_progress_advances_without_journal_events_or_cold_rebuild() -
     assert len(wakes) == first_wake_count + 1
 
 
-def _progress_row(epoch: str, progress: float) -> dict[str, Any]:
-    return {"owner_epoch": epoch, "operation_id": "operation.1", "operation_revision": 1, "progress": progress}
+def _progress_row(progress: float) -> dict[str, Any]:
+    return {"operation_id": 1, "operation_revision": 1, "progress": progress}
 
 
-@pytest.mark.parametrize("invalid", [None, [{"progress": 0.5}], [_progress_row("wrong-owner", 0.5)],
-                                     [_progress_row("owner.1", float("nan"))],
-                                     [_progress_row("owner.1", 0.5)] * 2])
+@pytest.mark.parametrize("invalid", [None, [{"progress": 0.5}],
+                                     [{**_progress_row(0.5), "owner_epoch": "owner.1"}],
+                                     [_progress_row(float("nan"))],
+                                     [_progress_row(0.5)] * 2,
+                                     [{**_progress_row(0.5), "operation_id": "operation.1"}]])
 def test_native_progress_requires_bounded_valid_unique_owner_rows(monkeypatch, tmp_path, invalid) -> None:
     client = ExecutionCommandClient(tmp_path)
-    response = _page("owner.1", [])
+    response = _page([])
     response["operation_progress"] = invalid
     monkeypatch.setattr(client, "_exchange", lambda _command: response)
     with pytest.raises(HeadlessApiError, match="progress"):
-        client.events("owner.1", 0)
+        client.events(0)
 
 
 def test_native_progress_on_empty_journal_page(monkeypatch, tmp_path) -> None:
     client = ExecutionCommandClient(tmp_path)
-    response = _page("owner.1", [])
-    response["operation_progress"] = [_progress_row("owner.1", 0.6)]
+    response = _page([])
+    response["operation_progress"] = [_progress_row(0.6)]
     monkeypatch.setattr(client, "_exchange", lambda _command: response)
-    assert client.events("owner.1", 0)["operation_progress"] == response["operation_progress"]
+    assert client.events(0)["operation_progress"] == response["operation_progress"]
 
 
 def test_progress_is_latest_only_bounded_and_quiet_when_unchanged() -> None:
-    pump = ExecutionEventPump(_RecordingCore(), _StreamingExecution())
+    pump = ExecutionEventPump(
+        _RecordingCore(), _StreamingExecution(), application_start_id=_APPLICATION_START_ID)
     samples = []
     pump.set_progress_observer(samples.append)
-    pump._capture_progress([_progress_row("owner.1", 0.1)])
+    pump._capture_progress([_progress_row(0.1)])
     pump._publish_progress(1.0)
     for sequence in range(2, 9):
-        pump._capture_progress([_progress_row("owner.1", sequence / 10)])
+        pump._capture_progress([_progress_row(sequence / 10)])
         pump._publish_progress(1.1)
     assert len(samples) == 1
     pump._publish_progress(1.21)
     assert samples[-1][0]["progress"] == 0.8
     pump._publish_progress(2.0)
-    pump._capture_progress([_progress_row("owner.1", 0.8)])
+    pump._capture_progress([_progress_row(0.8)])
     pump._publish_progress(2.01)
     assert len(samples) == 2
     pump._capture_progress([])
@@ -1671,47 +1824,13 @@ def test_progress_is_latest_only_bounded_and_quiet_when_unchanged() -> None:
     assert samples[-1] == []
 
 
-def test_event_pump_operation_semantic_cache_evicts_at_the_native_resident_bound(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # The change-detection memo is bounded by eviction, never refusal.
-    monkeypatch.setattr(
-        "manyforge_headless_api.execution.MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS",
-        1,
-    )
-    core = _RecordingCore()
-    execution = _StreamingExecution()
-    for sequence in (1, 2, 3):
-        execution.append(
-            _progress_event(
-                execution.owner_epoch,
-                sequence,
-                state="executing",
-                progress=0.1,
-                operation_id=f"operation.{sequence}",
-            )
-        )
-    pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
-    )
-    pump.start()
-    for _ in range(200):
-        if pump.last_error is not None or any(
-            call.get("through_source_sequence") == 3 for call in core.completed_calls
-        ):
-            break
-        threading.Event().wait(0.01)
-    pump.shutdown()
-
-    assert pump.last_error is None
-    assert any(call.get("through_source_sequence") == 3 for call in core.completed_calls)
-
 def test_event_pump_reconciles_typed_idle_owner_through_stable_events() -> None:
     core = _RecordingCore()
     execution = _IdleExecution()
     wakes: list[None] = []
     pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
     )
     pump.set_change_observer(lambda: wakes.append(None))
     pump.start()
@@ -1729,10 +1848,7 @@ def test_event_pump_reconciles_typed_idle_owner_through_stable_events() -> None:
     assert execution.events_calls >= 1
     assert len(core.completed_calls) >= 4
     assert wakes == [None]
-    assert core.completed_calls[0] == {
-        "source_owner_epoch": execution.owner_epoch,
-        "through_source_sequence": 0,
-    }
+    assert core.completed_calls[0] == {"through_source_sequence": 0}
 
 
 def test_event_pump_wakes_cold_state_when_idle_kernel_admission_advances() -> None:
@@ -1741,7 +1857,8 @@ def test_event_pump_wakes_cold_state_when_idle_kernel_admission_advances() -> No
     changed = threading.Event()
     wakes: list[None] = []
     pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
     )
 
     def observe() -> None:
@@ -1762,13 +1879,111 @@ def test_event_pump_wakes_cold_state_when_idle_kernel_admission_advances() -> No
     assert execution.events_calls >= 1
 
 
+class _TableExecution(_IdleExecution):
+    """An idle owner whose stream ``state`` carries the v4 Kernel memory
+    facts (OD-205 (b), OD-213): the operations table and the Stop facts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.operations: dict[str, Any] = {"change": 1, "faulted": [], "faulted_total": 0, "resident": [], "resident_total": 0}
+        self.stop_progress_sequence = 0
+
+    def events(self, _after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
+        page = super().events(_after_sequence, limit=limit)
+        page["operations"] = dict(self.operations)
+        page["last_stop_event_id"] = None
+        page["stop_progress_sequence"] = self.stop_progress_sequence
+        return page
+
+
+def test_event_pump_wakes_the_panel_and_refreshes_rest_on_an_operations_change() -> None:
+    core = _RecordingCore()
+    execution = _TableExecution()
+    changed = threading.Event()
+    wakes: list[None] = []
+    settled: list[None] = []
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
+    )
+
+    def observe() -> None:
+        wakes.append(None)
+        changed.set()
+
+    pump.set_change_observer(observe)
+    pump.set_settled_observer(lambda: settled.append(None))
+    pump.start()
+    assert changed.wait(timeout=1.0)
+    changed.clear()
+    baseline, settled_baseline = len(wakes), len(settled)
+
+    # A change of an operation in Kernel memory, no row: one wake, one refresh.
+    execution.operations = {"change": 2, "faulted": [], "faulted_total": 0, "resident": [], "resident_total": 0}
+    assert changed.wait(timeout=1.0)
+    changed.clear()
+    assert len(wakes) == baseline + 1
+    assert len(settled) == settled_baseline + 1
+
+    # A participant ended its Stop: one wake, one refresh.
+    execution.stop_progress_sequence = 1
+    assert changed.wait(timeout=1.0)
+    changed.clear()
+    assert len(wakes) == baseline + 2
+    assert len(settled) == settled_baseline + 2
+
+    # Unchanged facts: quiet.
+    threading.Event().wait(0.1)
+    pump.shutdown()
+    assert len(wakes) == baseline + 2
+    assert len(settled) == settled_baseline + 2
+    assert pump.last_error is None
+    # Each table's alarm members go to the alarm owner as received (OD-205
+    # (b)); the resident list is the runner's (OD-213).
+    assert core.operation_tables[0] == {"change": 1, "faulted": [], "faulted_total": 0}
+    assert core.operation_tables[-1] == {"change": 2, "faulted": [], "faulted_total": 0}
+
+
+def test_events_reply_passes_the_stream_memory_facts_and_rejects_a_bad_table(
+    monkeypatch, tmp_path
+) -> None:
+    response = _page([])
+    response["operations"] = {"change": 0, "faulted": [], "faulted_total": 0, "resident": [], "resident_total": 0}
+    response["last_stop_event_id"] = 3
+    response["stop_progress_sequence"] = 7
+    client = ExecutionCommandClient(tmp_path)
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    page = client.events(0)
+    assert page["operations"] == {"change": 0, "faulted": [], "faulted_total": 0, "resident": [], "resident_total": 0}
+    assert page["last_stop_event_id"] == 3
+    assert page["stop_progress_sequence"] == 7
+    # The `events` command reply carries no table.
+    del response["operations"]
+    assert client.events(0)["operations"] is None
+    response["operations"] = {"change": -1, "faulted": [], "faulted_total": 0, "resident": [], "resident_total": 0}
+    with pytest.raises(HeadlessApiError):
+        client.events(0)
+    # OD-213 (stream v4): the resident list and its count are required, and
+    # the list never exceeds its count.
+    for resident in (
+        {"faulted_total": 0},
+        {"faulted_total": 0, "resident": [], "resident_total": -1},
+        {"faulted_total": 0, "resident": None, "resident_total": 0},
+        {"faulted_total": 0, "resident": [{"operation_id": 1}], "resident_total": 0},
+    ):
+        response["operations"] = {"change": 0, "faulted": [], **resident}
+        with pytest.raises(HeadlessApiError):
+            client.events(0)
+
+
 def test_event_pump_reconciles_idle_after_owner_retirement_at_event_high_water() -> (
     None
 ):
     core = _RecordingCore()
     execution = _RetiringExecution()
     pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
     )
     pump.start()
     deadline = threading.Event()
@@ -1780,56 +1995,34 @@ def test_event_pump_reconciles_idle_after_owner_retirement_at_event_high_water()
 
     assert pump.last_error is None
     assert len(core.ingested) == 1
-    assert core.completed_calls[-1] == {
-        "source_owner_epoch": execution.owner_epoch,
-        "through_source_sequence": 1,
-    }
+    assert core.completed_calls[-1] == {"through_source_sequence": 1}
 
 
-def test_event_pump_rejects_untyped_idle_owner_response() -> None:
-    core = _RecordingCore()
-    execution = _IdleExecution(include_epoch=False)
-    pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
-    )
-    pump.start()
-    deadline = threading.Event()
-    for _ in range(100):
-        if pump.last_error is not None:
-            break
-        deadline.wait(0.01)
-    pump.shutdown()
-
-    # The owner epoch comes only from the subscription's snapshot: an
-    # owner that names none never connects, so nothing completes.
-    assert pump.last_error is not None
-    assert "execution_owner_unavailable" in pump.last_error
-    assert not core.completed.is_set()
-
-
-def test_event_pump_preserves_global_stop_projection_null_identity() -> None:
+def test_event_pump_preserves_stop_acceptance_null_identity() -> None:
     core = _RecordingCore()
     execution = _PagedExecution()
-    execution.event = _stop_projection_event(execution.owner_epoch, 1)
+    execution.event = _stop_accepted_event(1)
     pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
     )
     pump.start()
     assert core.completed.wait(timeout=1.0)
     pump.shutdown()
 
     assert len(core.ingested) == 1
-    assert core.ingested[0]["record_kind"] == "stop_acceptance_projected"
+    assert core.ingested[0]["record_kind"] == "stop_event_accepted"
     assert core.ingested[0]["operation_id"] is None
     assert core.ingested[0]["operation_revision"] is None
 
 
-def test_event_pump_preserves_terminal_stop_projection_and_digest() -> None:
+def test_event_pump_preserves_stop_completion_and_digest() -> None:
     core = _RecordingCore()
     execution = _PagedExecution()
-    execution.event = _stop_terminal_event(execution.owner_epoch, 1)
+    execution.event = _stop_completed_event(1)
     pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
     )
     pump.start()
     assert core.completed.wait(timeout=1.0)
@@ -1837,9 +2030,10 @@ def test_event_pump_preserves_terminal_stop_projection_and_digest() -> None:
 
     assert pump.last_error is None
     assert len(core.ingested) == 1
-    assert core.ingested[0]["record_kind"] == "stop_terminal_projected"
-    assert core.ingested[0]["request_id"] is None
+    assert core.ingested[0]["record_kind"] == "stop_event_completed"
+    assert core.ingested[0]["request_key"] is None
     assert core.ingested[0]["operation_id"] is None
+    assert "request_id" not in core.ingested[0]
     assert core.ingested[0]["payload_json"] == rfc8785.dumps(
         execution.event["payload"]
     ).decode("utf-8")
@@ -1850,7 +2044,8 @@ def test_event_pump_marks_a_lost_current_source_unknown() -> None:
     core = _RecordingCore()
     execution = _PagedExecution()
     pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
     )
     pump.start()
     assert core.completed.wait(timeout=1.0)
@@ -1863,23 +2058,6 @@ def test_event_pump_marks_a_lost_current_source_unknown() -> None:
     assert "execution_owner_unavailable" in pump.last_error
 
 
-def test_operation_settled_classifies_rest_states_and_terminal_stop() -> None:
-    def event(state: str) -> dict[str, Any]:
-        return {"record_kind": "state_observed", "payload": {"operation_state": {"state": state}}}
-
-    for state in ("completed", "stopped", "failed", "interrupted",
-                  "intervention_required", "cancelled_pre_dispatch"):
-        assert ExecutionEventPump._operation_is_settled(event(state)), state  # noqa: SLF001
-    for state in ("queued", "planning", "validating", "prepared", "executing", "stopping"):
-        assert not ExecutionEventPump._operation_is_settled(event(state)), state  # noqa: SLF001
-    assert ExecutionEventPump._operation_is_settled(  # noqa: SLF001
-        {"record_kind": "stop_terminal_projected", "payload": {}}
-    )
-    assert not ExecutionEventPump._operation_is_settled(  # noqa: SLF001
-        {"record_kind": "stop_acceptance_projected", "payload": {}}
-    )
-
-
 def test_event_pump_keeps_alarm_sources_current_on_every_iteration() -> None:
     """The pump is the alarm-source refresh cadence.
 
@@ -1889,7 +2067,8 @@ def test_event_pump_keeps_alarm_sources_current_on_every_iteration() -> None:
     core = _RecordingCore()
     execution = _PagedExecution()
     pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
+        core, execution, application_start_id=_APPLICATION_START_ID,
+        poll_seconds=0.01, page_limit=1
     )
     core.alarm_refresh_failure = RuntimeError("source publication invalid")
     pump.start()
@@ -1910,7 +2089,7 @@ def test_event_pump_keeps_alarm_sources_current_on_every_iteration() -> None:
 
 def _recovery_response(retry_eligibility: object = "absent") -> dict[str, Any]:
     assessment: dict[str, Any] = {
-        "schema_version": "manyforge.kernel_recovery_assessment.v1",
+        "schema_version": "manyforge.kernel_recovery_assessment.v2",
         "assessment_revision": 2,
         "control_command_epoch": 0,
         "execution_id": 1,
@@ -1919,13 +2098,12 @@ def _recovery_response(retry_eligibility: object = "absent") -> dict[str, Any]:
     if retry_eligibility != "absent":
         assessment["retry_eligibility"] = retry_eligibility
     return {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "command": "get_operation_recovery",
         "ok": True,
         "operation_revision": 3,
-        "participants": [{"operation_id": "operation.1"}],
-        "stop_id": None,
-        "stop_generation": None,
+        "participants": [{"operation_id": 1}],
+        "stop_event_id": None,
         "recovery_assessment": assessment,
     }
 
@@ -1951,7 +2129,7 @@ def test_recovery_assessment_accepts_closed_retry_eligibility(
     )
     response = _recovery_response(eligibility)
     monkeypatch.setattr(client, "_exchange", lambda _command: response)
-    assert client.operation_recovery("operation.1")["recovery_assessment"][
+    assert client.operation_recovery(1)["recovery_assessment"][
         "retry_eligibility"
     ] == eligibility
 
@@ -1969,7 +2147,7 @@ def test_recovery_assessment_accepts_every_frozen_retry_reason(
     )
     response = _recovery_response(eligibility)
     monkeypatch.setattr(client, "_exchange", lambda _command: response)
-    assert client.operation_recovery("operation.1")["recovery_assessment"][
+    assert client.operation_recovery(1)["recovery_assessment"][
         "retry_eligibility"
     ] == eligibility
 
@@ -1980,7 +2158,7 @@ def test_recovery_assessment_without_retry_eligibility_stays_valid(
     client = ExecutionCommandClient(tmp_path)
     response = _recovery_response()
     monkeypatch.setattr(client, "_exchange", lambda _command: response)
-    assert "retry_eligibility" not in client.operation_recovery("operation.1")[
+    assert "retry_eligibility" not in client.operation_recovery(1)[
         "recovery_assessment"
     ]
 
@@ -2019,7 +2197,7 @@ def test_recovery_assessment_rejects_malformed_retry_eligibility(
     response = _recovery_response(eligibility)
     monkeypatch.setattr(client, "_exchange", lambda _command: response)
     with pytest.raises(HeadlessApiError) as malformed:
-        client.operation_recovery("operation.1")
+        client.operation_recovery(1)
     assert malformed.value.code == "execution_command_response_invalid"
 
 
@@ -2033,11 +2211,11 @@ def test_recovery_action_request_is_serialized_with_the_native_ten_fields(
         commands.append(command)
         request = command["request"]
         return {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": "apply_operation_recovery",
             "ok": True,
             "result": {
-                "request_id": request["request_id"],
+                "request_key": request["request_key"],
                 "action": request["action"],
                 "accepted": True,
                 "resulting_assessment": {},
@@ -2046,11 +2224,11 @@ def test_recovery_action_request_is_serialized_with_the_native_ten_fields(
 
     monkeypatch.setattr(client, "_exchange", exchange)
     client.apply_operation_recovery(
-        "operation.1",
+        1,
         3,
         OperationRecoveryActionRequest.model_validate(
             {
-                "request_id": "recovery.1",
+                "request_key": _RUNNER_KEY,
                 "action": "retry_motion_from_current_state",
                 "expected_assessment_revision": 2,
                 "expected_control_command_epoch": 0,
@@ -2060,14 +2238,12 @@ def test_recovery_action_request_is_serialized_with_the_native_ten_fields(
     )
     # The native decoder requires exactly these fields.
     assert set(commands[0]["request"]) == {
-        "request_id",
+        "request_key",
         "action",
         "principal_id",
         "expected_assessment_revision",
         "expected_control_command_epoch",
         "expected_execution_id",
-        "expected_stop_certificate_id",
-        "expected_stop_owner_generation",
         "reason",
     }
 
@@ -2081,14 +2257,13 @@ def test_operation_events_pass_retry_fact_payloads_through_unchanged(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     # Native ingest owns the event-level wire shapes; Python only forwards them.
-    owner_epoch = "execution.epoch.1"
-    event = copy.deepcopy(_event(owner_epoch, 1))
+    event = copy.deepcopy(_event(1))
     event["payload"]["api_version"] = "manyforge.operation_journal_record.v4"
     event["payload"]["operation_state"]["motion_retry_candidate"] = "not_a_candidate"
     client = ExecutionCommandClient(tmp_path)
-    response = _page(owner_epoch, [event])
+    response = _page([event])
     monkeypatch.setattr(client, "_exchange", lambda _command: response)
-    page = client.events(owner_epoch, 0)
+    page = client.events(0)
     assert page["events"][0] == event
 
 def test_stable_event_readiness_tracks_active_idle_active_same_kernel() -> None:
@@ -2105,11 +2280,11 @@ def test_stable_event_readiness_tracks_active_idle_active_same_kernel() -> None:
             return {
                 "ok": False,
                 "error": {"code": "execution_owner_not_ready", "message": "No product",
-                          "details": {"owner_epoch": self.owner_epoch}},
+                          "details": {"application_start_id": self.application_start_id}},
             }
 
-        def events(self, owner_epoch: str, after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
-            page = super().events(owner_epoch, after_sequence, limit=limit)
+        def events(self, after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
+            page = super().events(after_sequence, limit=limit)
             page["execution_owner_ready"] = self.ready
             return page
 
@@ -2117,7 +2292,7 @@ def test_stable_event_readiness_tracks_active_idle_active_same_kernel() -> None:
     execution = ModeExecution()
     wakes: list[bool] = []
     changed = threading.Event()
-    pump = ExecutionEventPump(core, execution, poll_seconds=0.01, page_limit=1)  # type: ignore[arg-type]
+    pump = ExecutionEventPump(core, execution, application_start_id=_APPLICATION_START_ID, poll_seconds=0.01, page_limit=1)  # type: ignore[arg-type]
     def observe() -> None:
         wakes.append(execution.ready)
         changed.set()
@@ -2139,7 +2314,7 @@ def test_stable_event_readiness_tracks_active_idle_active_same_kernel() -> None:
     assert execution.identities == 1
     assert wakes == [True, False, True]
     assert len(core.ingested) == 1  # The same journal cursor survives mode changes.
-    assert all(call["source_owner_epoch"] == execution.owner_epoch
+    assert all(set(call) == {"through_source_sequence"}
                for call in core.completed_calls)
 
 
@@ -2147,23 +2322,23 @@ def test_stable_event_readiness_tracks_active_idle_active_same_kernel() -> None:
 def test_page_parse_errors_keep_runtime_fault_context_for_pump(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, malformed_kind: Any
 ) -> None:
-    epoch = "kernel.1"
     fault = {
-        "request_owner_epoch": epoch, "write_kind": "state_observed",
+        "write_kind": "state_observed",
         "error": {"code": "io_error", "message": "Journal failed", "details": {}},
-        "operation_id": None, "operation_revision": None, "request_id": None,
-        "program_run_id": None, "execution_scope": None,
+        "operation_id": 1, "operation_revision": 1, "request_key": _STOP_KEY,
+        "program_run_id": 1,
+        "execution_scope": {"node_instance_id": "move", "node_attempt_id": 1},
     }
-    response = _page(epoch, [_event(epoch, 1)])
+    response = _page([_event(1)])
     response["runtime_faults"]["operation_journal_write_fault"] = fault
     response["event_page"]["events"][0]["record_kind"] = malformed_kind
     client = ExecutionCommandClient(tmp_path)
     monkeypatch.setattr(client, "_exchange", lambda _request: response)
     expected_error = HeadlessApiError if malformed_kind is None else TypeError
     with pytest.raises(expected_error) as failed:
-        client.events(epoch, 0, limit=1)
+        client.events(0, limit=1)
     snapshot = failed.value.runtime_fault_snapshot
-    assert snapshot["owner_epoch"] == epoch
+    assert set(snapshot) == {"runtime_faults", "execution_owner_ready"}
     assert snapshot["runtime_faults"]["operation_journal_write_fault"] == fault
 
     class FailedExecution(_PagedExecution):
@@ -2172,16 +2347,15 @@ def test_page_parse_errors_keep_runtime_fault_context_for_pump(
 
         def __init__(self) -> None:
             super().__init__()
-            self.owner_epoch = epoch
             self.event = response["event_page"]["events"][0]
 
-        def events(self, owner_epoch: str, after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
-            page = super().events(owner_epoch, after_sequence, limit=limit)
+        def events(self, after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
+            page = super().events(after_sequence, limit=limit)
             page["runtime_faults"] = response["runtime_faults"]
             return page
 
     core = _RecordingCore()
-    pump = ExecutionEventPump(core, FailedExecution(), poll_seconds=0.01, page_limit=1)  # type: ignore[arg-type]
+    pump = ExecutionEventPump(core, FailedExecution(), application_start_id=_APPLICATION_START_ID, poll_seconds=0.01, page_limit=1)  # type: ignore[arg-type]
     pump.start()
     assert core.unknown.wait(timeout=1.0)
     pump.shutdown()
@@ -2193,9 +2367,8 @@ def test_page_parse_errors_keep_runtime_fault_context_for_pump(
     assert pump.last_error is not None  # Fault delivery does not turn page failure into Good.
 
 
-def _rule_state_event(owner_epoch: str, sequence: int, state: str) -> dict[str, Any]:
+def _rule_state_event(sequence: int, state: str) -> dict[str, Any]:
     payload = {
-        "owner_epoch": owner_epoch,
         "catalog_generation": "1",
         "active_publication_generation": 1,
         "retained_bundle_id": "bundle.1",
@@ -2205,23 +2378,20 @@ def _rule_state_event(owner_epoch: str, sequence: int, state: str) -> dict[str, 
         "triggering_acquisition": None,
     }
     return {
-        "effect_pending": False,
         "occurred_at_ns": 100 + sequence,
         "occurred_at_wall": f"2026-08-07T10:00:01.00000000{sequence}Z",
         "operation_id": None,
         "operation_revision": None,
-        "owner_epoch": owner_epoch,
         "payload": payload,
         "payload_digest": f"sha256:{hashlib.sha256(rfc8785.dumps(payload)).hexdigest()}",
         "record_kind": "interrupt_rule_state_changed",
-        "request_id": None,
+        "request_key": None,
         "sequence": sequence,
     }
 
 
-def _rule_catalog(owner_epoch: str) -> dict[str, Any]:
+def _rule_catalog() -> dict[str, Any]:
     return {
-        "owner_epoch": owner_epoch,
         "catalog_generation": "1",
         "active_publication_generation": 1,
         "bundle": "bundle.1",
@@ -2231,15 +2401,13 @@ def _rule_catalog(owner_epoch: str) -> dict[str, Any]:
     }
 
 
-def _rule_baseline(owner_epoch: str, through: int) -> dict[str, Any]:
+def _rule_baseline(state: str = "clear") -> dict[str, Any]:
     return {"status": "ready", "snapshot": {
-        "owner_epoch": owner_epoch,
         "catalog_generation": "1",
         "active_publication_generation": 1,
         "retained_bundle_id": "bundle.1",
         "graph_revision": "graph.1",
-        "through_sequence": through,
-        "states": [{"rule_id": "door", "state": "clear", "triggering_acquisition": None}],
+        "states": [{"rule_id": "door", "state": state, "triggering_acquisition": None}],
     }}
 
 
@@ -2247,49 +2415,50 @@ def test_execution_client_passes_global_rule_wire_and_null_identity_state_rows(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = ExecutionCommandClient(tmp_path)
-    owner_epoch = "execution-host.epoch.rules"
-    row = _rule_state_event(owner_epoch, 1, "tripped")
-    response = _page(owner_epoch, [row])
-    response["interrupt_rule_catalog"] = _rule_catalog(owner_epoch)
+    row = _rule_state_event(1, "tripped")
+    response = _page([row])
+    response["interrupt_rule_catalog"] = _rule_catalog()
     response["interrupt_rule_state_baseline"] = {"status": "projection_pending"}
     monkeypatch.setattr(client, "_exchange", lambda _command: response)
-    page = client.events(owner_epoch, 0)
+    page = client.events(0)
     assert page["events"][0]["record_kind"] == "interrupt_rule_state_changed"
     assert page["interrupt_rule_catalog"] == response["interrupt_rule_catalog"]
     assert page["interrupt_rule_state_baseline"] == {"status": "projection_pending"}
 
-    row["operation_id"] = "operation.1"
+    row["operation_id"] = 1
     with pytest.raises(HeadlessApiError):
-        client.events(owner_epoch, 0)
+        client.events(0)
 
 
 class _RuleStreamingExecution(_StreamingExecution):
     def __init__(self) -> None:
         super().__init__()
-        self.baseline_through = 0
+        # The Kernel's in-memory rule state, independent of the rows.
+        self.baseline_state = "clear"
 
-    def events(self, owner_epoch: str, after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
-        page = super().events(owner_epoch, after_sequence, limit=limit)
-        page["interrupt_rule_catalog"] = _rule_catalog(owner_epoch)
-        page["interrupt_rule_state_baseline"] = _rule_baseline(owner_epoch, self.baseline_through)
+    def events(self, after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
+        page = super().events(after_sequence, limit=limit)
+        page["interrupt_rule_catalog"] = _rule_catalog()
+        page["interrupt_rule_state_baseline"] = _rule_baseline(self.baseline_state)
         return page
 
 
 def test_event_pump_projects_global_rules_and_forwards_rule_rows_to_the_historian() -> None:
     core = _RecordingCore()
     execution = _RuleStreamingExecution()
-    epoch = execution.owner_epoch
-    execution.append(_event(epoch, 1))
-    execution.append(_rule_state_event(epoch, 2, "tripped"))
+    execution.baseline_state = "tripped"
+    execution.append(_event(1))
+    execution.append(_rule_state_event(2, "tripped"))
     published: list[list[dict[str, Any]] | None] = []
-    pump = ExecutionEventPump(core, execution, poll_seconds=0.01)  # type: ignore[arg-type]
+    pump = ExecutionEventPump(core, execution, application_start_id=_APPLICATION_START_ID, poll_seconds=0.01)  # type: ignore[arg-type]
     pump.set_global_rules_observer(published.append)
     pump.start()
     for _ in range(200):
         if core.completed_calls and published:
             break
         threading.Event().wait(0.01)
-    execution.append(_rule_state_event(epoch, 3, "inactive"))
+    execution.baseline_state = "inactive"
+    execution.append(_rule_state_event(3, "inactive"))
     for _ in range(200):
         if published and published[-1] == [{"rule_id": "door", "state": "inactive", "keys": []}]:
             break
@@ -2298,22 +2467,20 @@ def test_event_pump_projects_global_rules_and_forwards_rule_rows_to_the_historia
 
     # Rule rows reach the historian unchanged; snapshots cover them.
     assert [row["source_sequence"] for row in core.ingested] == [1, 2, 3]
-    tripped = _rule_state_event(epoch, 2, "tripped")
+    tripped = _rule_state_event(2, "tripped")
     assert core.ingested[1] == {
-        "source_owner_epoch": epoch,
         "source_sequence": 2,
         "record_kind": "interrupt_rule_state_changed",
-        "request_id": None,
+        "request_key": None,
         "operation_id": None,
         "operation_revision": None,
         "occurred_at_ns": tripped["occurred_at_ns"],
         "occurred_at_wall": tripped["occurred_at_wall"],
-        "effect_pending": False,
         "payload_json": rfc8785.dumps(tripped["payload"]).decode("utf-8"),
         "payload_digest": tripped["payload_digest"],
     }
     assert set(json.loads(core.ingested[1]["payload_json"])) == {
-        "owner_epoch", "catalog_generation", "active_publication_generation",
+        "catalog_generation", "active_publication_generation",
         "retained_bundle_id", "graph_revision", "rule_id", "state",
         "triggering_acquisition",
     }
@@ -2327,10 +2494,11 @@ def test_event_pump_projects_global_rules_and_forwards_rule_rows_to_the_historia
 def test_event_pump_keeps_the_historian_feed_when_the_rule_wire_is_malformed(caplog) -> None:
     core = _RecordingCore()
     execution = _RuleStreamingExecution()
-    execution.append(_event(execution.owner_epoch, 1))
-    execution.append(_rule_state_event(execution.owner_epoch, 2, "exploded"))
+    execution.baseline_state = "exploded"
+    execution.append(_event(1))
+    execution.append(_rule_state_event(2, "tripped"))
     published: list[list[dict[str, Any]] | None] = []
-    pump = ExecutionEventPump(core, execution, poll_seconds=0.01)  # type: ignore[arg-type]
+    pump = ExecutionEventPump(core, execution, application_start_id=_APPLICATION_START_ID, poll_seconds=0.01)  # type: ignore[arg-type]
     pump.set_global_rules_observer(published.append)
     # Capture on the module logger itself: suite-wide logging configuration
     # (propagation or levels set by other tests) must not hide the warning.
@@ -2341,7 +2509,7 @@ def test_event_pump_keeps_the_historian_feed_when_the_rule_wire_is_malformed(cap
     try:
         pump.start()
         for _ in range(200):
-            if core.completed_calls and published:
+            if core.completed_calls and "global rule status is unreadable" in caplog.text:
                 break
             threading.Event().wait(0.01)
         pump.shutdown()
@@ -2349,10 +2517,10 @@ def test_event_pump_keeps_the_historian_feed_when_the_rule_wire_is_malformed(cap
         module_logger.removeHandler(caplog.handler)
         module_logger.setLevel(previous_level)
 
-    # The historian still receives the row; only the GUI fold is unreadable.
+    # The historian still receives the rows; only the GUI fold is unreadable
+    # (unknown, never clear: nothing is published).
     assert [row["source_sequence"] for row in core.ingested] == [1, 2]
-    # The lost row is not covered by the cut (through 0): pending, not clear.
-    assert published == [[{"rule_id": "door", "state": "pending", "keys": []}]]
+    assert published == []
     assert pump.last_error is None
     assert "global rule status is unreadable" in caplog.text
 
@@ -2372,10 +2540,10 @@ class _RefusingRuleRowCore(_RecordingCore):
 def test_event_pump_surfaces_a_refused_rule_row_like_any_refused_row() -> None:
     core = _RefusingRuleRowCore()
     execution = _RuleStreamingExecution()
-    execution.append(_event(execution.owner_epoch, 1))
-    execution.append(_rule_state_event(execution.owner_epoch, 2, "tripped"))
+    execution.append(_event(1))
+    execution.append(_rule_state_event(2, "tripped"))
     published: list[list[dict[str, Any]] | None] = []
-    pump = ExecutionEventPump(core, execution, poll_seconds=0.01)  # type: ignore[arg-type]
+    pump = ExecutionEventPump(core, execution, application_start_id=_APPLICATION_START_ID, poll_seconds=0.01)  # type: ignore[arg-type]
     pump.set_global_rules_observer(published.append)
     pump.start()
     for _ in range(200):
@@ -2396,26 +2564,25 @@ def test_event_pump_surfaces_a_refused_rule_row_like_any_refused_row() -> None:
 
 
 def test_active_tcp_change_and_baseline_survive_events_reply(monkeypatch, tmp_path):
-    owner_epoch = "execution-host.epoch.tcp"
-    row = _event(owner_epoch, 1)
+    row = _event(1)
     row.update(record_kind="active_tcp_changed", operation_id=None, operation_revision=None,
-               request_id=None, payload={"api_version": "manyforge.active_tcp_change.v2",
-                   "owner_epoch": owner_epoch, "component_id": "robot", "previous": None,
+               request_key=None, payload={"api_version": "manyforge.active_tcp_change.v3",
+                   "component_id": "robot", "previous": None,
                    "entry": None, "source": "reset", "offset_sent": False,
                    "registration_generation": 1, "sequence": 1})
     row["payload_digest"] = "sha256:" + hashlib.sha256(rfc8785.dumps(row["payload"])).hexdigest()
-    response = _page(owner_epoch, [row])
-    baseline = [{"component_id": "robot", "entry": None, "owner_epoch": owner_epoch,
+    response = _page([row])
+    baseline = [{"component_id": "robot", "entry": None,
                  "registration_generation": 1, "sequence": 1}]
     response["active_tcp_baseline"] = baseline
     client = ExecutionCommandClient(tmp_path)
     monkeypatch.setattr(client, "_exchange", lambda _command: response)
-    page = client.events(owner_epoch, 0)
+    page = client.events(0)
     assert page["active_tcp_baseline"] == baseline
     assert page["events"][0]["payload"] == row["payload"]
-    row["operation_id"] = "unexpected"
+    row["operation_id"] = 1
     with pytest.raises(HeadlessApiError):
-        client.events(owner_epoch, 0)
+        client.events(0)
 
 
 @pytest.mark.parametrize("payload", [
@@ -2431,7 +2598,7 @@ def test_public_execution_submit_forwards_set_tcp_and_attribution(monkeypatch, t
     request = OperationIntentRequest.model_validate(operation)
     client = ExecutionCommandClient(tmp_path)
     commands = []
-    rows = [{"component_id": "robot", "entry": None, "owner_epoch": "owner.1",
+    rows = [{"component_id": "robot", "entry": None,
              "registration_generation": 1, "sequence": 0}]
     def exchange(command):
         commands.append(command)
@@ -2458,7 +2625,7 @@ def _bounded_motion_path() -> dict[str, Any]:
 def _v2_preview_response(operation: dict[str, Any]) -> dict[str, Any]:
     response = _preview_response(operation)
     receipt = response["preview_receipt"]
-    receipt["schema_version"] = "manyforge.direct_control_motion_preview.v4"
+    receipt["schema_version"] = "manyforge.direct_control_motion_preview.v5"
     receipt["path_preview"] = _bounded_motion_path()
     receipt.pop("receipt_digest")
     receipt["receipt_digest"] = "sha256:" + hashlib.sha256(rfc8785.dumps(receipt)).hexdigest()
@@ -2653,7 +2820,7 @@ def test_failed_motion_preview_diagnostic_is_optional_and_never_a_receipt(monkey
     client = ExecutionCommandClient(tmp_path)
     request = _direct_motion_request()
     error = {"code": "validation_collision", "message": "collision", "details": {}}
-    response = {"api_version": "manyforge.execution_command_response.v4", "ok": False,
+    response = {"api_version": "manyforge.execution_command_response.v6", "ok": False,
                 "error": error, "diagnostic_preview": _bounded_diagnostic()}
     monkeypatch.setattr(client, "_exchange", lambda _command: copy.deepcopy(response))
     assert client.preview_motion(request, trusted_principal_id=None) == response
@@ -2673,7 +2840,7 @@ def test_failed_motion_preview_diagnostic_is_optional_and_never_a_receipt(monkey
 def test_cartesian_diagnostic_failure_details_survive_execution_client(monkeypatch, tmp_path):
     client = ExecutionCommandClient(tmp_path)
     failure = {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "ok": False,
         "error": {
             "code": "cartesian_incomplete",
@@ -2704,7 +2871,7 @@ def test_motion_preview_path_limits_and_oversized_failure_preserves_error(monkey
     request = _direct_motion_request()
     diagnostic = _bounded_diagnostic()
     diagnostic["pairs"][0]["body_b"] = "scene/" + "a" * (48 * 1024) + "/shape/0"
-    failure = {"api_version": "manyforge.execution_command_response.v4", "ok": False,
+    failure = {"api_version": "manyforge.execution_command_response.v6", "ok": False,
                "error": {"code": "validation_collision", "message": "collision", "details": {}},
                "diagnostic_preview": diagnostic}
     monkeypatch.setattr(client, "_exchange", lambda _command: copy.deepcopy(failure))
@@ -2739,3 +2906,49 @@ def test_motion_preview_accepts_unmapped_raw_body_identity():
     path["pairs"][0]["body_a"] = "custom raw body identity"
     path["samples"][1]["contacts"][0]["disposition"] = "unknown"
     assert _motion_path_preview_valid(path)
+
+
+def test_recovery_assessment_names_its_stop_by_event_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    client = ExecutionCommandClient(tmp_path)
+    response = _recovery_response()
+    monkeypatch.setattr(client, "_exchange", lambda _command: response)
+    response["stop_event_id"] = 9
+    assert client.operation_recovery(1)["stop_event_id"] == 9
+    for invalid in (0, "9", True):
+        response["stop_event_id"] = invalid
+        with pytest.raises(HeadlessApiError):
+            client.operation_recovery(1)
+    response["stop_event_id"] = None
+    response["recovery_assessment"]["schema_version"] = (
+        "manyforge.kernel_recovery_assessment.v1"
+    )
+    with pytest.raises(HeadlessApiError):
+        client.operation_recovery(1)
+
+
+def test_pump_keeps_the_journal_queue_level_for_the_disk_check() -> None:
+    """OD-215: the pump keeps the Kernel journal's (queue full, storage
+    failure) levels from each runtime-fault snapshot, for the disk check."""
+
+    core = _RecordingCore()
+    pump = ExecutionEventPump(core, _PagedExecution(), application_start_id=_APPLICATION_START_ID)  # type: ignore[arg-type]
+    assert pump.journal_disk_signals == (False, False)
+    fault = {
+        "write_kind": "state_observed",
+        "error": {"code": "operation_journal_records_lost", "message": "dropped", "details": {}},
+        "operation_id": None, "operation_revision": None, "request_key": None,
+        "program_run_id": None, "execution_scope": None, "queue_full": True,
+    }
+    faults = {"operation_journal_write_fault": fault, "program_runner_loss": None,
+              "kernel_internal_fault": None}
+    pump._observe_runtime_fault_snapshot({"runtime_faults": faults})
+    assert pump.journal_disk_signals == (True, False)
+    fault["queue_full"] = False
+    fault["error"]["code"] = "operation_journal_storage_failure"
+    pump._observe_runtime_fault_snapshot({"runtime_faults": faults})
+    assert pump.journal_disk_signals == (False, True)
+    faults["operation_journal_write_fault"] = None
+    pump._observe_runtime_fault_snapshot({"runtime_faults": faults})
+    assert pump.journal_disk_signals == (False, False)

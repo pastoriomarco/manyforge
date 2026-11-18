@@ -1361,10 +1361,15 @@ ControllerLaunchSupervisor::ensure(const ControllerLaunchCommand &command,
   }
   if (artifacts_root.empty() || !artifacts_root.is_absolute())
     fail("the artifacts root must be a nonempty absolute directory");
+  const auto &component = command.controllable_component_id;
+  const auto not_starting = [&] { return !starting_.contains(component); };
   while (true) {
     std::shared_ptr<ControllerLaunchProcess> predecessor;
     {
-      std::lock_guard lock(mutex_);
+      std::unique_lock lock(mutex_);
+      // A start of this component in progress is awaited (lock released) and
+      // its result read, as the map lock was awaited across its spawn before.
+      start_done_.wait(lock, not_starting);
       if (host_shutdown_started_)
         fail("controller launch submission is closed for host shutdown");
       const auto found = processes_.find(command.controllable_component_id);
@@ -1391,6 +1396,12 @@ ControllerLaunchSupervisor::ensure(const ControllerLaunchCommand &command,
     std::unique_lock lock(mutex_);
     if (host_shutdown_started_)
       fail("controller launch submission is closed for host shutdown");
+    if (!not_starting()) {
+      // Another caller began this component's start meanwhile: await it, then
+      // reconsider, as for any concurrent ownership change.
+      start_done_.wait(lock, not_starting);
+      continue;
+    }
     const auto found = processes_.find(command.controllable_component_id);
     const auto actual =
         found == processes_.end() ? nullptr : found->second.current;
@@ -1411,14 +1422,31 @@ ControllerLaunchSupervisor::ensure(const ControllerLaunchCommand &command,
             : found->second.counters;
     if (found != processes_.end())
       found->second.current.reset();
-    const auto spawned = spawner_->spawn(command.argv, artifacts_root,
-                                         parent_death_signal(command));
-    auto process =
-        std::shared_ptr<ControllerLaunchProcess>(new ControllerLaunchProcess(
-            command, spawned.pid, artifacts_root / "ros", std::move(context),
-            counters));
+    // Mark the start, spawn without the map lock (the spawner thread forks
+    // and execs), then publish and unmark under it. A failed start leaves the
+    // slot as cleared above (or absent) and its error escapes as before.
+    starting_.insert(component);
+    lock.unlock();
+    std::shared_ptr<ControllerLaunchProcess> process;
+    SpawnResult spawned;
+    try {
+      spawned = spawner_->spawn(command.argv, artifacts_root,
+                                parent_death_signal(command));
+      process =
+          std::shared_ptr<ControllerLaunchProcess>(new ControllerLaunchProcess(
+              command, spawned.pid, artifacts_root / "ros", std::move(context),
+              counters));
+    } catch (...) {
+      lock.lock();
+      starting_.erase(component);
+      start_done_.notify_all();
+      throw;
+    }
+    lock.lock();
     processes_.insert_or_assign(command.controllable_component_id,
                                 Slot{process, std::move(counters)});
+    starting_.erase(component);
+    start_done_.notify_all();
     lock.unlock();
     process->output_->attach_wake(spawner_->wake_fd);
     spawner_->register_output(spawned.output_read_fd, process->output_);
@@ -1472,8 +1500,11 @@ ControllerLaunchSupervisor::HostShutdownSnapshot
 ControllerLaunchSupervisor::BeginHostShutdown() {
   HostShutdownSnapshot snapshot;
   {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     host_shutdown_started_ = true;
+    // Closed above, so no start begins now; one in progress is published
+    // before the cut copies the slots.
+    start_done_.wait(lock, [&] { return starting_.empty(); });
     for (const auto &[component, slot] : processes_) {
       static_cast<void>(component);
       if (slot.current)
@@ -1522,7 +1553,8 @@ ControllerLaunchSupervisor::PollHostShutdown(
 void ControllerLaunchSupervisor::stop_all() noexcept {
   HostShutdownSnapshot current;
   {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
+    start_done_.wait(lock, [&] { return starting_.empty(); });
     for (const auto &[component, slot] : processes_) {
       static_cast<void>(component);
       if (slot.current)
@@ -1553,7 +1585,8 @@ ControllerLaunchSupervisor::component_output_counters(
     const std::string &component) const {
   std::shared_ptr<ControllerLaunchProcess::ForwardingCounters> counters;
   {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
+    start_done_.wait(lock, [&] { return !starting_.contains(component); });
     const auto found = processes_.find(component);
     if (found == processes_.end())
       return std::nullopt;
@@ -1571,7 +1604,10 @@ std::optional<ControllerLaunchObservation>
 ControllerLaunchSupervisor::observe(const std::string &controllable_component_id) {
   std::shared_ptr<ControllerLaunchProcess> current;
   {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
+    start_done_.wait(lock, [&] {
+      return !starting_.contains(controllable_component_id);
+    });
     const auto found = processes_.find(controllable_component_id);
     if (found == processes_.end() || !found->second.current)
       return std::nullopt;

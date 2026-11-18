@@ -52,6 +52,7 @@ from types import MappingProxyType
 import uuid
 from typing import TYPE_CHECKING, Any, Callable, Mapping, NoReturn
 
+from .application_identity import format_application_start_id
 from .authoring_identity import canonical_digest
 from .scenario_artifacts import scenario_project_read_only
 
@@ -223,8 +224,8 @@ class AuthoringOperationContext:
     """
 
     operation: str
-    request_owner_epoch: str | None = None
-    request_id: str | None = None
+    application_start_id: int | None = None
+    request_key: bytes | None = None
     owner_transaction_id: str | None = None
     written_path: str | None = None
 
@@ -729,10 +730,16 @@ class AuthoringWorkspace:
             "operation": None if context is None else context.operation,
             "cause": cause,
             "written_path": self._contained_written_path,
-            "request_owner_epoch": (
-                None if context is None else context.request_owner_epoch
+            "application_start_id": (
+                None
+                if context is None or context.application_start_id is None
+                else format_application_start_id(context.application_start_id)
             ),
-            "request_id": None if context is None else context.request_id,
+            "request_key": (
+                None
+                if context is None or context.request_key is None
+                else context.request_key.hex()
+            ),
             "owner_transaction_id": (
                 None if context is None else context.owner_transaction_id
             ),

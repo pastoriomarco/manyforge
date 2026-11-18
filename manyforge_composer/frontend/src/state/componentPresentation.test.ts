@@ -18,6 +18,7 @@ import {
   faultPresentation,
   flattenComponentTree,
   prepareAllTargets,
+  haltCauseText,
   latchCauseText,
   latchSummary,
   offeredActions,
@@ -33,8 +34,8 @@ const robot = {
   component_id: 'lite6_robot',
   lifecycle: 'fault',
   fault: {
-    code: 'fault_estop', message: 'C2', clearable: true, operator_action: 'enable',
-    vendor_code: 'C2', vendor_text: 'emergency IO', since_ns: 5,
+    code: 'fault_protective_stop', message: 'C31', clearable: true, operator_action: 'enable',
+    vendor_code: 'C31', vendor_text: 'Abnormal current', since_ns: 5,
   },
   activity: 'idle',
   streams: [{ stream_id: 'joints', freshness: 'fresh', age_ns: 1000 }],
@@ -95,10 +96,10 @@ describe('component model v2 presentation', () => {
     const state = parseComponentState(robot, 'state');
     expect(componentTone(state)).toBe('error');
     const fault = faultPresentation(state.fault!);
-    expect(fault.title).toBe('Emergency stop active');
+    expect(fault.title).toBe('Robot stopped itself');
     expect(fault.operatorAction).toBe('Enable');
-    expect(fault.vendor).toBe('Vendor: C2 · emergency IO');
-    expect(componentSummary(state)).toBe('Fault · Emergency stop active');
+    expect(fault.vendor).toBe('Vendor: C31 · Abnormal current');
+    expect(componentSummary(state)).toBe('Fault · Robot stopped itself');
   });
 
   it('declares sim_reset as a component capability and offers it as an action', () => {
@@ -156,6 +157,39 @@ describe('component model v2 presentation', () => {
     }, 'state');
     expect(componentTone(state)).toBe('ok');
     expect(componentSummary(state)).toBe('Enabled · Simulation not playing');
+  });
+
+  it('shows a component whose last Stop ended uncontained as stop unconfirmed, activity unknown (F2)', () => {
+    const reason = { code: 'stop_unconfirmed', message: 'Its last Stop ended uncontained.' };
+    const state = parseComponentState({
+      component_id: 'lite6_robot', lifecycle: 'enabled', activity: 'unknown', reason,
+      streams: [], capabilities: [], observed_at_ns: 1,
+    }, 'state');
+    expect(componentTone(state)).toBe('warning');
+    expect(componentSummary(state)).toBe('Enabled · Stop not confirmed · activity unknown');
+    // The latch cause carries the same reason.
+    const latch = parseCellLatch({ latched: true, causes: [
+      { component_id: 'lite6_robot', kind: 'activity_unknown', reason },
+    ] });
+    expect(latch.causes[0]?.reason).toEqual(reason);
+    expect(latchCauseText(latch.causes[0]!)).toBe('lite6_robot: Stop not confirmed');
+    expect(latchCauseText({ component_id: 'a', kind: 'activity_unknown' }))
+      .toBe("a: can't report whether it is still moving");
+  });
+
+  it('names the cause of a Halt from its Stop, and nothing for other or unknown kinds', () => {
+    const cause = (kind: string, sourceLabel: string | null = null) => haltCauseText({ kind, sourceLabel });
+    expect(cause('halt')).toBe('Halted by the operator.');
+    expect(cause('halt', 'composer_ui')).toBe('Halted by the operator.');
+    expect(cause('halt', 'headless.disk_cannot_keep_records'))
+      .toBe("Halted: the disk cannot keep ManyForge's records.");
+    expect(cause('internal_fault')).toBe('Halted: internal fault.');
+    expect(cause('stop_failed_halt')).toBe('Halted: a stop was not confirmed.');
+    expect(cause('runner_loss')).toBe('Halted: the Program runner stopped answering.');
+    for (const kind of ['planned_stop', 'program_end', 'cell_stop', 'stop_all', 'some_future_kind', '']) {
+      expect(cause(kind)).toBeNull();
+    }
+    expect(haltCauseText(null)).toBeNull();
   });
 
   it('summarizes the latch as "N errors require attention · <leading cause>"', () => {
@@ -226,7 +260,7 @@ describe('component model v2 presentation', () => {
 describe('machines: owners and members', () => {
   const owner = parseComponentState({
     component_id: 'lite6', lifecycle: 'fault',
-    fault: { code: 'fault_estop', message: 'C2', clearable: true, operator_action: 'recover',
+    fault: { code: 'fault_protective_stop', message: 'C31', clearable: true, operator_action: 'recover',
       concerns: ['lite6_robot', 'lite6_robot_controller_io'], since_ns: 5 },
     activity: 'idle', streams: [], capabilities: ['power_off', 'reboot'], observed_at_ns: 10,
   }, 'owner');
@@ -265,8 +299,8 @@ describe('machines: owners and members', () => {
   });
 
   it('shows a member offline through its owner with the owner\'s own fault', () => {
-    expect(reasonText(arm, [owner, arm])).toBe('through lite6: Emergency stop active');
-    expect(componentSummary(arm, [owner, arm])).toBe('Offline · through lite6: Emergency stop active');
+    expect(reasonText(arm, [owner, arm])).toBe('through lite6: Robot stopped itself');
+    expect(componentSummary(arm, [owner, arm])).toBe('Offline · through lite6: Robot stopped itself');
     // Without the owner's state: the producer's text.
     expect(reasonText(arm)).toBe('through lite6: C2');
     expect(reasonText(plc)).toBeNull();
@@ -295,7 +329,7 @@ describe('machines: owners and members', () => {
     ]);
     // A member whose owner isn't listed, a tool whose parent isn't: on their own.
     expect(tree([gripper, arm], { lite_gripper: 'other' })).toEqual([['lite_gripper', 0], ['lite6_robot', 0]]);
-    expect(componentStateDetail(arm, [owner, arm])).toBe('through lite6: Emergency stop active');
+    expect(componentStateDetail(arm, [owner, arm])).toBe('through lite6: Robot stopped itself');
     expect(componentStateDetail(plc)).toBeNull();
     // Prepare all: not prepared or offline; Enable all: not yet enabled (the
     // backend prepares an unprepared one first), never an owner.
@@ -303,7 +337,7 @@ describe('machines: owners and members', () => {
     expect(enableAllTargets([{ ...owner, lifecycle: 'prepared' }, arm, io, plc]))
       .toEqual(['lite6_robot', 'lite6_robot_controller_io']);
     expect(latchCauseText({ component_id: 'lite6', kind: 'fault', fault: owner.fault }))
-      .toBe('lite6: Emergency stop active (concerns lite6_robot, lite6_robot_controller_io)');
+      .toBe('lite6: Robot stopped itself (concerns lite6_robot, lite6_robot_controller_io)');
   });
 });
 

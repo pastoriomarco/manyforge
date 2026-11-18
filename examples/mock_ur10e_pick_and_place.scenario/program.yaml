@@ -46,6 +46,18 @@
         },
         {
           "children": [],
+          "instance_id": "gripper_open_reached",
+          "node_id": "gripper.check_status",
+          "parameters": {
+            "expected_state": "reached",
+            "target": {
+              "command_target_id": "gripper",
+              "component_id": "robotiq_2f_140"
+            }
+          }
+        },
+        {
+          "children": [],
           "instance_id": "move_to_pick_approach",
           "node_id": "motion.move_to_pose",
           "parameters": {

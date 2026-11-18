@@ -29,6 +29,7 @@ from manyforge_behavior.orchestration_ports import (
     OwnerTaskSnapshot,
     OwnerTaskState,
     ProgramRunPortContext,
+    require_run_number,
 )
 
 from .simulation_control import SimulationControlClient
@@ -412,7 +413,7 @@ class SimulationProgramTaskPort:
             max_workers=1,
             thread_name_prefix="manyforge-simulation-program",
         )
-        self._runs: dict[str, _BoundRun] = {}
+        self._runs: dict[int, _BoundRun] = {}
         self._tasks: dict[str, _Task] = {}
         self._lock = RLock()
         self._closed = False
@@ -442,8 +443,8 @@ class SimulationProgramTaskPort:
                 raise RuntimeError("Program-run simulation context retention is full")
             self._runs[context.program_run_id] = bound
 
-    def unbind(self, program_run_id: str) -> None:
-        _text(program_run_id, field_name="program_run_id")
+    def unbind(self, program_run_id: int) -> None:
+        require_run_number(program_run_id)
         with self._lock:
             tasks = [
                 task
@@ -723,6 +724,12 @@ class SimulationProgramTaskPort:
             self._runs.clear()
 
 
+class SimulationRosThreadNotStopped(RuntimeError):
+    """The rclpy spin thread outlived its stop; node and context stay live."""
+
+    ros_left_running = True
+
+
 class RosSimulationProgramTaskPort:
     """Own an isolated rclpy node plus the focused Program task adapter."""
 
@@ -747,6 +754,7 @@ class RosSimulationProgramTaskPort:
         )
         self._ros_executor = SingleThreadedExecutor(context=self._context)
         self._ros_executor.add_node(self._node)
+        self._ros_left_running = False
         self._spin_thread = Thread(
             target=self._ros_executor.spin,
             name="manyforge-simulation-rclpy",
@@ -773,7 +781,7 @@ class RosSimulationProgramTaskPort:
     def bind(self, context: ProgramRunPortContext) -> None:
         self._port.bind(context)
 
-    def unbind(self, program_run_id: str) -> None:
+    def unbind(self, program_run_id: int) -> None:
         self._port.unbind(program_run_id)
 
     def start(
@@ -793,11 +801,24 @@ class RosSimulationProgramTaskPort:
     def acknowledge(self, task_id: str, identity: NodeAttemptIdentity) -> None:
         self._port.acknowledge(task_id, identity)
 
+    @property
+    def ros_left_running(self) -> bool:
+        """True once a stop left the spin thread running (OD-236).
+
+        Node and context then stay live; the owning process ends at once
+        rather than finalizing the interpreter with them.
+        """
+
+        return self._ros_left_running
+
     def _shutdown_ros(self, timeout_s: float) -> None:
         self._ros_executor.shutdown(timeout_sec=timeout_s + 1.0)
         self._spin_thread.join(timeout=timeout_s + 1.0)
         if self._spin_thread.is_alive():
-            raise RuntimeError("simulation rclpy executor did not stop")
+            self._ros_left_running = True
+            raise SimulationRosThreadNotStopped(
+                "simulation rclpy executor did not stop"
+            )
         self._node.destroy_node()
         if self._context.ok():
             self._context.shutdown()
@@ -839,6 +860,7 @@ __all__ = [
     "SIMULATION_PROGRAM_SITE_CONFIG_VERSION",
     "SimulationProgramSiteConfig",
     "SimulationProgramTaskPort",
+    "SimulationRosThreadNotStopped",
     "create_ros_simulation_program_port",
     "load_simulation_program_site_config",
 ]

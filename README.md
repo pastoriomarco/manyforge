@@ -101,7 +101,7 @@ picks the part and places it.
 ### Real robots
 
 Machine facts (robot addresses, extra project folders) go in a site settings
-file, `{"schema":"manyforge.site.v1","device_addresses":{"lite6_main":"192.168.1.31"}}`;
+file, `{"schema":"manyforge.site.v2","device_addresses":{"lite6_main":"192.168.1.31"}}`;
 export its absolute path as `MANYFORGE_DEV_SITE_SETTINGS` before `start`.
 Scenarios name the address key, never the address. Physical robot use
 requires attended sessions and the integrator's own safety system; a
@@ -143,9 +143,9 @@ host path. After changing configured folders, stop the workbench and start it
 again to update their mounts. See
 [Project folders](docs/operations/DEVELOPMENT_WORKBENCH.md#project-folders).
 
-Previous session journals are kept under the workbench's runtime state root;
-retention is limited, see the
-[session note](docs/operations/FRESH_CHECKOUT_CHECKLIST.md).
+Every start begins with an empty cell. The journals of previous runs are kept
+under the workbench's runtime state root in `previous-runs/`; retention is
+limited, see the [session note](docs/operations/FRESH_CHECKOUT_CHECKLIST.md).
 
 The optional Composer AI tab uses your OpenAI-compatible model server,
 configured through an `ai_model` component and an AI assistant component. See the
@@ -180,11 +180,11 @@ stop the runtime.
 - **Version:** [VERSION](VERSION) (SemVer). Every package declares the same
   version; `./scripts/ci/verify-version-sync.sh` checks it.
 - **Release notes:** [CHANGELOG.md](CHANGELOG.md). Releases are `vX.Y.Z` tags
-  on `main`: `v0.1.0`, `v0.2.0`, then `v0.2.1`.
+  on `main`: `v0.1.0`, `v0.2.0`, `v0.2.1`, then `v0.3.0`.
 - **Pinned companions:** a release builds the UFACTORY xArm driver from the
   fork `pastoriomarco/xarm_ros2`, branch `lyrical-no-gazebo`, at the commit in
   `Dockerfile.ros-lyrical-full` (`XARM_SOURCE_COMMIT`) and
-  `manyforge_xarm_control/vendor/driver.yaml`; for `v0.2.1` that is
+  `manyforge_xarm_control/vendor/driver.yaml`; for `v0.3.0` that is
   `3654c9afef9c51c3bd6723d65ccecca166bc38b0`. The release procedure is in
   [CONTRIBUTING.md](CONTRIBUTING.md#releases).
 - **Security:** report vulnerabilities as described in

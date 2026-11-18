@@ -8,7 +8,6 @@ namespace manyforge::core {
 /// Immutable identity and the existing shared watch/rule registration bound.
 /// Reading this requires no sample and grants no source qualification.
 struct IoRuleServiceConfigurationDTO final {
-  RequestOwnerEpoch owner_epoch;
   std::uint64_t catalog_generation;
   std::size_t maximum_registrations;
 };

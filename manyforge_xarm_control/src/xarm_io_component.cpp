@@ -67,12 +67,12 @@ std::int64_t xarm_io_stale_after_ns(const XArmIoSettings &settings) {
 XArmIoComponent::XArmIoComponent(XArmIoComponentConfig config,
                                  std::shared_ptr<const IXArmDriver> driver,
                                  std::function<bool(std::int64_t)> owner_usable,
-                                 core::IClock &clock)
+                                 core::IClock &clock, std::function<bool()> owner_arming)
     : config_(std::move(config)),
       confirmation_bound_ns_(xarm_io_confirmation_bound_ns(config_.settings)),
       stale_after_ns_(xarm_io_stale_after_ns(config_.settings)),
       driver_(std::move(driver)), owner_usable_(std::move(owner_usable)), clock_(clock),
-      tracks_(config_.signals.size()) {
+      owner_arming_(std::move(owner_arming)), tracks_(config_.signals.size()) {
   if (!driver_ || !owner_usable_) throw std::invalid_argument("the xArm I/O needs its owner");
   if (!(config_.settings.rate_hz > 0.0) || !(config_.settings.tgpio_monitor_frequency_hz > 0.0))
     throw std::invalid_argument("the xArm I/O stream settings must be positive");
@@ -179,6 +179,7 @@ core::ComponentState XArmIoComponent::State(const std::int64_t now_ns) const {
   core::ComponentState state;
   state.observed_at_ns = now_ns;
   const bool owner_usable = owner_usable_(now_ns);
+  const bool owner_arming = owner_arming_ && owner_arming_();
   std::lock_guard lock(mutex_);
   core::ComponentStream stream{std::string(kStreamId), core::StreamFreshness::kNone, std::nullopt};
   if (last_sample_at_ns_) {
@@ -194,8 +195,9 @@ core::ComponentState XArmIoComponent::State(const std::int64_t now_ns) const {
                    : unknown             ? core::ComponentActivity::kUnknown
                                          : core::ComponentActivity::kIdle;
   // Its own stream only while the owner is usable; otherwise the core shows
-  // the member offline through its owner.
-  if (lifecycle_ == ComponentLifecycle::kNotPrepared || !owner_usable ||
+  // the member offline through its owner. The owner's arming pauses the
+  // stream: no fault meanwhile (the stream still shows stale).
+  if (lifecycle_ == ComponentLifecycle::kNotPrepared || !owner_usable || owner_arming ||
       stream.freshness == core::StreamFreshness::kFresh) {
     stale_since_.reset();
     return state;

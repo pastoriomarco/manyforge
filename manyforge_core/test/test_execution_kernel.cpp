@@ -26,9 +26,9 @@
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_core/runtime_participant_stop_readiness.hpp>
-#include <manyforge_core/stop_terminal_reducer.hpp>
 #include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <manyforge_core/testing/fake_execution_port.hpp>
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include <manyforge_core/trajectory/trajectory_splice.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
@@ -44,6 +44,8 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #if defined(__unix__)
@@ -1132,12 +1134,10 @@ class MockExecution : public IExecutionBackend {
   }
 
   ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& participant,
-                           const ControllerGoalId& controller_goal_id,
-                           ControllerGoalGeneration controller_goal_generation) override {
+                           const ControllerGoalId& controller_goal_id) override {
     auto handle =
         execute_trajectory(std::get<PreparedMotionExecutionDTO>(participant.payload).trajectory);
     handle.controller_goal_id = controller_goal_id;
-    handle.controller_goal_generation = controller_goal_generation;
     handle.prepared_contract_digest = participant.prepared_contract_digest;
     return handle;
   }
@@ -1190,6 +1190,10 @@ class MockExecution : public IExecutionBackend {
   ExecutionProgressHazardClaimResult claim_execution_progress_hazard(
       std::uint64_t /*execution_generation*/) noexcept override {
     return ExecutionProgressHazardClaimResult::kGenerationMismatch;
+  }
+
+  bool close_execution_progress_hazard(std::uint64_t /*execution_generation*/) noexcept override {
+    return false;
   }
 
   void publish_observed_state(std::int64_t timestamp_ns, const std::vector<double>& positions,
@@ -1327,12 +1331,10 @@ class ControlledExecution : public IExecutionBackend {
   }
 
   ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& participant,
-                           const ControllerGoalId& controller_goal_id,
-                           ControllerGoalGeneration controller_goal_generation) override {
+                           const ControllerGoalId& controller_goal_id) override {
     auto handle =
         execute_trajectory(std::get<PreparedMotionExecutionDTO>(participant.payload).trajectory);
     handle.controller_goal_id = controller_goal_id;
-    handle.controller_goal_generation = controller_goal_generation;
     handle.prepared_contract_digest = participant.prepared_contract_digest;
     return handle;
   }
@@ -1451,6 +1453,11 @@ class ControlledExecution : public IExecutionBackend {
     return execution_progress_publication_
                ? execution_progress_publication_->claim_hazard_authority(execution_generation)
                : ExecutionProgressHazardClaimResult::kGenerationMismatch;
+  }
+
+  bool close_execution_progress_hazard(std::uint64_t execution_generation) noexcept override {
+    return execution_progress_publication_ &&
+           execution_progress_publication_->close_hazard_authority(execution_generation);
   }
 
   void publish_observed_state(std::int64_t timestamp_ns, const std::vector<double>& positions,
@@ -1894,15 +1901,40 @@ class ThreadSafeManualScheduler final : public IScheduler {
     return pending_changed_.wait_for(lock, timeout, [&]() { return pending_.contains(deadline); });
   }
 
+  // Test hook: models other work (another robot's check, an I/O rule pass)
+  // held on the shared RuntimeSafety lane. A drain of that lane waits, within
+  // its bound, until the lane is released; unheld it returns at once, as the
+  // default does for this synchronous scheduler.
+  bool drain_for(SchedulerPriority priority, std::chrono::nanoseconds timeout) override {
+    if (priority != SchedulerPriority::RuntimeSafety) return true;
+    std::unique_lock<std::mutex> lock(mu_);
+    ++runtime_safety_drains_;
+    return lane_changed_.wait_for(lock, timeout, [this]() { return !runtime_safety_lane_held_; });
+  }
+  void set_runtime_safety_lane_held(bool held) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      runtime_safety_lane_held_ = held;
+    }
+    lane_changed_.notify_all();
+  }
+  std::size_t runtime_safety_drains() const {
+    std::lock_guard<std::mutex> lock(mu_);
+    return runtime_safety_drains_;
+  }
+
  private:
   mutable std::mutex mu_;
   std::condition_variable pending_changed_;
+  std::condition_variable lane_changed_;
   std::multimap<TimePoint, std::pair<ScheduleHandle, std::function<void()>>> pending_;
   uint64_t next_handle_ = 1;
   std::size_t schedule_calls_ = 0;
   bool fail_next_cancel_{false};
   ScheduleHandle failed_cancel_handle_{0U};
   ScheduleHandle last_cancelled_handle_{0U};
+  bool runtime_safety_lane_held_{false};
+  std::size_t runtime_safety_drains_{0};
 };
 
 class ThreadSafeFakeClock final : public IClock {
@@ -1960,7 +1992,7 @@ Pose3DTO make_pose(double x, double y, double z, QuaternionDTO orientation = {0.
 }
 
 ExecuteRequestDTO make_test_request(const std::string& move_id = "move_1") {
-  auto req = testing::make_test_execute_request({"j1", "j2"}, "run-execution-kernel-test");
+  auto req = testing::make_test_execute_request({"j1", "j2"}, ProgramRunNumber(148U));
   req.binding.resources = {ResourceId("joint.1"), ResourceId("joint.2")};
   req.binding.retained_bundle_id = test_projection_revision().retained_bundle_id;
   req.binding.graph_revision = test_projection_revision().graph_revision;
@@ -1992,7 +2024,7 @@ ActionSpanDTO make_test_action_span() {
   ActionSpanDTO span;
   span.action_source = ActionSource::kProgramNode;
   span.action_span_id = "span-move-001";
-  span.program_run_id = "run-action-span-001";
+  span.program_run_id = ProgramRunNumber(150U);
   span.node_instance_id = "root/sequence/move_to_pick";
   span.node_attempt_id = "attempt-move-001";
   span.parent_node_attempt_id = "attempt-plan-001";
@@ -2008,10 +2040,11 @@ void expect_detail(const std::map<std::string, std::string>& details, const std:
 
 void expect_action_span_details(const std::map<std::string, std::string>& details,
                                 const ActionSpanDTO& span) {
-  expect_detail(details, "program_run_id", span.program_run_id);
+  expect_detail(details, "program_run_id", std::to_string(span.program_run_id->value()));
   expect_detail(details, "action_source", to_string(span.action_source));
   expect_detail(details, "action_span_id", span.action_span_id);
-  expect_detail(details, "action_span_program_run_id", span.program_run_id);
+  expect_detail(details, "action_span_program_run_id",
+                std::to_string(span.program_run_id->value()));
   expect_detail(details, "node_instance_id", span.node_instance_id);
   expect_detail(details, "node_attempt_id", span.node_attempt_id);
   expect_detail(details, "parent_node_attempt_id", span.parent_node_attempt_id);
@@ -2390,20 +2423,28 @@ LookaheadPermitDriveResult drive_until_lookahead_permit_admitted(
   return result;
 }
 
+// Both addressed Stop fence calls in the addressed owner's order: call (1)
+// (the linearising gate close, under the owner's lock), then call (2) (the
+// session/pending writes, cancels and wake-ups, after the owner's unlock).
+AddressedParticipantStopFenceResult fence_addressed_stop(
+    IResolvedParticipantExecutionEngine& engine, const std::uint64_t execution_id) {
+  const auto fenced = engine.fence_addressed_participant_stop(execution_id);
+  engine.complete_addressed_participant_stop_fence(execution_id, fenced.closed_gates);
+  return fenced;
+}
+
 KernelRecoveryActionRequestDTO bound_recovery_request(
     const KernelRecoveryAssessmentDTO& assessment, RecoveryAction action,
     std::string principal_id = "operator_test", std::string reason = "test recovery action",
     std::string request_id = "test-recovery-action") {
   KernelRecoveryActionRequestDTO request;
-  request.request_id = std::move(request_id);
+  request.request_key = TestRequestKey(request_id);
   request.action = action;
   request.principal_id = std::move(principal_id);
   request.reason = std::move(reason);
   request.expected_assessment_revision = assessment.assessment_revision;
   request.expected_control_command_epoch = assessment.control_command_epoch;
   request.expected_execution_id = assessment.execution_id;
-  request.expected_stop_certificate_id = assessment.stop_certificate_id;
-  request.expected_stop_owner_generation = assessment.stop_owner_generation;
   return request;
 }
 
@@ -2903,8 +2944,7 @@ TEST_F(ExecutionKernelTest, IndependentGripperParticipantHasNoMotionLifecycleOrW
 
 TEST_F(ExecutionKernelTest, MotionParticipantRejectsPreparedCommandLifecycleWithoutEffect) {
   const auto dispatch = kernel.DispatchPreparedCapabilityCommand(
-      1U, ContentDigest("command.digest"), ControllerGoalId("command.goal"),
-      ControllerGoalGeneration(1U));
+      1U, ContentDigest("command.digest"), ControllerGoalId{OperationNumber(901U), 1U, 1U});
   EXPECT_FALSE(dispatch.ok());
   EXPECT_FALSE(kernel.ObservePreparedCapabilityCommand(1U).ok());
   EXPECT_FALSE(kernel.CancelPreparedCapabilityCommand(1U).ok());
@@ -3971,9 +4011,9 @@ TEST_F(ExecutionKernelTest, MotionPreviewTimeoutAfterSuccessDoesNotInventFailure
   if (!readiness.ok()) throw std::logic_error(readiness.error().message);
   const auto& sealed = binding.value();
   auto& resolved = request.binding;
-  resolved.operation_id = OperationId("operation.prepared");
-  resolved.participant_id = OperationParticipantId("participant.prepared");
-  if (resolved.program_run_id.empty()) resolved.program_run_id = ProgramRunId("run.prepared");
+  resolved.operation_id = OperationNumber(1001U);
+  resolved.participant_id = OperationParticipantId{OperationNumber(957U), 1U};
+  if (!resolved.program_run_id) resolved.program_run_id = ProgramRunNumber(117U);
   resolved.program_id = sealed.program_id;
   resolved.program_revision = sealed.program_revision;
   resolved.program_binding_id = sealed.program_binding_id;
@@ -4111,6 +4151,141 @@ TEST_F(ExecutionKernelTest, NeverDispatchedPreparedFailureIsRetryableWithoutBack
   EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
   EXPECT_EQ(execution.reset_count, reset_count_before);
   EXPECT_EQ(execution.execute_count, 0);
+}
+
+// OD-257: holds the execute worker right after it settled its execution
+// (its kParticipantSettled event, on the worker thread), before its terminal
+// cleanup ends, and reports the worker thread's exit (after
+// `finish_execute_worker`) through a thread_local destructor.
+class HeldTerminalCleanup final {
+ public:
+  explicit HeldTerminalCleanup(ExecutionKernel& kernel)
+      : kernel_(kernel),
+        test_thread_(std::this_thread::get_id()),
+        handle_(kernel.subscribe_events([this](const KernelEvent& event) {
+          if (event.type != KernelEventType::kParticipantSettled ||
+              std::this_thread::get_id() == test_thread_)
+            return;
+          struct ExitSignal {
+            HeldTerminalCleanup* owner{};
+            ~ExitSignal() {
+              if (owner != nullptr) owner->set(owner->exited_);
+            }
+          };
+          thread_local ExitSignal exit_signal;
+          exit_signal.owner = this;
+          std::unique_lock lock(mutex_);
+          held_ = true;
+          changed_.notify_all();
+          changed_.wait(lock, [this] { return released_; });
+        })) {}
+  ~HeldTerminalCleanup() {
+    Release();
+    WaitWorkerExited();
+    kernel_.unsubscribe_events(handle_);
+  }
+  bool WaitHeld() { return wait(held_); }
+  void Release() { set(released_); }
+  bool WaitWorkerExited() { return wait(exited_); }
+
+ private:
+  void set(bool& flag) {
+    std::lock_guard lock(mutex_);
+    flag = true;
+    changed_.notify_all();
+  }
+  bool wait(const bool& flag) {
+    std::unique_lock lock(mutex_);
+    return changed_.wait_for(lock, std::chrono::seconds(5), [&] { return flag; });
+  }
+
+  ExecutionKernel& kernel_;
+  std::thread::id test_thread_;
+  std::mutex mutex_;
+  std::condition_variable changed_;
+  bool held_{};
+  bool released_{};
+  bool exited_{};
+  SubscriptionHandle handle_;
+};
+
+void fail_preparation_retryably(MockPlanner& planner) {
+  PlanResultDTO plan_err;
+  plan_err.error = ErrorDTO{std::string(to_string(ErrorCode::kExecutionRejected)),
+                            "RoboPlan could not resolve the pose goal",
+                            {{"reason", "native_ik_no_solution"}}};
+  planner.next_result = plan_err;
+}
+
+// OD-257: a failed execution, like a stopped one, is not decided while its
+// execute worker's terminal cleanup still runs: waiting
+// (`terminal_cleanup_pending`), never retry_ready without close permission.
+TEST_F(ExecutionKernelTest, FailedExecutionWaitsForTerminalCleanupThenIsRetryReadyAndCloseEligible) {
+  fail_preparation_retryably(planner);
+  HeldTerminalCleanup cleanup(kernel);
+  const auto prepared = kernel.PrepareMotion(prepared_motion_request(make_test_request("ik")));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  ASSERT_TRUE(cleanup.WaitHeld());
+  scheduler.advance_to(clock.now());
+
+  const auto pending = kernel.get_recovery_assessment();
+  EXPECT_EQ(pending.execution_state, ExecutionState::kFailed);
+  EXPECT_EQ(pending.recovery_class, RecoveryClass::kFailedValidation);
+  EXPECT_EQ(pending.status, RecoveryAssessmentStatus::kWaiting);
+  EXPECT_EQ(pending.reason_code, reason_codes::kRecoveryTerminalCleanupPending);
+  EXPECT_FALSE(pending.retry_admissible);
+  EXPECT_FALSE(pending.eligible_close);
+  EXPECT_FALSE(stopped_awaiting_terminal_cleanup(pending));
+
+  cleanup.Release();
+  ASSERT_TRUE(cleanup.WaitWorkerExited());
+  scheduler.advance_to(clock.now());
+  const auto decided = kernel.get_recovery_assessment();
+  EXPECT_EQ(decided.execution_state, ExecutionState::kFailed);
+  EXPECT_EQ(decided.status, RecoveryAssessmentStatus::kRetryReady);
+  EXPECT_EQ(decided.reason_code, reason_codes::kRecoveryFailedValidationRetryable);
+  EXPECT_TRUE(decided.retry_admissible);
+  EXPECT_TRUE(decided.eligible_close);
+}
+
+// OD-257: the cleanup's completion while a refresh runs (captured before the
+// completion, its scheduled flag not yet cleared) is not lost: the coalesced
+// refresh re-runs and publishes the decided assessment.
+TEST_F(ExecutionKernelTest, TerminalCleanupCompletionDuringRunningRefreshIsRepublished) {
+  fail_preparation_retryably(planner);
+  HeldTerminalCleanup cleanup(kernel);
+  const auto test_thread = std::this_thread::get_id();
+  std::atomic<bool> armed{false};
+  bool completed_inside_refresh = false;
+  const auto inside_refresh = kernel.subscribe_events([&](const KernelEvent& event) {
+    // Dispatched by the running refresh after its capture, before it clears
+    // its scheduled flag: the worker ends its cleanup exactly here.
+    if (event.type != KernelEventType::kRecoveryAssessmentChanged ||
+        std::this_thread::get_id() != test_thread || !armed.load() || completed_inside_refresh)
+      return;
+    completed_inside_refresh = true;
+    cleanup.Release();
+    EXPECT_TRUE(cleanup.WaitWorkerExited());
+  });
+  struct Unsubscribe {
+    ExecutionKernel& kernel;
+    SubscriptionHandle handle;
+    ~Unsubscribe() { kernel.unsubscribe_events(handle); }
+  } unsubscribe{kernel, inside_refresh};
+  const auto prepared = kernel.PrepareMotion(prepared_motion_request(make_test_request("ik")));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  ASSERT_TRUE(cleanup.WaitHeld());
+  armed.store(true);
+
+  scheduler.advance_to(clock.now());  // The refresh captured the pending cleanup.
+  ASSERT_TRUE(completed_inside_refresh);
+  EXPECT_FALSE(kernel.get_recovery_assessment().eligible_close);
+
+  scheduler.advance_to(clock.now());  // The coalesced refresh.
+  const auto decided = kernel.get_recovery_assessment();
+  EXPECT_EQ(decided.status, RecoveryAssessmentStatus::kRetryReady);
+  EXPECT_TRUE(decided.retry_admissible);
+  EXPECT_TRUE(decided.eligible_close);
 }
 
 TEST_F(ExecutionKernelTest, AutomaticPlanningRetryUsesExactPreparedFailureCause) {
@@ -4425,21 +4600,10 @@ TEST_F(ExecutionKernelTest, RecoveryObservationPollAllowsReentrantLifecycleAdmis
           const auto before = owner.get_recovery_assessment();
           ASSERT_TRUE(before.observed_state_fresh);
           ASSERT_TRUE(before.observed_state_at_rest);
-          // Use the existing pure terminal reducer's typed empty-Full-Stop
-          // fixture. The subscriber probes lifecycle reentry with a foreign
-          // candidate, never with missing strong certificate identities.
-          const auto certificate = ReduceStopTerminal(
-              {StopCertificateId("reentrant.poll.certificate"), StopCertificateRevision(1U),
-               StopId("reentrant.poll.stop"), StopGeneration(1U),
-               {StopRequestedSelectorKindDTO::kExplicitFull, ContentDigest(kTestDigestA),
-                std::nullopt, std::nullopt},
-               StopResolutionDispositionDTO::kExact,
-               StopScopeResolutionReasonDTO::kExplicitFullStop, {},
-               {{1U, StopResolutionDispositionDTO::kExact,
-                 StopScopeResolutionReasonDTO::kExplicitFullStop, ContentDigest(kTestDigestB),
-                 {}, {}, {}}},
-               {}, {}, {}, std::nullopt, clock.now(), std::nullopt});
-          ASSERT_TRUE(certificate.ok()) << certificate.error().message;
+          // A well-formed settled spring outcome; the subscriber probes
+          // lifecycle reentry with a foreign candidate.
+          const ParticipantStopOutcomeDTO incumbent{StopEventId(1003U), StopPhase::kStopped,
+                                                    StopMode::kSpringReturn, 0U, false, 1U};
           unsigned reentered = 0U;
           std::optional<KernelEvent> published;
           const auto subscription = owner.subscribe_events([&](const KernelEvent& event) {
@@ -4453,7 +4617,7 @@ TEST_F(ExecutionKernelTest, RecoveryObservationPollAllowsReentrantLifecycleAdmis
             // addressed fallback subscriber. A foreign ID refuses without an
             // effect after acquiring the existing lifecycle mutex.
             const auto nested = owner.PrepareColdMotionAfterStop(
-                std::numeric_limits<std::uint64_t>::max(), certificate.value());
+                std::numeric_limits<std::uint64_t>::max(), incumbent);
             ASSERT_FALSE(nested.ok());
             EXPECT_EQ(nested.error().details.at("reason"), "spring_return_candidate_stale");
             ++reentered;
@@ -7258,8 +7422,9 @@ TEST_F(ExecutionKernelTest, RuntimeCollisionIsAFactAndCertifiedRetirementIsMotio
   EXPECT_EQ(ended_as(controlled_kernel), "working:Executing");
 
   // The owner fences and certifies containment; the backend then ends.
-  ASSERT_EQ(controlled_kernel.fence_addressed_participant_stop(result.value()),
-            AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  const auto fenced = fence_addressed_stop(controlled_kernel, result.value());
+  ASSERT_EQ(fenced.disposition, AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  EXPECT_EQ(fenced.closed_gates, 0U);
   controlled_execution.release();
   EXPECT_TRUE(controlled_kernel.wait_for_completion(1'000'000'000));
   EXPECT_EQ(ended_as(controlled_kernel), "preempted_by_addressed_stop");
@@ -7315,8 +7480,8 @@ TEST_F(ExecutionKernelTest, AddressedStopFenceWinsLookaheadHandoffBeforeInterrup
     const auto surface = event.details.find("surface");
     if (event.type == KernelEventType::kCollisionDetected && surface != event.details.end() &&
         surface->second == "addressed_runtime_collision_authority") {
-      controlled_kernel.fence_addressed_participant_stop(
-          addressed_execution_id.load(std::memory_order_acquire));
+      (void)fence_addressed_stop(controlled_kernel,
+                                 addressed_execution_id.load(std::memory_order_acquire));
     }
     {
       std::lock_guard<std::mutex> lock(events_mutex);
@@ -9142,6 +9307,51 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
   EXPECT_EQ(ended_as(controlled_kernel), "completed");
 }
 
+// OD-190: a motion's start does not wait for other work on the shared
+// RuntimeSafety lane; detach still waits for the whole lane.
+TEST_F(ExecutionKernelTest, CollisionMonitoring_StartDoesNotWaitForOtherSharedLaneWork) {
+  auto controlled_execution_owner = std::make_shared<ControlledExecution>();
+  ControlledExecution& controlled_execution = *controlled_execution_owner;
+  auto local_clock_owner = std::make_shared<ThreadSafeFakeClock>();
+  ThreadSafeManualScheduler local_scheduler;
+  auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
+  auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
+  auto local_collision_engine = std::make_shared<MockCollisionEngine>();
+  auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
+  ExecutionKernel controlled_kernel{planner_owner,
+                                    test_execution_kernel_ports(context_owner),
+                                    controlled_execution_owner,
+                                    local_clock_owner,
+                                    local_scheduler,
+                                    local_cache_owner};
+  configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
+                                         local_collision_engine, local_runtime_engine);
+
+  local_scheduler.set_runtime_safety_lane_held(true);
+  auto dispatched = std::async(std::launch::async, [&]() {
+    return prepare_and_dispatch(controlled_kernel, make_test_request());
+  });
+  const bool execute_called = controlled_execution.wait_until_execute_called();
+  local_scheduler.set_runtime_safety_lane_held(false);
+  const auto result = dispatched.get();
+  ASSERT_TRUE(result.ok());
+  EXPECT_TRUE(execute_called) << "monitoring start waited for the held shared lane";
+  EXPECT_EQ(local_scheduler.runtime_safety_drains(), 0u);
+  ASSERT_TRUE(wait_for_state(controlled_kernel, ExecutionState::kExecuting));
+  controlled_execution.complete();
+  controlled_kernel.wait_for_completion();
+  EXPECT_EQ(ended_as(controlled_kernel), "completed");
+
+  local_scheduler.set_runtime_safety_lane_held(true);
+  auto detached = std::async(std::launch::async, [&]() {
+    return controlled_kernel.detach(std::chrono::steady_clock::time_point::max());
+  });
+  EXPECT_EQ(detached.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+  local_scheduler.set_runtime_safety_lane_held(false);
+  EXPECT_TRUE(detached.get().ok());
+  EXPECT_GE(local_scheduler.runtime_safety_drains(), 1u);
+}
+
 // --- Full cycle test ---
 
 // --- Status queries ---
@@ -10255,7 +10465,6 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedSc
                                          binding.control_binding_id,
                                          binding.control_binding_revision,
                                          binding.controller_goal_id,
-                                         binding.controller_goal_generation,
                                          binding.controller_topology_id,
                                          binding.topology_revision,
                                          binding.control_route_id,
@@ -10330,7 +10539,11 @@ TEST_F(ExecutionKernelTest, ZeroSpeedHoldTimeoutAsksTheAddressedOwnerToStopOnce)
     std::mutex events_mu;
     std::vector<KernelEvent> stop_requests;
     held_kernel.subscribe_events([&](const KernelEvent& event) {
-      if (event.type != KernelEventType::kStopRequested) return;
+      // The clock jumps 1 s per poll with no collision check, so the OD-217
+      // deadman also raises its fault; only the hold timeout is counted here.
+      if (event.type != KernelEventType::kStopRequested ||
+          event.details.at("reason") != "zero_speed_hold_timeout")
+        return;
       std::lock_guard lock(events_mu);
       stop_requests.push_back(event);
     });
@@ -10358,6 +10571,148 @@ TEST_F(ExecutionKernelTest, ZeroSpeedHoldTimeoutAsksTheAddressedOwnerToStopOnce)
       EXPECT_EQ(stop_requests.front().details.at("reason"), "zero_speed_hold_timeout");
       EXPECT_EQ(stop_requests.front().execution_id, accepted.value());
     }
+  }
+}
+
+// OD-217: the diagnostics reply reads the check monitor's counters and the
+// configured period; an engine that never checked reads zeros.
+TEST_F(ExecutionKernelTest, RuntimeCollisionCheckTimingIsTheMonitorsCounters) {
+  const auto timing = kernel.runtime_collision_check_timing();
+  EXPECT_EQ(timing.callbacks_started, 0U);
+  EXPECT_EQ(timing.late_periods, 0U);
+  EXPECT_EQ(timing.missed_periods, 0U);
+  EXPECT_EQ(kernel.runtime_collision_check_period_ns(),
+            ExecutionKernelConfig{}.collision_monitor_period_ns);
+  const auto metrics = kernel.get_metrics();
+  EXPECT_EQ(metrics.runtime_collision_tick_late_periods, timing.late_periods);
+  EXPECT_EQ(metrics.runtime_collision_tick_missed_periods, timing.missed_periods);
+  EXPECT_EQ(metrics.runtime_collision_monitor_period_ns,
+            static_cast<std::uint64_t>(kernel.runtime_collision_check_period_ns()));
+}
+
+// OD-217 deadman. The worker's script runs once per poll, before the worker
+// reads the clock, and advances the clock 30 ms; the monitor's own scheduled
+// checks never run (the scheduler is not advanced), so every check is the
+// script's. Period 50 ms: stale means the newest verified sample (or the
+// motion's start, time 0) is older than 100 ms when the worker looks. The
+// Stop is the runtime monitor's fault fact; its reason is "checks stopped"
+// unless a clear check finished within 100 ms (then: position feedback lost).
+TEST_F(ExecutionKernelTest, RuntimeChecksDeadmanJudgesTheVerifiedSampleTime) {
+  class ScriptedExecution final : public ControlledExecution {
+   public:
+    std::function<void()> poll;
+    ExecutionHandle execute_trajectory(const TrajectoryDTO& trajectory) override {
+      auto handle = ControlledExecution::execute_trajectory(trajectory);
+      const auto wait = handle.wait_for_completion;
+      handle.wait_for_completion = [this, wait](int64_t) {
+        if (wait(1)) return true;
+        poll();
+        return wait(1);
+      };
+      return handle;
+    }
+  };
+  enum class Check { kNone, kFreshSample, kSameSample };
+  constexpr auto kNo = Check::kNone;
+  constexpr auto kFresh = Check::kFreshSample;
+  constexpr auto kSame = Check::kSameSample;
+  struct DeadmanStop {
+    int poll = 0;
+    KernelEvent event;
+  };
+  const auto run = [&](const std::vector<Check>& script) {
+    auto execution_owner = std::make_shared<ScriptedExecution>();
+    ScriptedExecution& execution = *execution_owner;
+    auto clock_owner = std::make_shared<ThreadSafeFakeClock>();
+    ThreadSafeFakeClock& clock = *clock_owner;
+    ThreadSafeManualScheduler scheduler;
+    auto cache = std::make_shared<TrajectoryCache>(CacheConfig{10});
+    auto world = std::make_shared<MockCollisionWorldPublisher>();
+    auto validation_engine = std::make_shared<MockCollisionEngine>();
+    auto runtime_engine = std::make_shared<MockCollisionEngine>();
+    ExecutionKernel deadman_kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+                                   execution_owner, clock_owner,
+                                   scheduler,       cache};
+    configure_runtime_collision_monitoring(deadman_kernel, world, validation_engine,
+                                           runtime_engine);
+    std::mutex events_mu;
+    std::vector<DeadmanStop> stops;
+    std::atomic<int> polls{0};
+    deadman_kernel.subscribe_events([&](const KernelEvent& event) {
+      if (event.type != KernelEventType::kCollisionDetected) return;
+      std::lock_guard lock(events_mu);
+      stops.push_back({polls.load(), event});
+    });
+    execution.poll = [&] {
+      const auto index = static_cast<std::size_t>(++polls);  // 1-based
+      clock.advance(30'000'000);
+      if (index > script.size()) {
+        execution.complete();
+        return;
+      }
+      const auto check = script[index - 1U];
+      if (check == Check::kFreshSample) execution.set_progress(0.5, {0.25, 0.75}, clock.now());
+      if (check != Check::kNone) {
+      EXPECT_TRUE(deadman_kernel.collision_check_tick().ok());
+    }
+    };
+    // The backend's initial sample was received at 0, the motion's start.
+    const auto accepted = prepare_and_dispatch(deadman_kernel, make_test_request("deadman"));
+    EXPECT_TRUE(accepted.ok()) << accepted.error().message;
+    if (!accepted.ok()) return stops;
+    EXPECT_TRUE(deadman_kernel.wait_for_completion(2'000'000'000));
+    EXPECT_EQ(deadman_kernel.get_metrics().runtime_collision_ticks_faulted, 0U);
+    std::lock_guard lock(events_mu);
+    return stops;
+  };
+
+  {
+    SCOPED_TRACE("no check: not before two periods, then once");
+    // Polls at 30, 60, 90 ms are within two periods of the start (the first
+    // check is due at 50 ms); 120 ms is not.
+    const auto stops = run({kNo, kNo, kNo, kNo, kNo, kNo});
+    ASSERT_EQ(stops.size(), 1U);
+    EXPECT_EQ(stops.front().poll, 4);
+    EXPECT_EQ(stops.front().event.details.at("reason"), "runtime_monitor_checks_stopped");
+    EXPECT_EQ(stops.front().event.details.at("reason_code"), "runtime_collision_monitor");
+    EXPECT_EQ(stops.front().event.details.at("in_collision"), "false");
+    EXPECT_EQ(stops.front().event.details.at("verified_sample_age_ns"), "120000000");
+    EXPECT_EQ(stops.front().event.details.at("check_finished_age_ns"), "120000000");
+    EXPECT_EQ(stops.front().event.details.at("stale_after_ns"), "100000000");
+  }
+  {
+    SCOPED_TRACE("one late check of fresh data");
+    // Checks at 60 ms and 150 ms (the one due at 100 ms ran a period late):
+    // the verified sample is never older than 90 ms.
+    const auto stops = run({kNo, kFresh, kNo, kNo, kFresh, kNo, kNo});
+    EXPECT_TRUE(stops.empty());
+  }
+  {
+    SCOPED_TRACE("a recent check of old data does not count for its period");
+    // The check at 150 ms verifies the sample received at 60 ms (90 ms old,
+    // still within the 100 ms age limit): the stamp stays 60 ms, so at
+    // 180 ms the newest verified data is 120 ms old although a check just
+    // completed. That check finished 30 ms before, so the checks run and the
+    // data is old: the Stop names lost position feedback.
+    const auto stops = run({kNo, kFresh, kNo, kNo, kSame, kNo, kNo});
+    ASSERT_EQ(stops.size(), 1U);
+    EXPECT_EQ(stops.front().poll, 6);
+    EXPECT_EQ(stops.front().event.details.at("reason"), "stale_observed_robot_state");
+    EXPECT_EQ(stops.front().event.details.at("verified_sample_age_ns"), "120000000");
+    EXPECT_EQ(stops.front().event.details.at("check_finished_age_ns"), "30000000");
+  }
+  {
+    SCOPED_TRACE("feedback stops while the checks run: feedback lost, never checks stopped");
+    // The last sample arrives at 30 ms; the checks at 60, 90 and 120 ms find
+    // it clear (at most 90 ms old). At 150 ms its verified data is 120 ms
+    // old, the last check finished 30 ms before.
+    const auto stops = run({kFresh, kSame, kSame, kSame, kNo, kNo});
+    ASSERT_EQ(stops.size(), 1U);
+    EXPECT_EQ(stops.front().poll, 5);
+    EXPECT_EQ(stops.front().event.details.at("reason"), "stale_observed_robot_state");
+    EXPECT_EQ(stops.front().event.details.at("cause"), "stale_observed_robot_state");
+    EXPECT_EQ(stops.front().event.details.at("verified_sample_age_ns"), "120000000");
+    EXPECT_EQ(stops.front().event.details.at("check_finished_age_ns"), "30000000");
   }
 }
 
@@ -10451,7 +10806,7 @@ TEST_F(ExecutionKernelTest, CertifiedResetHardStopsAWindingDownBackendThenComple
   ASSERT_TRUE(result.ok()) << result.error().message;
   ASSERT_TRUE(winding.wait_until_execute_called());
   ASSERT_TRUE(wait_for_state(winding_kernel, ExecutionState::kExecuting));
-  ASSERT_EQ(winding_kernel.fence_addressed_participant_stop(result.value()),
+  ASSERT_EQ(fence_addressed_stop(winding_kernel, result.value()).disposition,
             AddressedParticipantStopFenceDisposition::kDispatchCommitted);
   winding.release();
   ASSERT_TRUE(winding_kernel.wait_for_completion(1'000'000'000));
@@ -10603,7 +10958,7 @@ TEST_F(ExecutionKernelTest, Execute_ProgramRunIdStampsEventsAndDoesNotLeakAcross
   });
 
   auto request = make_test_request("program_run_correlated_move");
-  request.binding.program_run_id = ProgramRunId("run-abc123");
+  request.binding.program_run_id = ProgramRunNumber(131U);
   auto result = execute_sync(request);
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(kernel.acknowledge_completed(result.value()).accepted);
@@ -10616,14 +10971,14 @@ TEST_F(ExecutionKernelTest, Execute_ProgramRunIdStampsEventsAndDoesNotLeakAcross
       ASSERT_NE(it, event.details.end())
           << "event missing program_run_id during correlated execution: type="
           << static_cast<int>(event.type) << " execution_id=" << event.execution_id;
-      EXPECT_EQ(it->second, "run-abc123");
+      EXPECT_EQ(it->second, "131");
     }
     events.clear();
   }
 
   // A later execution of another run must not inherit the stale id.
   auto next_run = make_test_request("next_run_move");
-  next_run.binding.program_run_id = ProgramRunId("run-def456");
+  next_run.binding.program_run_id = ProgramRunNumber(128U);
   auto second = execute_sync(next_run);
   ASSERT_TRUE(second.ok());
   {
@@ -10632,7 +10987,7 @@ TEST_F(ExecutionKernelTest, Execute_ProgramRunIdStampsEventsAndDoesNotLeakAcross
     for (const auto& event : events) {
       const auto it = event.details.find("program_run_id");
       ASSERT_NE(it, event.details.end());
-      EXPECT_EQ(it->second, "run-def456") << "stale program_run_id leaked onto a later execution";
+      EXPECT_EQ(it->second, "128") << "stale program_run_id leaked onto a later execution";
     }
   }
 }
@@ -10651,7 +11006,7 @@ TEST_F(ExecutionKernelTest, Execute_ActionSpanStampsEventsAndSnapshot) {
 
   const auto span = make_test_action_span();
   auto request = make_test_request("span_correlated_move");
-  request.binding.program_run_id = ProgramRunId(span.program_run_id);
+  request.binding.program_run_id = span.program_run_id;
   request.action_span = span;
 
   auto result = execute_sync(request);
@@ -10712,7 +11067,7 @@ TEST_F(ExecutionKernelTest, Execute_ContactPolicyStampsEventsAndFailedSnapshot) 
   const auto span = make_test_action_span();
   constexpr const char* kContactPolicyId = "contact_grasp/lite6_box";
   auto request = make_test_request("contact_policy_correlated_move");
-  request.binding.program_run_id = ProgramRunId(span.program_run_id);
+  request.binding.program_run_id = span.program_run_id;
   request.action_span = span;
   request.contact_policy_id = kContactPolicyId;
 
@@ -10855,6 +11210,99 @@ TEST_F(ExecutionKernelTest, CancelBeforeDispatchIsReportedAsItsOwnFact) {
   EXPECT_EQ(settled->execution_id, prepared.value());
 }
 
+// Prepares one motion and waits until it is Prepared (not dispatched).
+Result<std::uint64_t> prepare_until_ready(ExecutionKernel& kernel, const std::string& name) {
+  auto prepared = kernel.PrepareMotion(prepared_motion_request(make_test_request(name)));
+  if (!prepared.ok()) return prepared;
+  for (int attempt = 0; attempt < 2000; ++attempt) {
+    const auto observed = kernel.ObservePreparedMotion(prepared.value());
+    if (observed.ok() &&
+        observed.value().state == ResolvedPreparedMotionExecutionStateDTO::kPrepared)
+      return prepared;
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return Result<std::uint64_t>::Err(ErrorDTO{"test_timeout", "motion never became Prepared", {}});
+}
+
+// Stop state model X1 (engine part): fence call (1) is only the gate
+// compare-and-swap. The session's own state and cancellation are call (2).
+TEST_F(ExecutionKernelTest, StopFenceCallOneClosesGateWithoutCancellingSession) {
+  const auto prepared = prepare_until_ready(kernel, "fence_call_one_gate");
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+
+  const auto fenced = kernel.fence_addressed_participant_stop(prepared.value());
+  EXPECT_EQ(fenced.disposition,
+            AddressedParticipantStopFenceDisposition::kEffectPreventedBeforeDispatch);
+  EXPECT_EQ(fenced.closed_gates,
+            static_cast<std::uint8_t>(AddressedParticipantStopFenceGate::kActiveSession));
+  const auto between = kernel.ObservePreparedMotion(prepared.value());
+  ASSERT_TRUE(between.ok()) << between.error().message;
+  EXPECT_EQ(between.value().state, ResolvedPreparedMotionExecutionStateDTO::kPrepared);
+  EXPECT_FALSE(kernel.get_status().fact.has_value());
+
+  kernel.complete_addressed_participant_stop_fence(prepared.value(), fenced.closed_gates);
+  const auto after = kernel.ObservePreparedMotion(prepared.value());
+  ASSERT_TRUE(after.ok()) << after.error().message;
+  EXPECT_EQ(after.value().state, ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch);
+  ASSERT_TRUE(wait_for_ended(kernel, "cancelled_before_dispatch"));
+  EXPECT_EQ(execution.execute_count, 0);
+  // A repeated call (1) finds the gate already fenced: same disposition, no
+  // gate newly closed.
+  const auto repeated = kernel.fence_addressed_participant_stop(prepared.value());
+  EXPECT_EQ(repeated.disposition,
+            AddressedParticipantStopFenceDisposition::kEffectPreventedBeforeDispatch);
+  EXPECT_EQ(repeated.closed_gates, 0U);
+  ASSERT_TRUE(kernel.wait_for_completion(1'000'000'000));
+}
+
+// Between call (1) and call (2) a dispatch request reaches the worker, whose
+// gate claim fails: the work ends cancelled before dispatch, and the backend
+// never receives it.
+TEST_F(ExecutionKernelTest, NothingDispatchedBetweenFenceCalls) {
+  const auto prepared = prepare_until_ready(kernel, "fence_between_calls");
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  const auto ready = kernel.ObservePreparedMotion(prepared.value());
+  ASSERT_TRUE(ready.ok());
+  ASSERT_TRUE(ready.value().participant);
+
+  const auto fenced = kernel.fence_addressed_participant_stop(prepared.value());
+  ASSERT_EQ(fenced.disposition,
+            AddressedParticipantStopFenceDisposition::kEffectPreventedBeforeDispatch);
+  // The request itself is recorded; only the worker's gate claim decides.
+  ASSERT_TRUE(kernel
+                  .DispatchPreparedMotion(prepared.value(),
+                                          ready.value().participant->prepared_contract_digest)
+                  .ok());
+  ASSERT_TRUE(wait_for_ended(kernel, "cancelled_before_dispatch"));
+  EXPECT_EQ(execution.execute_count, 0);
+  const auto refused = kernel.ObservePreparedMotion(prepared.value());
+  ASSERT_TRUE(refused.ok());
+  EXPECT_EQ(refused.value().state, ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch);
+  EXPECT_FALSE(refused.value().last_dispatched_participant);
+
+  kernel.complete_addressed_participant_stop_fence(prepared.value(), fenced.closed_gates);
+  ASSERT_TRUE(kernel.wait_for_completion(1'000'000'000));
+  EXPECT_EQ(execution.execute_count, 0);
+}
+
+// Once the worker committed the dispatch, call (1) closes nothing.
+TEST_F(ExecutionKernelTest, FenceCallOneAfterDispatchReportsCommitted) {
+  execution.execution_generation = 1U;  // a dispatched goal has a backend generation
+  const auto started = prepare_and_dispatch(kernel, make_test_request("fence_after_dispatch"));
+  ASSERT_TRUE(started.ok()) << started.error().message;
+  ASSERT_TRUE(kernel.wait_for_completion(2'000'000'000));
+  ASSERT_EQ(execution.execute_count, 1);
+
+  const auto fenced = kernel.fence_addressed_participant_stop(started.value());
+  EXPECT_EQ(fenced.disposition, AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  EXPECT_EQ(fenced.closed_gates, 0U);
+  kernel.complete_addressed_participant_stop_fence(started.value(), fenced.closed_gates);
+  const auto observed = kernel.ObservePreparedMotion(started.value());
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  EXPECT_EQ(observed.value().state, ResolvedPreparedMotionExecutionStateDTO::kDispatched);
+  EXPECT_EQ(execution.execute_count, 1);
+}
+
 
 // =============================================================================
 // Core robot participant over IExecutionPort, driven by the real participant
@@ -10979,7 +11427,7 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
     return trajectory;
   }
 
-  std::optional<ExecutionGoalKey> SubmittedKey() const {
+  std::optional<ControllerGoalId> SubmittedKey() const {
     for (const auto& command : port->commands()) {
       if (const auto* submit = std::get_if<testing::FakeExecutionPort::SubmitCall>(&command)) {
         return submit->key;
@@ -10997,13 +11445,13 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
     return calls;
   }
 
-  void Executing(const ExecutionGoalKey& key) {
+  void Executing(const ControllerGoalId& key) {
     ExecutionGoalObservationDTO goal;
     goal.key = key;
     goal.binding_epoch = port->ReadReadiness().binding_epoch;
     goal.phase = ExecutionGoalPhase::kExecuting;
     goal.mechanism_goal_id =
-        MechanismGoalId("uuid-" + std::to_string(key.controller_goal_generation.value()));
+        manyforge::core::testing::TestMechanismGoalId(key.generation);
     ExecutionGoalFeedbackDTO feedback;
     feedback.source_stamp_ns = pclock.now() - 1;
     feedback.local_receipt_stamp_ns = pclock.now() - 1;
@@ -11046,15 +11494,13 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
   }
 
   static ResolvedParticipantStopStageDTO StageForProduct(
-      const PreparedOperationParticipantDTO& participant, const ExecutionGoalKey& key,
+      const PreparedOperationParticipantDTO& participant, const ControllerGoalId& key,
       std::size_t index) {
-    return ResolvedParticipantStopStageDTO{StopId("stop.port"),
-                                           StopGeneration(1U),
+    return ResolvedParticipantStopStageDTO{StopEventId(1004U),
                                            participant.operation_id,
                                            participant.operation_revision,
                                            participant.participant_id,
-                                           key.controller_goal_id,
-                                           key.controller_goal_generation,
+                                           key,
                                            participant.controllable_component_id,
                                            participant.command_target_id,
                                            participant.capability_id,
@@ -11082,7 +11528,7 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
   /// The stage's own Stop-time values at the Stop request: a controlled
   /// command carries its own profile deadline, nothing else is shared.
   static RemainingStopBudgetDTO BudgetFor(const ResolvedParticipantStopStageDTO& stage) {
-    RemainingStopBudgetDTO budget{stage.stop_id, stage.stop_generation, 0, std::nullopt};
+    RemainingStopBudgetDTO budget{stage.stop_event_id, 0, std::nullopt};
     const auto& command = stage.participant_stop_plan.stage_commands.at(stage.stage_index);
     if (command.resolved_stage.containment_command.command_kind ==
             StopContainmentCommandKind::kMotionControlledStop &&
@@ -11175,7 +11621,7 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
       const PreparedOperationParticipantDTO& original,
       const PreparedMotionReplacementSourceDTO& source) {
     auto successor = original;
-    successor.operation_id = OperationId("operation.direct.successor");
+    successor.operation_id = OperationNumber(1002U);
     successor.prepared_contract_digest = ContentDigest(kTestDigestB);
     auto& motion = std::get<PreparedMotionExecutionDTO>(successor.payload);
     motion.plan_request.operation_id = successor.operation_id;
@@ -11468,7 +11914,7 @@ TEST_F(PortParticipantKernelTest, DiagnosticContextCallbackPrecedesSendAndCannot
     ++observations;
     EXPECT_EQ(prepared.operation_id, expected_operation);
     EXPECT_EQ(prepared.program_run_id, request.binding.program_run_id);
-    EXPECT_EQ(key.controller_goal_id, request.binding.controller_goal_id);
+    EXPECT_EQ(key, request.binding.controller_goal_id);
     EXPECT_EQ(epoch, port->ReadReadiness().binding_epoch);
     EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
     throw std::runtime_error("diagnostic failure must not alter dispatch");
@@ -11619,13 +12065,13 @@ TEST_F(PortParticipantKernelTest, StopDuringASlowToolContextApplyWinsAndNoGoalIs
   };
   Build(std::move(config));
   ASSERT_EQ(participant->Prepare(product, 1U).state, PrepareParticipantResultStateDTO::kPrepared);
-  const ExecutionGoalKey key{ControllerGoalId("slow_apply.goal"), ControllerGoalGeneration(1U)};
+  const ControllerGoalId key{ControllerGoalId{OperationNumber(902U), 1U, 1U}};
   ExecutionHandle handle;
   Result<void> applied = Result<void>::Ok();
   std::thread dispatcher([&] {
     // The tool-context action, then the dispatch (as the Kernel runs them).
     applied = participant->ApplyToolContext(product);
-    handle = participant->Dispatch(product, key.controller_goal_id, key.controller_goal_generation);
+    handle = participant->Dispatch(product, key);
   });
   entered.get_future().wait();
   // The Stop (cancelled right after its entry so this test ends) runs while
@@ -11668,7 +12114,7 @@ TEST_F(PortParticipantKernelTest, AStopBeforeItsGoalIsSentIsContainedAndFencesTh
   Build(Config(StateAuthorityClass::kCommanded));
   ASSERT_EQ(participant->Prepare(product, 1U).state, PrepareParticipantResultStateDTO::kPrepared);
   // No controller sample at all (e.g. the joint state stream is off).
-  const ExecutionGoalKey key{ControllerGoalId("unsent.goal"), ControllerGoalGeneration(1U)};
+  const ControllerGoalId key{ControllerGoalId{OperationNumber(903U), 1U, 1U}};
   const auto stage = StageForProduct(product, key, 0U);
   const auto result = participant->TranslateStopStage(stage, BudgetFor(stage), {});
   ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
@@ -11686,7 +12132,7 @@ TEST_F(PortParticipantKernelTest, AStopBeforeItsGoalIsSentIsContainedAndFencesTh
   EXPECT_FALSE(participant->GoalInFlight());
 
   const auto handle =
-      participant->Dispatch(product, key.controller_goal_id, key.controller_goal_generation);
+      participant->Dispatch(product, key);
   EXPECT_EQ(handle.execution_generation, 0U);
   ASSERT_TRUE(handle.get_snapshot);
   const auto snapshot = handle.get_snapshot();
@@ -11697,13 +12143,473 @@ TEST_F(PortParticipantKernelTest, AStopBeforeItsGoalIsSentIsContainedAndFencesTh
 
   // No further checks: a sample reporting motion does not change it.
   Sample(0.0, 0.0, 0.5);
-  const ExecutionGoalKey other{ControllerGoalId("unsent.goal.other"),
-                               ControllerGoalGeneration(2U)};
+  const ControllerGoalId other{ControllerGoalId{OperationNumber(904U), 1U, 2U}};
   const auto other_stage = StageForProduct(product, other, 0U);
   const auto contained =
       participant->TranslateStopStage(other_stage, BudgetFor(other_stage), {});
   EXPECT_EQ(contained.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
   EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+}
+
+TEST_F(PortParticipantKernelTest, AStopThatFencesAPendingSendRefusesItAsTheStops) {
+  // A Stop stage that fences a send already pending in its sender (Dispatch
+  // is unlocked across Submit): the goal does not go out because of that
+  // Stop, and Dispatch says so (`execution_port_stop_in_flight`, the port's
+  // own refusal kept in the details). Any other port refusal stays
+  // `execution_port_submit_refused`.
+  const auto product = DirectBackendProduct();
+  std::promise<void> entered;
+  auto entered_future = entered.get_future();
+  std::atomic<int> submits{0};
+  port->SetBeforeSubmit([&](const std::shared_ptr<ExecutionDispatchToken>& token) {
+    if (++submits != 1 || !token) return;
+    entered.set_value();
+    // The send stays pending until the Stop stage fenced its token.
+    for (int attempt = 0;
+         attempt < 5000 && token->state() != ExecutionDispatchToken::State::kFenced; ++attempt)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  });
+  const ControllerGoalId key{ControllerGoalId{OperationNumber(905U), 1U, 1U}};
+  ExecutionHandle handle;
+  std::thread dispatcher([&] { handle = participant->Dispatch(product, key); });
+  const bool pending = entered_future.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+  EXPECT_TRUE(pending) << "the send never reached the port";
+  std::optional<ParticipantStopStageResultDTO> contained;
+  if (pending) {
+    const auto stage = StageForProduct(product, key, 0U);
+    contained = participant->TranslateStopStage(stage, BudgetFor(stage), {});
+  }
+  dispatcher.join();
+  ASSERT_TRUE(pending);
+  ASSERT_TRUE(contained.has_value());
+  ASSERT_EQ(contained->outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+      << (contained->error ? contained->error->details.at("reason") : "");
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+  EXPECT_FALSE(participant->GoalInFlight());
+  EXPECT_EQ(handle.execution_generation, 0U);
+  ASSERT_TRUE(handle.get_snapshot);
+  const auto snapshot = handle.get_snapshot();
+  EXPECT_EQ(snapshot.state, ExecutionState::kFailed);
+  ASSERT_TRUE(snapshot.error.has_value());
+  EXPECT_EQ(snapshot.error->details.at("reason"), "execution_port_stop_in_flight");
+  EXPECT_EQ(snapshot.error->details.at("port_refusal"), "stale_key");
+
+  // Another port refusal, no Stop: unchanged.
+  port->SetBeforeSubmit({});
+  port->QueueCommandResult(ExecutionPortCommandResultDTO{
+      ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kNotReady, std::nullopt});
+  const ControllerGoalId other{ControllerGoalId{OperationNumber(906U), 1U, 1U}};
+  const auto refused = participant->Dispatch(product, other);
+  EXPECT_EQ(refused.execution_generation, 0U);
+  ASSERT_TRUE(refused.get_snapshot);
+  const auto refused_snapshot = refused.get_snapshot();
+  EXPECT_EQ(refused_snapshot.state, ExecutionState::kFailed);
+  ASSERT_TRUE(refused_snapshot.error.has_value());
+  EXPECT_EQ(refused_snapshot.error->details.at("reason"), "execution_port_submit_refused");
+  EXPECT_EQ(refused_snapshot.error->details.at("port_refusal"), "not_ready");
+}
+
+/// The participant's reports of a committed send's outcome
+/// (`kParticipantDispatchOutcome`), captured for assertions. Shared so a
+/// late worker event never touches a finished test's stack.
+struct DispatchOutcomeReports final {
+  std::mutex mutex;
+  std::vector<KernelEvent> events;
+
+  [[nodiscard]] std::vector<KernelEvent> copy() {
+    std::lock_guard lock(mutex);
+    return events;
+  }
+};
+
+[[nodiscard]] SubscriptionHandle capture_dispatch_outcome_reports(
+    ExecutionKernel& kernel, const std::shared_ptr<DispatchOutcomeReports>& reports) {
+  return kernel.subscribe_events([reports](const KernelEvent& event) {
+    if (event.type != KernelEventType::kParticipantDispatchOutcome) return;
+    std::lock_guard lock(reports->mutex);
+    reports->events.push_back(event);
+  });
+}
+
+TEST_F(PortParticipantKernelTest, AStopInTheDispatchWindowNeverMovesSettlesAndResets) {
+  // Incident program-cycle.184: a Stop was accepted after the session worker
+  // committed the dispatch gate (`kOpen -> kCommitted`) and before it marked
+  // the session `kDispatched`. The fence answered "dispatch committed", the
+  // backend Stop stage found no goal and fenced it (no goal was ever sent),
+  // but the settlement refused with "Addressed Stop names a stale prepared
+  // motion"; every later Stop failed the same way.
+  //
+  // Now: the fence reports the send outcome as pending; the worker's refused
+  // send ends cancelled before dispatch (no effect, no local failure) and is
+  // reported to the Stop, whose no-effect settlement then succeeds, repeats,
+  // and Reset leaves the cell usable. The window is held at the tool-context
+  // action, inside `execute_worker_dispatch_phase` after the gate commit.
+  std::promise<void> entered;
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  std::atomic<int> applications{0};
+  auto config = Config(StateAuthorityClass::kCommanded);
+  config.apply_tool_context = [&, released](const PreparedOperationParticipantDTO&) {
+    if (++applications == 1) entered.set_value();
+    released.wait();
+    return Result<void>::Ok();
+  };
+  Build(std::move(config));
+  // The test releases the worker on every exit path.
+  struct Releaser {
+    std::promise<void>& release;
+    bool done{false};
+    void operator()() {
+      if (!done) release.set_value();
+      done = true;
+    }
+    ~Releaser() { (*this)(); }
+  } releaser{release};
+  const auto reports = std::make_shared<DispatchOutcomeReports>();
+  const auto subscription = capture_dispatch_outcome_reports(*pkernel, reports);
+  struct Unsubscribe {
+    ExecutionKernel& kernel;
+    SubscriptionHandle handle;
+    ~Unsubscribe() { kernel.unsubscribe_events(handle); }
+  } unsubscribe{*pkernel, subscription};
+
+  auto authority = prepared_motion_request(PortRequest("stop_in_dispatch_window"));
+  const auto goal = authority.execution_request.binding.controller_goal_id;
+  const auto prepared = pkernel->PrepareMotion(std::move(authority));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  const auto id = prepared.value();
+  std::shared_ptr<const PreparedOperationParticipantDTO> product;
+  for (int attempt = 0; attempt < 5000 && !product; ++attempt) {
+    const auto observed = pkernel->ObservePreparedMotion(id);
+    ASSERT_TRUE(observed.ok()) << observed.error().message;
+    if (observed.value().state == ResolvedPreparedMotionExecutionStateDTO::kPrepared) {
+      product = observed.value().participant;
+    } else {
+      ASSERT_EQ(observed.value().state, ResolvedPreparedMotionExecutionStateDTO::kPreparing);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  ASSERT_TRUE(product);
+  const auto dispatched = pkernel->DispatchPreparedMotion(id, product->prepared_contract_digest);
+  ASSERT_TRUE(dispatched.ok()) << dispatched.error().message;
+  ASSERT_EQ(entered.get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready)
+      << "the worker never reached the dispatch window";
+
+  // The Stop is accepted inside the window: both fence calls. The send is
+  // committed and has not returned, so its outcome is reported later.
+  const auto fenced = fence_addressed_stop(*pkernel, id);
+  ASSERT_EQ(fenced.disposition, AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  EXPECT_EQ(fenced.closed_gates, 0U);
+  EXPECT_TRUE(fenced.send_outcome_pending);
+  const auto in_flight = pkernel->ObservePreparedMotion(id);
+  ASSERT_FALSE(in_flight.ok());
+  EXPECT_EQ(in_flight.error().details.at("reason"), "prepared_motion_dispatch_outcome_unresolved");
+
+  // The owner's containment: the stage finds no goal and fences it.
+  const auto stage = StageForProduct(*product, goal, 0U);
+  const auto contained = participant->TranslateStopStage(stage, BudgetFor(stage), {});
+  ASSERT_EQ(contained.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+      << (contained.error ? contained.error->details.at("reason") : "");
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+
+  // A dispatched settlement before the report is stale; its details name
+  // what did not match (not two equal execution ids only).
+  const auto stale = pkernel->settle_addressed_participant_stop(
+      {id, stage.stop_event_id, contained, OperationParticipantPayloadKind::kMotion, false});
+  ASSERT_FALSE(stale.ok());
+  const auto& stale_details = stale.error().details;
+  EXPECT_EQ(stale_details.at("reason"), "addressed_motion_stop_execution_mismatch");
+  EXPECT_EQ(stale_details.at("mismatched_fields"), "session_state");
+  EXPECT_EQ(stale_details.at("session_state"), "dispatch_requested");
+  EXPECT_EQ(stale_details.at("expected_session_state"), "dispatched");
+  EXPECT_EQ(stale_details.at("dispatch_gate"), "committed");
+  EXPECT_EQ(stale_details.at("requested_execution_id"), stale_details.at("current_execution_id"));
+  EXPECT_TRUE(reports->copy().empty());
+
+  // The worker leaves the window; the accepted Stop wins: nothing is sent,
+  // and the send ends cancelled before dispatch, not as a local failure.
+  releaser();
+  ASSERT_TRUE(pkernel->wait_for_completion(2'000'000'000)) << ended_as(*pkernel);
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty())
+      << "a goal was sent after an accepted Stop";
+  EXPECT_EQ(applications.load(), 1);
+  EXPECT_EQ(ended_as(*pkernel), "cancelled_before_dispatch");
+  // Exactly one report, to the Stop: not sent, with the no-effect fact.
+  const auto outcome = reports->copy();
+  ASSERT_EQ(outcome.size(), 1U);
+  EXPECT_EQ(outcome.front().execution_id, id);
+  EXPECT_EQ(outcome.front().details.at("dispatched"), "false");
+  ASSERT_TRUE(outcome.front().participant_fact.has_value());
+  EXPECT_EQ(outcome.front().participant_fact->kind,
+            ParticipantExecutionFactKind::kCancelledBeforeDispatch);
+  EXPECT_EQ(outcome.front().participant_fact->effect, ParticipantEffectKnowledge::kNoEffect);
+  // The outcome is resolved now: cancelled before dispatch, nothing sent.
+  const auto observed = pkernel->ObservePreparedMotion(id);
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  EXPECT_EQ(observed.value().state, ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch);
+  EXPECT_FALSE(observed.value().last_dispatched_participant);
+  // A later Stop's fence finds the outcome known.
+  EXPECT_FALSE(fence_addressed_stop(*pkernel, id).send_outcome_pending);
+
+  // The settlement the addressed owner requests on that report: the
+  // pre-dispatch cancellation's (no effect).
+  const AddressedParticipantStopSettlementRequestDTO settlement{
+      id, stage.stop_event_id,
+      ParticipantStopStageResultDTO{stage,
+                                    StopStageAttemptDispositionDTO::kNotDispatched,
+                                    ParticipantStopStageOutcomeDTO::kSucceeded,
+                                    std::nullopt,
+                                    std::nullopt,
+                                    std::nullopt,
+                                    std::nullopt,
+                                    std::nullopt,
+                                    0,
+                                    {},
+                                    std::nullopt},
+      OperationParticipantPayloadKind::kMotion, true};
+  const auto settled = pkernel->settle_addressed_participant_stop(settlement);
+  ASSERT_TRUE(settled.ok()) << settled.error().message << " ("
+                            << (settled.error().details.contains("reason")
+                                    ? settled.error().details.at("reason")
+                                    : std::string())
+                            << ")";
+  EXPECT_EQ(settled.value().execution_id, id);
+  EXPECT_TRUE(settled.value().recovery_assessment.backend_stop_confirmed);
+  EXPECT_FALSE(settled.value().terminal_fact.has_value());
+
+  // A repeated delivery of the same Stop is not refused.
+  const auto again = pkernel->settle_addressed_participant_stop(settlement);
+  ASSERT_TRUE(again.ok()) << again.error().message;
+
+  // Reset is not refused and leaves the participant idle.
+  const auto reset = pkernel->reset_after_certified_containment(id);
+  ASSERT_TRUE(reset.accepted) << (reset.error ? reset.error->message : std::string());
+  EXPECT_EQ(ended_as(*pkernel), "working:Idle");
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+
+  // The cell is usable again: the next motion is sent. It carries the next
+  // goal generation, as a production retry does (the stage fenced the old
+  // goal identity for good).
+  auto next_request = PortRequest("after_dispatch_window_reset");
+  next_request.binding.controller_goal_id.generation = goal.generation + 1U;
+  const auto next = Start(std::move(next_request));
+  ASSERT_TRUE(next.ok()) << next.error().message;
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
+  // A motion no Stop fenced reports nothing.
+  EXPECT_EQ(reports->copy().size(), 1U);
+}
+
+TEST_F(PortParticipantKernelTest, AStopInTheDispatchWindowWhoseGoalWentOutIsReportedSent) {
+  // The other ending: the Stop's fence finds the send committed and in
+  // flight, but its stage has not run when the send happens. The goal goes
+  // out, the session is marked dispatched, and the worker reports "sent"
+  // (no fact) to the waiting Stop; the stage then stops the live goal.
+  std::promise<void> entered;
+  std::promise<void> release;
+  auto released = release.get_future().share();
+  std::atomic<int> applications{0};
+  auto config = Config(StateAuthorityClass::kCommanded);
+  config.apply_tool_context = [&, released](const PreparedOperationParticipantDTO&) {
+    if (++applications == 1) entered.set_value();
+    released.wait();
+    return Result<void>::Ok();
+  };
+  Build(std::move(config));
+  struct Releaser {
+    std::promise<void>& release;
+    bool done{false};
+    void operator()() {
+      if (!done) release.set_value();
+      done = true;
+    }
+    ~Releaser() { (*this)(); }
+  } releaser{release};
+  const auto reports = std::make_shared<DispatchOutcomeReports>();
+  const auto subscription = capture_dispatch_outcome_reports(*pkernel, reports);
+  struct Unsubscribe {
+    ExecutionKernel& kernel;
+    SubscriptionHandle handle;
+    ~Unsubscribe() { kernel.unsubscribe_events(handle); }
+  } unsubscribe{*pkernel, subscription};
+  std::atomic<bool> stopping{false};
+  std::atomic<int> step{0};
+  tick = [&] {
+    const auto key = SubmittedKey();
+    if (!key) return;
+    if (!stopping) {
+      ++step;
+      if (step == 1) Executing(*key);
+      Sample(1.0, 0.5, 0.5);
+      return;
+    }
+    const auto replaces = Calls<testing::FakeExecutionPort::ReplaceCall>();
+    if (replaces.empty()) return;
+    const auto next = replaces.back().next_key;
+    const auto goal = port->ReadGoal(next);
+    if (goal && goal->phase == ExecutionGoalPhase::kPending) {
+      Executing(next);
+      port->FinishGoal(*key, ExecutionGoalResult::kPreemptedBy, next, pclock.now());
+      Sample(0.01, 0.51, 0.3);
+    } else if (goal && goal->phase != ExecutionGoalPhase::kTerminal) {
+      pclock.advance(10'000'000);
+      port->FinishGoal(next, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
+      pclock.advance(1);
+      Sample(0.0, 0.6, 0.0);
+    } else {
+      pclock.advance(1);
+      Sample(0.0, 0.6, 0.0);
+    }
+  };
+
+  auto accepted = prepare_and_dispatch(*pkernel, PortRequest("sent_in_dispatch_window"));
+  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
+  const auto id = accepted.value();
+  ASSERT_EQ(entered.get_future().wait_for(std::chrono::seconds(5)), std::future_status::ready)
+      << "the worker never reached the dispatch window";
+  const auto fenced = fence_addressed_stop(*pkernel, id);
+  ASSERT_EQ(fenced.disposition, AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  EXPECT_TRUE(fenced.send_outcome_pending);
+
+  // No stage ran yet: the send goes out and is reported sent.
+  releaser();
+  for (int attempt = 0; attempt < 2000 && reports->copy().empty(); ++attempt)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const auto outcome = reports->copy();
+  ASSERT_EQ(outcome.size(), 1U);
+  EXPECT_EQ(outcome.front().execution_id, id);
+  EXPECT_EQ(outcome.front().details.at("dispatched"), "true");
+  EXPECT_FALSE(outcome.front().participant_fact.has_value());
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
+  const auto observed = pkernel->ObservePreparedMotion(id);
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  EXPECT_EQ(observed.value().state, ResolvedPreparedMotionExecutionStateDTO::kDispatched);
+  EXPECT_FALSE(fence_addressed_stop(*pkernel, id).send_outcome_pending);
+
+  // The Stop's stage then stops the live goal, as for any dispatched motion.
+  for (int attempt = 0; attempt < 2000 && step < 3; ++attempt)
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  const auto stage = StageFor(id, 0U);
+  stopping = true;
+  const auto result = participant->TranslateStopStage(stage, BudgetFor(stage), {});
+  ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+      << (result.error ? result.error->details.at("reason") : "");
+  ASSERT_TRUE(wait_for_ended(*pkernel, "preempted_by_addressed_stop")) << ended_as(*pkernel);
+  EXPECT_EQ(reports->copy().size(), 1U);
+}
+
+TEST_F(PortParticipantKernelTest, AStopWhileTheGoalIsBeingSentAfterExecutingEndsWithNoEffect) {
+  // The incident's own case: "executing" was already published when the Stop
+  // arrived. The worker is held in the port's Submit (Executing transition,
+  // `kExecuteStarted` and the monitor preparation done); the Stop is fenced
+  // and its stage fences the pending send; `Dispatch` returns the
+  // stop-in-flight refusal with the state machine in `kExecuting`.
+  Build(Config(StateAuthorityClass::kCommanded));
+  std::promise<void> entered;
+  auto entered_future = entered.get_future();
+  std::atomic<int> submits{0};
+  port->SetBeforeSubmit([&](const std::shared_ptr<ExecutionDispatchToken>& token) {
+    if (++submits != 1 || !token) return;
+    entered.set_value();
+    for (int attempt = 0;
+         attempt < 5000 && token->state() != ExecutionDispatchToken::State::kFenced; ++attempt)
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  });
+  const auto reports = std::make_shared<DispatchOutcomeReports>();
+  const auto subscription = capture_dispatch_outcome_reports(*pkernel, reports);
+  struct Unsubscribe {
+    ExecutionKernel& kernel;
+    SubscriptionHandle handle;
+    ~Unsubscribe() { kernel.unsubscribe_events(handle); }
+  } unsubscribe{*pkernel, subscription};
+
+  auto authority = prepared_motion_request(PortRequest("stop_while_sending"));
+  const auto goal = authority.execution_request.binding.controller_goal_id;
+  const auto prepared = pkernel->PrepareMotion(std::move(authority));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  const auto id = prepared.value();
+  std::shared_ptr<const PreparedOperationParticipantDTO> product;
+  for (int attempt = 0; attempt < 5000 && !product; ++attempt) {
+    const auto observed = pkernel->ObservePreparedMotion(id);
+    ASSERT_TRUE(observed.ok()) << observed.error().message;
+    if (observed.value().state == ResolvedPreparedMotionExecutionStateDTO::kPrepared) {
+      product = observed.value().participant;
+    } else {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  ASSERT_TRUE(product);
+  ASSERT_TRUE(pkernel->DispatchPreparedMotion(id, product->prepared_contract_digest).ok());
+  ASSERT_EQ(entered_future.wait_for(std::chrono::seconds(5)), std::future_status::ready)
+      << "the worker never reached the send";
+  // "Executing" is already published.
+  EXPECT_EQ(ended_as(*pkernel), "working:Executing");
+
+  const auto fenced = fence_addressed_stop(*pkernel, id);
+  ASSERT_EQ(fenced.disposition, AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  EXPECT_TRUE(fenced.send_outcome_pending);
+  const auto stage = StageForProduct(*product, goal, 0U);
+  const auto contained = participant->TranslateStopStage(stage, BudgetFor(stage), {});
+  ASSERT_EQ(contained.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
+      << (contained.error ? contained.error->details.at("reason") : "");
+
+  ASSERT_TRUE(pkernel->wait_for_completion(2'000'000'000)) << ended_as(*pkernel);
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty())
+      << "a goal was sent after an accepted Stop";
+  EXPECT_FALSE(participant->GoalInFlight());
+  EXPECT_EQ(ended_as(*pkernel), "cancelled_before_dispatch");
+  ASSERT_TRUE(pkernel->get_status().fact.has_value());
+  EXPECT_EQ(pkernel->get_status().fact->effect, ParticipantEffectKnowledge::kNoEffect);
+  const auto outcome = reports->copy();
+  ASSERT_EQ(outcome.size(), 1U);
+  EXPECT_EQ(outcome.front().details.at("dispatched"), "false");
+  ASSERT_TRUE(outcome.front().participant_fact.has_value());
+  EXPECT_EQ(outcome.front().participant_fact->kind,
+            ParticipantExecutionFactKind::kCancelledBeforeDispatch);
+  const auto observed = pkernel->ObservePreparedMotion(id);
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  EXPECT_EQ(observed.value().state, ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch);
+  EXPECT_FALSE(observed.value().last_dispatched_participant);
+
+  // The deferred no-effect settlement succeeds, also when delivered again.
+  const AddressedParticipantStopSettlementRequestDTO settlement{
+      id, stage.stop_event_id,
+      ParticipantStopStageResultDTO{stage,
+                                    StopStageAttemptDispositionDTO::kNotDispatched,
+                                    ParticipantStopStageOutcomeDTO::kSucceeded,
+                                    std::nullopt,
+                                    std::nullopt,
+                                    std::nullopt,
+                                    std::nullopt,
+                                    std::nullopt,
+                                    0,
+                                    {},
+                                    std::nullopt},
+      OperationParticipantPayloadKind::kMotion, true};
+  const auto settled = pkernel->settle_addressed_participant_stop(settlement);
+  ASSERT_TRUE(settled.ok()) << settled.error().message << " ("
+                            << (settled.error().details.contains("reason")
+                                    ? settled.error().details.at("reason")
+                                    : std::string())
+                            << ")";
+  EXPECT_TRUE(settled.value().recovery_assessment.backend_stop_confirmed);
+  EXPECT_FALSE(settled.value().terminal_fact.has_value());
+  // A second Stop: its fence finds the outcome known, its delivery is accepted.
+  EXPECT_FALSE(fence_addressed_stop(*pkernel, id).send_outcome_pending);
+  ASSERT_TRUE(pkernel->settle_addressed_participant_stop(settlement).ok());
+  EXPECT_EQ(reports->copy().size(), 1U);
+
+  const auto reset = pkernel->reset_after_certified_containment(id);
+  ASSERT_TRUE(reset.accepted) << (reset.error ? reset.error->message : std::string());
+  EXPECT_EQ(ended_as(*pkernel), "working:Idle");
+  EXPECT_TRUE(Calls<testing::FakeExecutionPort::SubmitCall>().empty());
+
+  // The next motion (next goal generation) is sent normally.
+  port->SetBeforeSubmit({});
+  auto next_request = PortRequest("after_stop_while_sending");
+  next_request.binding.controller_goal_id.generation = goal.generation + 1U;
+  const auto next = Start(std::move(next_request));
+  ASSERT_TRUE(next.ok()) << next.error().message;
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
 }
 
 TEST_F(PortParticipantKernelTest, ToolContextIsNeverSentForAMovingReplacement) {
@@ -11728,10 +12634,10 @@ TEST_F(PortParticipantKernelTest, ToolContextIsNeverSentForAMovingReplacement) {
     Build(std::move(config));
     ASSERT_EQ(participant->Prepare(product, 1U).state, PrepareParticipantResultStateDTO::kPrepared);
     Sample(0.0, 0.0, 0.0);
-    const ExecutionGoalKey old{ControllerGoalId("toolctx.old"), ControllerGoalGeneration(1U)};
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(905U), 1U, 1U}};
     ASSERT_TRUE(participant->ApplyToolContext(product).ok());
     const auto handle =
-        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+        participant->Dispatch(product, old);
     ASSERT_NE(handle.execution_generation, 0U);
     EXPECT_EQ(applications.load(), 1);
     pclock.advance(10'000'000);
@@ -11745,7 +12651,7 @@ TEST_F(PortParticipantKernelTest, ToolContextIsNeverSentForAMovingReplacement) {
     const auto successor = DirectSuccessor(product, source.value());
     ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
               PrepareParticipantResultStateDTO::kPrepared);
-    const ExecutionGoalKey next{ControllerGoalId("toolctx.next"), ControllerGoalGeneration(2U)};
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(906U), 1U, 2U}};
     const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next,
                                                        pclock.now() + 1'000'000'000);
     ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
@@ -12130,9 +13036,9 @@ TEST_F(PortParticipantKernelTest, RebuiltOwnerRequiresLaterFreshStillObservation
   ASSERT_TRUE(staged.ok());
   ASSERT_TRUE(participant->RetireOwnerRebindTimer(staged.value()).ok());
   ASSERT_TRUE(participant->LockOwnerRebind(staged.value()).ok());
-  EXPECT_TRUE(participant->LockedOwnerRebindNeedsMotionProof(staged.value()));
-  participant->CommitLockedOwnerRebind(staged.value());
-  EXPECT_TRUE(participant->LockedOwnerRebindNeedsMotionProof(staged.value()));
+  EXPECT_EQ(participant->LockedOwnerRebindNeedsMotionProof(staged.value()), std::optional<bool>(true));
+  EXPECT_TRUE(participant->CommitLockedOwnerRebind(staged.value()));
+  EXPECT_EQ(participant->LockedOwnerRebindNeedsMotionProof(staged.value()), std::optional<bool>(true));
   participant->UnlockOwnerRebind(staged.value());
   pkernel->NotifyOwnerRebuilt();
   pscheduler.advance_to(pclock.now());
@@ -12177,8 +13083,7 @@ TEST_F(PortParticipantKernelTest, MissingGoalReportsUncertainEffectsWithoutAnoth
     port->FinishGoal(*key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
     for (unsigned index = 0; index < kExecutionGoalRecordCapacity; ++index) {
       ExecutionGoalObservationDTO retained;
-      retained.key = {ControllerGoalId("later.goal." + std::to_string(index)),
-                      ControllerGoalGeneration(100U + index)};
+      retained.key = ControllerGoalId{OperationNumber(970U + index), 1U, 100U + index};
       retained.binding_epoch = port->ReadReadiness().binding_epoch;
       retained.phase = ExecutionGoalPhase::kTerminal;
       retained.result = ExecutionGoalResult::kSucceeded;
@@ -12286,7 +13191,11 @@ TEST_F(PortParticipantKernelTest, ZeroSpeedHoldTimeoutAsksTheAddressedOwnerToSto
   std::mutex events_mu;
   std::vector<KernelEvent> stop_requests;
   pkernel->subscribe_events([&](const KernelEvent& event) {
-    if (event.type != KernelEventType::kStopRequested) return;
+    // The clock jumps 1 s per poll with no collision check, so the OD-217
+    // deadman also raises its fault; only the hold timeout is counted here.
+    if (event.type != KernelEventType::kStopRequested ||
+        event.details.at("reason") != "zero_speed_hold_timeout")
+      return;
     std::lock_guard lock(events_mu);
     stop_requests.push_back(event);
   });
@@ -12491,7 +13400,7 @@ TEST_F(PortParticipantKernelTest, SoftStopUnderTheAddressedFenceEndsTheExecution
   for (int attempt = 0; attempt < 2000 && step < 3; ++attempt) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  EXPECT_EQ(pkernel->fence_addressed_participant_stop(accepted.value()),
+  EXPECT_EQ(fence_addressed_stop(*pkernel, accepted.value()).disposition,
             AddressedParticipantStopFenceDisposition::kDispatchCommitted);
   const auto stage = StageFor(accepted.value(), 0U);
   stopping = true;
@@ -12545,7 +13454,7 @@ TEST_F(PortParticipantKernelTest, HardStopStageUnderTheFenceBrakesThroughTheHelp
   for (int attempt = 0; attempt < 2000 && step < 3; ++attempt) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
-  ASSERT_EQ(pkernel->fence_addressed_participant_stop(accepted.value()),
+  ASSERT_EQ(fence_addressed_stop(*pkernel, accepted.value()).disposition,
             AddressedParticipantStopFenceDisposition::kDispatchCommitted);
   const auto stage = StageFor(accepted.value(), 1U);
   stopping = true;
@@ -12637,13 +13546,52 @@ TEST_F(PortParticipantKernelTest, StagedOwnerRebindPublishesOnlyAfterLockedCommi
   participant->UnlockOwnerRebind(staged.value());
   EXPECT_FALSE(participant->owner_rebuild_observation());
   ASSERT_TRUE(participant->LockOwnerRebind(staged.value()).ok());
-  EXPECT_FALSE(participant->LockedOwnerRebindNeedsMotionProof(staged.value()));
-  participant->CommitLockedOwnerRebind(staged.value());
-  EXPECT_FALSE(participant->LockedOwnerRebindNeedsMotionProof(staged.value()));
+  EXPECT_EQ(participant->LockedOwnerRebindNeedsMotionProof(staged.value()), std::optional<bool>(false));
+  EXPECT_TRUE(participant->CommitLockedOwnerRebind(staged.value()));
+  EXPECT_EQ(participant->LockedOwnerRebindNeedsMotionProof(staged.value()), std::optional<bool>(false));
   participant->UnlockOwnerRebind(staged.value());
   EXPECT_FALSE(participant->owner_rebuild_observation());
   EXPECT_TRUE(port->commands().empty());
   EXPECT_TRUE(next->commands().empty());
+}
+
+TEST_F(PortParticipantKernelTest, InvalidOwnerRebindStageIsRefusedWithoutChange) {
+  Build(Config(StateAuthorityClass::kCommanded));
+  auto next = std::make_shared<testing::FakeExecutionPort>();
+  next->SetLaneFacts(port->ReadLaneFacts());
+  next->SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
+  auto staged = participant->StageOwnerRebind(next);
+  ASSERT_TRUE(staged.ok());
+  ASSERT_TRUE(participant->RetireOwnerRebindTimer(staged.value()).ok());
+  ::testing::internal::CaptureStderr();
+  // Null and unlocked stages.
+  const auto null_proof = participant->LockedOwnerRebindNeedsMotionProof(nullptr);
+  const bool null_commit = participant->CommitLockedOwnerRebind(nullptr);
+  const auto unlocked_proof = participant->LockedOwnerRebindNeedsMotionProof(staged.value());
+  const bool unlocked_commit = participant->CommitLockedOwnerRebind(staged.value());
+  // The refused stage is still current and uncommitted.
+  const bool locked = participant->LockOwnerRebind(staged.value()).ok();
+  const bool committed = locked && participant->CommitLockedOwnerRebind(staged.value());
+  // An already committed stage.
+  const bool recommitted = participant->CommitLockedOwnerRebind(staged.value());
+  participant->UnlockOwnerRebind(staged.value());
+  const auto released_proof = participant->LockedOwnerRebindNeedsMotionProof(staged.value());
+  const std::string output = ::testing::internal::GetCapturedStderr();
+  EXPECT_FALSE(null_proof.has_value());
+  EXPECT_FALSE(null_commit);
+  EXPECT_FALSE(unlocked_proof.has_value());
+  EXPECT_FALSE(unlocked_commit);
+  EXPECT_TRUE(locked);
+  EXPECT_TRUE(committed);
+  EXPECT_FALSE(recommitted);
+  EXPECT_FALSE(released_proof.has_value());
+  EXPECT_FALSE(participant->owner_rebuild_observation());
+  EXPECT_TRUE(port->commands().empty());
+  EXPECT_TRUE(next->commands().empty());
+  const std::string line = "manyforge_fault code=owner_rebind_stage_invalid check=";
+  std::size_t lines = 0;
+  for (auto at = output.find(line); at != std::string::npos; at = output.find(line, at + 1)) ++lines;
+  EXPECT_EQ(lines, 6U) << output;
 }
 
 TEST_F(PortParticipantKernelTest, StagedOwnerRebindClearsUnrelatedMarkerForCompletedMotion) {
@@ -12658,8 +13606,8 @@ TEST_F(PortParticipantKernelTest, StagedOwnerRebindClearsUnrelatedMarkerForCompl
   ASSERT_EQ(participant->Prepare(product, 2U).state, PrepareParticipantResultStateDTO::kPrepared);
   port = first;
   Sample(0.0, 0.0, 0.0);
-  const ExecutionGoalKey key{ControllerGoalId("rebuild.completed"), ControllerGoalGeneration(1U)};
-  const auto handle = participant->Dispatch(product, key.controller_goal_id, key.controller_goal_generation);
+  const ControllerGoalId key{ControllerGoalId{OperationNumber(907U), 1U, 1U}};
+  const auto handle = participant->Dispatch(product, key);
   Executing(key);
   port->FinishGoal(key, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
   ASSERT_TRUE(handle.wait_for_completion(0));
@@ -12671,8 +13619,8 @@ TEST_F(PortParticipantKernelTest, StagedOwnerRebindClearsUnrelatedMarkerForCompl
   ASSERT_TRUE(staged.ok());
   ASSERT_TRUE(participant->RetireOwnerRebindTimer(staged.value()).ok());
   ASSERT_TRUE(participant->LockOwnerRebind(staged.value()).ok());
-  EXPECT_FALSE(participant->LockedOwnerRebindNeedsMotionProof(staged.value()));
-  participant->CommitLockedOwnerRebind(staged.value());
+  EXPECT_EQ(participant->LockedOwnerRebindNeedsMotionProof(staged.value()), std::optional<bool>(false));
+  EXPECT_TRUE(participant->CommitLockedOwnerRebind(staged.value()));
   participant->UnlockOwnerRebind(staged.value());
   EXPECT_FALSE(participant->owner_rebuild_observation());
 }
@@ -12736,9 +13684,8 @@ TEST_F(PortParticipantKernelTest, OwnerRebuildWithoutRetainedGoalUsesOwnerOnlyMa
 TEST_F(PortParticipantKernelTest, OwnerRebuildKeepsPreparedSuccessorWithoutNewRefusal) {
   const auto product = DirectBackendProduct();
   Sample(0.0, 0.0, 0.0);
-  const ExecutionGoalKey old{ControllerGoalId("rebuild.old"), ControllerGoalGeneration(1U)};
-  const auto handle = participant->Dispatch(product, old.controller_goal_id,
-                                             old.controller_goal_generation);
+  const ControllerGoalId old{ControllerGoalId{OperationNumber(908U), 1U, 1U}};
+  const auto handle = participant->Dispatch(product, old);
   pclock.advance(10'000'000);
   Executing(old);
   Sample(0.5, 0.25, 0.5);
@@ -12768,9 +13715,8 @@ TEST_F(PortParticipantKernelTest, OwnerRebuildKeepsPreparedSuccessorWithoutNewRe
 TEST_F(PortParticipantKernelTest, OwnerRebuildRetainsUnknownDispatchedSuccessorUntilRest) {
   const auto product = DirectBackendProduct();
   Sample(0.0, 0.0, 0.0);
-  const ExecutionGoalKey old{ControllerGoalId("rebuild.unknown.old"), ControllerGoalGeneration(1U)};
-  const auto handle = participant->Dispatch(product, old.controller_goal_id,
-                                             old.controller_goal_generation);
+  const ControllerGoalId old{ControllerGoalId{OperationNumber(909U), 1U, 1U}};
+  const auto handle = participant->Dispatch(product, old);
   pclock.advance(10'000'000);
   Executing(old);
   Sample(0.5, 0.25, 0.5);
@@ -12781,8 +13727,7 @@ TEST_F(PortParticipantKernelTest, OwnerRebuildRetainsUnknownDispatchedSuccessorU
   const auto successor = DirectSuccessor(product, source.value());
   ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
             PrepareParticipantResultStateDTO::kPrepared);
-  const ExecutionGoalKey next_key{ControllerGoalId("rebuild.unknown.next"),
-                                  ControllerGoalGeneration(2U)};
+  const ControllerGoalId next_key{ControllerGoalId{OperationNumber(910U), 1U, 2U}};
   const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next_key,
                                                       pclock.now() + 1'000'000'000);
   ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
@@ -12837,13 +13782,12 @@ TEST_F(PortParticipantKernelTest, RebindKeepsTheOldPreparedMembershipUntilItsOwn
   next_port->SetReadiness({true, true, true, ExecutionBindingEpoch(2U)});
   ASSERT_TRUE(participant->RebindPort(next_port).ok());
   const auto replay =
-      participant->Dispatch(dispatched, key.controller_goal_id, key.controller_goal_generation);
+      participant->Dispatch(dispatched, key);
   EXPECT_NE(replay.execution_generation, 0U);
   EXPECT_TRUE(next_port->commands().empty());
 
   ASSERT_TRUE(participant->RetirePreparedExecution(accepted.value()).ok());
-  const auto after = participant->Dispatch(dispatched, ControllerGoalId("goal.after.retire"),
-                                           ControllerGoalGeneration(1U));
+  const auto after = participant->Dispatch(dispatched, ControllerGoalId{OperationNumber(911U), 1U, 1U});
   EXPECT_EQ(after.execution_generation, 0U);
   EXPECT_EQ(after.get_snapshot().error->details.at("reason"), "prepared_participant_not_admitted");
   EXPECT_TRUE(next_port->commands().empty());
@@ -12880,16 +13824,13 @@ TEST_F(PortParticipantKernelTest, DispatchReplayReturnsTheSameHandleAndRefusesAn
   const auto& dispatched = *observed.value().last_dispatched_participant;
   const auto key = SubmittedKey().value();
   // Exact repetition: the same goal-bound handle, no second goal.
-  const auto again = participant->Dispatch(dispatched, key.controller_goal_id,
-                                           key.controller_goal_generation);
+  const auto again = participant->Dispatch(dispatched, key);
   EXPECT_NE(again.execution_generation, 0U);
-  EXPECT_FALSE(prepared_execution_handle_field_error(again, dispatched, key.controller_goal_id,
-                                                     key.controller_goal_generation)
+  EXPECT_FALSE(prepared_execution_handle_field_error(again, dispatched, key)
                    .has_value());
   // Another generation of the same goal is a conflict, refused before effect.
   const auto conflict = participant->Dispatch(
-      dispatched, key.controller_goal_id,
-      ControllerGoalGeneration(key.controller_goal_generation.value() + 1U));
+      dispatched, ControllerGoalId{key.operation_id, key.ordinal, key.generation + 1U});
   EXPECT_EQ(conflict.execution_generation, 0U);
   EXPECT_EQ(conflict.get_snapshot().error->details.at("reason"),
             "controller_goal_identity_conflict");
@@ -12924,7 +13865,7 @@ TEST_F(PortParticipantKernelTest, StopIntentWinsWhileTheMeasuredCompletionGateIs
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
   }
   ASSERT_EQ(ended_as(*pkernel), "working:Executing");
-  ASSERT_EQ(pkernel->fence_addressed_participant_stop(accepted.value()),
+  ASSERT_EQ(fence_addressed_stop(*pkernel, accepted.value()).disposition,
             AddressedParticipantStopFenceDisposition::kDispatchCommitted);
   const auto stage = StageFor(accepted.value(), 0U);
   stopping = true;
@@ -12945,9 +13886,9 @@ TEST_F(PortParticipantKernelTest,
        PendingReplacementCannotCompleteOldHandleOrLoseFaultCancellation) {
   const auto product = DirectBackendProduct();
   Sample(0.0, 0.0, 0.0);
-  const ExecutionGoalKey old{ControllerGoalId("direct.old"), ControllerGoalGeneration(1U)};
+  const ControllerGoalId old{ControllerGoalId{OperationNumber(912U), 1U, 1U}};
   const auto handle =
-      participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+      participant->Dispatch(product, old);
   ASSERT_NE(handle.execution_generation, 0U);
   pclock.advance(10'000'000);
   Executing(old);
@@ -12961,7 +13902,7 @@ TEST_F(PortParticipantKernelTest,
   ASSERT_EQ(prepared.state, PrepareParticipantResultStateDTO::kPrepared)
       << (prepared.error ? prepared.error->message : "no preparation error")
       << (prepared.error ? ::testing::PrintToString(prepared.error->details) : "");
-  const ExecutionGoalKey next{ControllerGoalId("direct.next"), ControllerGoalGeneration(2U)};
+  const ControllerGoalId next{ControllerGoalId{OperationNumber(913U), 1U, 2U}};
   const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next,
                                                      pclock.now() + 1'000'000'000);
   ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
@@ -13001,9 +13942,8 @@ TEST_F(PortParticipantKernelTest, ReplacementSourceCapturesOnlyScheduledControll
     port->SetLaneFacts(facts);
     const auto product = DirectBackendProduct();
     Sample(0.0, 0.0, 0.0);
-    const ExecutionGoalKey goal{ControllerGoalId("period.capture"), ControllerGoalGeneration(1U)};
-    const auto handle = participant->Dispatch(product, goal.controller_goal_id,
-                                               goal.controller_goal_generation);
+    const ControllerGoalId goal{ControllerGoalId{OperationNumber(914U), 1U, 1U}};
+    const auto handle = participant->Dispatch(product, goal);
     pclock.advance(10'000'000);
     Executing(goal);
     Sample(0.5, 0.25, 0.5);
@@ -13023,10 +13963,9 @@ TEST_F(PortParticipantKernelTest,
        ReplacementSourceKeepsMatchedSampleUntilOrdinaryProgressTick) {
   const auto product = DirectBackendProduct();
   Sample(0.0, 0.0, 0.0);
-  const ExecutionGoalKey goal{ControllerGoalId("sample.capture"),
-                              ControllerGoalGeneration(1U)};
+  const ControllerGoalId goal{ControllerGoalId{OperationNumber(915U), 1U, 1U}};
   const auto handle =
-      participant->Dispatch(product, goal.controller_goal_id, goal.controller_goal_generation);
+      participant->Dispatch(product, goal);
   ASSERT_NE(handle.execution_generation, 0U);
   pclock.advance(10'000'000);
   Executing(goal);
@@ -13095,9 +14034,9 @@ TEST_F(PortParticipantKernelTest, ReplacementSourceAppliesFreshnessToItsRetained
   ASSERT_EQ(participant->Prepare(product, 1U).state,
             PrepareParticipantResultStateDTO::kPrepared);
   Sample(0.0, 0.0, 0.0);
-  const ExecutionGoalKey goal{ControllerGoalId("pair.freshness"), ControllerGoalGeneration(1U)};
+  const ControllerGoalId goal{ControllerGoalId{OperationNumber(916U), 1U, 1U}};
   const auto handle =
-      participant->Dispatch(product, goal.controller_goal_id, goal.controller_goal_generation);
+      participant->Dispatch(product, goal);
   ASSERT_NE(handle.execution_generation, 0U);
   pclock.advance(10'000'000);
   Executing(goal);
@@ -13126,10 +14065,9 @@ TEST_F(PortParticipantKernelTest,
     SCOPED_TRACE(boundary);
     const auto product = DirectBackendProduct();
     Sample(0.0, 0.0, 0.0);
-    const ExecutionGoalKey goal{ControllerGoalId("pair.guard." + std::to_string(boundary)),
-                                ControllerGoalGeneration(1U)};
+    const ControllerGoalId goal{OperationNumber(980U + boundary), 1U, 1U};
     const auto handle =
-        participant->Dispatch(product, goal.controller_goal_id, goal.controller_goal_generation);
+        participant->Dispatch(product, goal);
     ASSERT_NE(handle.execution_generation, 0U);
     pclock.advance(10'000'000);
     Executing(goal);
@@ -13177,9 +14115,9 @@ TEST_F(PortParticipantKernelTest,
 TEST_F(PortParticipantKernelTest, RejectedReplacementIsNoEffectAndCannotBeAdopted) {
   const auto product = DirectBackendProduct();
   Sample(0.0, 0.0, 0.0);
-  const ExecutionGoalKey old{ControllerGoalId("reject.old"), ControllerGoalGeneration(1U)};
+  const ControllerGoalId old{ControllerGoalId{OperationNumber(917U), 1U, 1U}};
   const auto handle =
-      participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+      participant->Dispatch(product, old);
   pclock.advance(10'000'000);
   Executing(old);
   Sample(0.5, 0.25, 0.5);
@@ -13192,7 +14130,7 @@ TEST_F(PortParticipantKernelTest, RejectedReplacementIsNoEffectAndCannotBeAdopte
   ASSERT_EQ(prepared.state, PrepareParticipantResultStateDTO::kPrepared)
       << (prepared.error ? prepared.error->message : "no preparation error")
       << (prepared.error ? ::testing::PrintToString(prepared.error->details) : "");
-  const ExecutionGoalKey next{ControllerGoalId("reject.next"), ControllerGoalGeneration(2U)};
+  const ControllerGoalId next{ControllerGoalId{OperationNumber(918U), 1U, 2U}};
   ASSERT_EQ(
       participant
           ->DispatchReplacement(source.value(), 2U, successor, next, pclock.now() + 1'000'000'000)
@@ -13202,16 +14140,13 @@ TEST_F(PortParticipantKernelTest, RejectedReplacementIsNoEffectAndCannotBeAdopte
   const auto observed = participant->ObserveReplacement(source.value(), 2U);
   ASSERT_TRUE(observed.ok());
   EXPECT_EQ(observed.value().phase, PreparedMotionReplacementPhaseDTO::kNoEffect);
-  int commits = 0;
-  const PreparedMotionReplacementCommitDTO commit{&commits, [](void* context) noexcept {
-                                                    ++*static_cast<int*>(context);
-                                                    return Result<void>::Ok();
-                                                  }};
-  EXPECT_FALSE(participant->AdoptReplacement(source.value(), 2U, commit).ok());
-  EXPECT_EQ(commits, 0);
+  // OD-175: "prove" refuses, so the Kernel never decides and "apply" never runs.
+  const auto proven = participant->ProveReplacement(source.value(), 2U);
+  ASSERT_FALSE(proven.ok());
+  EXPECT_EQ(proven.error().details.at("reason"), "motion_replacement_not_ready");
   EXPECT_TRUE(participant->RetirePreparedExecution(2U).ok());
   // Candidate cleanup preserves the source preparation and original handle.
-  EXPECT_EQ(participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation)
+  EXPECT_EQ(participant->Dispatch(product, old)
                 .execution_generation,
             handle.execution_generation);
   EXPECT_EQ(Calls<testing::FakeExecutionPort::SubmitCall>().size(), 1U);
@@ -13225,9 +14160,9 @@ TEST_F(PortParticipantKernelTest, ReplacementSendRecheckCancelsTheSwapBeforeTheP
     SCOPED_TRACE(revoke);
     const auto product = DirectBackendProduct();
     Sample(0.0, 0.0, 0.0);
-    const ExecutionGoalKey old{ControllerGoalId("recheck.old"), ControllerGoalGeneration(1U)};
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(919U), 1U, 1U}};
     const auto handle =
-        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+        participant->Dispatch(product, old);
     pclock.advance(10'000'000);
     Executing(old);
     Sample(0.5, 0.25, 0.5);
@@ -13238,7 +14173,7 @@ TEST_F(PortParticipantKernelTest, ReplacementSendRecheckCancelsTheSwapBeforeTheP
     const auto successor = DirectSuccessor(product, source.value());
     ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
               PrepareParticipantResultStateDTO::kPrepared);
-    const ExecutionGoalKey next{ControllerGoalId("recheck.next"), ControllerGoalGeneration(2U)};
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(920U), 1U, 2U}};
     int rechecks = 0;
     const auto sent = participant->DispatchReplacement(
         source.value(), 2U, successor, next, pclock.now() + 1'000'000'000,
@@ -13289,9 +14224,9 @@ TEST_F(PortParticipantKernelTest, AStopDuringTheReplacementSendFencesItBeforeThe
     SCOPED_TRACE(static_cast<int>(kind));
     const auto product = DirectBackendProduct();
     Sample(0.0, 0.0, 0.0);
-    const ExecutionGoalKey old{ControllerGoalId("inflight.old"), ControllerGoalGeneration(1U)};
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(921U), 1U, 1U}};
     const auto handle =
-        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+        participant->Dispatch(product, old);
     pclock.advance(10'000'000);
     Executing(old);
     Sample(0.5, 0.25, 0.5);
@@ -13302,7 +14237,7 @@ TEST_F(PortParticipantKernelTest, AStopDuringTheReplacementSendFencesItBeforeThe
     const auto successor = DirectSuccessor(product, source.value());
     ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
               PrepareParticipantResultStateDTO::kPrepared);
-    const ExecutionGoalKey next{ControllerGoalId("inflight.next"), ControllerGoalGeneration(2U)};
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(922U), 1U, 2U}};
     struct Gate {
       std::mutex mutex;
       std::condition_variable changed;
@@ -13401,9 +14336,9 @@ TEST_F(PortParticipantKernelTest, RestartedControllerCursorRefusesTheTakeoverWit
   // configured Stop fallback).
   const auto product = DirectBackendProduct();
   Sample(0.0, 0.0, 0.0);
-  const ExecutionGoalKey old{ControllerGoalId("restart.old"), ControllerGoalGeneration(1U)};
+  const ControllerGoalId old{ControllerGoalId{OperationNumber(923U), 1U, 1U}};
   const auto handle =
-      participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+      participant->Dispatch(product, old);
   pclock.advance(10'000'000);
   Executing(old);
   Sample(0.5, 0.25, 0.5);
@@ -13416,7 +14351,7 @@ TEST_F(PortParticipantKernelTest, RestartedControllerCursorRefusesTheTakeoverWit
             PrepareParticipantResultStateDTO::kPrepared);
   pclock.advance(1'000'000);
   Sample(0.0, 0.0, 0.0);  // restarted cursor, goal not yet terminal
-  const ExecutionGoalKey next{ControllerGoalId("restart.next"), ControllerGoalGeneration(2U)};
+  const ControllerGoalId next{ControllerGoalId{OperationNumber(924U), 1U, 2U}};
   const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next,
                                                      pclock.now() + 1'000'000'000);
   EXPECT_EQ(sent.command.dispatch, ExecutionPortDispatch::kNotDispatched);
@@ -13440,9 +14375,9 @@ TEST_F(PortParticipantKernelTest,
     // phase prediction during an evolving ramp or an actual RT installation.
     participant->set_runtime_velocity_scale(factor);
     Sample(0.0, 0.0, 0.0, factor);
-    const ExecutionGoalKey old{ControllerGoalId("scheduled.old"), ControllerGoalGeneration(1U)};
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(925U), 1U, 1U}};
     const auto handle =
-        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+        participant->Dispatch(product, old);
     ASSERT_NE(handle.execution_generation, 0U);
     pclock.advance(10'000'000);
     Executing(old);
@@ -13455,7 +14390,7 @@ TEST_F(PortParticipantKernelTest,
     const auto successor = DirectSuccessor(product, source.value());
     ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
               PrepareParticipantResultStateDTO::kPrepared);
-    const ExecutionGoalKey next{ControllerGoalId("scheduled.next"), ControllerGoalGeneration(2U)};
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(926U), 1U, 2U}};
     const auto scales_before = Calls<testing::FakeExecutionPort::SetScaleCall>().size();
     const auto sent = participant->DispatchReplacement(
         source.value(), 2U, successor, next, pclock.now() + 1'000'000'000);
@@ -13497,8 +14432,9 @@ TEST_F(PortParticipantKernelTest,
     Sample(0.1, 0.3 + 0.5 * factor * 0.03, 0.5, factor);
     ASSERT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
               PreparedMotionReplacementPhaseDTO::kReadyToCommit);
-    ASSERT_TRUE(participant->AdoptReplacement(
-        source.value(), 2U, {nullptr, [](void*) noexcept { return Result<void>::Ok(); }}).ok());
+    // OD-175: "prove", then (after the Kernel's "decide") "apply".
+    ASSERT_TRUE(participant->ProveReplacement(source.value(), 2U).ok());
+    participant->ApplyReplacement(2U);
     ASSERT_TRUE(participant->RetirePreparedExecution(1U).ok());
     const auto source2 = participant->CaptureReplacementSource(
         2U, sent.handle->execution_generation, next, successor.prepared_contract_digest);
@@ -13509,7 +14445,7 @@ TEST_F(PortParticipantKernelTest,
     const auto third_product = DirectSuccessor(successor, source2.value());
     ASSERT_EQ(participant->PrepareReplacement(third_product, 3U, source2.value()).state,
               PrepareParticipantResultStateDTO::kPrepared);
-    const ExecutionGoalKey third{ControllerGoalId("scheduled.third"), ControllerGoalGeneration(3U)};
+    const ControllerGoalId third{ControllerGoalId{OperationNumber(927U), 1U, 3U}};
     const auto sent2 = participant->DispatchReplacement(
         source2.value(), 3U, third_product, third, pclock.now() + 1'000'000'000);
     ASSERT_EQ(sent2.command.dispatch, ExecutionPortDispatch::kDispatched);
@@ -13547,9 +14483,9 @@ TEST_F(PortParticipantKernelTest, ExperimentFlagsEachChangeOnlyTheirPartOfMoving
     const auto product = DirectBackendProduct();
     participant->set_runtime_velocity_scale(1.0);
     Sample(0.0, 0.0, 0.0, 1.0);
-    const ExecutionGoalKey old{ControllerGoalId("flags.old"), ControllerGoalGeneration(1U)};
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(928U), 1U, 1U}};
     const auto handle =
-        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+        participant->Dispatch(product, old);
     ASSERT_NE(handle.execution_generation, 0U);
     pclock.advance(10'000'000);
     Executing(old);
@@ -13562,7 +14498,7 @@ TEST_F(PortParticipantKernelTest, ExperimentFlagsEachChangeOnlyTheirPartOfMoving
     const auto successor = DirectSuccessor(product, source.value());
     ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
               PrepareParticipantResultStateDTO::kPrepared);
-    const ExecutionGoalKey next{ControllerGoalId("flags.next"), ControllerGoalGeneration(2U)};
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(929U), 1U, 2U}};
     const auto join_started = pclock.now();
     TimePoint unsent_until = 0;
     {
@@ -13633,9 +14569,9 @@ TEST_F(PortParticipantKernelTest, ReleaseTimerChargesGridRoundingButPreservesOth
     const auto product = DirectBackendProduct();
     participant->set_runtime_velocity_scale(1.0);
     Sample(0.0, 0.0, 0.0, 1.0);
-    const ExecutionGoalKey old{ControllerGoalId("grid.old"), ControllerGoalGeneration(1U)};
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(930U), 1U, 1U}};
     const auto handle =
-        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+        participant->Dispatch(product, old);
     pclock.advance(10'000'000);
     Executing(old);
     Sample(0.5, 0.25, 0.5, 1.0);
@@ -13665,7 +14601,7 @@ TEST_F(PortParticipantKernelTest, ReleaseTimerChargesGridRoundingButPreservesOth
       port->SetOnReadSample([&](auto&) {
         if (++reads == 2) pclock.advance(21'000'000);
       });
-    const ExecutionGoalKey next{ControllerGoalId("grid.next"), ControllerGoalGeneration(2U)};
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(931U), 1U, 2U}};
     const auto sent = participant->DispatchReplacement(
         source.value(), 2U, successor, next,
         join_started + (mode == Mode::kPreparationDeadline ? 20'000'000 : 1'000'000'000));
@@ -13715,9 +14651,9 @@ TEST_F(PortParticipantKernelTest, ReleaseHoldNeverCrossesADeadlineAndRechecksRea
     const auto product = DirectBackendProduct();
     participant->set_runtime_velocity_scale(1.0);
     Sample(0.0, 0.0, 0.0, 1.0);
-    const ExecutionGoalKey old{ControllerGoalId("hold.old"), ControllerGoalGeneration(1U)};
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(932U), 1U, 1U}};
     const auto handle =
-        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+        participant->Dispatch(product, old);
     pclock.advance(10'000'000);
     Executing(old);
     Sample(0.5, 0.25, 0.5, 1.0);
@@ -13729,7 +14665,7 @@ TEST_F(PortParticipantKernelTest, ReleaseHoldNeverCrossesADeadlineAndRechecksRea
     const auto successor = DirectSuccessor(product, source.value());
     ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
               PrepareParticipantResultStateDTO::kPrepared);
-    const ExecutionGoalKey next{ControllerGoalId("hold.next"), ControllerGoalGeneration(2U)};
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(933U), 1U, 2U}};
     const auto ready = port->ReadReadiness();
     {
       std::lock_guard lock(hook_mutex);
@@ -13781,9 +14717,9 @@ TEST_F(PortParticipantKernelTest, ReleaseHoldWaitsWithoutTheParticipantLockAndRe
     const auto product = DirectBackendProduct();
     participant->set_runtime_velocity_scale(1.0);
     Sample(0.0, 0.0, 0.0, 1.0);
-    const ExecutionGoalKey old{ControllerGoalId("race.old"), ControllerGoalGeneration(1U)};
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(934U), 1U, 1U}};
     const auto handle =
-        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+        participant->Dispatch(product, old);
     pclock.advance(10'000'000);
     Executing(old);
     Sample(0.5, 0.25, 0.5, 1.0);
@@ -13795,8 +14731,8 @@ TEST_F(PortParticipantKernelTest, ReleaseHoldWaitsWithoutTheParticipantLockAndRe
     const auto successor = DirectSuccessor(product, source.value());
     ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
               PrepareParticipantResultStateDTO::kPrepared);
-    const ExecutionGoalKey next{ControllerGoalId("race.next"), ControllerGoalGeneration(2U)};
-    const ExecutionGoalKey other{ControllerGoalId("race.other"), ControllerGoalGeneration(3U)};
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(935U), 1U, 2U}};
+    const ControllerGoalId other{ControllerGoalId{OperationNumber(936U), 1U, 3U}};
     const auto join_started = pclock.now();
     const auto deadline = pclock.now() + 1'000'000'000;
     std::atomic<int> waits{0};
@@ -13921,9 +14857,9 @@ TEST_F(PortParticipantKernelTest, ReplacementDeadlineAndInheritedRampBoundsRefus
     port->SetLaneFacts(lane);
     const auto product = DirectBackendProduct();
     Sample(0.0, 0.0, 0.0);
-    const ExecutionGoalKey old{ControllerGoalId("bounds.old"), ControllerGoalGeneration(1U)};
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(937U), 1U, 1U}};
     const auto handle =
-        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+        participant->Dispatch(product, old);
     participant->set_runtime_velocity_scale(0.5);
     pclock.advance(10'000'000);
     pscheduler.advance_to(pclock.now());
@@ -13944,7 +14880,7 @@ TEST_F(PortParticipantKernelTest, ReplacementDeadlineAndInheritedRampBoundsRefus
     ASSERT_EQ(prepared.state, PrepareParticipantResultStateDTO::kPrepared)
         << (prepared.error ? prepared.error->message : "no preparation error")
         << (prepared.error ? ::testing::PrintToString(prepared.error->details) : "");
-    const ExecutionGoalKey next{ControllerGoalId("bounds.next"), ControllerGoalGeneration(2U)};
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(938U), 1U, 2U}};
     int reads = 0;
     if (expired)
       port->SetOnReadSample([&](auto&) {
@@ -13993,9 +14929,9 @@ TEST_F(PortParticipantKernelTest, PreparationHoldDefersSliderThroughAdoptedConne
   const auto product = DirectBackendProduct();
   participant->set_runtime_velocity_scale(1.0);
   Sample(0.0, 0.0, 0.0);
-  const ExecutionGoalKey old{ControllerGoalId("hold.old"), ControllerGoalGeneration(1U)};
+  const ControllerGoalId old{ControllerGoalId{OperationNumber(932U), 1U, 1U}};
   const auto handle =
-      participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+      participant->Dispatch(product, old);
   pclock.advance(10'000'000);
   Executing(old);
   Sample(0.5, 0.25, 0.5);
@@ -14028,7 +14964,7 @@ TEST_F(PortParticipantKernelTest, PreparationHoldDefersSliderThroughAdoptedConne
   motion.trajectory.runtime_scale_bounds->max_rate_per_s = 2.0;
   ASSERT_EQ(participant->PrepareReplacement(next_product, 2U, source.value()).state,
             PrepareParticipantResultStateDTO::kPrepared);
-  const ExecutionGoalKey next{ControllerGoalId("hold.next"), ControllerGoalGeneration(2U)};
+  const ControllerGoalId next{ControllerGoalId{OperationNumber(933U), 1U, 2U}};
   const auto sent = participant->DispatchReplacement(source.value(), 2U, next_product, next,
                                                      pclock.now() + 1'000'000'000);
   ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched)
@@ -14040,10 +14976,8 @@ TEST_F(PortParticipantKernelTest, PreparationHoldDefersSliderThroughAdoptedConne
   Sample(0.1, 0.3, 0.5);
   ASSERT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
             PreparedMotionReplacementPhaseDTO::kReadyToCommit);
-  ASSERT_TRUE(participant
-                  ->AdoptReplacement(source.value(), 2U,
-                                     {nullptr, [](void*) noexcept { return Result<void>::Ok(); }})
-                  .ok());
+  ASSERT_TRUE(participant->ProveReplacement(source.value(), 2U).ok());
+  participant->ApplyReplacement(2U);
   pclock.advance(10'000'000);
   Sample(0.4, 0.45, 0.5);
   EXPECT_FALSE(sent.handle->wait_for_completion(0));
@@ -14059,15 +14993,96 @@ TEST_F(PortParticipantKernelTest, PreparationHoldDefersSliderThroughAdoptedConne
   EXPECT_NEAR(scales.back().value, 0.98, 1e-12);
 }
 
+// OD-175 design test 15 (the exits a participant sees; vendor TCP speed
+// limit, design §9): from the preparation hold to the adopted connector no
+// physical scale is written. A "prove" that refuses and a "prove" with no
+// "apply" (the Kernel's "decide" refused) both leave the hold standing;
+// "apply" turns it into the pin, which holds until the connector ends.
+TEST_F(PortParticipantKernelTest, ProveWithoutApplyKeepsTheHoldAndApplyPinsIt) {
+  const auto product = DirectBackendProduct();
+  participant->set_runtime_velocity_scale(1.0);
+  Sample(0.0, 0.0, 0.0);
+  const ControllerGoalId old{ControllerGoalId{OperationNumber(934U), 1U, 1U}};
+  const auto handle = participant->Dispatch(product, old);
+  pclock.advance(10'000'000);
+  Executing(old);
+  Sample(0.5, 0.25, 0.5);
+  ASSERT_FALSE(handle.wait_for_completion(0));
+  const auto source = participant->CaptureReplacementSource(1U, handle.execution_generation, old,
+                                                            product.prepared_contract_digest);
+  ASSERT_TRUE(source.ok());
+  ASSERT_TRUE(participant
+                  ->BeginReplacementPreparationScaleHold(source.value(), 2U,
+                                                         pclock.now() + 1'000'000'000, {})
+                  .ok());
+  const auto count = Calls<testing::FakeExecutionPort::SetScaleCall>().size();
+  participant->set_runtime_velocity_scale(0.5);
+  pclock.advance(10'000'000);
+  pscheduler.advance_to(pclock.now());
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
+  auto next_product = DirectSuccessor(product, source.value());
+  auto& motion = std::get<PreparedMotionExecutionDTO>(next_product.payload);
+  const auto& original = std::get<PreparedMotionExecutionDTO>(product.payload).trajectory;
+  const auto point = [&](double time) {
+    const auto sample = sample_trajectory(original, 0.5 + time);
+    if (!sample.ok()) throw std::logic_error(sample.error().message);
+    return TrajectoryWaypointDTO{time, sample.value().positions_rad,
+                                 sample.value().velocities_rad_s,
+                                 sample.value().accelerations_rad_s2};
+  };
+  motion.plan_request.moving_replacement->source_prefix_trajectory.waypoints = {point(0.0),
+                                                                                point(1.0)};
+  motion.trajectory.waypoints = {point(0.0), point(1.0), point(1.25), point(3.5)};
+  motion.trajectory.runtime_scale_bounds->max_rate_per_s = 2.0;
+  ASSERT_EQ(participant->PrepareReplacement(next_product, 2U, source.value()).state,
+            PrepareParticipantResultStateDTO::kPrepared);
+  const ControllerGoalId next{ControllerGoalId{OperationNumber(935U), 1U, 2U}};
+  const auto sent = participant->DispatchReplacement(source.value(), 2U, next_product, next,
+                                                     pclock.now() + 1'000'000'000);
+  ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched)
+      << (sent.command.error ? sent.command.error->message : "");
+  ASSERT_TRUE(sent.handle);
+  port->FinishGoal(old, ExecutionGoalResult::kPreemptedBy, next, pclock.now());
+  pclock.advance(30'000'000);
+  Executing(next);
+  Sample(0.1, 0.3, 0.5);
+  ASSERT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
+            PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+  // Exit 1: "prove" refuses (it names another candidate). The hold stands.
+  EXPECT_FALSE(participant->ProveReplacement(source.value(), 3U).ok());
+  pscheduler.advance_to(pclock.now());
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
+  // Exit 2: "prove" passes and no "apply" follows yet (as when "decide"
+  // refuses). The hold stands.
+  ASSERT_TRUE(participant->ProveReplacement(source.value(), 2U).ok());
+  pscheduler.advance_to(pclock.now());
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
+  // "Apply": the hold becomes the pin; still no physical write until the
+  // adopted connector ends.
+  participant->ApplyReplacement(2U);
+  pclock.advance(10'000'000);
+  Sample(0.4, 0.45, 0.5);
+  EXPECT_FALSE(sent.handle->wait_for_completion(0));
+  pscheduler.advance_to(pclock.now());
+  EXPECT_EQ(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
+  pclock.advance(10'000'000);
+  Sample(1.4, 0.95, 0.5);
+  EXPECT_FALSE(sent.handle->wait_for_completion(0));
+  pclock.advance(10'000'000);
+  pscheduler.advance_to(pclock.now());
+  // After the connector the deferred value is applied.
+  EXPECT_GT(Calls<testing::FakeExecutionPort::SetScaleCall>().size(), count);
+}
+
 TEST_F(PortParticipantKernelTest, ScheduledMovingReplacementKeepsExistingEvolvingRampAdmission) {
   auto lane = port->ReadLaneFacts();
   lane.supports_scheduled_replacement = true;
   port->SetLaneFacts(lane);
   const auto product = DirectBackendProduct();
   Sample(0.0, 0.0, 0.0);
-  const ExecutionGoalKey old{ControllerGoalId("ramp.scheduled.old"), ControllerGoalGeneration(1U)};
+  const ControllerGoalId old{ControllerGoalId{OperationNumber(939U), 1U, 1U}};
   const auto handle =
-      participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+      participant->Dispatch(product, old);
   participant->set_runtime_velocity_scale(0.5);
   pclock.advance(10'000'000);
   pscheduler.advance_to(pclock.now());
@@ -14080,7 +15095,7 @@ TEST_F(PortParticipantKernelTest, ScheduledMovingReplacementKeepsExistingEvolvin
   const auto successor = DirectSuccessor(product, source.value());
   ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
             PrepareParticipantResultStateDTO::kPrepared);
-  const ExecutionGoalKey next{ControllerGoalId("ramp.scheduled.next"), ControllerGoalGeneration(2U)};
+  const ControllerGoalId next{ControllerGoalId{OperationNumber(940U), 1U, 2U}};
   const auto sent = participant->DispatchReplacement(
       source.value(), 2U, successor, next, pclock.now() + 1'000'000'000);
   ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
@@ -14113,9 +15128,9 @@ TEST_F(PortParticipantKernelTest,
         {ResourceId("joint.1"), "joint_1", {1.0, 3.0, std::nullopt}},
         {ResourceId("joint.2"), "joint_2", {1.0, 3.0, std::nullopt}}};
     Sample(0.0, 0.0, 0.0);
-    const ExecutionGoalKey old{ControllerGoalId("delay.old"), ControllerGoalGeneration(1U)};
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(941U), 1U, 1U}};
     const auto handle =
-        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+        participant->Dispatch(product, old);
     participant->set_runtime_velocity_scale(0.5);
     pclock.advance(10'000'000);
     pscheduler.advance_to(pclock.now());
@@ -14138,7 +15153,7 @@ TEST_F(PortParticipantKernelTest,
       // copying / source proof latency before the actual SDK boundary.
       if (++reads == 2) pclock.advance(delay_ns);
     });
-    const ExecutionGoalKey next{ControllerGoalId("delay.next"), ControllerGoalGeneration(2U)};
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(942U), 1U, 2U}};
     const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next,
                                                        pclock.now() + 1'000'000'000);
     port->SetOnReadSample(nullptr);
@@ -14192,9 +15207,9 @@ TEST_F(PortParticipantKernelTest, ScopedStopRetiresPendingOnlyWithEveryRetainedE
     SCOPED_TRACE(complete);
     const auto product = DirectBackendProduct();
     Sample(0.0, 0.0, 0.0);
-    const ExecutionGoalKey old{ControllerGoalId("stop.old"), ControllerGoalGeneration(1U)};
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(943U), 1U, 1U}};
     const auto handle =
-        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+        participant->Dispatch(product, old);
     pclock.advance(10'000'000);
     Executing(old);
     Sample(0.5, 0.25, 0.5);
@@ -14207,7 +15222,7 @@ TEST_F(PortParticipantKernelTest, ScopedStopRetiresPendingOnlyWithEveryRetainedE
     ASSERT_EQ(prepared.state, PrepareParticipantResultStateDTO::kPrepared)
         << (prepared.error ? prepared.error->message : "no preparation error")
         << (prepared.error ? ::testing::PrintToString(prepared.error->details) : "");
-    const ExecutionGoalKey next{ControllerGoalId("stop.next"), ControllerGoalGeneration(2U)};
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(944U), 1U, 2U}};
     ASSERT_EQ(
         participant
             ->DispatchReplacement(source.value(), 2U, successor, next, pclock.now() + 1'000'000'000)
@@ -14236,7 +15251,7 @@ TEST_F(PortParticipantKernelTest, ScopedStopRetiresPendingOnlyWithEveryRetainedE
       // Pending cleanup does not consume the source membership. Its original
       // handle is still exact and is retired only by the source owner.
       EXPECT_EQ(
-          participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation)
+          participant->Dispatch(product, old)
               .execution_generation,
           handle.execution_generation);
       EXPECT_TRUE(participant->RetirePreparedExecution(1U).ok());
@@ -14253,9 +15268,9 @@ TEST_F(PortParticipantKernelTest,
     SCOPED_TRACE(late);
     const auto product = DirectBackendProduct();
     Sample(0.0, 0.0, 0.0);
-    const ExecutionGoalKey old{ControllerGoalId("unknown.old"), ControllerGoalGeneration(1U)};
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(945U), 1U, 1U}};
     const auto handle =
-        participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+        participant->Dispatch(product, old);
     pclock.advance(10'000'000);
     Executing(old);
     Sample(0.5, 0.25, 0.5);
@@ -14271,7 +15286,7 @@ TEST_F(PortParticipantKernelTest,
     ASSERT_EQ(prepared.state, PrepareParticipantResultStateDTO::kPrepared)
         << (prepared.error ? prepared.error->message : "no preparation error")
         << (prepared.error ? ::testing::PrintToString(prepared.error->details) : "");
-    const ExecutionGoalKey next{ControllerGoalId("unknown.next"), ControllerGoalGeneration(2U)};
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(946U), 1U, 2U}};
     const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next,
                                                        pclock.now() + 2'000'000'000);
     ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
@@ -14283,22 +15298,14 @@ TEST_F(PortParticipantKernelTest,
       accepted.key = next;
       accepted.binding_epoch = source.value().binding_epoch;
       accepted.phase = ExecutionGoalPhase::kAccepted;
-      accepted.mechanism_goal_id = MechanismGoalId("accepted-delayed-feedback");
+      accepted.mechanism_goal_id = manyforge::core::testing::TestMechanismGoalId(1U);
       accepted.accepted_stamp_ns = pclock.now();
       port->SetGoal(accepted);
       const auto before = participant->execution_progress_publication()->acquire();
       EXPECT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
                 PreparedMotionReplacementPhaseDTO::kPossiblySent);
-      int early_commits = 0;
-      EXPECT_FALSE(participant
-                       ->AdoptReplacement(source.value(), 2U,
-                                          {&early_commits,
-                                           [](void* count) noexcept {
-                                             ++*static_cast<int*>(count);
-                                             return Result<void>::Ok();
-                                           }})
-                       .ok());
-      EXPECT_EQ(early_commits, 0);
+      // OD-175: "prove" refuses; "apply" is never reached.
+      EXPECT_FALSE(participant->ProveReplacement(source.value(), 2U).ok());
       EXPECT_EQ(participant->execution_progress_publication()->acquire().sequence,
                 before.sequence);
       pclock.advance(50'000'000);
@@ -14319,16 +15326,10 @@ TEST_F(PortParticipantKernelTest,
       EXPECT_GE(*observed.value().recognition_delay_ns, 49'999'999);
       EXPECT_FALSE(observed.value().error);
     }
-    int commits = 0;
-    EXPECT_EQ(participant
-                  ->AdoptReplacement(source.value(), 2U,
-                                     {&commits, [](void* count) noexcept {
-                                        ++*static_cast<int*>(count);
-                                        return Result<void>::Ok();
-                                      }})
-                  .ok(),
-              late);
-    EXPECT_EQ(commits, late ? 1 : 0);
+    // OD-175: "apply" follows only a "prove" that passed.
+    const bool proven = participant->ProveReplacement(source.value(), 2U).ok();
+    EXPECT_EQ(proven, late);
+    if (proven) participant->ApplyReplacement(2U);
     EXPECT_FALSE(participant->RetirePreparedExecution(2U).ok());
     const auto replay = participant->DispatchReplacement(source.value(), 2U, successor, next, 0);
     EXPECT_EQ(replay.submitted_at_ns, sent.submitted_at_ns);
@@ -14337,12 +15338,74 @@ TEST_F(PortParticipantKernelTest,
   }
 }
 
+// OD-175 decision (1) (a), design §6.1 and test 9 (rows 23, 23b): the
+// controller ends the new goal between "prove" and "apply". It is adopted
+// anyway and ends as its own result: Failed (controller_result_failed) for an
+// abort, Stopped for a cancel, Completed for a finish (as before OD-175).
+TEST_F(PortParticipantKernelTest, SuccessorEndingBetweenProveAndApplyEndsAsItsOwnResult) {
+  struct Case {
+    ExecutionGoalResult result;
+    ExecutionState state;
+    bool controller_failure;
+  };
+  for (const auto& item : {Case{ExecutionGoalResult::kAbortedPathTolerance,
+                                ExecutionState::kFailed, true},
+                           Case{ExecutionGoalResult::kCanceled, ExecutionState::kStopped, false},
+                           Case{ExecutionGoalResult::kSucceeded, ExecutionState::kCompleted,
+                                false}}) {
+    SCOPED_TRACE(static_cast<int>(item.result));
+    const auto product = DirectBackendProduct();
+    Sample(0.0, 0.0, 0.0);
+    const ControllerGoalId old{ControllerGoalId{OperationNumber(957U), 1U, 1U}};
+    const auto handle = participant->Dispatch(product, old);
+    pclock.advance(10'000'000);
+    Executing(old);
+    Sample(0.5, 0.25, 0.5);
+    EXPECT_FALSE(handle.wait_for_completion(0));
+    const auto source = participant->CaptureReplacementSource(
+        1U, handle.execution_generation, old, product.prepared_contract_digest);
+    ASSERT_TRUE(source.ok());
+    const auto successor = DirectSuccessor(product, source.value());
+    ASSERT_EQ(participant->PrepareReplacement(successor, 2U, source.value()).state,
+              PrepareParticipantResultStateDTO::kPrepared);
+    const ControllerGoalId next{ControllerGoalId{OperationNumber(958U), 1U, 2U}};
+    const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next,
+                                                       pclock.now() + 1'000'000'000);
+    ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
+    ASSERT_TRUE(sent.handle);
+    port->FinishGoal(old, ExecutionGoalResult::kPreemptedBy, next, pclock.now());
+    pclock.advance(30'000'000);
+    Executing(next);
+    Sample(0.1, 0.3, 0.5);
+    ASSERT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
+              PreparedMotionReplacementPhaseDTO::kReadyToCommit);
+    ASSERT_TRUE(participant->ProveReplacement(source.value(), 2U).ok());
+    // Between "prove" and "apply": the controller ends the new goal.
+    port->FinishGoal(next, item.result, std::nullopt, pclock.now());
+    participant->ApplyReplacement(2U);
+    // The old motion ended as preempted (adopted, not stopped by a fallback).
+    EXPECT_TRUE(handle.wait_for_completion(0));
+    EXPECT_EQ(handle.get_snapshot().state, ExecutionState::kStopped);
+    EXPECT_TRUE(sent.handle->wait_for_completion(0));
+    const auto ended = sent.handle->get_snapshot();
+    EXPECT_EQ(ended.state, item.state);
+    if (item.controller_failure) {
+      ASSERT_TRUE(ended.error);
+      EXPECT_EQ(ended.error->details.at("reason"), "controller_result_failed");
+    } else {
+      EXPECT_FALSE(ended.error);
+    }
+    EXPECT_TRUE(Calls<testing::FakeExecutionPort::CancelCall>().empty());
+    Reset();
+  }
+}
+
 TEST_F(PortParticipantKernelTest, RecognitionUsesOneOriginAndRetirementRestoresOrdinaryMembership) {
   const auto product = DirectBackendProduct();
   Sample(0.0, 0.0, 0.0);
-  const ExecutionGoalKey old{ControllerGoalId("origin.old"), ControllerGoalGeneration(1U)};
+  const ControllerGoalId old{ControllerGoalId{OperationNumber(947U), 1U, 1U}};
   const auto handle =
-      participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+      participant->Dispatch(product, old);
   pclock.advance(10'000'000);
   Executing(old);
   Sample(0.5, 0.25, 0.5);
@@ -14359,7 +15422,7 @@ TEST_F(PortParticipantKernelTest, RecognitionUsesOneOriginAndRetirementRestoresO
   port->SetOnReadSample([&](auto&) {
     if (++reads == 2) pclock.advance(20'000'000);
   });
-  const ExecutionGoalKey next{ControllerGoalId("origin.next"), ControllerGoalGeneration(2U)};
+  const ControllerGoalId next{ControllerGoalId{OperationNumber(948U), 1U, 2U}};
   const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next,
                                                      pclock.now() + 1'000'000'000);
   port->SetOnReadSample(nullptr);
@@ -14373,10 +15436,8 @@ TEST_F(PortParticipantKernelTest, RecognitionUsesOneOriginAndRetirementRestoresO
   Sample(0.95, 0.735, 0.5);
   ASSERT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
             PreparedMotionReplacementPhaseDTO::kReadyToCommit);
-  ASSERT_TRUE(participant
-                  ->AdoptReplacement(source.value(), 2U,
-                                     {nullptr, [](void*) noexcept { return Result<void>::Ok(); }})
-                  .ok());
+  ASSERT_TRUE(participant->ProveReplacement(source.value(), 2U).ok());
+  participant->ApplyReplacement(2U);
   port->FinishGoal(next, ExecutionGoalResult::kSucceeded, std::nullopt, pclock.now());
   EXPECT_TRUE(sent.handle->wait_for_completion(0));
   EXPECT_EQ(sent.handle->get_snapshot().state, ExecutionState::kCompleted);
@@ -14385,9 +15446,9 @@ TEST_F(PortParticipantKernelTest, RecognitionUsesOneOriginAndRetirementRestoresO
   auto ordinary = product;
   ordinary.prepared_contract_digest = ContentDigest(kTestDigestC);
   ASSERT_EQ(participant->Prepare(ordinary, 3U).state, PrepareParticipantResultStateDTO::kPrepared);
-  const ExecutionGoalKey third{ControllerGoalId("origin.ordinary"), ControllerGoalGeneration(3U)};
+  const ControllerGoalId third{ControllerGoalId{OperationNumber(949U), 1U, 3U}};
   const auto ordinary_handle =
-      participant->Dispatch(ordinary, third.controller_goal_id, third.controller_goal_generation);
+      participant->Dispatch(ordinary, third);
   ASSERT_NE(ordinary_handle.execution_generation, 0U);
   pclock.advance(10'000'000);
   Executing(third);
@@ -14414,9 +15475,9 @@ TEST_F(PortParticipantKernelTest, RecognitionUsesOneOriginAndRetirementRestoresO
 TEST_F(PortParticipantKernelTest, TimelyAdoptionPreservesRampDeliveryClockAndQualifiesSpringPoint) {
   const auto product = DirectBackendProduct(true);
   Sample(0.0, 0.0, 0.0);
-  const ExecutionGoalKey old{ControllerGoalId("adopt.old"), ControllerGoalGeneration(1U)};
+  const ControllerGoalId old{ControllerGoalId{OperationNumber(950U), 1U, 1U}};
   const auto old_handle =
-      participant->Dispatch(product, old.controller_goal_id, old.controller_goal_generation);
+      participant->Dispatch(product, old);
   participant->set_runtime_velocity_scale(0.5);
   pclock.advance(10'000'000);
   pscheduler.advance_to(pclock.now());
@@ -14431,7 +15492,7 @@ TEST_F(PortParticipantKernelTest, TimelyAdoptionPreservesRampDeliveryClockAndQua
   ASSERT_EQ(prepared.state, PrepareParticipantResultStateDTO::kPrepared)
       << (prepared.error ? prepared.error->message : "no preparation error")
       << (prepared.error ? ::testing::PrintToString(prepared.error->details) : "");
-  const ExecutionGoalKey next{ControllerGoalId("adopt.next"), ControllerGoalGeneration(2U)};
+  const ControllerGoalId next{ControllerGoalId{OperationNumber(951U), 1U, 2U}};
   const auto sent = participant->DispatchReplacement(source.value(), 2U, successor, next,
                                                      pclock.now() + 1'000'000'000);
   ASSERT_EQ(sent.command.dispatch, ExecutionPortDispatch::kDispatched);
@@ -14451,14 +15512,9 @@ TEST_F(PortParticipantKernelTest, TimelyAdoptionPreservesRampDeliveryClockAndQua
             source.value().progress.trajectory_time_ns);
   EXPECT_EQ(participant->ObserveReplacement(source.value(), 2U).value().phase,
             PreparedMotionReplacementPhaseDTO::kReadyToCommit);
-  int commits = 0;
-  const auto adopted =
-      participant->AdoptReplacement(source.value(), 2U, {&commits, [](void* context) noexcept {
-                                                           ++*static_cast<int*>(context);
-                                                           return Result<void>::Ok();
-                                                         }});
-  ASSERT_TRUE(adopted.ok()) << adopted.error().message;
-  EXPECT_EQ(commits, 1);
+  const auto proven = participant->ProveReplacement(source.value(), 2U);
+  ASSERT_TRUE(proven.ok()) << proven.error().message;
+  participant->ApplyReplacement(2U);
   const auto progress = participant->execution_progress_publication()->acquire();
   EXPECT_EQ(progress.execution_generation, sent.handle->execution_generation);
   // The wire starts later than captured canonical zero; retain its actual
@@ -14468,7 +15524,7 @@ TEST_F(PortParticipantKernelTest, TimelyAdoptionPreservesRampDeliveryClockAndQua
   EXPECT_EQ(old_handle.get_snapshot().state, ExecutionState::kStopped);
   EXPECT_TRUE(participant->RetirePreparedExecution(1U).ok());
   EXPECT_EQ(
-      participant->Dispatch(successor, next.controller_goal_id, next.controller_goal_generation)
+      participant->Dispatch(successor, next)
           .execution_generation,
       sent.handle->execution_generation);
   pclock.advance(10'000'000);
@@ -14552,9 +15608,8 @@ class ReplacementObservationExecution : public ControlledExecution {
   std::int64_t replacement_controller_period_ns{0};
 
   ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& product,
-                           const ControllerGoalId& goal,
-                           ControllerGoalGeneration generation) override {
-    auto handle = ControlledExecution::Dispatch(product, goal, generation);
+                           const ControllerGoalId& goal) override {
+    auto handle = ControlledExecution::Dispatch(product, goal);
     auto wait = std::move(handle.wait_for_completion);
     handle.wait_for_completion = [this, wait = std::move(wait)](std::int64_t timeout) {
       {
@@ -14568,7 +15623,7 @@ class ReplacementObservationExecution : public ControlledExecution {
   }
 
   Result<PreparedMotionReplacementSourceDTO> CaptureReplacementSource(
-      std::uint64_t id, std::uint64_t generation, const ExecutionGoalKey& key,
+      std::uint64_t id, std::uint64_t generation, const ControllerGoalId& key,
       const ContentDigest& digest) const override {
     auto progress = execution_progress_publication()->acquire();
     ExecutionControllerSampleDTO sample;
@@ -14653,7 +15708,7 @@ TEST_F(ExecutionKernelTest,
   auto newcomer_request = make_test_request("replacement.newcomer");
   newcomer_request.action_span = make_test_action_span();
   auto newcomer = prepared_motion_request(newcomer_request);
-  newcomer.execution_request.binding.controller_goal_id = ControllerGoalId("replacement.new.goal");
+  newcomer.execution_request.binding.controller_goal_id = ControllerGoalId{OperationNumber(952U), 1U, 1U};
   newcomer.replacement = ResolvedPreparedMotionReplacementContextDTO{source.value(), 250'000'000,
                                                                      std::nullopt, 100'000'000};
   const auto preparing = owner.PrepareMotion(std::move(newcomer));
@@ -14766,7 +15821,7 @@ TEST_F(ExecutionKernelTest, MovingReplacementPlansOneUnscaledPeriodAheadAcrossRa
         auto next = prepared_motion_request(make_test_request("period.newcomer"));
         next.execution_request.cache_mode = CacheMode::kDisable;
         next.execution_request.action_span = make_test_action_span();
-        next.execution_request.binding.controller_goal_id = ControllerGoalId("period.new.goal");
+        next.execution_request.binding.controller_goal_id = ControllerGoalId{OperationNumber(953U), 1U, 1U};
         next.replacement = ResolvedPreparedMotionReplacementContextDTO{source.value(), budget_ns};
         const auto preparing = owner.PrepareMotion(std::move(next));
         ASSERT_TRUE(preparing.ok());
@@ -14895,7 +15950,7 @@ TEST_F(ExecutionKernelTest,
         next.execution_request.cache_mode = CacheMode::kDisable;
         next.execution_request.action_span = make_test_action_span();
         next.execution_request.binding.controller_goal_id =
-            ControllerGoalId("end.boundary.new.goal");
+            ControllerGoalId{OperationNumber(954U), 1U, 1U};
         next.replacement = ResolvedPreparedMotionReplacementContextDTO{source.value(), budget_ns};
         const auto preparing = owner.PrepareMotion(std::move(next));
         ASSERT_TRUE(preparing.ok()) << preparing.error().message;
@@ -14952,12 +16007,13 @@ class KernelReplacementCommitExecution : public ReplacementObservationExecution 
   TrajectoryDTO candidate_curve;
   std::uint64_t next_generation{};
   int replacements{};
+  int proofs{};
   int adoptions{};
+  std::function<void()> apply_hook;
 
   ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& product,
-                           const ControllerGoalId& goal,
-                           ControllerGoalGeneration generation) override {
-    current_handle = ReplacementObservationExecution::Dispatch(product, goal, generation);
+                           const ControllerGoalId& goal) override {
+    current_handle = ReplacementObservationExecution::Dispatch(product, goal);
     return current_handle;
   }
 
@@ -14969,7 +16025,7 @@ class KernelReplacementCommitExecution : public ReplacementObservationExecution 
 
   PreparedMotionReplacementDispatchDTO DispatchReplacement(
       const PreparedMotionReplacementSourceDTO& source, std::uint64_t,
-      const PreparedOperationParticipantDTO& product, const ExecutionGoalKey& goal,
+      const PreparedOperationParticipantDTO& product, const ControllerGoalId& goal,
       std::int64_t, const ReplacementSendRecheck& recheck_before_send) override {
     // As the participant: the Kernel's lock-free re-check right before the send.
     if (recheck_before_send) {
@@ -14983,8 +16039,7 @@ class KernelReplacementCommitExecution : public ReplacementObservationExecution 
     auto handle = current_handle;
     next_generation = source.execution_generation + 1U;
     handle.execution_generation = next_generation;
-    handle.controller_goal_id = goal.controller_goal_id;
-    handle.controller_goal_generation = goal.controller_goal_generation;
+    handle.controller_goal_id = goal;
     handle.prepared_contract_digest = product.prepared_contract_digest;
     return {{ExecutionPortDispatch::kDispatched, {}, {}}, std::move(handle), watchdog_clock->now()};
   }
@@ -15001,24 +16056,52 @@ class KernelReplacementCommitExecution : public ReplacementObservationExecution 
         {PreparedMotionReplacementPhaseDTO::kReadyToCommit, {}, {}, 1, {}});
   }
 
-  Result<void> AdoptReplacement(const PreparedMotionReplacementSourceDTO&, std::uint64_t,
-                                PreparedMotionReplacementCommitDTO commit) override {
+  // OD-175 D1: "prove" refuses nothing here (the real participant's proof is
+  // tested separately); "apply" makes the swaps.
+  Result<void> ProveReplacement(const PreparedMotionReplacementSourceDTO&,
+                                std::uint64_t) override {
+    ++proofs;
+    return Result<void>::Ok();
+  }
+
+  void ApplyReplacement(std::uint64_t) override {
     ++adoptions;
-    auto accepted = commit.owner_commit(commit.context);
-    if (!accepted.ok()) return accepted;
+    // Runs while the engine's "apply" holds its scale lock (OD-175 D1).
+    if (apply_hook) apply_hook();
     std::swap(last_execute_trajectory, candidate_curve);
     auto* progress = const_cast<ExecutionProgressPublication*>(execution_progress_publication());
     (void)progress->publish(next_generation, 0, 0, 0);
-    return Result<void>::Ok();
   }
 };
 
+// OD-175 design test 16: "apply" has no refusal (void) and is not noexcept,
+// so a defect that throws leaves the Kernel's close step to run during
+// unwinding instead of ending the process.
+TEST(ExecutionKernelHandoverShapeTest, ApplyHasNoRefusal) {
+  static_assert(std::is_same_v<decltype(std::declval<ExecutionKernel&>()
+                                            .ApplyPreparedMotionReplacement(1U)),
+                               void>);
+  static_assert(!noexcept(std::declval<ExecutionKernel&>().ApplyPreparedMotionReplacement(1U)));
+  static_assert(std::is_same_v<decltype(std::declval<IExecutionBackend&>().ApplyReplacement(1U)),
+                               void>);
+  static_assert(!noexcept(std::declval<IExecutionBackend&>().ApplyReplacement(1U)));
+  SUCCEED();
+}
+
 TEST_F(ExecutionKernelTest,
        MovingReplacementAdoptionPreservesWorkerAndRejectsPriorHazardOrOwnerRefusal) {
-  // 0: accepted handover; 1: a hazard already won before the owner CAS;
-  // 2: the existing owner CAS rejects. Each is deterministically ordered by
-  // the synchronous worker-ready event, with no clock sleeps.
-  for (const int mode : {0, 1, 2, 3}) {
+  // 0: accepted handover; 1: a hazard already won before the owner decision
+  // (the decision's close fails, OD-175 D2); 2: the owner decision refuses.
+  // Each is deterministically ordered by the synchronous worker-ready event,
+  // with no clock sleeps. The subscriber plays the Kernel's part: "prove" on
+  // the worker, "decide", then "apply" (OD-175 D1). 4: as 0, after "prove"
+  // was first called from a plain thread while the worker is parked: it
+  // refuses with "not now" and changes nothing (OD-175 §3.2, design test 14).
+  // 5: teardown (detach) starts while the worker is parked at its safe
+  // point: "prove" refuses on the detach flag and nothing is handed over
+  // (row 37). 6: teardown starts after "decide": "apply" still completes and
+  // detach's join waits for it (row 38, the engine's part).
+  for (const int mode : {0, 1, 2, 3, 4, 5, 6}) {
     SCOPED_TRACE(mode);
     planner.on_plan = {};
     context.on_validate = {};
@@ -15074,6 +16157,7 @@ TEST_F(ExecutionKernelTest,
     std::condition_variable result_changed;
     std::optional<Result<bool>> result;
     std::atomic<int> owner_commits{0};
+    std::future<Result<void>> detached;
     const auto subscription = owner.subscribe_events([&](const KernelEvent& event) {
       if (event.type != KernelEventType::kParticipantPrepared ||
           event.execution_id == started.value())
@@ -15095,19 +16179,61 @@ TEST_F(ExecutionKernelTest,
         return;
       if (mode == 1)
         (void)backend.claim_execution_progress_hazard(source.value().execution_generation);
-      struct CommitState {
-        std::atomic<int>& calls;
-        int mode;
-      } state{owner_commits, mode};
-      const PreparedMotionReplacementCommitDTO commit{
-          &state, [](void* opaque) noexcept -> Result<void> {
-            auto& value = *static_cast<CommitState*>(opaque);
-            ++value.calls;
-            return value.mode == 2 ? Result<void>::Err(ErrorCode::kStaleGeneration)
-                                   : Result<void>::Ok();
-          }};
-      auto committed =
-          owner.CommitPreparedMotionReplacement(event.execution_id, source.value(), commit);
+      if (mode == 4) {
+        auto off_worker = std::async(std::launch::async, [&] {
+          return owner.ProvePreparedMotionReplacement(event.execution_id, source.value());
+        });
+        const auto refused = off_worker.get();
+        EXPECT_TRUE(refused.ok());
+        if (refused.ok()) { EXPECT_FALSE(refused.value()); }
+        EXPECT_EQ(backend.proofs, 0);
+      }
+      if (mode == 5 || mode == 6) {
+        const auto start_detach = [&] {
+          detached = std::async(std::launch::async, [&] {
+            return owner.detach(std::chrono::steady_clock::time_point::max());
+          });
+          // Detach sets its flag before it joins this worker; "prove" reads
+          // that flag first, so it is the observable for "teardown started".
+          auto proven = owner.ProvePreparedMotionReplacement(event.execution_id, source.value());
+          while (proven.ok()) {
+            std::this_thread::yield();
+            proven = owner.ProvePreparedMotionReplacement(event.execution_id, source.value());
+          }
+          return proven;
+        };
+        Result<bool> outcome = Result<bool>::Ok(false);
+        if (mode == 5) {
+          outcome = start_detach();
+        } else {
+          outcome = owner.ProvePreparedMotionReplacement(event.execution_id, source.value());
+          if (outcome.ok() && outcome.value() && owner.CloseMotionReplacementHazard(source.value())) {
+            ++owner_commits;
+            const auto refused = start_detach();
+            EXPECT_EQ(refused.error().details.at("reason"), "scheduler_not_ready");
+            owner.ApplyPreparedMotionReplacement(event.execution_id);
+          }
+        }
+        {
+          std::lock_guard lock(result_mutex);
+          if (!result) result = std::move(outcome);
+        }
+        result_changed.notify_all();
+        return;
+      }
+      auto committed = owner.ProvePreparedMotionReplacement(event.execution_id, source.value());
+      if (committed.ok() && committed.value()) {
+        ++owner_commits;
+        if (mode == 2)
+          committed = Result<bool>::Err(ErrorCode::kStaleGeneration);
+        else if (!owner.CloseMotionReplacementHazard(source.value()))
+          committed = Result<bool>::Err(ErrorDTO{kErrorExecutionRejected,
+                                                 "Replacement adoption was refused",
+                                                 {{"reason",
+                                                   "motion_replacement_source_hazard_authority"}}});
+        else
+          owner.ApplyPreparedMotionReplacement(event.execution_id);
+      }
       {
         std::lock_guard lock(result_mutex);
         if (!result) result = std::move(committed);
@@ -15134,7 +16260,7 @@ TEST_F(ExecutionKernelTest,
     auto newcomer = prepared_motion_request(newcomer_request);
     EXPECT_FALSE(newcomer.execution_request.initial_runtime_scale);
     newcomer.execution_request.binding.controller_goal_id =
-        ControllerGoalId("worker.successor.goal");
+        ControllerGoalId{OperationNumber(955U), 1U, 1U};
     newcomer.replacement = ResolvedPreparedMotionReplacementContextDTO{source.value(), 250'000'000};
     const auto candidate = prepare_and_dispatch(owner, std::move(newcomer));
     ASSERT_TRUE(candidate.ok());
@@ -15142,23 +16268,48 @@ TEST_F(ExecutionKernelTest,
       std::unique_lock lock(result_mutex);
       ASSERT_TRUE(result_changed.wait_for(lock, std::chrono::seconds(2),
                                           [&]() { return result.has_value(); }));
-      ASSERT_TRUE((mode != 0 && mode != 3) || result->ok())
+      ASSERT_TRUE((mode != 0 && mode != 3 && mode != 4 && mode != 6) || result->ok())
           << (result->ok() ? "" : result->error().message);
-      EXPECT_EQ(result->ok(), mode == 0 || mode == 3);
+      EXPECT_EQ(result->ok(), mode == 0 || mode == 3 || mode == 4 || mode == 6);
+    }
+    if (mode == 5 || mode == 6) {
+      ASSERT_TRUE(detached.valid());
+      EXPECT_TRUE(detached.get().ok());
+      if (mode == 5) {
+        ASSERT_FALSE(result->ok());
+        EXPECT_EQ(result->error().details.at("reason"), "scheduler_not_ready");
+        EXPECT_EQ(owner_commits.load(), 0);
+        EXPECT_EQ(backend.adoptions, 0);
+      } else {
+        ASSERT_TRUE(result->ok());
+        EXPECT_TRUE(result->value());
+        EXPECT_EQ(owner_commits.load(), 1);
+        EXPECT_EQ(backend.adoptions, 1);
+        EXPECT_EQ(owner.get_status().execution_id, candidate.value());
+      }
+      continue;
     }
     EXPECT_EQ(backend.replacements, 1);
-    EXPECT_EQ(owner_commits.load(), mode == 1 ? 0 : 1);
-    EXPECT_EQ(backend.adoptions, mode == 1 ? 0 : 1);
+    if (mode == 1) {
+      // The claim that won first is refused at the decision's close, with the
+      // reason the engine's proof gave for it before OD-175.
+      ASSERT_FALSE(result->ok());
+      EXPECT_EQ(result->error().details.at("reason"),
+                "motion_replacement_source_hazard_authority");
+    }
+    EXPECT_EQ(owner_commits.load(), 1);
+    EXPECT_EQ(backend.proofs, 1);
+    EXPECT_EQ(backend.adoptions, (mode == 0 || mode == 3 || mode == 4) ? 1 : 0);
     EXPECT_EQ(owner.get_status().execution_id,
-              (mode == 0 || mode == 3) ? candidate.value() : started.value());
+              (mode == 0 || mode == 3 || mode == 4) ? candidate.value() : started.value());
     owner.unsubscribe_events(subscription);
     unsubscribe.active = false;
-    if (mode == 0)
+    if (mode == 0 || mode == 4)
       backend.complete();
     else if (mode == 3)
       clock.advance(60'000'000);
     else {
-      (void)owner.fence_addressed_participant_stop(started.value());
+      (void)fence_addressed_stop(owner, started.value());
       (void)backend.stop();
     }
     ASSERT_TRUE(owner.wait_for_completion(2'000'000'000));
@@ -15191,7 +16342,7 @@ class HeldReplacementCommitExecution final : public KernelReplacementCommitExecu
 
   PreparedMotionReplacementDispatchDTO DispatchReplacement(
       const PreparedMotionReplacementSourceDTO& source, std::uint64_t id,
-      const PreparedOperationParticipantDTO& product, const ExecutionGoalKey& goal,
+      const PreparedOperationParticipantDTO& product, const ControllerGoalId& goal,
       std::int64_t deadline_ns, const ReplacementSendRecheck& recheck_before_send) override {
     {
       std::unique_lock lock(hold_mutex);
@@ -15281,9 +16432,9 @@ TEST_F(ExecutionKernelTest, MovingReplacementHoldHoldsNoKernelLockAndAStopDuring
   auto newcomer_request = make_test_request("held.successor");
   newcomer_request.action_span = make_test_action_span();
   auto newcomer = prepared_motion_request(newcomer_request);
-  newcomer.execution_request.binding.controller_goal_id = ControllerGoalId("held.successor.goal");
+  newcomer.execution_request.binding.controller_goal_id = ControllerGoalId{OperationNumber(956U), 1U, 1U};
   newcomer.replacement = ResolvedPreparedMotionReplacementContextDTO{source.value(), 250'000'000};
-  std::future<AddressedParticipantStopFenceDisposition> fenced;
+  std::future<AddressedParticipantStopFenceResult> fenced;
   std::future<Result<ResolvedPreparedMotionExecutionSnapshotDTO>> observed;
   struct ReleaseHold {
     HeldReplacementCommitExecution& backend;
@@ -15298,9 +16449,13 @@ TEST_F(ExecutionKernelTest, MovingReplacementHoldHoldsNoKernelLockAndAStopDuring
   }
   // Both return while the hold is still in progress.
   fenced = std::async(std::launch::async,
-                      [&] { return owner.fence_addressed_participant_stop(started.value()); });
+                      [&] { return fence_addressed_stop(owner, started.value()); });
   ASSERT_EQ(fenced.wait_for(std::chrono::seconds(2)), std::future_status::ready);
-  EXPECT_EQ(fenced.get(), AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  // The replacement already claimed its gate for the held send: call (1)
+  // closes nothing, and the send's pre-send re-check sees the fence id.
+  const auto fence = fenced.get();
+  EXPECT_EQ(fence.disposition, AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  EXPECT_EQ(fence.closed_gates, 0U);
   observed = std::async(std::launch::async,
                         [&] { return owner.ObservePreparedMotion(candidate.value()); });
   ASSERT_EQ(observed.wait_for(std::chrono::seconds(2)), std::future_status::ready);
@@ -15343,9 +16498,14 @@ class ScaleReplacementCommitExecution final : public KernelReplacementCommitExec
     if (!held) applied = scale;
   }
   RuntimeScaleMechanismStatusDTO runtime_velocity_scale_status() const override {
+    // One read held at a test point: `set_runtime_scale` makes it under its
+    // submission lock (OD-175 design test 12).
+    if (hold_status_once.exchange(false)) status_hook();
     std::lock_guard lock(scale_mutex);
     return {true, true, target, applied, 0.0, acknowledgement, 1, {}};
   }
+  mutable std::atomic<bool> hold_status_once{false};
+  std::function<void()> status_hook;
   void release_hold() {
     std::lock_guard lock(scale_mutex);
     held = false;
@@ -15354,12 +16514,19 @@ class ScaleReplacementCommitExecution final : public KernelReplacementCommitExec
   }
 };
 
+// One stable operation number per fixture name (name-keyed fixtures below).
+OperationNumber named_operation(const std::string& name) {
+  static std::map<std::string, std::uint64_t> numbers;
+  const auto next = numbers.size() + 1U;
+  return OperationNumber(numbers.try_emplace(name, next).first->second);
+}
+
 ResolvedPreparedMotionExecutionRequestDTO scale_replacement_request(const std::string& name,
                                                                     double seed) {
   auto request = prepared_motion_request(make_test_request(name));
   auto& binding = request.execution_request.binding;
-  binding.operation_id = OperationId(name);
-  binding.controller_goal_id = ControllerGoalId(name + ".goal");
+  binding.operation_id = named_operation(name);
+  binding.controller_goal_id = ControllerGoalId{binding.operation_id, 1U, 1U};
   binding.runtime_scale_qualification = RuntimeScaleRouteQualificationDTO{
       binding.control_route_id, ScalingDomainId("scale.test"), EndpointRoleId("scale.command"),
       EndpointRoleId("scale.state"), {}, RuntimeScaleAcknowledgementKind::kAppliedState,
@@ -15370,7 +16537,7 @@ ResolvedPreparedMotionExecutionRequestDTO scale_replacement_request(const std::s
       binding.operation_id, request.operation_revision, binding.participant_id,
       binding.controllable_component_id, binding.command_target_id, binding.capability_id,
       binding.control_domain_id, binding.control_domain_revision, binding.control_binding_id,
-      binding.control_binding_revision, binding.controller_goal_id, binding.controller_goal_generation,
+      binding.control_binding_revision, binding.controller_goal_id,
       binding.controller_topology_id, binding.topology_revision, binding.control_route_id,
       ScalingDomainId("scale.test"), {}, binding.resources, binding.active_control_configuration_id,
       binding.active_control_configuration_generation, RuntimeScaleGeneration(0U),
@@ -15392,9 +16559,14 @@ ResolvedPreparedMotionExecutionRequestDTO scale_replacement_request(const std::s
 
 TEST_F(ExecutionKernelTest,
        MovingReplacementTransfersLatestScaleWithoutSetScaleAndFencesPriorCommands) {
-  // Same target, target changed during freeze, refused owner CAS, old
-  // submission still in its backend call. All ordering uses worker callbacks and explicit gates.
-  for (const int mode : {0, 1, 2, 3}) {
+  // Same target, target changed during freeze, refused owner decision, old
+  // submission still in its backend call (adoption takes no submission lock,
+  // OD-175 D1). 4: a speed acceptance holds the submission lock across its
+  // backend read while the hand-over proves, decides and applies; "apply"
+  // completes without it, and the late acceptance gets the binding mismatch
+  // (design test 12, rows 14 and 26). All ordering uses worker callbacks and
+  // explicit gates.
+  for (const int mode : {0, 1, 2, 3, 4}) {
     SCOPED_TRACE(mode);
     planner.on_plan = {};
     context.on_validate = {};
@@ -15450,7 +16622,7 @@ TEST_F(ExecutionKernelTest,
     std::optional<Result<bool>> result;
     std::future<Result<ResolvedRuntimeScaleStatusDTO>> simultaneous_status;
     std::barrier query_started(2);
-    const double latest = mode == 0 ? 0.5 : 0.8;
+    const double latest = (mode == 0 || mode == 4) ? 0.5 : 0.8;
     const auto subscription = owner.subscribe_events([&](const KernelEvent& event) {
       if (event.type != KernelEventType::kParticipantPrepared || event.execution_id == started.value())
         return;
@@ -15472,45 +16644,54 @@ TEST_F(ExecutionKernelTest,
       std::mutex gate_mutex;
       std::condition_variable gate_changed;
       bool entered = false, released = false;
-      if (mode == 3) {
-        backend.scale_hook = [&] {
+      if (mode == 3 || mode == 4) {
+        const auto hold = [&] {
           std::unique_lock lock(gate_mutex);
           entered = true;
           gate_changed.notify_all();
           gate_changed.wait(lock, [&] { return released; });
         };
+        if (mode == 3) {
+          backend.scale_hook = hold;
+        } else {
+          auto late = update;
+          late.requested_scale = 0.8;
+          update = late;
+          backend.status_hook = hold;
+          backend.hold_status_once.store(true);
+        }
         in_flight = std::async(std::launch::async, [&] { return owner.set_runtime_scale(update); });
         std::unique_lock lock(gate_mutex);
         gate_changed.wait(lock, [&] { return entered; });
       } else {
         EXPECT_TRUE(owner.set_runtime_scale(update).ok());
       }
-      struct Context {
-        int mode;
-        ExecutionKernel* owner;
-        const ResolvedRuntimeScaleCommandDTO* command;
-        std::future<Result<ResolvedRuntimeScaleStatusDTO>>* observed;
-        std::barrier<>* query_started;
-      } state{mode, &owner, &successor_command, &simultaneous_status, &query_started};
-      const PreparedMotionReplacementCommitDTO callback{
-          &state, [](void* opaque) noexcept -> Result<void> {
-            auto& state = *static_cast<Context*>(opaque);
-            if (state.mode == 2) return Result<void>::Err(ErrorCode::kStaleGeneration);
-            // Rendezvous before the query: adoption still owns the scale
-            // mutex, so this exact successor read must remain pending.
-            *state.observed = std::async(
-                std::launch::async, [owner = state.owner, command = state.command,
-                                    started = state.query_started] {
-                  started->arrive_and_wait();
-                  return owner->runtime_scale_status(command->operation_id,
-                                                       command->control_binding_id);
-                });
-            state.query_started->arrive_and_wait();
-            EXPECT_EQ(state.observed->wait_for(std::chrono::milliseconds(20)),
+      // The subscriber plays the Kernel's part (OD-175 D1): "prove" on the
+      // worker, "decide" (mode 2 refuses there), then "apply".
+      auto adopted = owner.ProvePreparedMotionReplacement(event.execution_id, source.value());
+      if (adopted.ok() && adopted.value()) {
+        if (mode == 2) {
+          adopted = Result<bool>::Err(ErrorCode::kStaleGeneration);
+        } else if (!owner.CloseMotionReplacementHazard(source.value())) {
+          adopted = Result<bool>::Err(ErrorCode::kStaleGeneration);
+        } else {
+          backend.apply_hook = [&] {
+            // Rendezvous before the query: "apply" owns the scale mutex while
+            // the participant swaps, so this exact successor read must
+            // remain pending.
+            simultaneous_status = std::async(std::launch::async, [&] {
+              query_started.arrive_and_wait();
+              return owner.runtime_scale_status(successor_command.operation_id,
+                                                successor_command.control_binding_id);
+            });
+            query_started.arrive_and_wait();
+            EXPECT_EQ(simultaneous_status.wait_for(std::chrono::milliseconds(20)),
                       std::future_status::timeout);
-            return Result<void>::Ok();
-          }};
-      auto adopted = owner.CommitPreparedMotionReplacement(event.execution_id, source.value(), callback);
+          };
+          owner.ApplyPreparedMotionReplacement(event.execution_id);
+          backend.apply_hook = {};
+        }
+      }
       if (mode == 3) {
         // The operator value is accepted (recorded as the latest) before its
         // backend call, which runs outside the submission lock and is ordered
@@ -15526,6 +16707,18 @@ TEST_F(ExecutionKernelTest,
         gate_changed.notify_all();
         EXPECT_TRUE(in_flight.get().ok());
         backend.scale_hook = {};
+      } else if (mode == 4) {
+        // "Apply" did not wait for the held acceptance.
+        EXPECT_TRUE(adopted.ok());
+        if (adopted.ok()) { EXPECT_TRUE(adopted.value()); }
+        {
+          std::lock_guard lock(gate_mutex);
+          released = true;
+        }
+        gate_changed.notify_all();
+        const auto late = in_flight.get();
+        ASSERT_FALSE(late.ok());
+        EXPECT_EQ(late.error().details.at("reason"), "resolved_runtime_scale_binding_mismatch");
       }
       {
         std::lock_guard lock(result_mutex);
@@ -15546,7 +16739,9 @@ TEST_F(ExecutionKernelTest,
       EXPECT_EQ(result->ok(), mode != 2);
       if (result->ok()) { EXPECT_TRUE(result->value()); }
     }
-    EXPECT_EQ(backend.scale_calls.load(), 2);  // initial and operator, never adoption
+    // Initial and operator, never adoption; mode 4's late operator value was
+    // refused before its backend call.
+    EXPECT_EQ(backend.scale_calls.load(), mode == 4 ? 1 : 2);
     const auto& active = mode == 2 ? original_command : successor_command;
     auto status = owner.runtime_scale_status(active.operation_id, active.control_binding_id);
     ASSERT_TRUE(status.ok()) << status.error().message;
@@ -15595,15 +16790,14 @@ class ColdPreparationExecution final : public ReplacementObservationExecution {
   }
 
   ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& product,
-                           const ControllerGoalId& goal,
-                           ControllerGoalGeneration generation) override {
-    auto handle = ReplacementObservationExecution::Dispatch(product, goal, generation);
+                           const ControllerGoalId& goal) override {
+    auto handle = ReplacementObservationExecution::Dispatch(product, goal);
     auto wait = std::move(handle.wait_for_completion);
-    handle.wait_for_completion = [this, wait = std::move(wait), goal, generation](
+    handle.wait_for_completion = [this, wait = std::move(wait), goal](
                                      std::int64_t timeout) {
       {
         std::lock_guard lock(poll_mutex_);
-        const ExecutionGoalKey key{goal, generation};
+        const ControllerGoalId key = goal;
         if (std::find(polled_goals_.begin(), polled_goals_.end(), key) == polled_goals_.end())
           polled_goals_.push_back(key);
       }
@@ -15613,7 +16807,7 @@ class ColdPreparationExecution final : public ReplacementObservationExecution {
     return handle;
   }
 
-  bool wait_until_goal_polled(const ExecutionGoalKey& goal) {
+  bool wait_until_goal_polled(const ControllerGoalId& goal) {
     std::unique_lock lock(poll_mutex_);
     return poll_changed_.wait_for(lock, std::chrono::seconds(2),
                                   [&] {
@@ -15625,21 +16819,21 @@ class ColdPreparationExecution final : public ReplacementObservationExecution {
  private:
   std::mutex poll_mutex_;
   std::condition_variable poll_changed_;
-  std::vector<ExecutionGoalKey> polled_goals_;
+  std::vector<ControllerGoalId> polled_goals_;
 };
 
 ResolvedPreparedMotionExecutionRequestDTO kernel_spring_authority(
-    const std::string& name, std::optional<ProgramRunId> run_id = std::nullopt) {
+    const std::string& name, std::optional<ProgramRunNumber> run_id = std::nullopt) {
   auto request = make_test_request(name);
   request.action_span = make_test_action_span();
   if (run_id) {
     request.binding.program_run_id = *run_id;
-    request.action_span->program_run_id = run_id->value();
+    request.action_span->program_run_id = *run_id;
   }
   auto authority = prepared_motion_request(std::move(request));
   auto& binding = authority.execution_request.binding;
-  binding.operation_id = OperationId(name);
-  binding.controller_goal_id = ControllerGoalId(name + ".goal");
+  binding.operation_id = named_operation(name);
+  binding.controller_goal_id = ControllerGoalId{binding.operation_id, 1U, 1U};
   MotionInterruptStopProfileDTO profile;
   profile.profile_id = "kernel.spring.return";
   profile.stop_mode = MotionInterruptStopMode::kSpringBackHold;
@@ -15662,18 +16856,15 @@ ResolvedPreparedMotionExecutionRequestDTO kernel_spring_authority(
 }
 
 ResolvedParticipantStopStageDTO kernel_spring_stage(
-    const PreparedOperationParticipantDTO& product, const ExecutionGoalKey& goal,
+    const PreparedOperationParticipantDTO& product, const ControllerGoalId& goal,
     const ResolvedPreparedMotionExecutionRequestDTO& authority,
-    StopId stop_id = StopId("kernel.spring.stop"),
-    StopGeneration stop_generation = StopGeneration(1U)) {
+    StopEventId stop_event_id = StopEventId(1002U)) {
   auto stage = ResolvedParticipantStopStageDTO{
-      stop_id,
-      stop_generation,
+      stop_event_id,
       product.operation_id,
       product.operation_revision,
       product.participant_id,
-      goal.controller_goal_id,
-      goal.controller_goal_generation,
+      goal,
       product.controllable_component_id,
       product.command_target_id,
       product.capability_id,
@@ -15699,7 +16890,7 @@ ResolvedParticipantStopStageDTO kernel_spring_stage(
       0U,
       ContentDigest(kTestDigestA)};
   auto sealed = MakeResolvedParticipantStopStage(
-      std::move(stage), {std::move(stop_id), stop_generation, 0, 1'500'000'000},
+      std::move(stage), {stop_event_id, 0, 1'500'000'000},
       authority.stop_readiness.value().resolved_stop_base_plan, authority.binding,
       authority.retained_default_stop_limits, authority.stop_node_category, product.resources);
   if (!sealed.ok()) throw std::logic_error(sealed.error().message);
@@ -15729,56 +16920,20 @@ ParticipantStopStageResultDTO kernel_spring_result(const ResolvedParticipantStop
   return result;
 }
 
-StopCertificateDTO kernel_spring_certificate(const ParticipantStopStageResultDTO& result) {
-  const auto& stage = result.request;
-  const StopScopeEntryKeyDTO key{
-      stage.stop_id, stage.stop_generation,
-      StopParticipantScopeKeyDTO{stage.operation_id, stage.participant_id}};
-  const OperationRevision accepted_revision(stage.operation_revision.value() + 1U);
-  const StopScopeEntryDTO entry{
-      key,
-      StopParticipantScopeFactsDTO{
-          accepted_revision, stage.controllable_component_id, stage.command_target_id,
-          stage.capability_id, stage.control_domain_id, stage.control_domain_revision,
-          stage.control_binding_id, stage.control_binding_revision, stage.controller_goal_id,
-          stage.controller_goal_generation, stage.active_control_configuration_id,
-          stage.active_control_configuration_generation, stage.controller_topology_id,
-          stage.topology_revision, stage.control_route_id, stage.provider_runtime_epoch,
-          stage.resources, stage.containment_granularity,
-          StopParticipantScopeFactsDTO::TerminalSettlementState::kSettled},
-      StopScopeEntryDispositionDTO::kStoppable,
-      StopScopeDispatchStateDTO::kDispatched,
-      stage.stop_evidence_policy_id,
-      stage.stop_evidence_policy_revision,
-      stage.participant_stop_plan.participant_stop_invocation_plan_digest,
-      0};
-  const auto reduced = ReduceStopTerminal(
-      {StopCertificateId("kernel.spring.certificate"),
-       StopCertificateRevision(1U),
-       stage.stop_id,
-       stage.stop_generation,
-       {StopRequestedSelectorKindDTO::kOrdinaryOperations, ContentDigest(kTestDigestA),
-        StopSelectorDTO{std::vector<StopOperationTargetDTO>{
-            {stage.operation_id, stage.operation_revision, StopGeneration(0U)}}},
-        std::nullopt},
-       StopResolutionDispositionDTO::kExact,
-       StopScopeResolutionReasonDTO::kExactCurrentScope,
-       {},
-       {{1U,
-         StopResolutionDispositionDTO::kExact,
-         StopScopeResolutionReasonDTO::kExactCurrentScope,
-         ContentDigest(kTestDigestB),
-         {},
-         {{stage.operation_id, accepted_revision}},
-         stage.resources}},
-       {},
-       {entry},
-       {{key, 1U, 300'000'000, StopStageResultAuthorityDTO::kAuthoritative, result}},
-       std::nullopt,
-       300'000'000,
-       std::nullopt});
-  if (!reduced.ok()) throw std::logic_error(reduced.error().message);
-  return reduced.value();
+// The incumbent's settled outcome as the addressed owner hands it to the
+// cold spring preparation: the attempt started by the stage's own event,
+// stopped (not escalated) at that spring stage.
+ParticipantStopOutcomeDTO kernel_spring_outcome(const ResolvedParticipantStopStageDTO& stage) {
+  return ParticipantStopOutcomeDTO{stage.stop_event_id, StopPhase::kStopped,
+                                   StopMode::kSpringReturn,
+                                   static_cast<std::uint8_t>(stage.stage_index), false, 1U};
+}
+
+// The same containment handed over under another Stop event id.
+ParticipantStopStageResultDTO kernel_containment_for_event(ParticipantStopStageResultDTO result,
+                                                           const StopEventId stop_event_id) {
+  result.request.stop_event_id = stop_event_id;
+  return result;
 }
 
 TEST_F(ExecutionKernelTest,
@@ -15811,19 +16966,15 @@ TEST_F(ExecutionKernelTest,
   const auto& binding = authority.execution_request.binding;
   const auto stage = kernel_spring_stage(
       *observed.value().last_dispatched_participant,
-      {binding.controller_goal_id, binding.controller_goal_generation}, authority,
-      StopId("ack.settled-failure.stop"), StopGeneration(1U));
-  EXPECT_EQ(owner.fence_addressed_participant_stop(started.value()),
-            AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+      {binding.controller_goal_id}, authority, StopEventId(1000U));
+  const auto fenced = fence_addressed_stop(owner, started.value());
+  EXPECT_EQ(fenced.disposition, AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+  EXPECT_EQ(fenced.closed_gates, 0U);
   const auto containment = kernel_spring_result(stage);
-  const auto certificate = kernel_spring_certificate(containment);
-  ASSERT_EQ(certificate.result, StopCertificateResultDTO::kSucceededNominal);
   const auto backend_containment = execution.execute_controlled_stop(
       *authority.ordinary_stop_plan->participant_stop_profile);
   ASSERT_TRUE(backend_containment.backend_stop_confirmed);
-  const StopCertificateRefDTO reference{
-      certificate.stop_certificate_id, certificate.stop_certificate_revision,
-      certificate.stop_id, certificate.stop_generation};
+  const auto reference = stage.stop_event_id;
 
   const auto settled = owner.settle_addressed_participant_stop(
       {started.value(), reference, containment, OperationParticipantPayloadKind::kMotion, false});
@@ -15837,10 +16988,7 @@ TEST_F(ExecutionKernelTest,
   EXPECT_EQ(assessment.status, RecoveryAssessmentStatus::kActionRequired);
   EXPECT_TRUE(assessment.eligible_close);
   EXPECT_TRUE(assessment.backend_stop_confirmed);
-  EXPECT_EQ(assessment.stop_certificate_id, reference.stop_certificate_id.value());
-  EXPECT_EQ(assessment.stop_certificate_revision,
-            reference.stop_certificate_revision.value());
-  EXPECT_EQ(assessment.stop_owner_generation, reference.stop_generation.value());
+  EXPECT_EQ(assessment.stop_event_id, reference.value());
   EXPECT_TRUE(std::find(assessment.allowed_actions.begin(), assessment.allowed_actions.end(),
                         RecoveryAction::kCloseOperation) != assessment.allowed_actions.end());
   EXPECT_EQ(owner.get_status().state, failed.state);
@@ -15850,20 +16998,17 @@ TEST_F(ExecutionKernelTest,
       {started.value(), reference, containment, OperationParticipantPayloadKind::kMotion, false});
   ASSERT_TRUE(replay.ok()) << replay.error().message;
   EXPECT_EQ(replay.value().terminal_fact, std::optional(original_fact));
-  EXPECT_EQ(replay.value().recovery_assessment.stop_certificate_id,
-            reference.stop_certificate_id.value());
-  auto conflicting = reference;
-  conflicting.stop_certificate_revision = StopCertificateRevision(
-      reference.stop_certificate_revision.value() + 1U);
+  EXPECT_EQ(replay.value().recovery_assessment.stop_event_id, reference.value());
+  const StopEventId conflicting(reference.value() + 1U);
   const auto conflict = owner.settle_addressed_participant_stop(
-      {started.value(), conflicting, containment, OperationParticipantPayloadKind::kMotion, false});
+      {started.value(), conflicting, kernel_containment_for_event(containment, conflicting),
+       OperationParticipantPayloadKind::kMotion, false});
   ASSERT_FALSE(conflict.ok());
   EXPECT_EQ(conflict.error().details.at("reason"), "addressed_motion_stop_identity_conflict");
 
   const KernelRecoveryActionRequestDTO close{
-      "ack.settled-failure.close", RecoveryAction::kCloseOperation, "operator",
+      TestRequestKey("ack.settled-failure.close"), RecoveryAction::kCloseOperation, "operator",
       assessment.assessment_revision, assessment.control_command_epoch, assessment.execution_id,
-      assessment.stop_certificate_id, assessment.stop_owner_generation,
       "acknowledge contained failure", false};
   const auto resets = execution.reset_count;
   const auto stops = execution.stop_count;
@@ -15890,9 +17035,8 @@ class HeldCleanupExecution final : public ReplacementObservationExecution {
   bool released{};
 
   ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& product,
-                           const ControllerGoalId& goal,
-                           ControllerGoalGeneration generation) override {
-    auto handle = ReplacementObservationExecution::Dispatch(product, goal, generation);
+                           const ControllerGoalId& goal) override {
+    auto handle = ReplacementObservationExecution::Dispatch(product, goal);
     auto wait = std::move(handle.wait_for_completion);
     handle.wait_for_completion = [this, wait = std::move(wait)](std::int64_t timeout) {
       const bool done = wait(timeout);
@@ -15950,24 +17094,19 @@ TEST_F(ExecutionKernelTest, AddressedNominalStopWaitsForTerminalCleanupThenIsClo
   const auto& binding = authority.execution_request.binding;
   const auto stage = kernel_spring_stage(
       *observed.value().last_dispatched_participant,
-      {binding.controller_goal_id, binding.controller_goal_generation}, authority,
-      StopId("gate.moving.stop"), StopGeneration(1U));
-  EXPECT_EQ(owner.fence_addressed_participant_stop(started.value()),
+      {binding.controller_goal_id}, authority, StopEventId(1001U));
+  EXPECT_EQ(fence_addressed_stop(owner, started.value()).disposition,
             AddressedParticipantStopFenceDisposition::kDispatchCommitted);
   const auto containment = kernel_spring_result(stage);
-  const auto certificate = kernel_spring_certificate(containment);
-  ASSERT_EQ(certificate.result, StopCertificateResultDTO::kSucceededNominal);
   backend.publish_observed_state(clock.now(), {0.0, 0.0}, {0.0, 0.0});
   ASSERT_TRUE(
       backend.execute_controlled_stop(*authority.ordinary_stop_plan->participant_stop_profile)
           .backend_stop_confirmed);
   ASSERT_TRUE(backend.WaitEnded());  // The backend ended; worker cleanup is held.
-  const StopCertificateRefDTO reference{certificate.stop_certificate_id,
-                                        certificate.stop_certificate_revision, certificate.stop_id,
-                                        certificate.stop_generation};
+  const auto reference = stage.stop_event_id;
   const auto settled = owner.settle_addressed_participant_stop(
       {started.value(), reference, containment, OperationParticipantPayloadKind::kMotion, false});
-  // Settlement accepts the certified Stop while cleanup is pending.
+  // Settlement accepts the contained Stop while cleanup is pending.
   ASSERT_TRUE(settled.ok()) << settled.error().message;
   const auto& held = settled.value().recovery_assessment;
   EXPECT_EQ(held.execution_state, ExecutionState::kStopped);
@@ -15975,7 +17114,9 @@ TEST_F(ExecutionKernelTest, AddressedNominalStopWaitsForTerminalCleanupThenIsClo
   EXPECT_EQ(held.reason_code, reason_codes::kRecoveryTerminalCleanupPending);
   EXPECT_TRUE(stopped_awaiting_terminal_cleanup(held));
   EXPECT_TRUE(held.backend_stop_confirmed);
-  EXPECT_EQ(held.stop_certificate_id, reference.stop_certificate_id.value());
+  EXPECT_EQ(held.stop_event_id, reference.value());
+  // The engine names the Stop event; the phase is the Kernel's (K20).
+  EXPECT_TRUE(held.stop_phase.empty());
   EXPECT_FALSE(held.eligible_close);
   EXPECT_FALSE(held.retry_admissible);
   backend.Release();
@@ -15990,7 +17131,7 @@ TEST_F(ExecutionKernelTest, AddressedNominalStopWaitsForTerminalCleanupThenIsClo
   EXPECT_TRUE(current.eligible_close);
   EXPECT_EQ(current.status, RecoveryAssessmentStatus::kRetryReady);
   EXPECT_EQ(current.execution_state, ExecutionState::kStopped);
-  EXPECT_EQ(current.stop_certificate_id, reference.stop_certificate_id.value());
+  EXPECT_EQ(current.stop_event_id, reference.value());
 }
 
 TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithoutReplanning) {
@@ -16026,16 +17167,16 @@ TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithout
   point.initial.path_time_rate = 1.0;
   point.initial.spring_back_return_point = {0.0, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}};
   point.canonical_return_path_time_s = 0.0;
-  EXPECT_EQ(owner.fence_addressed_participant_stop(started.value()),
+  EXPECT_EQ(fence_addressed_stop(owner, started.value()).disposition,
             AddressedParticipantStopFenceDisposition::kDispatchCommitted);
 
   auto candidate = kernel_spring_authority("cold.successor");
-  candidate.replacement = ResolvedPreparedMotionReplacementContextDTO{
-      {},
-      250'000'000,
-      ResolvedPreparedMotionSpringReturnContextDTO{
-          std::make_shared<const ResolvedParticipantStopStageDTO>(stage),
-          std::make_shared<const SpringBackReturnPointDTO>(point)}};
+  // Built in place: an empty source with every member at its default.
+  auto& cold_replacement = candidate.replacement.emplace();
+  cold_replacement.preparation_budget_ns = 250'000'000;
+  cold_replacement.spring_return = ResolvedPreparedMotionSpringReturnContextDTO{
+      std::make_shared<const ResolvedParticipantStopStageDTO>(stage),
+      std::make_shared<const SpringBackReturnPointDTO>(point)};
   // The raw helper point is insufficient even while the exact Stop is fenced.
   auto unqualified = candidate;
   point.canonical_return_path_time_s.reset();
@@ -16091,9 +17232,9 @@ TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithout
   EXPECT_EQ(backend.execute_count, 1);
   EXPECT_EQ(owner.get_status().execution_id, started.value());
   const auto containment = kernel_spring_result(stage);
-  const auto certificate = kernel_spring_certificate(containment);
-  ASSERT_EQ(certificate.result, StopCertificateResultDTO::kSucceededNominal);
-  EXPECT_FALSE(owner.PrepareColdMotionAfterStop(preparing.value(), certificate).ok());
+  const auto incumbent = kernel_spring_outcome(stage);
+  // Not settled yet: the engine holds no local settlement for the event.
+  EXPECT_FALSE(owner.PrepareColdMotionAfterStop(preparing.value(), incumbent).ok());
 
   // Computation completed before 250 ms. Physical spring return finishes
   // another 300 ms later, inside its independent Stop deadline; this must not expire the
@@ -16103,9 +17244,7 @@ TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithout
   ASSERT_TRUE(
       backend.execute_controlled_stop(*authority.ordinary_stop_plan->participant_stop_profile)
           .backend_stop_confirmed);
-  const StopCertificateRefDTO reference{certificate.stop_certificate_id,
-                                        certificate.stop_certificate_revision, certificate.stop_id,
-                                        certificate.stop_generation};
+  const auto reference = stage.stop_event_id;
   const auto settled = owner.settle_addressed_participant_stop(
       {started.value(), reference, containment, OperationParticipantPayloadKind::kMotion, false});
   ASSERT_TRUE(settled.ok()) << settled.error().message;
@@ -16113,18 +17252,18 @@ TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithout
   const auto replay = owner.settle_addressed_participant_stop(
       {started.value(), reference, containment, OperationParticipantPayloadKind::kMotion, false});
   ASSERT_TRUE(replay.ok()) << replay.error().message;
-  EXPECT_EQ(replay.value().aggregate_stop_certificate, first_settlement.aggregate_stop_certificate);
-  auto conflicting_reference = reference;
-  conflicting_reference.stop_certificate_revision = StopCertificateRevision(2U);
+  EXPECT_EQ(replay.value().stop_event_id, first_settlement.stop_event_id);
+  const StopEventId conflicting_reference(reference.value() + 1U);
   const auto conflict = owner.settle_addressed_participant_stop(
-      {started.value(), conflicting_reference, containment,
+      {started.value(), conflicting_reference,
+       kernel_containment_for_event(containment, conflicting_reference),
        OperationParticipantPayloadKind::kMotion, false});
   ASSERT_FALSE(conflict.ok());
   EXPECT_EQ(conflict.error().details.at("reason"), "addressed_motion_stop_identity_conflict");
-  auto wrong_certificate = certificate;
-  wrong_certificate.stop_certificate_revision = StopCertificateRevision(2U);
-  EXPECT_FALSE(owner.PrepareColdMotionAfterStop(preparing.value(), wrong_certificate).ok());
-  const auto activated = owner.PrepareColdMotionAfterStop(preparing.value(), certificate);
+  auto wrong_event = incumbent;
+  wrong_event.stop_event_id = conflicting_reference;
+  EXPECT_FALSE(owner.PrepareColdMotionAfterStop(preparing.value(), wrong_event).ok());
+  const auto activated = owner.PrepareColdMotionAfterStop(preparing.value(), incumbent);
   ASSERT_TRUE(activated.ok()) << activated.error().message;
   ASSERT_TRUE(activated.value());
   // Activation starts the ordinary worker; ColdPrepared remains observable
@@ -16180,7 +17319,7 @@ TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithout
     SCOPED_TRACE(next_run ? "distinct Run" : "same Run");
     const auto next_authority = kernel_spring_authority(
         next_run ? "cold.next_run.incumbent" : "cold.same_run.incumbent",
-        next_run ? ProgramRunId("cold.next.run")
+        next_run ? ProgramRunNumber(138U)
                  : authority.execution_request.binding.program_run_id);
     backend.publish_observed_state(clock.now(), {0.0, 0.0}, {0.0, 0.0});
     const auto next_started = prepare_and_dispatch(owner, next_authority);
@@ -16191,31 +17330,27 @@ TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithout
     // poll. Wait for this goal's poll rather than the earlier backend state.
     const auto& next_binding = next_authority.execution_request.binding;
     ASSERT_TRUE(backend.wait_until_goal_polled(
-        {next_binding.controller_goal_id, next_binding.controller_goal_generation}));
+        {next_binding.controller_goal_id}));
     const auto next_observed = owner.ObservePreparedMotion(next_started.value());
     ASSERT_TRUE(next_observed.ok()) << next_observed.error().message;
     ASSERT_TRUE(next_observed.value().last_dispatched_participant);
     const auto next_stage = kernel_spring_stage(
         *next_observed.value().last_dispatched_participant,
-        {next_binding.controller_goal_id, next_binding.controller_goal_generation}, next_authority,
-        StopId(next_run ? "kernel.spring.next_run.stop" : "kernel.spring.same_run.stop"),
-        StopGeneration(next_run ? 4U : 3U));
-    EXPECT_EQ(owner.fence_addressed_participant_stop(next_started.value()),
+        {next_binding.controller_goal_id}, next_authority,
+        StopEventId(next_run ? 1010U : 1011U));
+    EXPECT_EQ(fence_addressed_stop(owner, next_started.value()).disposition,
               AddressedParticipantStopFenceDisposition::kDispatchCommitted);
     ASSERT_TRUE(backend.execute_controlled_stop(
                            *next_authority.ordinary_stop_plan->participant_stop_profile)
                     .backend_stop_confirmed);
     const auto next_containment = kernel_spring_result(next_stage);
-    const auto next_certificate = kernel_spring_certificate(next_containment);
-    const StopCertificateRefDTO next_reference{
-        next_certificate.stop_certificate_id, next_certificate.stop_certificate_revision,
-        next_certificate.stop_id, next_certificate.stop_generation};
+    const auto next_reference = next_stage.stop_event_id;
     const auto next_settled = owner.settle_addressed_participant_stop(
         {next_started.value(), next_reference, next_containment,
          OperationParticipantPayloadKind::kMotion, false});
     ASSERT_TRUE(next_settled.ok()) << next_settled.error().message;
     EXPECT_EQ(next_settled.value().execution_id, next_started.value());
-    EXPECT_EQ(next_settled.value().aggregate_stop_certificate, next_reference);
+    EXPECT_EQ(next_settled.value().stop_event_id, next_reference);
     EXPECT_NE(next_started.value(), first_settlement.execution_id);
     EXPECT_EQ(next_authority.execution_request.binding.program_run_id ==
                   authority.execution_request.binding.program_run_id,
@@ -16225,9 +17360,139 @@ TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithout
     ASSERT_FALSE(old_replay.ok());
     EXPECT_EQ(old_replay.error().details.at("reason"), "addressed_motion_stop_execution_mismatch");
     EXPECT_EQ(first_settlement.execution_id, started.value());
-    EXPECT_EQ(first_settlement.aggregate_stop_certificate, reference);
+    EXPECT_EQ(first_settlement.stop_event_id, reference);
     EXPECT_EQ(first_settlement.operation_id, stage.operation_id);
   }
+}
+
+// The cold spring successor commits only for the settled attempt started by
+// its own spring stage's event: stopped at that stage, in spring-return mode,
+// not escalated. An exact repeat after activation answers true.
+TEST_F(ExecutionKernelTest, SpringFallbackCommitRequiresSettledAttemptOfItsEvent) {
+  auto backend_owner = std::make_shared<ColdPreparationExecution>();
+  ColdPreparationExecution& backend = *backend_owner;
+  backend.enable_execution_progress_publication();
+  ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+                        clock_owner, scheduler, cache_owner);
+  owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
+  owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
+                                {collision_engine});
+  const auto authority = kernel_spring_authority("spring.event.incumbent");
+  const auto started = prepare_and_dispatch(owner, authority);
+  ASSERT_TRUE(started.ok()) << started.error().message;
+  ASSERT_TRUE(backend.wait_until_execute_called());
+  {
+    std::unique_lock lock(backend.observations_mutex);
+    ASSERT_TRUE(backend.observations_changed.wait_for(lock, std::chrono::seconds(2),
+                                                      [&]() { return backend.polls > 0; }));
+  }
+  const auto source = owner.CaptureMotionReplacementSource(started.value());
+  ASSERT_TRUE(source.ok()) << source.error().message;
+  const auto observed = owner.ObservePreparedMotion(started.value());
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  ASSERT_TRUE(observed.value().last_dispatched_participant);
+  const auto stage = kernel_spring_stage(*observed.value().last_dispatched_participant,
+                                         source.value().goal, authority, StopEventId(1020U));
+  SpringBackReturnPointDTO point;
+  point.source_goal = source.value().goal;
+  point.binding_epoch = source.value().binding_epoch;
+  point.trip = source.value().controller_sample;
+  point.initial.joint_names = {"j1", "j2"};
+  point.initial.path_time_rate = 1.0;
+  point.initial.spring_back_return_point = {0.0, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}};
+  point.canonical_return_path_time_s = 0.0;
+  ASSERT_EQ(fence_addressed_stop(owner, started.value()).disposition,
+            AddressedParticipantStopFenceDisposition::kDispatchCommitted);
+
+  auto candidate = kernel_spring_authority("spring.event.successor");
+  // Built in place: an empty source with every member at its default.
+  auto& event_replacement = candidate.replacement.emplace();
+  event_replacement.preparation_budget_ns = 250'000'000;
+  event_replacement.spring_return = ResolvedPreparedMotionSpringReturnContextDTO{
+      std::make_shared<const ResolvedParticipantStopStageDTO>(stage),
+      std::make_shared<const SpringBackReturnPointDTO>(point)};
+  std::atomic<bool> cold_completed{false};
+  const auto completion = owner.subscribe_events([&](const KernelEvent& event) {
+    if (event.type == KernelEventType::kParticipantPrepared &&
+        event.execution_id != started.value())
+      cold_completed.store(true);
+  });
+  struct RemoveColdSubscription {
+    ExecutionKernel& owner;
+    SubscriptionHandle handle;
+    ~RemoveColdSubscription() { owner.unsubscribe_events(handle); }
+  } remove_completion{owner, completion};
+  const auto preparing = owner.PrepareMotion(std::move(candidate));
+  ASSERT_TRUE(preparing.ok()) << preparing.error().message;
+  bool cold_ready = false;
+  const auto cold_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!cold_ready && std::chrono::steady_clock::now() < cold_deadline) {
+    const auto snapshot = owner.ObservePreparedMotion(preparing.value());
+    ASSERT_TRUE(snapshot.ok());
+    ASSERT_FALSE(snapshot.value().error) << snapshot.value().error->message;
+    cold_ready = snapshot.value().state == ResolvedPreparedMotionExecutionStateDTO::kColdPrepared &&
+                 cold_completed.load();
+    if (!cold_ready) std::this_thread::yield();
+  }
+  ASSERT_TRUE(cold_ready);
+
+  const auto matching = kernel_spring_outcome(stage);
+  backend.publish_observed_state(clock.now(), {0.0, 0.0}, {0.0, 0.0});
+  ASSERT_TRUE(
+      backend.execute_controlled_stop(*authority.ordinary_stop_plan->participant_stop_profile)
+          .backend_stop_confirmed);
+  ASSERT_TRUE(owner
+                  .settle_addressed_participant_stop({started.value(), stage.stop_event_id,
+                                                      kernel_spring_result(stage),
+                                                      OperationParticipantPayloadKind::kMotion,
+                                                      false})
+                  .ok());
+
+  const auto refuses = [&](const ParticipantStopOutcomeDTO& outcome) {
+    const auto refused = owner.PrepareColdMotionAfterStop(preparing.value(), outcome);
+    return !refused.ok() && refused.error().details.contains("reason") &&
+           refused.error().details.at("reason") == "spring_return_stop_not_settled";
+  };
+  auto other_event = matching;
+  other_event.stop_event_id = StopEventId(stage.stop_event_id.value() + 1U);
+  EXPECT_TRUE(refuses(other_event));
+  auto escalated = matching;
+  escalated.escalated = true;
+  EXPECT_TRUE(refuses(escalated));
+  auto ordinary = matching;
+  ordinary.mode = StopMode::kOrdinary;
+  EXPECT_TRUE(refuses(ordinary));
+  auto other_stage = matching;
+  other_stage.containing_stage = static_cast<std::uint8_t>(stage.stage_index + 1U);
+  EXPECT_TRUE(refuses(other_stage));
+  auto stopping = matching;
+  stopping.phase = StopPhase::kStopping;
+  EXPECT_TRUE(refuses(stopping));
+  // Refusals leave the cold successor waiting and nothing is dispatched.
+  const auto still_cold = owner.ObservePreparedMotion(preparing.value());
+  ASSERT_TRUE(still_cold.ok());
+  EXPECT_EQ(still_cold.value().state, ResolvedPreparedMotionExecutionStateDTO::kColdPrepared);
+  EXPECT_EQ(backend.execute_count, 1);
+
+  const auto activated = owner.PrepareColdMotionAfterStop(preparing.value(), matching);
+  ASSERT_TRUE(activated.ok()) << activated.error().message;
+  EXPECT_TRUE(activated.value());
+  const auto repeated = owner.PrepareColdMotionAfterStop(preparing.value(), matching);
+  ASSERT_TRUE(repeated.ok()) << repeated.error().message;
+  EXPECT_TRUE(repeated.value());
+  EXPECT_EQ(owner.get_status().execution_id, preparing.value());
+
+  // Activation readies the successor; it is never dispatched here.
+  bool ready = false;
+  const auto ready_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!ready && std::chrono::steady_clock::now() < ready_deadline) {
+    const auto snapshot = owner.ObservePreparedMotion(preparing.value());
+    ASSERT_TRUE(snapshot.ok()) << snapshot.error().message;
+    ready = snapshot.value().state == ResolvedPreparedMotionExecutionStateDTO::kPrepared;
+    if (!ready) std::this_thread::yield();
+  }
+  ASSERT_TRUE(ready);
+  EXPECT_EQ(backend.execute_count, 1);
 }
 
 // SDK-like identity retention is deliberately stricter than the historical
@@ -16264,23 +17529,21 @@ class StrictSentSpringExecution final : public ReplacementObservationExecution {
     return Prepare(product, id);
   }
   ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& product,
-                           const ControllerGoalId& goal,
-                           ControllerGoalGeneration generation) override {
-    remember_key({goal, generation});
-    current_handle_ = ReplacementObservationExecution::Dispatch(product, goal, generation);
+                           const ControllerGoalId& goal) override {
+    remember_key(goal);
+    current_handle_ = ReplacementObservationExecution::Dispatch(product, goal);
     return current_handle_;
   }
   PreparedMotionReplacementDispatchDTO DispatchReplacement(
       const PreparedMotionReplacementSourceDTO& source, std::uint64_t id,
-      const PreparedOperationParticipantDTO& product, const ExecutionGoalKey& goal,
+      const PreparedOperationParticipantDTO& product, const ControllerGoalId& goal,
       std::int64_t, const ReplacementSendRecheck&) override {
     remember_key(goal);
     sent_preparation_id.store(id);
     ++replacement_sends;
     auto handle = current_handle_;
     handle.execution_generation = source.execution_generation + 1U;
-    handle.controller_goal_id = goal.controller_goal_id;
-    handle.controller_goal_generation = goal.controller_goal_generation;
+    handle.controller_goal_id = goal;
     handle.prepared_contract_digest = product.prepared_contract_digest;
     return {{ExecutionPortDispatch::kDispatched, {}, {}}, std::move(handle), source_clock->now()};
   }
@@ -16310,16 +17573,14 @@ class StrictSentSpringExecution final : public ReplacementObservationExecution {
   }
 
  private:
-  void remember_key(const ExecutionGoalKey& key) {
+  void remember_key(const ControllerGoalId& key) {
     std::lock_guard lock(keys_mutex_);
-    const auto identity =
-        std::make_pair(key.controller_goal_id.value(), key.controller_goal_generation.value());
-    if (!sent_keys_.insert(identity).second)
+    if (!sent_keys_.insert(key).second)
       throw std::logic_error("SDK goal key cannot be reused after retirement");
     maximum_live_goals = std::max(maximum_live_goals, ++live_goals_);
   }
   std::mutex keys_mutex_;
-  std::set<std::pair<std::string, std::uint64_t>> sent_keys_;
+  std::set<ControllerGoalId> sent_keys_;
   std::size_t live_goals_{};
   std::uint64_t highest_preparation_id_{};
   ExecutionHandle current_handle_;
@@ -16416,19 +17677,19 @@ TEST_F(ExecutionKernelTest, SentSpringColdResultSharesOwnerUntilExactRetirementA
     point.initial.path_time_rate = 1.0;
     point.initial.spring_back_return_point = {0.0, {0.0, 0.0}, {0.0, 0.0}, {0.0, 0.0}};
     point.canonical_return_path_time_s = 0.0;
-    EXPECT_EQ(owner.fence_addressed_participant_stop(started.value()),
+    EXPECT_EQ(fence_addressed_stop(owner, started.value()).disposition,
               AddressedParticipantStopFenceDisposition::kDispatchCommitted);
     auto future = sent_authority;
     // A shorter authored planning timeout remains the cap for the actual
     // attached cold candidate, independent of its full preparation budget.
     future.execution_request.timeouts.planning_timeout_s = 0.1;
-    future.execution_request.binding.controller_goal_generation = ControllerGoalGeneration(2U);
-    future.replacement = ResolvedPreparedMotionReplacementContextDTO{
-        {},
-        250'000'000,
-        ResolvedPreparedMotionSpringReturnContextDTO{
-            std::make_shared<const ResolvedParticipantStopStageDTO>(stage),
-            std::make_shared<const SpringBackReturnPointDTO>(point), sent.value()}};
+    future.execution_request.binding.controller_goal_id.generation = 2U;
+    // Built in place: an empty source with every member at its default.
+    auto& future_replacement = future.replacement.emplace();
+    future_replacement.preparation_budget_ns = 250'000'000;
+    future_replacement.spring_return = ResolvedPreparedMotionSpringReturnContextDTO{
+        std::make_shared<const ResolvedParticipantStopStageDTO>(stage),
+        std::make_shared<const SpringBackReturnPointDTO>(point), sent.value()};
     const int before_cold = planner.plan_count;
     const auto attached = owner.PrepareMotion(future);
     ASSERT_TRUE(attached.ok()) << attached.error().message;
@@ -16478,10 +17739,7 @@ TEST_F(ExecutionKernelTest, SentSpringColdResultSharesOwnerUntilExactRetirementA
                 ResolvedPreparedMotionExecutionStateDTO::kCancelledPreDispatch);
     }
     const auto result = kernel_spring_result(stage);
-    const auto certificate = kernel_spring_certificate(result);
-    const StopCertificateRefDTO reference{certificate.stop_certificate_id,
-                                          certificate.stop_certificate_revision,
-                                          certificate.stop_id, certificate.stop_generation};
+    const auto reference = stage.stop_event_id;
     clock.advance(300'000'000);  // timely product survives independent spring return wait
     backend.publish_observed_state(clock.now(), {0.0, 0.0}, {0.0, 0.0});
     ASSERT_TRUE(
@@ -16529,11 +17787,11 @@ TEST_F(ExecutionKernelTest, SentSpringColdResultSharesOwnerUntilExactRetirementA
       ASSERT_TRUE(owner.ObservePreparedMotion(cold.reserved_execution_id).ok());
       EXPECT_THROW(
           backend.Dispatch(*old.value().participant,
-                           sent_authority.execution_request.binding.controller_goal_id,
-                           sent_authority.execution_request.binding.controller_goal_generation),
+                           sent_authority.execution_request.binding.controller_goal_id),
           std::logic_error);
       const auto activated =
-          owner.PrepareColdMotionAfterStop(cold.reserved_execution_id, certificate);
+          owner.PrepareColdMotionAfterStop(cold.reserved_execution_id,
+                                           kernel_spring_outcome(stage));
       ASSERT_TRUE(activated.ok()) << activated.error().message;
       ASSERT_TRUE(activated.value());
       std::shared_ptr<const PreparedOperationParticipantDTO> ready;

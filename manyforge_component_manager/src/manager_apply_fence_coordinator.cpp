@@ -31,13 +31,10 @@ namespace core = manyforge::core;
     std::optional<core::ConfigurationFenceAcceptedDTO> observed_acceptance =
         std::nullopt,
     std::optional<core::ApplyFenceAcquireAttemptReconcileResultDTO>
-        observed_reconciliation = std::nullopt,
-    std::optional<core::ApplyFenceReconcileResultDTO> observed_rehydration =
-        std::nullopt) {
+        observed_reconciliation = std::nullopt) {
   throw ManagerApplyFenceEffectUncertainError(
       std::move(detail), phase, acquire_invoked_in_this_call, query,
-      std::move(observed_acceptance), std::move(observed_reconciliation),
-      std::move(observed_rehydration));
+      std::move(observed_acceptance), std::move(observed_reconciliation));
 }
 
 struct PreparedFence final {
@@ -150,12 +147,10 @@ PrepareFence(const SqliteManagerApplyJournal &apply_journal,
 }
 
 [[nodiscard]] core::ApplyFenceAcquireAttemptQueryDTO
-RecoveryQuery(const PersistedManagerApplyFenceAttempt &attempt,
-              const core::RuntimeEpoch &manager_runtime_epoch) {
+RecoveryQuery(const PersistedManagerApplyFenceAttempt &attempt) {
   core::ApplyFenceAcquireAttemptQueryDTO query{
       attempt.fence_intent,
       attempt.fence_attempt_digest,
-      manager_runtime_epoch,
   };
   if (!query.valid()) {
     Fail("durable Apply-fence attempt cannot form a valid recovery query");
@@ -229,100 +224,6 @@ RecoveryQuery(const PersistedManagerApplyFenceAttempt &attempt,
                            observed_reconciliation);
 }
 
-[[nodiscard]] ManagerApplyFenceAcquireResult RehydrateAndFinish(
-    core::IManagerKernelApplyFencePort &kernel_fence,
-    const core::RuntimeEpoch &manager_runtime_epoch,
-    ManagerApplyIntentWriteResult durable_intent,
-    ManagerApplyAffectedScopeWriteResult durable_affected_scope,
-    ManagerApplyFenceAttemptWriteResult durable_attempt,
-    ManagerApplyFenceAcceptanceWriteResult durable_acceptance,
-    const ManagerApplyFenceAcquirePath path,
-    const core::ApplyFenceAcquireAttemptQueryDTO &recovery_query,
-    const std::optional<core::ApplyFenceAcquireAttemptReconcileResultDTO>
-        &observed_attempt_reconciliation) {
-  const bool acquire_invoked_in_this_call =
-      path == ManagerApplyFenceAcquirePath::kAcquiredFromNewAttempt ||
-      path == ManagerApplyFenceAcquirePath::kRetriedAfterAuthoritativeNotSeen;
-  const auto &intent = durable_intent.record.intent;
-  const auto &acceptance = durable_acceptance.record.accepted_fence;
-  core::ApplyFenceRehydrateDTO request{
-      intent.apply_id,
-      intent.apply_generation,
-      intent.request_context.request_id,
-      intent.request_context.request_owner_epoch,
-      durable_intent.record.intent_digest,
-      intent.expected_active_projection_revision.retained_bundle_id,
-      intent.expected_active_projection_revision.graph_revision,
-      intent.candidate_retained_bundle_id,
-      intent.candidate_graph_revision,
-      acceptance.configuration_fence_id,
-      acceptance.configuration_fence_generation,
-      acceptance.captured_scope,
-      "fence_accepted",
-      manager_runtime_epoch,
-  };
-  if (!request.valid()) {
-    FailUncertain(
-        "durable Apply-fence records cannot form a valid rehydration request",
-        ManagerApplyFenceUncertaintyPhase::kRehydrateResponse,
-        acquire_invoked_in_this_call, recovery_query, acceptance,
-        observed_attempt_reconciliation);
-  }
-
-  std::optional<core::ApplyFenceReconcileResultDTO> rehydration;
-  try {
-    rehydration = kernel_fence.Rehydrate(request);
-  } catch (const std::exception &error) {
-    FailUncertain(
-        ExceptionDetail("Kernel Apply-fence rehydration failed", error),
-        ManagerApplyFenceUncertaintyPhase::kRehydrateCall,
-        acquire_invoked_in_this_call, recovery_query, acceptance,
-        observed_attempt_reconciliation);
-  } catch (...) {
-    FailUncertain(
-        "Kernel Apply-fence rehydration raised a non-standard exception",
-        ManagerApplyFenceUncertaintyPhase::kRehydrateCall,
-        acquire_invoked_in_this_call, recovery_query, acceptance,
-        observed_attempt_reconciliation);
-  }
-
-  const bool reconciled =
-      rehydration->matches(request) && !rehydration->admission_fenced &&
-      !rehydration->error.has_value() &&
-      rehydration->required_compensation_or_operator_direction.empty() &&
-      rehydration->fence_results.size() == 1U &&
-      (rehydration->fence_results.front().state ==
-           core::ApplyFenceReconcileState::kMatched ||
-       rehydration->fence_results.front().state ==
-           core::ApplyFenceReconcileState::kRecreated);
-  if (!reconciled) {
-    std::string detail =
-        "Kernel returned invalid, unresolved, or fail-closed Apply-fence "
-        "rehydration evidence";
-    if (rehydration->error.has_value()) {
-      detail += ": [" + rehydration->error->code + "] " +
-                rehydration->error->message;
-    } else if (rehydration->admission_fenced) {
-      detail += ": admission remains fenced";
-    }
-    FailUncertain(
-        std::move(detail),
-        ManagerApplyFenceUncertaintyPhase::kRehydrateResponse,
-        acquire_invoked_in_this_call, recovery_query, acceptance,
-        observed_attempt_reconciliation, *rehydration);
-  }
-
-  return {
-      std::move(durable_intent),
-      std::move(durable_affected_scope),
-      std::move(durable_attempt),
-      std::move(durable_acceptance),
-      std::move(request),
-      std::move(*rehydration),
-      path,
-  };
-}
-
 } // namespace
 
 ManagerApplyFenceEffectUncertainError::ManagerApplyFenceEffectUncertainError(
@@ -331,14 +232,12 @@ ManagerApplyFenceEffectUncertainError::ManagerApplyFenceEffectUncertainError(
     core::ApplyFenceAcquireAttemptQueryDTO recovery_query,
     std::optional<core::ConfigurationFenceAcceptedDTO> observed_acceptance,
     std::optional<core::ApplyFenceAcquireAttemptReconcileResultDTO>
-        observed_reconciliation,
-    std::optional<core::ApplyFenceReconcileResultDTO> observed_rehydration)
+        observed_reconciliation)
     : ManagerApplyFenceCoordinatorError(std::move(detail)), phase_(phase),
       acquire_invoked_in_this_call_(acquire_invoked_in_this_call),
       recovery_query_(std::move(recovery_query)),
       observed_acceptance_(std::move(observed_acceptance)),
-      observed_reconciliation_(std::move(observed_reconciliation)),
-      observed_rehydration_(std::move(observed_rehydration)) {}
+      observed_reconciliation_(std::move(observed_reconciliation)) {}
 
 ManagerApplyFenceUncertaintyPhase
 ManagerApplyFenceEffectUncertainError::phase() const noexcept {
@@ -366,22 +265,12 @@ ManagerApplyFenceEffectUncertainError::observed_reconciliation()
   return observed_reconciliation_;
 }
 
-const std::optional<core::ApplyFenceReconcileResultDTO> &
-ManagerApplyFenceEffectUncertainError::observed_rehydration() const noexcept {
-  return observed_rehydration_;
-}
-
 ManagerApplyFenceCoordinator::ManagerApplyFenceCoordinator(
     SqliteManagerApplyJournal &apply_journal,
     core::IManagerKernelApplyFencePort &kernel_fence,
-    core::RuntimeEpoch manager_runtime_epoch, manyforge::deployment::SiteFacts site_facts)
+    manyforge::deployment::SiteFacts site_facts)
     : apply_journal_(apply_journal), kernel_fence_(kernel_fence),
-      manager_runtime_epoch_(std::move(manager_runtime_epoch)),
-      site_facts_(std::move(site_facts)) {
-  if (manager_runtime_epoch_.empty()) {
-    Fail("Manager runtime epoch is empty");
-  }
-}
+      site_facts_(std::move(site_facts)) {}
 
 ManagerApplyFenceAcquireResult
 ManagerApplyFenceCoordinator::AcquireOrRecoverFence(
@@ -403,8 +292,7 @@ ManagerApplyFenceCoordinator::AcquireOrRecoverFence(
       durable_intent.record.intent_digest,
       durable_affected_scope.record.affected_scope_digest,
       prepared.fence_intent);
-  const auto query =
-      RecoveryQuery(durable_attempt.record, manager_runtime_epoch_);
+  const auto query = RecoveryQuery(durable_attempt.record);
 
   std::optional<PersistedManagerApplyFenceAcceptance> existing_acceptance;
   try {
@@ -441,25 +329,20 @@ ManagerApplyFenceCoordinator::AcquireOrRecoverFence(
           ManagerApplyFenceUncertaintyPhase::kAcceptancePersistence, false,
           query, existing_acceptance->accepted_fence);
     }
-    return RehydrateAndFinish(
-        kernel_fence_, manager_runtime_epoch_, std::move(durable_intent),
-        std::move(durable_affected_scope), std::move(durable_attempt),
-        ManagerApplyFenceAcceptanceWriteResult{std::move(*existing_acceptance),
-                                               false},
-        ManagerApplyFenceAcquirePath::kDurableAcceptanceReplay, query,
-        std::nullopt);
+    return {std::move(durable_intent), std::move(durable_affected_scope),
+            std::move(durable_attempt),
+            ManagerApplyFenceAcceptanceWriteResult{
+                std::move(*existing_acceptance), false},
+            ManagerApplyFenceAcquirePath::kDurableAcceptanceReplay};
   }
 
   if (durable_attempt.inserted) {
     auto durable_acceptance =
         AcquireAndPersist(apply_journal_, kernel_fence_, durable_attempt.record,
                           query, std::nullopt);
-    return RehydrateAndFinish(
-        kernel_fence_, manager_runtime_epoch_, std::move(durable_intent),
-        std::move(durable_affected_scope), std::move(durable_attempt),
-        std::move(durable_acceptance),
-        ManagerApplyFenceAcquirePath::kAcquiredFromNewAttempt, query,
-        std::nullopt);
+    return {std::move(durable_intent), std::move(durable_affected_scope),
+            std::move(durable_attempt), std::move(durable_acceptance),
+            ManagerApplyFenceAcquirePath::kAcquiredFromNewAttempt};
   }
 
   std::optional<core::ApplyFenceAcquireAttemptReconcileResultDTO>
@@ -493,23 +376,17 @@ ManagerApplyFenceCoordinator::AcquireOrRecoverFence(
     auto durable_acceptance = PersistAcceptance(
         apply_journal_, durable_attempt.record, *reconciliation->accepted_fence,
         query, false, reconciliation);
-    return RehydrateAndFinish(
-        kernel_fence_, manager_runtime_epoch_, std::move(durable_intent),
-        std::move(durable_affected_scope), std::move(durable_attempt),
-        std::move(durable_acceptance),
-        ManagerApplyFenceAcquirePath::kRecoveredAcceptedExact, query,
-        reconciliation);
+    return {std::move(durable_intent), std::move(durable_affected_scope),
+            std::move(durable_attempt), std::move(durable_acceptance),
+            ManagerApplyFenceAcquirePath::kRecoveredAcceptedExact};
   }
   case core::ApplyFenceAcquireAttemptReconcileState::kNotSeen: {
     auto durable_acceptance =
         AcquireAndPersist(apply_journal_, kernel_fence_, durable_attempt.record,
                           query, reconciliation);
-    return RehydrateAndFinish(
-        kernel_fence_, manager_runtime_epoch_, std::move(durable_intent),
-        std::move(durable_affected_scope), std::move(durable_attempt),
-        std::move(durable_acceptance),
-        ManagerApplyFenceAcquirePath::kRetriedAfterAuthoritativeNotSeen, query,
-        reconciliation);
+    return {std::move(durable_intent), std::move(durable_affected_scope),
+            std::move(durable_attempt), std::move(durable_acceptance),
+            ManagerApplyFenceAcquirePath::kRetriedAfterAuthoritativeNotSeen};
   }
   case core::ApplyFenceAcquireAttemptReconcileState::kConflicting:
     FailUncertain(

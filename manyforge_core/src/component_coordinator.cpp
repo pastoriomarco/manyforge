@@ -152,12 +152,11 @@ std::vector<std::jthread> ComponentCoordinator::SetComponents(
                              component.owner, std::nullopt, std::nullopt, false, {}, reserved});
       }
     }
-    for (auto& entry : entries_) {
-      entry.worker.request_stop();
-      removed.push_back(std::move(entry.worker));
-    }
+    for (auto& entry : entries_) removed.push_back(std::move(entry.worker));
     entries_ = std::move(next);
   }
+  // The removed actions' stop callbacks run after the lock.
+  for (auto& worker : removed) worker.request_stop();
   Refresh();
   return removed;
 }
@@ -196,15 +195,42 @@ ComponentRecoveryFact RecoveryFact(const ComponentState& state) {
 Result<ComponentRecoveryPreflight> ComponentCoordinator::RecoveryPreflight(
     const std::string& component_id) const {
   using Reply = Result<ComponentRecoveryPreflight>;
-  std::lock_guard lock(mutex_);
-  const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
-    return row.component_id == component_id;
-  });
-  if (entry == entries_.end() || closing_)
-    return Reply::Err(action_error("component_not_found", "The component is not in the cell",
-                                   component_id, ComponentAction::kEnable));
+  // The coordinator's part is copied under the lock; the adapters are read
+  // after it (an observation without admission authority).
+  struct Row {
+    std::string component_id;
+    std::optional<std::string> owner_id;
+    std::optional<std::string> role;
+    std::optional<ComponentActionInProgress> action;
+    std::optional<ActionResult> last_action;
+    std::shared_ptr<IComponentAdapter> adapter;
+  };
+  const auto copy = [](const Entry& row) {
+    return Row{row.component_id, row.owner_id, row.role, row.action, row.last_action, row.adapter};
+  };
+  std::optional<Row> member;
+  std::optional<Row> owner;
+  {
+    std::lock_guard lock(mutex_);
+    const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
+      return row.component_id == component_id;
+    });
+    if (entry == entries_.end() || closing_)
+      return Reply::Err(action_error("component_not_found", "The component is not in the cell",
+                                     component_id, ComponentAction::kEnable));
+    member = copy(*entry);
+    if (entry->owner_id) {
+      const auto found = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
+        return row.component_id == *entry->owner_id;
+      });
+      if (found == entries_.end())
+        return Reply::Err(action_error("owner_not_prepared", "The component's machine is not in the cell",
+                                       component_id, ComponentAction::kEnable));
+      owner = copy(*found);
+    }
+  }
   const auto now = clock_.now();
-  const auto read = [&](const Entry& row) {
+  const auto read = [&](const Row& row) {
     auto state = row.adapter->State(now);
     state.component_id = row.component_id;
     state.owner_id = row.owner_id;
@@ -215,16 +241,8 @@ Result<ComponentRecoveryPreflight> ComponentCoordinator::RecoveryPreflight(
       state.capabilities = row.adapter->capabilities();
     return state;
   };
-  ComponentRecoveryPreflight result{read(*entry), std::nullopt};
-  if (entry->owner_id) {
-    const auto owner = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
-      return row.component_id == *entry->owner_id;
-    });
-    if (owner == entries_.end())
-      return Reply::Err(action_error("owner_not_prepared", "The component's machine is not in the cell",
-                                     component_id, ComponentAction::kEnable));
-    result.owner = read(*owner);
-  }
+  ComponentRecoveryPreflight result{read(*member), std::nullopt};
+  if (owner) result.owner = read(*owner);
   return Reply::Ok(std::move(result));
 }
 
@@ -232,83 +250,122 @@ Result<ComponentActionInProgress> ComponentCoordinator::SubmitRecoveryEnable(
     const std::string& component_id, std::vector<ComponentRecoveryFact> confirmed,
     std::function<bool()> current, std::function<bool()> owner_recovered) {
   using Reply = Result<ComponentActionInProgress>;
-  std::jthread finished;
+  using Row = std::vector<Entry>::iterator;
   ComponentActionInProgress accepted{ComponentAction::kEnable, clock_.now()};
-  {
-    std::lock_guard lock(mutex_);
+  // Every check on the coordinator's state, in today's order (all of them
+  // rank before the facts); on none, `entry` and `owner` (end() for none) are
+  // the rows. The caller holds `mutex_`.
+  const auto state_refusal = [&](Row& entry, Row& owner) -> std::optional<ErrorDTO> {
     if (action_admission_closed_ || closing_) {
       auto refused = action_error("component_not_ready", "Component actions are closing",
                                   component_id, ComponentAction::kEnable);
       refused.details.emplace("reason", "coordinator_closing");
-      return Result<ComponentActionInProgress>::Err(std::move(refused));
+      return refused;
     }
-    const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
+    entry = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
       return row.component_id == component_id;
     });
     if (entry == entries_.end() || closing_)
-      return Reply::Err(action_error("component_not_found", "The component is not in the cell",
-                                     component_id, ComponentAction::kEnable));
+      return action_error("component_not_found", "The component is not in the cell",
+                          component_id, ComponentAction::kEnable);
     if (entry->owner)
-      return Reply::Err(action_error("component_action_unsupported", "A machine has no Enable action",
-                                     component_id, ComponentAction::kEnable));
+      return action_error("component_action_unsupported", "A machine has no Enable action",
+                          component_id, ComponentAction::kEnable);
     if (entry->action || entry->composite_reserved)
-      return Reply::Err(action_error("component_action_in_progress", "Another component action is running",
-                                     component_id, ComponentAction::kEnable));
-    auto owner = entries_.end();
+      return action_error("component_action_in_progress", "Another component action is running",
+                          component_id, ComponentAction::kEnable);
+    owner = entries_.end();
     if (entry->owner_id) {
       owner = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
         return row.component_id == *entry->owner_id;
       });
       if (owner == entries_.end())
-        return Reply::Err(action_error("owner_not_prepared", "The machine is not in the cell",
-                                       component_id, ComponentAction::kEnable));
+        return action_error("owner_not_prepared", "The machine is not in the cell",
+                            component_id, ComponentAction::kEnable);
       if (owner->action || owner->composite_reserved)
-        return Reply::Err(action_error("component_action_in_progress", "Another machine action is running",
-                                       component_id, ComponentAction::kEnable));
+        return action_error("component_action_in_progress", "Another machine action is running",
+                            component_id, ComponentAction::kEnable);
       const auto busy_member = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
         return row.owner_id == entry->owner_id && (row.action || row.composite_reserved);
       });
       if (busy_member != entries_.end())
-        return Reply::Err(action_error("component_action_in_progress", "Another machine member action is running",
-                                       component_id, ComponentAction::kEnable));
+        return action_error("component_action_in_progress", "Another machine member action is running",
+                            component_id, ComponentAction::kEnable);
     }
-    const auto read_fact = [&](const Entry& row) {
-      auto state = row.adapter->State(clock_.now());
-      state.component_id = row.component_id;
-      if (!(state.fault && state.fault->code == FaultCode::kOwnerStalled))
-        state.capabilities = row.adapter->capabilities();
-      return RecoveryFact(state);
-    };
+    return std::nullopt;
+  };
+  const auto read_fact = [&](const std::string& id, const std::shared_ptr<IComponentAdapter>& source) {
+    auto state = source->State(clock_.now());
+    state.component_id = id;
+    if (!(state.fault && state.fault->code == FaultCode::kOwnerStalled))
+      state.capabilities = source->capabilities();
+    return RecoveryFact(state);
+  };
+  // The adapters are read without the lock, between two memory-only passes
+  // under it. Runs again only when the component list replaced the component
+  // or its owner in between: the order "replaced, then Submit".
+  for (;;) {
+    std::shared_ptr<IComponentAdapter> adapter;
+    std::optional<std::string> owner_id;
+    std::shared_ptr<IComponentAdapter> owner_adapter;
+    {
+      std::lock_guard lock(mutex_);
+      Row entry;
+      Row owner;
+      if (auto refused = state_refusal(entry, owner)) return Reply::Err(std::move(*refused));
+      adapter = entry->adapter;
+      owner_id = entry->owner_id;
+      if (owner != entries_.end()) owner_adapter = owner->adapter;
+    }
     std::vector<ComponentRecoveryFact> actual;
-    if (owner != entries_.end()) actual.push_back(read_fact(*owner));
-    actual.push_back(read_fact(*entry));
-    if (!current || !current() || actual != confirmed)
-      return Reply::Err(action_error("stale_generation", "Configuration changed; confirm again",
-                                     component_id, ComponentAction::kEnable));
-    const auto& member_fact = actual.back();
-    const bool owner_recover = owner != entries_.end() && actual.front().eligibility == "recover";
-    if ((owner != entries_.end() && actual.front().eligibility != "ready" && !owner_recover) ||
-        member_fact.eligibility == "blocked" || member_fact.eligibility == "excluded" ||
-        (member_fact.eligibility == "unknown" && !owner_recover))
-      return Reply::Err(action_error("component_action_refused", "The component cannot be recovered and enabled",
-                                     component_id, ComponentAction::kEnable));
-    const auto owner_id = entry->owner_id;
-    auto owner_adapter = owner == entries_.end() ? std::shared_ptr<IComponentAdapter>{} : owner->adapter;
-    if (owner != entries_.end()) owner->composite_reserved = true;
-    entry->action = accepted;
-    entry->interrupted = false;
-    finished = std::move(entry->worker);
-    ++actions_in_flight_;
+    if (owner_adapter) actual.push_back(read_fact(*owner_id, owner_adapter));
+    actual.push_back(read_fact(component_id, adapter));
+    std::optional<ErrorDTO> refused_by_facts;
+    if (!current || !current()) {
+      refused_by_facts = action_error("stale_generation", "Configuration changed; confirm again",
+                                      component_id, ComponentAction::kEnable);
+    } else if (actual != confirmed) {
+      // OD-312: the causes changed, not the configuration: the GUI re-reads them.
+      refused_by_facts = action_error("component_recovery_confirmation_changed",
+                                      "Recovery causes changed; confirm again",
+                                      component_id, ComponentAction::kEnable);
+    } else {
+      const auto& member_fact = actual.back();
+      const bool owner_recover = owner_adapter && actual.front().eligibility == "recover";
+      if ((owner_adapter && actual.front().eligibility != "ready" && !owner_recover) ||
+          member_fact.eligibility == "blocked" || member_fact.eligibility == "excluded" ||
+          (member_fact.eligibility == "unknown" && !owner_recover))
+        refused_by_facts = action_error("component_action_refused",
+                                        "The component cannot be recovered and enabled",
+                                        component_id, ComponentAction::kEnable);
+    }
+    {
+      std::lock_guard lock(mutex_);
+      Row entry;
+      Row owner;
+      if (auto refused = state_refusal(entry, owner)) return Reply::Err(std::move(*refused));
+      const auto current_owner =
+          owner == entries_.end() ? std::shared_ptr<IComponentAdapter>{} : owner->adapter;
+      if (entry->adapter != adapter || entry->owner_id != owner_id || current_owner != owner_adapter)
+        continue;  // replaced since the read: read the current one
+      if (refused_by_facts) return Reply::Err(std::move(*refused_by_facts));
+      if (owner != entries_.end()) owner->composite_reserved = true;
+      entry->action = accepted;
+      entry->interrupted = false;
+      ++actions_in_flight_;
+    }
+    // The thread is created without the lock and stored after it.
+    std::jthread worker;
     try {
       auto action_body =
-          [this, component_id, adapter = entry->adapter, owner_id,
-           owner_adapter = std::move(owner_adapter), confirmed = std::move(confirmed),
-           current = std::move(current), owner_recovered = std::move(owner_recovered),
+          [this, component_id, adapter, owner_id, owner_adapter,
+           confirmed = std::move(confirmed), current = std::move(current),
+           owner_recovered = std::move(owner_recovered),
            started = accepted.started_at_ns](std::stop_token stop) mutable {
             RunRecoveryEnable(component_id, adapter, owner_id, owner_adapter,
                               std::move(confirmed), std::move(current), std::move(owner_recovered), started, stop);
           };
-      entry->worker = std::jthread(
+      worker = std::jthread(
           [this, action_body = std::optional{std::move(action_body)}](std::stop_token stop) mutable {
             ActionCompletion completion{this};
             {
@@ -318,158 +375,234 @@ Result<ComponentActionInProgress> ComponentCoordinator::SubmitRecoveryEnable(
             } // Both callable wrappers and captures retire before completion.
           });
     } catch (...) {
-      --actions_in_flight_;
-      if (owner != entries_.end()) owner->composite_reserved = false;
-      entry->action.reset();
-      entry->worker = std::move(finished);
+      // As today: the action is taken back and refused. No other request can
+      // reserve the owner meanwhile, so its mark is this one's.
+      {
+        std::lock_guard lock(mutex_);
+        for (auto& row : entries_) {
+          if (row.component_id == component_id && row.adapter == adapter && row.action == accepted) {
+            row.action.reset();
+            row.interrupted = false;
+          }
+          if (owner_adapter && row.component_id == *owner_id) row.composite_reserved = false;
+        }
+        --actions_in_flight_;
+        actions_drained_.notify_all();
+      }
       return Reply::Err(action_error("component_action_refused", "The component action could not start",
                                      component_id, ComponentAction::kEnable));
     }
+    // Joined after Refresh, without the lock.
+    auto finished = StoreWorker(component_id, adapter, accepted, std::move(worker));
+    Refresh();
+    return Reply::Ok(accepted);
   }
-  Refresh();
-  return Reply::Ok(accepted);
+}
+
+std::jthread ComponentCoordinator::StoreWorker(const std::string& component_id,
+                                               const std::shared_ptr<IComponentAdapter>& adapter,
+                                               const ComponentActionInProgress& accepted,
+                                               std::jthread worker) {
+  std::stop_source stop(std::nostopstate);
+  std::jthread finished;
+  {
+    std::lock_guard lock(mutex_);
+    const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
+      return row.component_id == component_id && row.adapter == adapter;
+    });
+    if (entry != entries_.end() && !closing_ && entry->action == accepted) {
+      // A Stop between the acceptance and here found no thread to stop.
+      if (entry->interrupted) stop = worker.get_stop_source();
+      finished = std::move(entry->worker);
+      entry->worker = std::move(worker);
+    } else {
+      // Replaced or removed (or closing) while the thread was being created:
+      // its result is dropped, as for an action removed by SetComponents, and
+      // it is joined by Submit. Or the action already ended (a short join).
+      stop = worker.get_stop_source();
+      finished = std::move(worker);
+    }
+  }
+  stop.request_stop();
+  return finished;
 }
 
 Result<ComponentActionInProgress> ComponentCoordinator::Submit(const std::string& component_id,
                                                                 const ComponentAction action) {
-  std::jthread finished;
-  ComponentActionInProgress accepted;
-  {
-    std::lock_guard lock(mutex_);
+  using Reply = Result<ComponentActionInProgress>;
+  using Row = std::vector<Entry>::iterator;
+  // The first checks on the coordinator's state, in today's order; on none,
+  // `entry` is the component's row. The caller holds `mutex_`.
+  const auto state_refusal = [&](Row& entry) -> std::optional<ErrorDTO> {
     if (action_admission_closed_ || closing_) {
       auto refused = action_error("component_not_ready", "Component actions are closing",
                                   component_id, action);
       refused.details.emplace("reason", "coordinator_closing");
-      return Result<ComponentActionInProgress>::Err(std::move(refused));
+      return refused;
     }
-    const auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
+    entry = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
       return row.component_id == component_id;
     });
-    if (entry == entries_.end()) {
-      return Result<ComponentActionInProgress>::Err(action_error(
-          "component_not_found", "The component is not in the cell", component_id, action));
+    if (entry == entries_.end())
+      return action_error("component_not_found", "The component is not in the cell", component_id,
+                          action);
+    if (entry->action || entry->composite_reserved)
+      return action_error("component_action_in_progress",
+                          "Another action of this component is still running", component_id,
+                          action);
+    return std::nullopt;
+  };
+  const auto owner_row = [&](const std::optional<std::string>& owner_id) {
+    return !owner_id ? entries_.end()
+                     : std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
+                         return row.component_id == *owner_id;
+                       });
+  };
+  // An owner's power action disables its members first.
+  const bool power_action = action == ComponentAction::kPowerOff || action == ComponentAction::kReboot;
+  const bool motion_action =
+      action == ComponentAction::kEnable || action == ComponentAction::kResetPosition;
+  // The adapters are read without the lock, between two memory-only passes
+  // under it. Runs again only when the component list replaced the component
+  // or its owner in between: the order "replaced, then Submit".
+  for (;;) {
+    std::shared_ptr<IComponentAdapter> adapter;
+    bool owner{};
+    std::optional<std::string> owner_id;
+    // The member's owner, when it is in the cell.
+    std::shared_ptr<IComponentAdapter> owner_adapter;
+    {
+      std::lock_guard lock(mutex_);
+      Row entry;
+      if (auto refused = state_refusal(entry)) return Reply::Err(std::move(*refused));
+      adapter = entry->adapter;
+      owner = entry->owner;
+      owner_id = entry->owner_id;
+      if (const auto found = owner_row(owner_id); found != entries_.end())
+        owner_adapter = found->adapter;
     }
-    if (entry->action || entry->composite_reserved) {
-      return Result<ComponentActionInProgress>::Err(
-          action_error("component_action_in_progress",
-                       "Another action of this component is still running", component_id, action));
-    }
+    // The adapters' facts and the refusals they decide; returned under the
+    // lock at today's positions.
+    std::optional<ErrorDTO> refused_by_facts;
     // An owner offers no enable/disable.
-    if (!action_supported(action, entry->adapter->capabilities()) ||
-        (entry->owner &&
-         (action == ComponentAction::kEnable || action == ComponentAction::kDisable))) {
-      return Result<ComponentActionInProgress>::Err(
-          action_error("component_action_unsupported", "The component doesn't offer this action",
-                       component_id, action));
-    }
-    if (action == ComponentAction::kEnable) {
-      auto state = entry->adapter->State(clock_.now());
-      state.capabilities = entry->adapter->capabilities();
+    if (!action_supported(action, adapter->capabilities()) ||
+        (owner && (action == ComponentAction::kEnable || action == ComponentAction::kDisable)))
+      refused_by_facts = action_error("component_action_unsupported",
+                                      "The component doesn't offer this action", component_id, action);
+    if (!refused_by_facts && action == ComponentAction::kEnable) {
+      auto state = adapter->State(clock_.now());
+      state.capabilities = adapter->capabilities();
       if (RecoveryFact(state).eligibility != "excluded" && (state.fault || state.stop))
-        return Result<ComponentActionInProgress>::Err(
-            action_error("component_action_refused", "Recovery confirmation is required before Enable",
-                         component_id, action));
+        refused_by_facts = action_error("component_action_refused",
+                                        "Recovery confirmation is required before Enable",
+                                        component_id, action);
     }
     // A position reset can't take effect while
     // the component's simulation isn't playing; refused at once, never waited.
-    if (action == ComponentAction::kResetPosition) {
-      const auto reason = entry->adapter->State(clock_.now()).reason;
+    if (!refused_by_facts && action == ComponentAction::kResetPosition) {
+      const auto reason = adapter->State(clock_.now()).reason;
       if (reason && reason->code == "simulation_not_playing")
-        return Result<ComponentActionInProgress>::Err(action_error(
-            "simulation_not_playing", "The simulation is not playing", component_id, action));
+        refused_by_facts = action_error("simulation_not_playing", "The simulation is not playing",
+                                        component_id, action);
     }
-    auto prepared_recovery = action == ComponentAction::kRecover
-                                 ? entry->adapter->PrepareSharedOwnerRecovery()
+    auto prepared_recovery = !refused_by_facts && action == ComponentAction::kRecover
+                                 ? adapter->PrepareSharedOwnerRecovery()
                                  : IComponentAdapter::PreparedRecovery{};
-    if (entry->owner_id) {
-      const auto owner_entry = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
-        return row.component_id == *entry->owner_id;
-      });
-      if (owner_entry != entries_.end() && owner_entry->composite_reserved)
-        return Result<ComponentActionInProgress>::Err(
-            action_error("component_action_in_progress", "The machine has a recovery action in progress",
-                         component_id, action));
-      // An owner's stop (an e-stop and its latched error) is normal: it gates
-      // motion (Enable, Reset position), never its members' Prepare, Disable
-      // or Recover. Its explicit clear is the machine's Recover (Recover and
-      // enable, or Enable all).
-      const auto owner_state = owner_entry == entries_.end()
-                                   ? std::optional<ComponentState>{}
-                                   : std::optional<ComponentState>{
-                                         owner_entry->adapter->State(clock_.now())};
-      const bool motion_action =
-          action == ComponentAction::kEnable || action == ComponentAction::kResetPosition;
-      if (owner_state && owner_state->lifecycle == ComponentLifecycle::kPrepared &&
-          !owner_state->fault && owner_state->stop && motion_action && !prepared_recovery) {
-        auto refused = action_error("owner_estop_active",
-                                    "The machine " + *entry->owner_id +
-                                        " reports an e-stop; Recover it once the e-stop is released",
-                                    component_id, action);
-        refused.details.emplace("owner_id", *entry->owner_id);
-        return Result<ComponentActionInProgress>::Err(std::move(refused));
-      }
-      const bool owner_ready = owner_state &&
-                               owner_state->lifecycle == ComponentLifecycle::kPrepared &&
-                               !owner_state->fault;
-      if (owner_entry == entries_.end() || (!owner_ready && !prepared_recovery)) {
-        auto refused = action_error("owner_not_prepared",
-                                    "The machine " + *entry->owner_id + " isn't prepared",
-                                    component_id, action);
-        refused.details.emplace("owner_id", *entry->owner_id);
-        return Result<ComponentActionInProgress>::Err(std::move(refused));
-      }
-    }
-    // An owner's power action disables its members first.
-    const bool group = entry->owner && (action == ComponentAction::kPowerOff ||
-                                        action == ComponentAction::kReboot);
-    if (entry->owner && action == ComponentAction::kRecover) {
-      const auto busy = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
-        return row.owner_id == component_id && row.composite_reserved;
-      });
-      if (busy != entries_.end()) {
-        auto refused = action_error("component_action_in_progress",
-                                    "An action of the member " + busy->component_id +
-                                        " is still running", component_id, action);
-        refused.details.emplace("member_id", busy->component_id);
-        return Result<ComponentActionInProgress>::Err(std::move(refused));
-      }
-    }
-    if (group) {
-      const auto busy = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
-        return row.owner_id == component_id && (row.action || row.composite_reserved);
-      });
-      if (busy != entries_.end()) {
-        auto refused = action_error("component_action_in_progress",
-                                    "An action of the member " + busy->component_id +
-                                        " is still running",
-                                    component_id, action);
-        refused.details.emplace("member_id", busy->component_id);
-        return Result<ComponentActionInProgress>::Err(std::move(refused));
-      }
-    }
-    accepted = ComponentActionInProgress{action, clock_.now()};
+    std::optional<ComponentState> owner_state;
+    if (!refused_by_facts && owner_adapter) owner_state = owner_adapter->State(clock_.now());
+
+    ComponentActionInProgress accepted;
     std::vector<GroupMember> members;
-    if (group) {
-      for (auto& row : entries_) {
-        if (row.owner_id != component_id) continue;
-        row.action = ComponentActionInProgress{ComponentAction::kDisable, accepted.started_at_ns};
-        row.interrupted = false;
-        members.push_back({row.component_id, row.adapter});
+    {
+      std::lock_guard lock(mutex_);
+      Row entry;
+      if (auto refused = state_refusal(entry)) return Reply::Err(std::move(*refused));
+      const auto owner_entry = owner_row(owner_id);
+      const auto current_owner =
+          owner_entry == entries_.end() ? std::shared_ptr<IComponentAdapter>{} : owner_entry->adapter;
+      if (entry->adapter != adapter || entry->owner != owner || entry->owner_id != owner_id ||
+          current_owner != owner_adapter)
+        continue;  // replaced since the read: read the current one
+      if (refused_by_facts) return Reply::Err(std::move(*refused_by_facts));
+      if (owner_id) {
+        if (owner_entry != entries_.end() && owner_entry->composite_reserved)
+          return Reply::Err(action_error("component_action_in_progress",
+                                         "The machine has a recovery action in progress",
+                                         component_id, action));
+        // An owner's stop (an e-stop and its latched error) is normal: it gates
+        // motion (Enable, Reset position), never its members' Prepare, Disable
+        // or Recover. Its explicit clear is the machine's Recover (Recover and
+        // enable, or Enable all).
+        if (owner_state && owner_state->lifecycle == ComponentLifecycle::kPrepared &&
+            !owner_state->fault && owner_state->stop && motion_action && !prepared_recovery) {
+          auto refused = action_error("owner_estop_active",
+                                      "The machine " + *owner_id +
+                                          " reports an e-stop; Recover it once the e-stop is released",
+                                      component_id, action);
+          refused.details.emplace("owner_id", *owner_id);
+          return Reply::Err(std::move(refused));
+        }
+        const bool owner_ready = owner_state &&
+                                 owner_state->lifecycle == ComponentLifecycle::kPrepared &&
+                                 !owner_state->fault;
+        if (owner_entry == entries_.end() || (!owner_ready && !prepared_recovery)) {
+          auto refused = action_error("owner_not_prepared",
+                                      "The machine " + *owner_id + " isn't prepared",
+                                      component_id, action);
+          refused.details.emplace("owner_id", *owner_id);
+          return Reply::Err(std::move(refused));
+        }
       }
+      const bool group = owner && power_action;
+      if (owner && action == ComponentAction::kRecover) {
+        const auto busy = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
+          return row.owner_id == component_id && row.composite_reserved;
+        });
+        if (busy != entries_.end()) {
+          auto refused = action_error("component_action_in_progress",
+                                      "An action of the member " + busy->component_id +
+                                          " is still running", component_id, action);
+          refused.details.emplace("member_id", busy->component_id);
+          return Reply::Err(std::move(refused));
+        }
+      }
+      if (group) {
+        const auto busy = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
+          return row.owner_id == component_id && (row.action || row.composite_reserved);
+        });
+        if (busy != entries_.end()) {
+          auto refused = action_error("component_action_in_progress",
+                                      "An action of the member " + busy->component_id +
+                                          " is still running",
+                                      component_id, action);
+          refused.details.emplace("member_id", busy->component_id);
+          return Reply::Err(std::move(refused));
+        }
+      }
+      accepted = ComponentActionInProgress{action, clock_.now()};
+      if (group) {
+        for (auto& row : entries_) {
+          if (row.owner_id != component_id) continue;
+          row.action = ComponentActionInProgress{ComponentAction::kDisable, accepted.started_at_ns};
+          row.interrupted = false;
+          members.push_back({row.component_id, row.adapter});
+        }
+      }
+      entry->action = accepted;
+      entry->interrupted = false;
+      ++actions_in_flight_;
     }
-    entry->action = accepted;
-    entry->interrupted = false;
-    finished = std::move(entry->worker);
-    ++actions_in_flight_;
+    // The thread is created without the lock and stored after it.
+    std::jthread worker;
     try {
       auto action_body =
-        [this, component_id, adapter = entry->adapter, action,
+        [this, component_id, adapter, action,
          started_at_ns = accepted.started_at_ns,
          members = std::move(members),
          prepared_recovery = std::move(prepared_recovery)](const std::stop_token& stop) {
           RunAction(component_id, adapter, action, started_at_ns, members, stop, prepared_recovery);
         };
-      entry->worker = std::jthread(
+      worker = std::jthread(
         [this, action_body = std::optional{std::move(action_body)}](const std::stop_token& stop) mutable {
           ActionCompletion completion{this};
           {
@@ -479,12 +612,18 @@ Result<ComponentActionInProgress> ComponentCoordinator::Submit(const std::string
           } // Both callable wrappers and captures retire before completion.
         });
     } catch (...) {
-      --actions_in_flight_;
+      {
+        std::lock_guard lock(mutex_);
+        --actions_in_flight_;
+        actions_drained_.notify_all();
+      }
       throw;
     }
+    // Joined after Refresh, without the lock.
+    auto finished = StoreWorker(component_id, adapter, accepted, std::move(worker));
+    Refresh();
+    return Reply::Ok(accepted);
   }
-  Refresh();
-  return Result<ComponentActionInProgress>::Ok(accepted);
 }
 
 void ComponentCoordinator::RunRecoveryEnable(
@@ -510,19 +649,21 @@ void ComponentCoordinator::RunRecoveryEnable(
       state.capabilities = source->capabilities();
     return RecoveryFact(state);
   };
+  // The adapters' facts are read before the lock; under it only the identity
+  // of the member and its owner and their reservations.
   const auto revalidate = [&] {
+    if (stop.stop_requested() || !current()) return false;
+    if (owner && read(*owner_id, owner) != *owner_fact) return false;
+    if (read(component_id, adapter) != member_fact) return false;
     std::lock_guard lock(mutex_);
     const auto member = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
       return row.component_id == component_id && row.adapter == adapter && row.owner_id == owner_id;
     });
-    if (member == entries_.end() || !member->action || stop.stop_requested() || !current()) return false;
-    if (owner) {
-      const auto parent = std::find_if(entries_.begin(), entries_.end(), [&](const Entry& row) {
-        return owner_id && row.component_id == *owner_id && row.adapter == owner && row.composite_reserved;
-      });
-      if (parent == entries_.end() || read(*owner_id, owner) != *owner_fact) return false;
-    }
-    return read(component_id, adapter) == member_fact;
+    if (member == entries_.end() || !member->action) return false;
+    if (!owner) return true;
+    return std::any_of(entries_.begin(), entries_.end(), [&](const Entry& row) {
+      return owner_id && row.component_id == *owner_id && row.adapter == owner && row.composite_reserved;
+    });
   };
   const auto phase = [&](const std::string& id, const std::shared_ptr<IComponentAdapter>& target,
                          ComponentAction action) {
@@ -574,7 +715,8 @@ void ComponentCoordinator::RunRecoveryEnable(
         if (observed.eligibility == "ready" && !observed.cause_code && !observed.stop_code) {
           member_fact = observed;
         } else if (observed != member_fact || member_fact.eligibility == "unknown") {
-          refused("stale_generation", "The member has an undisclosed cause; confirm again");
+          refused("component_recovery_confirmation_changed",
+                  "The member has an undisclosed cause; confirm again");
           proceed = false;
         }
       }
@@ -666,12 +808,7 @@ void ComponentCoordinator::Finish(const std::string& component_id,
 }
 
 void ComponentCoordinator::InterruptActions() {
-  std::lock_guard lock(mutex_);
-  for (auto& entry : entries_) {
-    if (!entry.action) continue;
-    entry.interrupted = true;
-    entry.worker.request_stop();
-  }
+  InterruptActionsOf([](std::string_view) { return true; });
 }
 
 void ComponentCoordinator::Refresh() {

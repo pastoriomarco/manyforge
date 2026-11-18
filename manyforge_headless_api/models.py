@@ -37,6 +37,14 @@ from .program_binding_projection import validate_project_path
 
 
 MAX_IDENTITY_BYTES = 256
+# Contract 1.4: source_label is 1-128 bytes NFC with no control characters.
+MAX_SOURCE_LABEL_BYTES = 128
+MAXIMUM_SAFE_INTEGER_ID = 9_007_199_254_740_991
+# Integer ids (contract 1.5): the member names stay, their type is a JSON
+# integer within the Kernel JSON integer bound.
+ProgramRunNumber = Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER_ID)]
+OperationNumber = Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER_ID)]
+NodeAttemptNumber = Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER_ID)]
 MAX_ACTIVATION_ID_BYTES = 2_048
 MAX_REASON_BYTES = 4096
 MAX_BULK_MEMBERS = 256
@@ -51,6 +59,8 @@ MAX_STOP_SELECTOR_TARGETS = 4096
 MAX_OPERATION_PARTICIPANTS = 4096
 MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES = 2 * 1024 * 1024
 SHA256_PATTERN = r"^sha256:[0-9a-f]{64}$"
+# A formed request key as carried downstream: 32 lowercase hex characters.
+REQUEST_KEY_PATTERN = r"^[0-9a-f]{32}$"
 _SHA256_RE = re.compile(SHA256_PATTERN)
 
 
@@ -144,7 +154,10 @@ class ProgramTargetReferenceRequest(StrictRequest):
     component_id: str
     command_target_id: str
 
-    @field_validator("component_id", "command_target_id")
+    @field_validator(
+        "component_id",
+        "command_target_id",
+    )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
@@ -154,7 +167,10 @@ class ProgramFrameReferenceRequest(StrictRequest):
     component_id: str
     frame_id: str
 
-    @field_validator("component_id", "frame_id")
+    @field_validator(
+        "component_id",
+        "frame_id",
+    )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
@@ -164,7 +180,10 @@ class ProgramCollisionBodyReferenceRequest(StrictRequest):
     component_id: str
     collision_body_id: str
 
-    @field_validator("component_id", "collision_body_id")
+    @field_validator(
+        "component_id",
+        "collision_body_id",
+    )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
@@ -174,7 +193,10 @@ class ProgramSignalReferenceRequest(StrictRequest):
     component_id: str
     signal_name: str
 
-    @field_validator("component_id", "signal_name")
+    @field_validator(
+        "component_id",
+        "signal_name",
+    )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
@@ -188,8 +210,7 @@ class TargetObservationQuery(StrictRequest):
     `io_signal` reads one component-owned boolean signal.
     """
 
-    schema_version: Literal["manyforge.target_observation_query.v2"]
-    owner_epoch: str
+    schema_version: Literal["manyforge.target_observation_query.v3"]
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     target: ProgramTargetReferenceRequest | None = None
     kind: Literal["frame_pose", "gripper_status", "frame_transform", "io_signal"]
@@ -199,17 +220,6 @@ class TargetObservationQuery(StrictRequest):
     pose: Pose3Request | None = None
     source_frame: FrameReferenceRequest | None = None
     target_frame: FrameReferenceRequest | None = None
-
-    @field_validator(
-        "owner_epoch",
-    )
-    @classmethod
-    def validate_identity(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(
-            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
-        )
 
     @model_validator(mode="after")
     def exact_query(self) -> "TargetObservationQuery":
@@ -248,164 +258,84 @@ class SkillExpansionRequest(StrictRequest):
 class ProgramOperationQuery(StrictRequest):
     """Select one resident operation from exact backend-owned Program scope."""
 
-    schema_version: Literal["manyforge.program_operation_query.v2"]
-    owner_epoch: str
+    schema_version: Literal["manyforge.program_operation_query.v3"]
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    program_run_id: str
+    program_run_id: ProgramRunNumber
     target: ProgramTargetReferenceRequest
 
-    @field_validator("owner_epoch", "program_run_id")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
-        )
 
+class RequestContext(StrictRequest):
+    """The request context of one request: ``{request_key, source_label}``.
 
-class CallerAttributionRequest(StrictRequest):
-    request_id: str
-    request_owner_epoch: str
-    source_label: str
-    correlation_id: str | None = None
-
-    @field_validator("request_id", "request_owner_epoch", "source_label")
-    @classmethod
-    def validate_required_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-    @field_validator("correlation_id")
-    @classmethod
-    def validate_optional_identity(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(
-            value,
-            label="correlation_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-
-class ManagerApplyAcknowledgementContext(StrictRequest):
-    """Bounded audit context for one operator acknowledgement attempt.
-
-    The Apply identity is carried separately in the URL/private command. This
-    request context records the acknowledging client; it is not authority or a
-    replay key, and callers that have no operator-command epoch omit it.
+    At HTTP ingress ``request_key`` is the client's 32-hex key, unchecked
+    here: Headless forms the key (class 3, or a Headless key for a Stop) and
+    refuses a missing or invalid one with its own typed code. Downstream
+    every request context carries the formed key.
     """
 
-    request_id: str
+    request_key: str | None = None
     source_label: str
-    request_owner_epoch: str | None = None
-    correlation_id: str | None = None
 
-    @field_validator("request_id", "source_label")
+    @field_validator("source_label")
     @classmethod
-    def validate_required_identity(cls, value: str, info) -> str:
+    def validate_source_label(cls, value: str) -> str:
+        if any(unicodedata.category(character) == "Cc" for character in value):
+            raise ValueError("source_label must not contain control characters")
         return _bounded_nfc(
             value,
-            label=info.field_name,
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-    @field_validator("request_owner_epoch", "correlation_id")
-    @classmethod
-    def validate_optional_identity(cls, value: str | None, info) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAX_IDENTITY_BYTES,
+            label="source_label",
+            maximum_bytes=MAX_SOURCE_LABEL_BYTES,
         )
 
 
-class ManagerApplyAcknowledgementRequest(StrictRequest):
+class CallerAttributionRequest(RequestContext):
+    """A request with its context at the top level.
+
+    ``application_start_id`` is the ``A`` the caller built the request
+    against; Headless checks it once where the request names a value minted
+    inside one start (contract 1.6).
+    """
+
+    # Checked once at the Headless edge and never serialized downstream.
+    application_start_id: str | None = Field(default=None, exclude=True)
+
+
+class StartIdentityRequest(StrictRequest):
+    """The ``A`` of a request whose context is nested."""
+
+    # Checked once at the Headless edge and never serialized downstream.
+    application_start_id: str | None = Field(default=None, exclude=True)
+
+
+class ManagerApplyAcknowledgementContext(RequestContext):
+    """Bounded audit context for one operator acknowledgement attempt.
+
+    The Apply identity is carried separately in the URL/private command.
+    """
+
+
+class ManagerApplyAcknowledgementRequest(StartIdentityRequest):
     request_context: ManagerApplyAcknowledgementContext
-
-
-class ExecutionControlAttributionRequest(CallerAttributionRequest):
-    """Optional causal identity of one persistent execution-control session."""
-
-    session_id: str | None = None
-    client_sequence: str | None = None
-
-    @field_validator("session_id")
-    @classmethod
-    def validate_session_identity(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(
-            value,
-            label="session_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-    @field_validator("client_sequence")
-    @classmethod
-    def validate_client_sequence(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        if (
-            not value.isascii()
-            or not value.isdigit()
-            or value.startswith("0")
-            or not 1 <= int(value) <= 18_446_744_073_709_551_615
-            or str(int(value)) != value
-        ):
-            raise ValueError("client_sequence must be canonical positive uint64 text")
-        return value
-
-    @model_validator(mode="after")
-    def paired_control_session(self) -> "ExecutionControlAttributionRequest":
-        if (self.session_id is None) != (self.client_sequence is None):
-            raise ValueError("session_id and client_sequence must be paired")
-        return self
 
 
 class AuthoringMutationContext(CallerAttributionRequest):
     """Exact owner-issued context carried by one authoring transaction."""
 
     expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    request_payload_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    owner_transaction_id: str
-
-    @field_validator("owner_transaction_id")
-    @classmethod
-    def validate_transaction_identity(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="owner_transaction_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
 
 
-class AuthoringMutationSettlementRequest(StrictRequest):
-    """Settle exactly one previously issued authoring claim."""
+class AuthoringMutationSettlementRequest(StartIdentityRequest):
+    """Settle exactly one previously issued authoring claim.
 
+    ``request_key`` is the key of the request that causes the release
+    (contract 1.15.2); Headless forms it like every HTTP key. The claim is
+    named by its own identity, not by this key.
+    """
+
+    request_key: str | None = None
     claim: dict[str, Any]
     settlement_kind: Literal["owner_commit", "proven_no_effect"]
     evidence_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-
-
-class AuthoringMutationRecoveryRequest(StrictRequest):
-    """Private Composer-owner lookup for one exact durable claim intent."""
-
-    intent: dict[str, Any]
-    expected_claim: dict[str, Any] | None
-    expected_release: dict[str, Any] | None
-
-
-class AuthoringOwnerReconciliationRequest(StrictRequest):
-    """Rotate only the Composer authoring-owner epoch after local recovery."""
-
-    kernel_owner_epoch: str
-    retained_claims: list[dict[str, Any]]
-    current_owner_epochs: list[dict[str, Any]]
-    reconciliation_evidence_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
 
 
 class AcknowledgeAlarmRequest(CallerAttributionRequest):
@@ -483,7 +413,10 @@ class ExpectedCurrentRequest(StrictRequest):
     graph_revision: str
     retained_bundle_id: str
 
-    @field_validator("graph_revision", "retained_bundle_id")
+    @field_validator(
+        "graph_revision",
+        "retained_bundle_id",
+    )
     @classmethod
     def validate_revision(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -494,7 +427,7 @@ class ExpectedCurrentRequest(StrictRequest):
 
 
 class ManagerDeploymentCandidateReceipt(StrictRequest):
-    schema_version: Literal["manyforge.manager_deployment_candidate_receipt.v2"]
+    schema_version: Literal["manyforge.manager_deployment_candidate_receipt.v3"]
     deployment_artifact_id: str
     deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
@@ -502,7 +435,6 @@ class ManagerDeploymentCandidateReceipt(StrictRequest):
     candidate_graph_revision: str
     expected_current: ExpectedCurrentRequest
     expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    manager_owner_epoch: str
     # Digest of the Manager's authoritative preview impact; a
     # destructive impact must be accepted via ``accepted_impact_digest``.
     impact_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
@@ -513,7 +445,6 @@ class ManagerDeploymentCandidateReceipt(StrictRequest):
         "deployment_artifact_id",
         "candidate_retained_bundle_id",
         "candidate_graph_revision",
-        "manager_owner_epoch",
     )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
@@ -532,13 +463,13 @@ class ManagerDeploymentCandidatePreviewRequest(StrictRequest):
     prepared_activation_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     expected_current: ExpectedCurrentRequest
     expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    request_owner_epoch: str
+    # Checked once at the Headless edge and never serialized downstream.
+    application_start_id: str | None = Field(default=None, exclude=True)
 
     @field_validator(
         "deployment_artifact_id",
         "candidate_retained_bundle_id",
         "candidate_graph_revision",
-        "request_owner_epoch",
     )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
@@ -557,7 +488,11 @@ class ReferenceValidationGeneration(StrictRequest):
     deployment_draft_id: str
     deployment_draft_revision: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)]
 
-    @field_validator("workspace_epoch", "program_draft_id", "deployment_draft_id")
+    @field_validator(
+        "workspace_epoch",
+        "program_draft_id",
+        "deployment_draft_id",
+    )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
@@ -598,7 +533,10 @@ class ComponentFrameLookupRequest(StrictRequest):
         return self
 
 
-class ActivationPreparationRequest(StrictRequest):
+class ActivationPreparationRequest(StartIdentityRequest):
+    # The command's identity (OD-214): a resend with the same key gets the
+    # same row back and prepares nothing again.
+    request_key: Annotated[str, Field(pattern=REQUEST_KEY_PATTERN)]
     source_document_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     scenario_id: str
     project_path: ProjectPath
@@ -717,7 +655,10 @@ class ManagerApplyPreparedActivation(StrictRequest):
             raise ValueError("Program outcome kind is unsupported")
         return value
 
-    @field_validator("deployment_artifact_id", "program_id")
+    @field_validator(
+        "deployment_artifact_id",
+        "program_id",
+    )
     @classmethod
     def validate_identity(cls, value: str | None, info) -> str | None:
         if value is None:
@@ -806,7 +747,7 @@ class ManagerApplyRequest(CallerAttributionRequest):
         return self
 
 
-class ProgramRunStartRequest(ExecutionControlAttributionRequest):
+class ProgramRunStartRequest(CallerAttributionRequest):
     """Start exactly the Applied Program selected by these immutable facts."""
 
     scenario_id: Annotated[
@@ -843,37 +784,24 @@ class ProgramScenePreparationRequest(CallerAttributionRequest):
         return self
 
 
-class ProgramRunStopRequest(ExecutionControlAttributionRequest):
-    """Request Kernel-first Stop for one exact runner-owned Program run."""
+def _program_run_reason(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return _bounded_nfc(
+        value,
+        label="reason",
+        maximum_bytes=MAX_PROGRAM_RUN_REASON_BYTES,
+    )
 
-    program_run_id: str
-    expected_owner_epoch: str
+
+class ProgramSelectionStopRequest(CallerAttributionRequest):
+    """Stop immutable Program membership, never caller-selected operations.
+
+    Headless only: sent to the Kernel, never to the runner (1.15.1).
+    """
+
+    program_run_id: ProgramRunNumber
     reason: str | None = None
-
-    @field_validator("program_run_id", "expected_owner_epoch")
-    @classmethod
-    def validate_run_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
-
-    @field_validator("reason")
-    @classmethod
-    def validate_program_stop_reason(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(
-            value,
-            label="reason",
-            maximum_bytes=MAX_PROGRAM_RUN_REASON_BYTES,
-        )
-
-
-class ProgramSelectionStopRequest(ProgramRunStopRequest):
-    """Stop immutable Program membership, never caller-selected operations."""
-
     group_ids: Annotated[
         list[
             Annotated[
@@ -883,26 +811,30 @@ class ProgramSelectionStopRequest(ProgramRunStopRequest):
         Field(min_length=1, max_length=4096),
     ] = Field(default_factory=lambda: ["all"])
 
+    @field_validator("reason")
+    @classmethod
+    def validate_selection_reason(cls, value: str | None) -> str | None:
+        return _program_run_reason(value)
+
 
 class ProgramSelectionResumeRequest(ProgramSelectionStopRequest):
     """Reassess and release one selection of the exact current Program run.
 
-    Fenced on run id, owner epoch and selection revision only: tree ticks
+    Fenced on run id and hold revision only: tree ticks
     raise the run revision without changing what Run/Resume releases.
     """
 
-    expected_selection_revision: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
+    expected_hold_revision: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
 
 
 class ProgramSelectionStartRequest(ProgramSelectionResumeRequest):
     """Release one initially Ready selection of the current Program run."""
 
 
-class ProgramCycleResetRequest(ExecutionControlAttributionRequest):
+class ProgramCycleResetRequest(CallerAttributionRequest):
     reload_initial_scene: bool = False
     reset_robot_position: bool = False
-    program_run_id: str | None
-    expected_owner_epoch: str
+    program_run_id: ProgramRunNumber | None
     expected_cycle_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     expected_claim_generation: (
         Annotated[int, Field(ge=1, le=9_007_199_254_740_991)] | None
@@ -912,33 +844,16 @@ class ProgramCycleResetRequest(ExecutionControlAttributionRequest):
         None
     )
 
-    @field_validator("program_run_id", "expected_owner_epoch")
-    @classmethod
-    def validate_cycle_identity(cls, value: str | None, info) -> str | None:
-        if value is None and info.field_name == "program_run_id":
-            return None
-        return _bounded_nfc(
-            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
-        )
 
-
-class ProgramRunControlRequest(ExecutionControlAttributionRequest):
+class ProgramRunControlRequest(CallerAttributionRequest):
     """Common exact fence for one current-run-only control."""
 
-    program_run_id: str
-    expected_owner_epoch: str
+    program_run_id: ProgramRunNumber
     expected_run_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
-    @field_validator("program_run_id", "expected_owner_epoch")
-    @classmethod
-    def validate_runtime_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
-        )
 
-
-class ProgramFullStopResumeRequest(ProgramRunControlRequest):
-    """Resume one exact tree preserved by Program Full Stop."""
+class ProgramHaltResumeRequest(ProgramRunControlRequest):
+    """Execute after Halt: resume one exact tree the Halt froze."""
 
     reason: str | None = None
 
@@ -954,8 +869,8 @@ class ProgramFullStopResumeRequest(ProgramRunControlRequest):
         )
 
 
-class ProgramFullStopResetRequest(ProgramFullStopResumeRequest):
-    """Discard one exact Full-stopped tree and reset its Program cycle."""
+class ProgramHaltDiscardRequest(ProgramHaltResumeRequest):
+    """Discard one exact halted tree and reset its Program cycle."""
 
     expected_cycle_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     expected_claim_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
@@ -999,7 +914,7 @@ class PersistentKeyValueResetRequest(CallerAttributionRequest):
     project_path: ProjectPath
     key: str
     expected_program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    program_run_id: str | None = None
+    program_run_id: ProgramRunNumber | None = None
     expected_run_revision: (
         Annotated[int, Field(ge=1, le=9_007_199_254_740_991)] | None
     ) = None
@@ -1008,15 +923,6 @@ class PersistentKeyValueResetRequest(CallerAttributionRequest):
     @classmethod
     def validate_key(cls, value: str) -> str:
         return _bounded_nfc(value, label="key", maximum_bytes=MAX_IDENTITY_BYTES)
-
-    @field_validator("program_run_id")
-    @classmethod
-    def validate_run(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(
-            value, label="program_run_id", maximum_bytes=MAX_IDENTITY_BYTES
-        )
 
     @model_validator(mode="after")
     def exact_fence(self) -> "PersistentKeyValueResetRequest":
@@ -1033,11 +939,11 @@ class PersistentKeyValueSetRequest(PersistentKeyValueResetRequest):
 
 class ManualResultStageRequest(ProgramRunControlRequest):
     node_instance_id: str
-    node_attempt_id: str
+    node_attempt_id: NodeAttemptNumber
     outcome: Literal["succeeded", "failed"]
     output: Any = None
 
-    @field_validator("node_instance_id", "node_attempt_id")
+    @field_validator("node_instance_id")
     @classmethod
     def validate_attempt_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -1045,10 +951,9 @@ class ManualResultStageRequest(ProgramRunControlRequest):
         )
 
 
-class CycleRecoveryActionRequest(ExecutionControlAttributionRequest):
+class CycleRecoveryActionRequest(CallerAttributionRequest):
     """Consume exactly one current owner-issued cycle recovery offer."""
 
-    expected_owner_epoch: str
     offer_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     offer_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     action_id: Literal[
@@ -1061,13 +966,6 @@ class CycleRecoveryActionRequest(ExecutionControlAttributionRequest):
         "continue_with_failure",
     ]
     reason: str | None = None
-
-    @field_validator("expected_owner_epoch")
-    @classmethod
-    def validate_recovery_owner(cls, value: str) -> str:
-        return _bounded_nfc(
-            value, label="expected_owner_epoch", maximum_bytes=MAX_IDENTITY_BYTES
-        )
 
     @field_validator("reason")
     @classmethod
@@ -1086,11 +984,17 @@ class ProgramModelAuditPolicy(StrictRequest):
 
 
 class ProgramDiagnosticRequest(StrictRequest):
-    """Asynchronous attributed evidence; never a command or recovered state."""
+    """Asynchronous attributed evidence; never a command or recovered state.
 
-    schema_version: Literal["manyforge.program_diagnostic.v4"]
-    program_run_id: str
-    owner_epoch: str
+    The record carries its start's ``application_start_id`` inside: Headless
+    checks it once at the route (1.6) and History keeps it with the record.
+    """
+
+    schema_version: Literal["manyforge.program_diagnostic.v5"]
+    program_run_id: ProgramRunNumber
+    # Kept in the record (unlike ``StartIdentityRequest``); the route refuses
+    # a missing or other value before the record is stored (1.6).
+    application_start_id: str | None = None
     program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     retained_bundle_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
@@ -1106,7 +1010,7 @@ class ProgramDiagnosticRequest(StrictRequest):
     details: dict[str, Any] | None
     origin: dict[str, Any] | None
 
-    @field_validator("program_run_id", "owner_epoch", "reason_code")
+    @field_validator("reason_code")
     @classmethod
     def bounded_identity(cls, value, info):
         return (
@@ -1139,13 +1043,20 @@ class ProgramDiagnosticRequest(StrictRequest):
 
 
 class ProgramModelAttemptRequest(StrictRequest):
-    """Closed durable audit record emitted by the isolated Program runner."""
+    """Closed durable audit record emitted by the isolated Program runner.
 
-    schema_version: Literal["manyforge.program_model_attempt.v1"]
-    model_attempt_id: str
-    program_run_id: str
+    Like the diagnostic, the record carries its start's
+    ``application_start_id`` inside (checked once at the route, 1.6).
+    """
+
+    schema_version: Literal["manyforge.program_model_attempt.v2"]
+    # Kept in the record; the route refuses a missing or other value (1.6).
+    application_start_id: str | None = None
+    # A class 2 request key (run, attempt, phase), 32 hex (1.15.12).
+    model_attempt_id: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+    program_run_id: ProgramRunNumber
     node_instance_id: str
-    node_attempt_id: str
+    node_attempt_id: NodeAttemptNumber
     external_attempt_index: Annotated[int, Field(ge=1, le=2)]
     assistant_projection_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     model_endpoint_alias: str
@@ -1223,10 +1134,7 @@ class ProgramModelAttemptRequest(StrictRequest):
         return nonnegative_int64_value(value)
 
     @field_validator(
-        "model_attempt_id",
-        "program_run_id",
         "node_instance_id",
-        "node_attempt_id",
         "model_endpoint_alias",
         "external_resource_alias",
         "model_id",
@@ -1253,7 +1161,10 @@ class ProgramModelAttemptRequest(StrictRequest):
         )
 
     @field_validator(
-        "prompt_text", "error_message", "model_version", "occurred_at_wall"
+        "prompt_text",
+        "error_message",
+        "model_version",
+        "occurred_at_wall",
     )
     @classmethod
     def validate_model_attempt_text(cls, value: str | None, info) -> str | None:
@@ -1292,7 +1203,10 @@ class ProjectionRevisionRequest(StrictRequest):
     graph_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     scene_revision: SceneRevisionRequest
 
-    @field_validator("retained_bundle_id", "graph_revision")
+    @field_validator(
+        "retained_bundle_id",
+        "graph_revision",
+    )
     @classmethod
     def validate_projection_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -1362,7 +1276,10 @@ class ManagerApplyFailure(StrictRequest):
     # readiness may still exist; whoever releases them checks those directly.
     effect_boundary: Literal["before_effect", "unknown"]
 
-    @field_validator("code", "cause_code")
+    @field_validator(
+        "code",
+        "cause_code",
+    )
     @classmethod
     def validate_code(cls, value: str) -> str:
         return _bounded_nfc(
@@ -1439,11 +1356,11 @@ class ManagerApplyStatus(StrictRequest):
     unknown_effect.
     """
 
-    apply_id: str
+    # The Manager's Apply number (contract 1.16.1).
+    apply_id: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     scene_initialization: Literal["preserve", "initialize"]
     apply_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    request_id: str
-    request_owner_epoch: str
+    request_key: Annotated[str, Field(pattern=REQUEST_KEY_PATTERN)]
     prepared_activation: ManagerApplyStatusPreparedActivation
     phase: ManagerApplyPhase
     last_progress: ManagerApplyProgress
@@ -1451,15 +1368,6 @@ class ManagerApplyStatus(StrictRequest):
     failure_acknowledgement: Literal["available", "acknowledged", "unavailable"]
     candidate_projection_revision: ProjectionRevisionRequest | None = None
     failure: ManagerApplyFailure | None = None
-
-    @field_validator("apply_id", "request_id", "request_owner_epoch")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
 
     @model_validator(mode="after")
     def require_one_consistent_lifecycle(self) -> "ManagerApplyStatus":
@@ -1534,6 +1442,33 @@ class SceneResourcePoseQuery(StrictRequest):
         if normalized != sorted(set(normalized)):
             raise ValueError("scene_resource_ids must be strictly sorted and unique")
         return normalized
+
+
+class SceneRuntimeIdentityRequest(StrictRequest):
+    """The Manager's scene-runtime identity, as `GET /api/scene/runtime-owner` reads it."""
+
+    retained_bundle_id: Annotated[str, Field(min_length=1, max_length=MAX_IDENTITY_BYTES)]
+    graph_revision: Annotated[str, Field(min_length=1, max_length=MAX_IDENTITY_BYTES)]
+    deployment_generation: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)]
+    program_generation: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)]
+    runtime_generation: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
+
+
+class SceneRuntimeLatchRequest(StrictRequest):
+    """One Program Runner between-nodes latch of pose observations (OD-294)."""
+
+    expected_runtime_identity: SceneRuntimeIdentityRequest
+    scene_resource_ids: (
+        Annotated[list[str], Field(min_length=1, max_length=MAX_SCENE_POSE_QUERY_RESOURCES)]
+        | None
+    ) = None
+
+    @field_validator("scene_resource_ids")
+    @classmethod
+    def validate_scene_resource_ids(cls, values: list[str] | None) -> list[str] | None:
+        if values is not None and values != sorted(set(values)):
+            raise ValueError("scene_resource_ids must be strictly sorted and unique")
+        return values
 
 
 class Vector3Request(StrictRequest):
@@ -1624,7 +1559,11 @@ class ComponentSceneFrameRequest(StrictRequest):
     model_instance_id: str
     frame_role_id: str
 
-    @field_validator("controllable_component_id", "model_instance_id", "frame_role_id")
+    @field_validator(
+        "controllable_component_id",
+        "model_instance_id",
+        "frame_role_id",
+    )
     @classmethod
     def validate_frame_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -1639,7 +1578,10 @@ class PassiveModelSceneFrameRequest(StrictRequest):
     model_instance_id: str
     frame_role_id: str
 
-    @field_validator("model_instance_id", "frame_role_id")
+    @field_validator(
+        "model_instance_id",
+        "frame_role_id",
+    )
     @classmethod
     def validate_frame_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -1682,7 +1624,10 @@ class CollisionPairRequest(StrictRequest):
     body_a: str
     body_b: str
 
-    @field_validator("body_a", "body_b")
+    @field_validator(
+        "body_a",
+        "body_b",
+    )
     @classmethod
     def validate_body(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -1824,7 +1769,10 @@ class ContactGraspPolicyRequest(StrictRequest):
         float, Field(ge=0, le=1, allow_inf_nan=False)
     ]
 
-    @field_validator("policy_id", "selected_object_id")
+    @field_validator(
+        "policy_id",
+        "selected_object_id",
+    )
     @classmethod
     def validate_grasp_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -2023,7 +1971,10 @@ class AttachCarriedObjectRequest(StrictRequest):
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
 
-    @field_validator("touch_body_roles", "expected_component_attachment_revisions")
+    @field_validator(
+        "touch_body_roles",
+        "expected_component_attachment_revisions",
+    )
     @classmethod
     def validate_sorted_identities(cls, values: list[str], info) -> list[str]:
         normalized = [
@@ -2106,81 +2057,83 @@ SceneOperationRequest = Annotated[
 ]
 
 
+class ProgramResetAcceptedResetRequest(StrictRequest):
+    """The accepted Reset occurrence named by the runner's cycle status."""
+
+    request_key: Annotated[str, Field(pattern=REQUEST_KEY_PATTERN)]
+    request_payload_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
+    reload_initial_scene: bool
+    reset_robot_position: bool
+    reset_claim_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)] | None
+
+
+class ProgramResetCycleStatusRequest(StrictRequest):
+    """The Program runner's current cycle status, carried by a Reset proof so
+    the Kernel validates it in memory. The same six facts the runner publishes
+    to its liveness probe."""
+
+    cycle_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    state: Literal[
+        "idle_after_reset",
+        "starting",
+        "running",
+        "terminal_awaiting_reset",
+        "intervention_or_recovery",
+        "resetting",
+        "recovery_required",
+    ]
+    program_run_id: ProgramRunNumber | None
+    cycle_claim_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)] | None
+    terminal_or_settlement_reference: Annotated[str, Field(pattern=SHA256_PATTERN)] | None
+    accepted_reset: ProgramResetAcceptedResetRequest | None
+
+
 class ProgramResetSceneAuthorizationRequest(StrictRequest):
     """Internal exact scope for one backend-owned Reset scene mutation."""
 
-    program_runner_owner_epoch: str
-    program_run_id: str
+    program_run_id: ProgramRunNumber
     cycle_claim_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     terminal_or_settlement_reference: Annotated[str, Field(pattern=SHA256_PATTERN)]
-
-    @field_validator("program_runner_owner_epoch", "program_run_id")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
+    program_cycle_status: ProgramResetCycleStatusRequest
 
 
 class ProgramResetClaimSceneContextRequest(StrictRequest):
-    request_owner_epoch: Annotated[str, Field(min_length=1, max_length=256)]
-    request_id: Annotated[str, Field(min_length=1, max_length=256)]
+    request_key: Annotated[str, Field(pattern=REQUEST_KEY_PATTERN)]
     request_payload_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
     reset_claim_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 
-    @field_validator("request_owner_epoch", "request_id")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
 
 
 class ProgramResetClaimSceneAuthorizationRequest(StrictRequest):
-    program_runner_owner_epoch: Annotated[str, Field(min_length=1, max_length=256)]
     cycle_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     reset_claim: ProgramResetClaimSceneContextRequest
-
-    @field_validator("program_runner_owner_epoch")
-    @classmethod
-    def validate_identity(cls, value: str) -> str:
-        return _bounded_nfc(value, label="program_runner_owner_epoch", maximum_bytes=MAX_IDENTITY_BYTES)
+    program_cycle_status: ProgramResetCycleStatusRequest
 
 
 class ProgramNodeAdmissionEvidenceRequest(StrictRequest):
     """Exact runtime-node attribution; the Kernel checks the sealed owner API."""
 
-    program_runner_owner_epoch: str
-    program_run_id: str
+    program_run_id: ProgramRunNumber
     parent_program_cycle_claim_generation: Annotated[
         int, Field(ge=1, le=9_007_199_254_740_991)
     ]
     node_instance_id: str
-    node_attempt_id: str
+    node_attempt_id: NodeAttemptNumber
     owner_api: Literal[
         "scene.transaction",
         "scene.carried_attachment",
     ]
 
-    @field_validator(
-        "program_runner_owner_epoch",
-        "program_run_id",
-        "node_instance_id",
-        "node_attempt_id",
-    )
+    @field_validator("node_instance_id")
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=(
-                512 if info.field_name == "node_attempt_id" else MAX_IDENTITY_BYTES
-            ),
+            value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES
         )
 
 
-class SceneTransactionRequest(StrictRequest):
-    request_context: CallerAttributionRequest
+class SceneTransactionRequest(StartIdentityRequest):
+    request_context: RequestContext
     expected_projection_revision: ProjectionRevisionRequest
     operation: SceneOperationRequest
     expected_admission_generation: Annotated[
@@ -2199,14 +2152,15 @@ class ActionSpanRequest(StrictRequest):
         "program_node", "direct_control", "robot_control", "mcp", "system"
     ]
     action_span_id: str
-    program_run_id: str | None = None
+    program_run_id: ProgramRunNumber | None = None
     node_instance_id: str | None = None
+    # Span attempt ids are decimal text on this wire, as the behaviour layer
+    # sends them and the execution host reads them (contract 1.15.9, P-21 (a)).
     node_attempt_id: str | None = None
     parent_node_attempt_id: str | None = None
 
     @field_validator(
         "action_span_id",
-        "program_run_id",
         "node_instance_id",
         "node_attempt_id",
         "parent_node_attempt_id",
@@ -2226,6 +2180,7 @@ class ActionSpanRequest(StrictRequest):
         if self.action_source == "program_node" and (
             self.node_instance_id is None
             or self.node_attempt_id is None
+            # The span id is the decimal attempt number (1.15.9).
             or self.action_span_id != self.node_attempt_id
         ):
             raise ValueError(
@@ -2376,14 +2331,19 @@ class GripperCommandObservation(StrictRequest):
     source_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     source_epoch: str
 
-    @field_validator("active_control_configuration_id", "source_id", "source_epoch")
+    @field_validator(
+        "active_control_configuration_id",
+        "source_id",
+        "source_epoch",
+    )
     @classmethod
     def bounded_identity(cls, value: str, info) -> str:
         return _bounded_nfc(value, label=info.field_name, maximum_bytes=256)
 
 
 class GripperFeedbackObservation(GripperCommandObservation):
-    observed_position: CoordinatePositionRequest
+    # None for a pneumatic gripper: its finger coordinates are display-only.
+    observed_position: CoordinatePositionRequest | None
     grasp_confirmed: bool | None
 
 
@@ -2440,7 +2400,11 @@ class IoSignalObservation(StrictRequest):
     continuity_loss_generation: str
     error: dict[str, Any] | None
 
-    @field_validator("signal_name", "source_id", "source_epoch")
+    @field_validator(
+        "signal_name",
+        "source_id",
+        "source_epoch",
+    )
     @classmethod
     def bounded_identity(cls, value: str | None, info) -> str | None:
         # `source_epoch` is the opaque source incarnation.
@@ -2486,12 +2450,11 @@ class IoSourceCursor(StrictRequest):
     source replacement, so a published record has one of at least 1.
     """
 
-    owner_epoch: str
     catalog_generation: str
     source_id: str
     record_sequence: str
 
-    @field_validator("owner_epoch", "source_id")
+    @field_validator("source_id")
     @classmethod
     def bounded_identity(cls, value: str, info) -> str:
         return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
@@ -2519,21 +2482,15 @@ class MockIoPublicationError(BaseModel):
 class IoSignalReadRequest(StrictRequest):
     """One effect-free GUI read of one bound boolean signal.
 
-    Exactly the `io_signal` kind of `manyforge.target_observation_query.v2`:
+    Exactly the `io_signal` kind of `manyforge.target_observation_query.v3`:
     the host resolves it through the current Program Binding and installed
     descriptor before reading.
     """
 
-    schema_version: Literal["manyforge.target_observation_query.v2"]
-    owner_epoch: str
+    schema_version: Literal["manyforge.target_observation_query.v3"]
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     kind: Literal["io_signal"]
     signal: ProgramSignalReferenceRequest
-
-    @field_validator("owner_epoch")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
 
     def target_query(self) -> TargetObservationQuery:
         return TargetObservationQuery.model_validate(self.model_dump(mode="json"))
@@ -2547,17 +2504,11 @@ class MockIoInputRequest(StrictRequest):
     requested value is explicit, never an implicit inversion.
     """
 
-    schema_version: Literal["manyforge.mock_io_input_request.v2"]
-    owner_epoch: str
+    schema_version: Literal["manyforge.mock_io_input_request.v3"]
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     signal: ProgramSignalReferenceRequest
     expected_source_epoch: str
     value: bool
-
-    @field_validator("owner_epoch")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(value, label=info.field_name, maximum_bytes=MAX_IDENTITY_BYTES)
 
     @field_validator("expected_source_epoch")
     @classmethod
@@ -2576,7 +2527,12 @@ class IoWatchMatchedSample(StrictRequest):
     value: bool
     received_at_ns: int | str
 
-    @field_validator("controllable_component_id", "signal_name", "source_id", "source_epoch")
+    @field_validator(
+        "controllable_component_id",
+        "signal_name",
+        "source_id",
+        "source_epoch",
+    )
     @classmethod
     def bounded_identity(cls, value: str, info) -> str:
         return _bounded_nfc(value, label=info.field_name, maximum_bytes=256)
@@ -2689,7 +2645,10 @@ class CapabilityCommandParticipantRequest(StrictRequest):
         Field(max_length=64),
     ]
 
-    @field_validator("command_schema_id", "command_schema_revision")
+    @field_validator(
+        "command_schema_id",
+        "command_schema_revision",
+    )
     @classmethod
     def validate_command_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -2774,7 +2733,10 @@ class RuntimeObjectReferenceBindingRequest(StrictRequest):
     runtime_object_id: str
     scene_resource_id: str
 
-    @field_validator("runtime_object_id", "scene_resource_id")
+    @field_validator(
+        "runtime_object_id",
+        "scene_resource_id",
+    )
     @classmethod
     def validate_runtime_object_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -2793,14 +2755,8 @@ class TcpEntryRequest(StrictRequest):
 class ResolvedPreviewTcp(StrictRequest):
     entry: TcpEntryRequest
     source: Literal["active_tcp", "explicit_entry", "joint_flange_fallback"]
-    owner_epoch: str
     registration_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     sequence: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
-
-    @field_validator("owner_epoch")
-    @classmethod
-    def validate_owner_epoch(cls, value: str) -> str:
-        return _bounded_nfc(value, label="owner_epoch", maximum_bytes=MAX_IDENTITY_BYTES)
 
 
 class CurrentTcpSelectorRequest(StrictRequest):
@@ -2868,7 +2824,8 @@ class MotionParticipantRequest(StrictRequest):
         return result
 
     @field_validator(
-        "move_id", "contact_policy_id"
+        "move_id",
+        "contact_policy_id",
     )
     @classmethod
     def validate_motion_identity(cls, value: str | None, info) -> str | None:
@@ -2962,17 +2919,9 @@ class OperationParticipantRequest(StrictRequest):
 class ManualProgramHandoverContext(StrictRequest):
     """Kernel-held Program coordinates, not a client-issued permission."""
 
-    program_runner_owner_epoch: str
-    program_run_id: str
+    program_run_id: ProgramRunNumber
     claim_generation: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
-    selection_revision: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)]
-
-    @field_validator("program_runner_owner_epoch", "program_run_id")
-    @classmethod
-    def bounded_identity(cls, value: str, info) -> str:
-        if "\0" in value:
-            raise ValueError("manual handover identity contains NUL")
-        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
+    hold_revision: Annotated[int, Field(ge=0, le=MAXIMUM_SAFE_INTEGER)]
 
 
 class ManualControlAvailability(StrictRequest):
@@ -3013,12 +2962,14 @@ class ManualProgramHandover(StrictRequest):
         return values
 
 
-class OperationIntentRequest(StrictRequest):
-    request_context: CallerAttributionRequest
+class OperationIntentRequest(StartIdentityRequest):
+    request_context: RequestContext
     program_id: str
     program_revision: str
     program_binding_id: str
-    program_run_id: str
+    # Present for Program work; None for manual work, including a manual
+    # handover (its parent run is in ``manual_handover``).
+    program_run_id: ProgramRunNumber | None = None
     expected_graph_revision: str
     expected_retained_bundle_id: str
     expected_scene_revision: SceneRevisionRequest | None
@@ -3040,7 +2991,6 @@ class OperationIntentRequest(StrictRequest):
         "program_id",
         "program_revision",
         "program_binding_id",
-        "program_run_id",
         "expected_graph_revision",
         "expected_retained_bundle_id",
     )
@@ -3058,14 +3008,14 @@ class OperationIntentRequest(StrictRequest):
             raise ValueError("participant count must match the coordination policy")
         if self.manual_handover is not None and (
             self.coordination_policy != "independent"
-            or self.manual_handover.program_run_id == self.program_run_id
+            or self.program_run_id is not None
             or any(
                 getattr(row, "execution_scope", None) is not None
                 for row in self.participants
             )
         ):
             raise ValueError(
-                "manual handover requires independent non-node work with its own Run"
+                "manual handover requires independent non-node work without a Run"
             )
         for participant in self.participants:
             span = participant.action_span
@@ -3078,20 +3028,23 @@ class OperationIntentRequest(StrictRequest):
         return self
 
 
-class ProgramManualHandoverRequest(ProgramRunStopRequest):
+class ProgramManualHandoverRequest(CallerAttributionRequest):
     """Retire Kernel-selected held tasks, without releasing their holds."""
 
+    program_run_id: ProgramRunNumber
+    reason: str | None = None
     expected_run_revision: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
     operation: OperationIntentRequest
+
+    @field_validator("reason")
+    @classmethod
+    def validate_handover_reason(cls, value: str | None) -> str | None:
+        return _program_run_reason(value)
 
     @model_validator(mode="after")
     def exact_parent(self) -> "ProgramManualHandoverRequest":
         context = self.operation.manual_handover
-        if (
-            context is None
-            or context.program_run_id != self.program_run_id
-            or context.program_runner_owner_epoch != self.expected_owner_epoch
-        ):
+        if context is None or context.program_run_id != self.program_run_id:
             raise ValueError(
                 "manual cleanup must name the operation's exact held Program"
             )
@@ -3116,26 +3069,23 @@ class ProgramNodeCorrectionPreviewRequest(StrictRequest):
     lifecycle come from the captured run; this request cannot select them.
     """
 
-    schema_version: Literal["manyforge.program_node_correction_preview_request.v1"]
-    request_id: str
-    program_run_id: str
-    expected_owner_epoch: str
+    schema_version: Literal["manyforge.program_node_correction_preview_request.v2"]
+    request_key: str | None = None
+    # Checked once at the Headless edge and never serialized downstream.
+    application_start_id: str | None = Field(default=None, exclude=True)
+    program_run_id: ProgramRunNumber
     program_id: str
     program_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
     program_binding_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
     node_instance_id: str
-    node_attempt_id: str
+    node_attempt_id: NodeAttemptNumber
     proposed_inputs: Annotated[
         list[ProposedNodeInputRequest], Field(max_length=MAX_PROPOSED_NODE_INPUTS)
     ] = Field(default_factory=list)
 
     @field_validator(
-        "request_id",
-        "program_run_id",
-        "expected_owner_epoch",
         "program_id",
         "node_instance_id",
-        "node_attempt_id",
     )
     @classmethod
     def validate_preview_identity(cls, value: str, info) -> str:
@@ -3237,9 +3187,9 @@ def _validate_pick_place_operations(
     retreat: OperationIntentRequest,
 ) -> None:
     operations = (approach, descend, tool, retreat)
-    request_ids = [operation.request_context.request_id for operation in operations]
-    if len(request_ids) != len(set(request_ids)):
-        raise ValueError("pick/place phase request_id values must be distinct")
+    request_keys = [operation.request_context.request_key for operation in operations]
+    if len(request_keys) != len(set(request_keys)):
+        raise ValueError("pick/place phase request_key values must be distinct")
     contexts = {
         (
             operation.program_id,
@@ -3249,7 +3199,6 @@ def _validate_pick_place_operations(
             operation.expected_graph_revision,
             operation.expected_retained_bundle_id,
             operation.expected_scene_revision,
-            operation.request_context.request_owner_epoch,
         )
         for operation in operations
     }
@@ -3302,7 +3251,8 @@ class PickSequencePlanningRequest(StrictRequest):
         return _bounded_nfc(value, label="sequence_id", maximum_bytes=96)
 
     @field_validator(
-        "selected_object_id", "selected_runtime_object_id"
+        "selected_object_id",
+        "selected_runtime_object_id",
     )
     @classmethod
     def validate_pick_identity(cls, value: str, info) -> str:
@@ -3392,20 +3342,12 @@ class PlaceSequencePlanningRequest(StrictRequest):
         return self
 
 
-class OperationControlRequest(StrictRequest):
-    request_context: CallerAttributionRequest
-    operation_id: str
+class OperationControlRequest(StartIdentityRequest):
+    request_context: RequestContext
+    operation_id: OperationNumber
     expected_operation_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
     reason: str | None = None
 
-    @field_validator("operation_id")
-    @classmethod
-    def validate_operation_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="operation_id",
-            maximum_bytes=MAX_IDENTITY_BYTES,
-        )
 
     @field_validator("reason")
     @classmethod
@@ -3422,7 +3364,7 @@ class OperationResetRequest(OperationControlRequest):
 class OperationRecoveryActionRequest(StrictRequest):
     """Private Program-Runner request to one exact native operation owner."""
 
-    request_id: str
+    request_key: Annotated[str, Field(pattern=REQUEST_KEY_PATTERN)]
     action: Literal[
         "retry_motion_from_current_state",
         "acknowledge_and_continue",
@@ -3437,22 +3379,14 @@ class OperationRecoveryActionRequest(StrictRequest):
         int, Field(ge=0, le=9_007_199_254_740_991)
     ]
     expected_execution_id: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    expected_stop_certificate_id: str = ""
-    expected_stop_owner_generation: Annotated[
-        int, Field(ge=0, le=9_007_199_254_740_991)
-    ] = 0
     reason: str = ""
 
     @field_validator(
-        "request_id",
         "principal_id",
-        "expected_stop_certificate_id",
         "reason",
     )
     @classmethod
     def validate_text(cls, value: str, info) -> str:
-        if info.field_name == "request_id" and not value:
-            raise ValueError("request_id must be non-empty")
         if not value:
             return value
         return _bounded_nfc(
@@ -3465,18 +3399,8 @@ class OperationRecoveryActionRequest(StrictRequest):
 
 
 class StopOperationTargetRequest(StrictRequest):
-    operation_id: str
+    operation_id: OperationNumber
     expected_operation_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    expected_stop_generation: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
-
-    @field_validator("operation_id")
-    @classmethod
-    def validate_operation_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="operation_id",
-            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
-        )
 
 
 class StopComponentTargetRequest(StrictRequest):
@@ -3486,7 +3410,10 @@ class StopComponentTargetRequest(StrictRequest):
         int, Field(ge=1, le=9_007_199_254_740_991)
     ]
 
-    @field_validator("controllable_component_id", "expected_graph_revision")
+    @field_validator(
+        "controllable_component_id",
+        "expected_graph_revision",
+    )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -3502,9 +3429,11 @@ class StopResourceTargetRequest(StrictRequest):
     expected_operation_resource_generation: Annotated[
         int, Field(ge=0, le=9_007_199_254_740_991)
     ]
-    expected_stop_generation: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
 
-    @field_validator("resource_id", "expected_graph_revision")
+    @field_validator(
+        "resource_id",
+        "expected_graph_revision",
+    )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -3514,8 +3443,8 @@ class StopResourceTargetRequest(StrictRequest):
         )
 
 
-class StopIntentRequest(StrictRequest):
-    request_context: CallerAttributionRequest
+class StopIntentRequest(StartIdentityRequest):
+    request_context: RequestContext
     operations: (
         Annotated[
             list[StopOperationTargetRequest],
@@ -3571,88 +3500,31 @@ class StopIntentRequest(StrictRequest):
         ]
         if identities != sorted(identities) or len(set(identities)) != len(identities):
             raise ValueError("Stop selector rows must be sorted and unique")
-        context = self.request_context
-        for label, value, maximum in (
-            ("request_id", context.request_id, MAX_STOP_IDENTITY_BYTES),
-            (
-                "request_owner_epoch",
-                context.request_owner_epoch,
-                MAX_STOP_IDENTITY_BYTES,
-            ),
-            ("source_label", context.source_label, MAX_IDENTITY_BYTES),
-        ):
-            _bounded_nfc(value, label=label, maximum_bytes=maximum)
-        if context.correlation_id is not None:
-            _bounded_nfc(
-                context.correlation_id,
-                label="correlation_id",
-                maximum_bytes=MAX_IDENTITY_BYTES,
-            )
         return self
 
 
 class ProgramRunStopIntentRequest(StrictRequest):
-    """Private exact Program-owner selector for one addressed Kernel."""
+    """Private Forced Program End of one run (host ``stop_program_run``)."""
 
-    request_context: CallerAttributionRequest
-    program_run_id: str
-    reason: str | None = None
-
-    @field_validator("program_run_id")
-    @classmethod
-    def validate_program_run_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="program_run_id",
-            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
-        )
-
-    @field_validator("reason", mode="before")
-    @classmethod
-    def normalize_reason(cls, value: object) -> str | None:
-        return StopIntentRequest.normalize_reason(value)
-
-    @model_validator(mode="after")
-    def validate_context(self) -> ProgramRunStopIntentRequest:
-        context = self.request_context
-        for label, value, maximum in (
-            ("request_id", context.request_id, MAX_STOP_IDENTITY_BYTES),
-            (
-                "request_owner_epoch",
-                context.request_owner_epoch,
-                MAX_STOP_IDENTITY_BYTES,
-            ),
-            ("source_label", context.source_label, MAX_IDENTITY_BYTES),
-        ):
-            _bounded_nfc(value, label=label, maximum_bytes=maximum)
-        return self
+    request_context: RequestContext
+    program_run_id: ProgramRunNumber
 
 
 class FullStopIntentRequest(StrictRequest):
-    request_context: CallerAttributionRequest
-    expected_stop_generation: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
+    """Body of Stop all and Halt: names no run and no operation, so it
+    carries no ``A``."""
 
-    @model_validator(mode="after")
-    def validate_context(self) -> FullStopIntentRequest:
-        context = self.request_context
-        _bounded_nfc(
-            context.request_id,
-            label="request_id",
-            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
-        )
-        _bounded_nfc(
-            context.request_owner_epoch,
-            label="request_owner_epoch",
-            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
-        )
-        return self
+    request_context: RequestContext
 
 
 class RuntimeScaleControlTargetRequest(StrictRequest):
     component_id: str
     command_target_id: str
 
-    @field_validator("component_id", "command_target_id")
+    @field_validator(
+        "component_id",
+        "command_target_id",
+    )
     @classmethod
     def validate_identity(cls, value: str, info) -> str:
         return _bounded_nfc(
@@ -3716,18 +3588,11 @@ class RuntimeScaleControlSelectorRequest(StrictRequest):
         return result
 
 
-class RuntimeScaleControlRequest(StrictRequest):
-    request_context: CallerAttributionRequest
+class RuntimeScaleControlRequest(StartIdentityRequest):
+    request_context: RequestContext
     selector: RuntimeScaleControlSelectorRequest
     expected_control_generation: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
     scale: Annotated[float, Field(ge=0, le=1, allow_inf_nan=False)]
-
-
-class HistorianReconcileRequest(CallerAttributionRequest):
-    expected_health_generation: Annotated[
-        int,
-        Field(ge=1, le=9_007_199_254_740_991),
-    ]
 
 
 ComponentActionName = Literal[
@@ -3750,7 +3615,7 @@ class ConfirmedRecoveryComponent(StrictRequest):
     eligibility: Literal["ready", "recover", "blocked", "unknown", "excluded"]
 
 
-class RecoveryPreflightConfirmation(StrictRequest):
+class RecoveryPreflightConfirmation(StartIdentityRequest):
     snapshot_id: Annotated[str, Field(min_length=1, max_length=2048)]
     confirmed: Annotated[list[ConfirmedRecoveryComponent], Field(min_length=1, max_length=2)]
 
@@ -3822,7 +3687,7 @@ class RecoveryGroupTarget(StrictRequest):
         return self
 
 
-class RecoveryGroupRequest(StrictRequest):
+class RecoveryGroupRequest(StartIdentityRequest):
     targets: Annotated[list[RecoveryGroupTarget], Field(min_length=1, max_length=256)]
 
     @model_validator(mode="after")
@@ -3878,6 +3743,35 @@ class ApplyOutcomeRequest(StrictRequest):
     components: list[ApplyOutcomeComponentRequest] = Field(
         default_factory=list, max_length=256
     )
+
+
+_ResetText = Annotated[str, Field(min_length=1, max_length=256)]
+_ResetNumber = Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+
+
+class ProgramResetFactsRequest(StrictRequest):
+    """What one Program Reset did (OD-305): its options, the run it reset,
+    the Applied Program it used for the scene and the logical-scene revision
+    its verified readback left (null when this Reset reloaded no scene)."""
+
+    reload_initial_scene: bool
+    reset_robot_position: bool
+    program_run_id: _ResetNumber | None = None
+    program_revision: _ResetText | None = None
+    applied_record_digest: _ResetText | None = None
+    scene_revision_id: _ResetNumber | None = None
+    scene_content_hash: _ResetText | None = None
+    # The typed cause of a `program_cycle_recovery_required` failure.
+    cause_code: _ResetText | None = None
+
+
+class ProgramResetOutcomeRequest(StrictRequest):
+    """`POST /api/execution/history/program-reset-outcomes`: one Program Reset
+    terminal, recorded once in History by the Program Runner that ran it."""
+
+    outcome: Literal["succeeded", "refused", "failed", "unknown"]
+    error: ActivityErrorRequest | None = None
+    reset: ProgramResetFactsRequest
 
 
 class SetOutputRequest(StrictRequest):

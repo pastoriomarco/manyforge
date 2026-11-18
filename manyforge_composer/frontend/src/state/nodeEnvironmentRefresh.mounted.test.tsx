@@ -41,12 +41,12 @@ const isTransientReadError = (error: unknown) => (
 
 function managerSnapshot(
   bundleId: string,
-  applyId: string,
+  applyId: number,
   applyGeneration: number,
   incomplete: boolean,
 ): ComposerHeadlessState {
   const activeBundleId = incomplete ? 'sha256:old' : bundleId;
-  const activeApplyId = incomplete ? 'apply.old' : applyId;
+  const activeApplyId = incomplete ? 1 : applyId;
   const activeApplyGeneration = 1;
   const appliedRecord = {
     incomplete: false,
@@ -86,7 +86,7 @@ function managerSnapshot(
     });
   }
   return {
-    receiverEpoch: 'receiver.1',
+    applicationStartId: '3f9a0000000000a1',
     runtime: {
       sections: {
         manager: {
@@ -94,7 +94,6 @@ function managerSnapshot(
           freshness: 'fresh',
           knownGaps: [],
           sourceGeneration: 1,
-          sourceOwnerEpoch: 'manager.1',
           sourceOwnerId: 'component-manager.cell',
           payload: {
             active: {
@@ -334,8 +333,8 @@ afterEach(async () => {
 
 describe('settled catalog/environment refresh with late transient failures', () => {
   it('keeps each settlement request separate and makes one follow-up fetch per resource', async () => {
-    const pending = managerSnapshot('sha256:new', 'apply.new', 1, true);
-    const settled = managerSnapshot('sha256:new', 'apply.new', 1, false);
+    const pending = managerSnapshot('sha256:new', 2, 1, true);
+    const settled = managerSnapshot('sha256:new', 2, 1, false);
     await render(pending);
     expect(pendingFetches.map((request) => request.url)).toEqual([
       '/api/catalog', '/api/nodes/environment',
@@ -379,7 +378,7 @@ describe('settled catalog/environment refresh with late transient failures', () 
   });
 
   it('waits for connected, semantically current control before spending the retry', async () => {
-    const settled = managerSnapshot('sha256:new', 'apply.new', 1, false);
+    const settled = managerSnapshot('sha256:new', 2, 1, false);
     await render(settled, 'disconnected', 'current');
     expect(pendingFetches).toHaveLength(2);
 

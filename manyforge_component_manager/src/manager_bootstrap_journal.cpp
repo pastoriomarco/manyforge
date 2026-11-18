@@ -3,6 +3,7 @@
 #include "embedded_manager_bootstrap_journal_schema.hpp"
 #include "sqlite_store_startup_internal.hpp"
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
+#include <manyforge_persistence/sqlite_record_writer.hpp>
 
 #include <openssl/evp.h>
 #include <sqlite3.h>
@@ -803,7 +804,10 @@ std::string_view ToString(
 
 class SqliteManagerBootstrapJournal::Impl final {
  public:
-  Impl(std::filesystem::path database_path, CellId cell_id)
+  Impl(
+      std::filesystem::path database_path,
+      CellId cell_id,
+      persistence::SqliteRecordWriter* record_writer)
       : database_path_(ValidateDatabasePath(std::move(database_path))),
         cell_id_(std::move(cell_id)) {
     ValidateBoundedIdentity(cell_id_.value(), "cell_id");
@@ -851,12 +855,23 @@ class SqliteManagerBootstrapJournal::Impl final {
       InitializeOrValidateSchema();
       Transaction transaction(database_, "BEGIN");
       static_cast<void>(VerifyIntegrityLocked());
+      LoadLocked();
       transaction.Commit();
     } catch (...) {
       sqlite3_close(database_);
       database_ = nullptr;
       throw;
     }
+    if (record_writer == nullptr) {
+      owned_writer_ = std::make_unique<persistence::SqliteRecordWriter>();
+      record_writer = owned_writer_.get();
+    }
+    writer_ = record_writer;
+    slot_ = writer_->RegisterConnection(
+        database_,
+        "manager-bootstrap-journal",
+        "UPDATE bootstrap_journal_metadata SET records_lost = 1 "
+        "WHERE singleton = 1");
   }
 
   ~Impl() {
@@ -874,6 +889,10 @@ class SqliteManagerBootstrapJournal::Impl final {
   }
 
   void Close() {
+    // A handed-in writer is drained by its owner before Close.
+    if (owned_writer_ != nullptr) {
+      owned_writer_->DrainAndStop();
+    }
     auto startup_lock =
         sqlite_startup_internal::
             AcquireManagerSqliteStoreStartupLockForClose();
@@ -923,10 +942,10 @@ class SqliteManagerBootstrapJournal::Impl final {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
     }
-    Exec(database_, "PRAGMA synchronous = FULL");
-    if (ScalarInteger(database_, "PRAGMA synchronous") != 2) {
+    Exec(database_, "PRAGMA synchronous = NORMAL");
+    if (ScalarInteger(database_, "PRAGMA synchronous") != 1) {
       throw ManagerBootstrapJournalIntegrityError(
-          "SQLite FULL synchronous mode is required");
+          "SQLite NORMAL synchronous mode is required");
     }
     Exec(database_, "PRAGMA trusted_schema = OFF");
     if (ScalarInteger(database_, "PRAGMA trusted_schema") != 0) {
@@ -1379,18 +1398,116 @@ class SqliteManagerBootstrapJournal::Impl final {
     };
   }
 
+  struct HeldAttempt final {
+    PersistedManagerBootstrapIntent intent;
+    std::optional<PersistedManagerBootstrapAcceptedTarget> accepted_target;
+  };
+
+  // Loads the records of a reopened file at open; a new file loads nothing.
+  void LoadLocked() {
+    const auto bootstrap_id = StoredBootstrapIdLocked();
+    if (!bootstrap_id.has_value()) {
+      return;
+    }
+    const auto high_water = GenerationHighWaterLocked(*bootstrap_id);
+    for (std::int64_t generation = 1; generation <= *high_water;
+         ++generation) {
+      auto intent = IntentLocked(*bootstrap_id, generation);
+      auto accepted_target = AcceptedTargetLocked(*intent);
+      held_binding_count_ += static_cast<std::int64_t>(
+          intent->intent.execution_host_bindings.size());
+      if (accepted_target.has_value()) {
+        ++held_accepted_count_;
+      }
+      held_.push_back(
+          HeldAttempt{std::move(*intent), std::move(accepted_target)});
+    }
+  }
+
+  std::optional<BootstrapId> HeldBootstrapIdLocked() const {
+    if (held_.empty()) {
+      return std::nullopt;
+    }
+    return held_.front().intent.intent.bootstrap_id;
+  }
+
+  std::optional<std::int64_t> HeldHighWaterLocked(
+      const BootstrapId& bootstrap_id) const {
+    if (held_.empty() ||
+        held_.front().intent.intent.bootstrap_id != bootstrap_id) {
+      return std::nullopt;
+    }
+    return static_cast<std::int64_t>(held_.size());
+  }
+
+  HeldAttempt* HeldAttemptLocked(
+      const BootstrapId& bootstrap_id,
+      const std::int64_t generation) {
+    const auto high_water = HeldHighWaterLocked(bootstrap_id);
+    if (!high_water.has_value() || generation < 1 ||
+        generation > *high_water) {
+      return nullptr;
+    }
+    return &held_[static_cast<std::size_t>(generation - 1)];
+  }
+
+  ManagerBootstrapJournalSnapshot HeldSnapshotLocked() const {
+    ManagerBootstrapJournalSnapshot snapshot{
+        cell_id_,
+        ManagerBootstrapJournalPhase::kEmpty,
+        std::nullopt,
+        std::nullopt,
+    };
+    if (!held_.empty()) {
+      snapshot.intent = held_.back().intent;
+      snapshot.accepted_target = held_.back().accepted_target;
+      snapshot.phase = snapshot.accepted_target.has_value() ?
+          ManagerBootstrapJournalPhase::kAcceptedTargetPersisted :
+          ManagerBootstrapJournalPhase::kIntentPersisted;
+    }
+    return snapshot;
+  }
+
+  ManagerBootstrapJournalIntegrityReport HeldIntegrityReportLocked() const {
+    std::optional<BootstrapGeneration> high_water;
+    if (!held_.empty()) {
+      high_water =
+          BootstrapGeneration(static_cast<std::uint64_t>(held_.size()));
+    }
+    return {
+        cell_id_,
+        std::string(kManagerBootstrapJournalSchemaId),
+        kManagerBootstrapJournalSchemaVersion,
+        RawDigest(detail::kEmbeddedManagerBootstrapJournalSchema),
+        static_cast<std::int64_t>(held_.size()),
+        held_binding_count_,
+        held_accepted_count_,
+        HeldBootstrapIdLocked(),
+        high_water,
+        HeldSnapshotLocked().phase,
+    };
+  }
+
   std::filesystem::path database_path_;
   CellId cell_id_;
   sqlite3* database_{};
   mutable std::mutex mutex_;
   bool closed_{};
+  // Index is the bootstrap generation minus one.
+  std::vector<HeldAttempt> held_;
+  std::int64_t held_binding_count_{};
+  std::int64_t held_accepted_count_{};
+  std::unique_ptr<persistence::SqliteRecordWriter> owned_writer_;
+  persistence::SqliteRecordWriter* writer_{};
+  persistence::SqliteRecordWriter::StoreSlot slot_{};
 };
 
 SqliteManagerBootstrapJournal::SqliteManagerBootstrapJournal(
     std::filesystem::path database_path,
-    CellId cell_id)
+    CellId cell_id,
+    persistence::SqliteRecordWriter* record_writer)
     : impl_(std::make_unique<Impl>(
-          std::move(database_path), std::move(cell_id))) {}
+          std::move(database_path), std::move(cell_id), record_writer)) {}
 
 SqliteManagerBootstrapJournal::~SqliteManagerBootstrapJournal() = default;
 
@@ -1420,28 +1537,24 @@ SqliteManagerBootstrapJournal::EnsureIntent(
   }
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  if (const auto existing =
-          impl_->IntentLocked(intent.bootstrap_id, encoded.generation);
-      existing.has_value()) {
-    if (existing->intent != intent ||
-        existing->intent_digest.value() != encoded.intent_digest) {
+  if (const auto* existing =
+          impl_->HeldAttemptLocked(intent.bootstrap_id, encoded.generation);
+      existing != nullptr) {
+    if (existing->intent.intent != intent ||
+        existing->intent.intent_digest.value() != encoded.intent_digest) {
       throw ManagerBootstrapJournalConflictError(
           "bootstrap intent conflicts with the durable intent");
     }
-    transaction.Commit();
-    return {*existing, false};
+    return {existing->intent, false};
   }
 
-  const auto stored_bootstrap_id = impl_->StoredBootstrapIdLocked();
+  const auto stored_bootstrap_id = impl_->HeldBootstrapIdLocked();
   if (stored_bootstrap_id.has_value() &&
       *stored_bootstrap_id != intent.bootstrap_id) {
     throw ManagerBootstrapJournalConflictError(
         "bootstrap intent changes the durable bootstrap identity");
   }
-  const auto high_water =
-      impl_->GenerationHighWaterLocked(intent.bootstrap_id);
+  const auto high_water = impl_->HeldHighWaterLocked(intent.bootstrap_id);
   if (high_water.has_value() &&
       *high_water == std::numeric_limits<std::int64_t>::max()) {
     throw ManagerBootstrapJournalLimitError(
@@ -1454,60 +1567,51 @@ SqliteManagerBootstrapJournal::EnsureIntent(
         "bootstrap generation must advance the durable high-water mark "
         "by exactly one");
   }
-  const auto attempt_count = ScalarInteger(
-      impl_->database_,
-      "SELECT COUNT(*) FROM manager_bootstrap_intents");
-  if (attempt_count >=
-      static_cast<std::int64_t>(kMaximumBootstrapAttempts)) {
+  if (impl_->held_.size() >= kMaximumBootstrapAttempts) {
     throw ManagerBootstrapJournalLimitError(
         "bootstrap attempt inventory reached its fixed limit");
   }
 
-  Statement insert(
-      impl_->database_,
-      "INSERT INTO manager_bootstrap_intents ("
-      "bootstrap_id,bootstrap_generation,"
-      "canonical_empty_retained_bundle_id,"
-      "canonical_empty_graph_revision,"
-      "execution_host_binding_set_digest,intent_digest"
-      ") VALUES (?,?,?,?,?,?)");
-  insert.Bind(1, intent.bootstrap_id.value());
-  insert.Bind(2, encoded.generation);
-  insert.Bind(3, intent.canonical_empty_retained_bundle_id.value());
-  insert.Bind(4, intent.canonical_empty_graph_revision.value());
-  insert.Bind(5, encoded.native_bindings_digest);
-  insert.Bind(6, encoded.intent_digest);
-  static_cast<void>(insert.Step());
-
+  persistence::SqliteRecord record;
+  record
+      .Statement(
+          "INSERT INTO manager_bootstrap_intents ("
+          "bootstrap_id,bootstrap_generation,"
+          "canonical_empty_retained_bundle_id,"
+          "canonical_empty_graph_revision,"
+          "execution_host_binding_set_digest,intent_digest"
+          ") VALUES (?,?,?,?,?,?)")
+      .Bind(1, intent.bootstrap_id.value())
+      .Bind(2, encoded.generation)
+      .Bind(3, intent.canonical_empty_retained_bundle_id.value())
+      .Bind(4, intent.canonical_empty_graph_revision.value())
+      .Bind(5, encoded.native_bindings_digest)
+      .Bind(6, encoded.intent_digest);
   for (std::size_t index = 0U;
        index < intent.execution_host_bindings.size();
        ++index) {
     const auto& binding = intent.execution_host_bindings[index];
-    Statement binding_insert(
-        impl_->database_,
-        "INSERT INTO manager_bootstrap_execution_host_bindings ("
-        "bootstrap_id,bootstrap_generation,ordinal,provider_binding_id,"
-        "provider_binding_revision,runtime_unit_id,runtime_epoch"
-        ") VALUES (?,?,?,?,?,?,?)");
-    binding_insert.Bind(1, intent.bootstrap_id.value());
-    binding_insert.Bind(2, encoded.generation);
-    binding_insert.Bind(3, static_cast<std::int64_t>(index));
-    binding_insert.Bind(4, binding.provider_binding_id.value());
-    binding_insert.Bind(5, binding.provider_binding_revision.value());
-    binding_insert.Bind(6, binding.runtime_unit_id.value());
-    binding_insert.Bind(7, binding.runtime_epoch.value());
-    static_cast<void>(binding_insert.Step());
+    record
+        .Statement(
+            "INSERT INTO manager_bootstrap_execution_host_bindings ("
+            "bootstrap_id,bootstrap_generation,ordinal,provider_binding_id,"
+            "provider_binding_revision,runtime_unit_id,runtime_epoch"
+            ") VALUES (?,?,?,?,?,?,?)")
+        .Bind(1, intent.bootstrap_id.value())
+        .Bind(2, encoded.generation)
+        .Bind(3, static_cast<std::int64_t>(index))
+        .Bind(4, binding.provider_binding_id.value())
+        .Bind(5, binding.provider_binding_revision.value())
+        .Bind(6, binding.runtime_unit_id.value())
+        .Bind(7, binding.runtime_epoch.value());
   }
-  const auto stored =
-      impl_->IntentLocked(intent.bootstrap_id, encoded.generation);
-  if (!stored.has_value() || stored->intent != intent ||
-      stored->intent_digest.value() != encoded.intent_digest) {
-    throw ManagerBootstrapJournalIntegrityError(
-        "inserted bootstrap intent cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  transaction.Commit();
-  return {*stored, true};
+  PersistedManagerBootstrapIntent stored{
+      intent, ContentDigest(encoded.intent_digest)};
+  impl_->held_.push_back(Impl::HeldAttempt{stored, std::nullopt});
+  impl_->held_binding_count_ +=
+      static_cast<std::int64_t>(intent.execution_host_bindings.size());
+  impl_->writer_->Post(impl_->slot_, std::move(record));
+  return {std::move(stored), true};
 }
 
 ManagerBootstrapAcceptedTargetWriteResult
@@ -1517,79 +1621,71 @@ SqliteManagerBootstrapJournal::RecordAcceptedTarget(
       EncodeAcceptedTarget(impl_->cell_id_, accepted_target);
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  const auto intent = impl_->IntentLocked(
+  auto* const attempt = impl_->HeldAttemptLocked(
       accepted_target.bootstrap_id, encoded.bootstrap_generation);
-  if (!intent.has_value()) {
+  if (attempt == nullptr) {
     throw ManagerBootstrapJournalConflictError(
         "accepted bootstrap target cannot precede the durable intent");
   }
-  if (accepted_target.bootstrap_id != intent->intent.bootstrap_id ||
+  const auto& intent = attempt->intent;
+  if (accepted_target.bootstrap_id != intent.intent.bootstrap_id ||
       accepted_target.bootstrap_generation !=
-          intent->intent.bootstrap_generation ||
+          intent.intent.bootstrap_generation ||
       accepted_target.canonical_empty_target.retained_bundle_id !=
-          intent->intent.canonical_empty_retained_bundle_id ||
+          intent.intent.canonical_empty_retained_bundle_id ||
       accepted_target.canonical_empty_target.graph_revision !=
-          intent->intent.canonical_empty_graph_revision) {
+          intent.intent.canonical_empty_graph_revision) {
     throw ManagerBootstrapJournalConflictError(
         "accepted bootstrap target does not match the durable intent");
   }
-  if (const auto existing = impl_->AcceptedTargetLocked(*intent);
-      existing.has_value()) {
-    if (existing->accepted_target != accepted_target ||
-        existing->accepted_target_digest.value() !=
+  if (attempt->accepted_target.has_value()) {
+    const auto& existing = *attempt->accepted_target;
+    if (existing.accepted_target != accepted_target ||
+        existing.accepted_target_digest.value() !=
             encoded.accepted_target_digest) {
       throw ManagerBootstrapJournalConflictError(
           "accepted bootstrap target conflicts with the durable target");
     }
-    transaction.Commit();
-    return {*existing, false};
+    return {existing, false};
   }
 
   const auto high_water =
-      impl_->GenerationHighWaterLocked(accepted_target.bootstrap_id);
+      impl_->HeldHighWaterLocked(accepted_target.bootstrap_id);
   if (!high_water.has_value() ||
       *high_water != encoded.bootstrap_generation) {
     throw ManagerBootstrapJournalConflictError(
         "accepted bootstrap target belongs to a stale generation");
   }
 
-  Statement insert(
-      impl_->database_,
-      "INSERT INTO manager_bootstrap_accepted_targets ("
-      "bootstrap_id,bootstrap_generation,"
-      "candidate_retained_bundle_id,candidate_graph_revision,"
-      "candidate_scene_id,candidate_scene_revision_id,"
-      "candidate_scene_content_hash,accepted_target_digest"
-      ") VALUES (?,?,?,?,?,?,?,?)");
-  insert.Bind(1, accepted_target.bootstrap_id.value());
-  insert.Bind(2, encoded.bootstrap_generation);
-  insert.Bind(
-      3, accepted_target.canonical_empty_target.retained_bundle_id.value());
-  insert.Bind(
-      4, accepted_target.canonical_empty_target.graph_revision.value());
-  insert.Bind(
-      5,
-      accepted_target.canonical_empty_target.scene_revision.scene_id.value());
-  insert.Bind(6, encoded.scene_revision_id);
-  insert.Bind(
-      7,
-      accepted_target.canonical_empty_target.scene_revision.content_hash
-          .value());
-  insert.Bind(8, encoded.accepted_target_digest);
-  static_cast<void>(insert.Step());
-  const auto stored = impl_->AcceptedTargetLocked(*intent);
-  if (!stored.has_value() ||
-      stored->accepted_target != accepted_target ||
-      stored->accepted_target_digest.value() !=
-          encoded.accepted_target_digest) {
-    throw ManagerBootstrapJournalIntegrityError(
-        "inserted accepted bootstrap target cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyIntegrityLocked());
-  transaction.Commit();
-  return {*stored, true};
+  persistence::SqliteRecord record;
+  record
+      .Statement(
+          "INSERT INTO manager_bootstrap_accepted_targets ("
+          "bootstrap_id,bootstrap_generation,"
+          "candidate_retained_bundle_id,candidate_graph_revision,"
+          "candidate_scene_id,candidate_scene_revision_id,"
+          "candidate_scene_content_hash,accepted_target_digest"
+          ") VALUES (?,?,?,?,?,?,?,?)")
+      .Bind(1, accepted_target.bootstrap_id.value())
+      .Bind(2, encoded.bootstrap_generation)
+      .Bind(
+          3, accepted_target.canonical_empty_target.retained_bundle_id.value())
+      .Bind(4, accepted_target.canonical_empty_target.graph_revision.value())
+      .Bind(
+          5,
+          accepted_target.canonical_empty_target.scene_revision.scene_id
+              .value())
+      .Bind(6, encoded.scene_revision_id)
+      .Bind(
+          7,
+          accepted_target.canonical_empty_target.scene_revision.content_hash
+              .value())
+      .Bind(8, encoded.accepted_target_digest);
+  attempt->accepted_target = PersistedManagerBootstrapAcceptedTarget{
+      accepted_target, ContentDigest(encoded.accepted_target_digest)};
+  ++impl_->held_accepted_count_;
+  impl_->writer_->Post(impl_->slot_, std::move(record));
+  return {*attempt->accepted_target, true};
 }
 
 std::optional<BootstrapGeneration>
@@ -1598,16 +1694,13 @@ SqliteManagerBootstrapJournal::ReadBootstrapGenerationHighWater(
   ValidateBoundedIdentity(bootstrap_id.value(), "bootstrap_id");
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto stored_bootstrap_id = impl_->StoredBootstrapIdLocked();
+  const auto stored_bootstrap_id = impl_->HeldBootstrapIdLocked();
   if (stored_bootstrap_id.has_value() &&
       *stored_bootstrap_id != bootstrap_id) {
     throw ManagerBootstrapJournalConflictError(
         "bootstrap high-water query names a different bootstrap identity");
   }
-  const auto high_water =
-      impl_->GenerationHighWaterLocked(bootstrap_id);
-  transaction.Commit();
+  const auto high_water = impl_->HeldHighWaterLocked(bootstrap_id);
   if (!high_water.has_value()) {
     return std::nullopt;
   }
@@ -1619,20 +1712,15 @@ ManagerBootstrapJournalSnapshot
 SqliteManagerBootstrapJournal::ReadSnapshot() const {
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto snapshot = impl_->SnapshotLocked();
-  transaction.Commit();
-  return snapshot;
+  return impl_->HeldSnapshotLocked();
 }
 
+// Answers from memory; the file itself is verified once, at open.
 ManagerBootstrapJournalIntegrityReport
 SqliteManagerBootstrapJournal::VerifyIntegrity() const {
   std::lock_guard lock(impl_->mutex_);
   impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto report = impl_->VerifyIntegrityLocked();
-  transaction.Commit();
-  return report;
+  return impl_->HeldIntegrityReportLocked();
 }
 
 void SqliteManagerBootstrapJournal::Close() {

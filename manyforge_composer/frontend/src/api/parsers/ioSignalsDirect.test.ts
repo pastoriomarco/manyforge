@@ -10,7 +10,7 @@ const signal = { reference, target, runtime_unit_id: 'unit', value_type: 'bool' 
   direction: 'input' as const, transition_capability: 'sampled_only' as const, signal_descriptor_digest: digest };
 const binding = { program_binding_id: digest, target_bindings: [{ target, signal_references: [reference] }],
   signal_bindings: [signal] } as unknown as ProgramBindingDocument;
-const selector = { ownerEpoch: 'epoch', programBindingId: digest, componentId: 'station', signalName: 'ready' };
+const selector = { programBindingId: digest, componentId: 'station', signalName: 'ready' };
 
 describe('direct I/O signal transport', () => {
   it('joins exact target signal references without role coordinates', () => {
@@ -40,15 +40,15 @@ describe('direct I/O signal transport', () => {
 
   it('uses direct v2 requests and checks the exact returned signal', () => {
     const read = ioSignalReadBody(selector);
-    expect(read).toEqual({ schema_version: 'manyforge.target_observation_query.v2', owner_epoch: 'epoch',
+    expect(read).toEqual({ schema_version: 'manyforge.target_observation_query.v3',
       program_binding_id: digest, kind: 'io_signal', signal: reference });
-    expect(mockIoInputBody(selector, 'source', true)).toEqual({ schema_version: 'manyforge.mock_io_input_request.v2',
-      owner_epoch: 'epoch', program_binding_id: digest, signal: reference, expected_source_epoch: 'source', value: true });
+    expect(mockIoInputBody(selector, 'source', true)).toEqual({ schema_version: 'manyforge.mock_io_input_request.v3',
+      program_binding_id: digest, signal: reference, expected_source_epoch: 'source', value: true });
     const value = { liveness: { mode: 'in_process', warning: null }, signal_name: 'ready', value_type: 'bool',
       value: true, quality: 'fresh', source_id: 'source', source_epoch: '1', source_sequence: '1',
       receipt_age_ns: 1, continuity_loss_generation: '0', error: null };
-    const response = { api_version: 'manyforge.execution_command_response.v4', command: 'query_target', ok: true,
-      target_observation: { schema_version: 'manyforge.target_observation.v2', owner_epoch: 'epoch',
+    const response = { api_version: 'manyforge.execution_command_response.v6', command: 'query_target', ok: true,
+      target_observation: { schema_version: 'manyforge.target_observation.v3',
         program_binding_id: digest, kind: 'io_signal', signal: reference, evaluated_at_ns: 1, value } };
     expect(parseIoSignalResponse(response, 'query_target', selector).value).toBe(true);
     expect(() => parseIoSignalResponse(response, 'query_target', { ...selector, componentId: 'other' })).toThrow();

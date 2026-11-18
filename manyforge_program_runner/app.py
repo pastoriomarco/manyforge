@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import json
 from threading import Lock
 import time
+from collections.abc import Callable
 from typing import Annotated, Any, Protocol, runtime_checkable
 
 from fastapi import FastAPI, Path, Query, Request, WebSocket, WebSocketDisconnect
@@ -25,10 +26,8 @@ from manyforge_headless_api.program_cycle import (
     program_cycle_event_class,
 )
 from manyforge_headless_api.models import (
-    ProgramFullStopResetRequest,
-    ProgramFullStopResumeRequest,
+    ProgramHaltResumeRequest,
     ProgramRunStartRequest,
-    ProgramRunStopRequest,
 )
 
 from .models import (
@@ -38,7 +37,6 @@ from .models import (
     ProgramNodeAvailabilityRequest,
     ProgramNodeCorrectionPreviewRequest,
     ProgramScenePreparationRequest,
-    ProgramSelectionStopRequest,
     ProgramSelectionStartRequest,
     ProgramSelectionResumeRequest,
     ProgramManualHandoverRequest,
@@ -47,6 +45,7 @@ from .models import (
     PersistentKeyValuesClearRequest,
     RuntimeBlackboardWriteRequest,
 )
+from .heap_settle import settle_heap
 from .runtime import ProgramRunnerError
 
 
@@ -256,68 +255,44 @@ class ProgramRunnerApplicationPort(Protocol):
         self, request: ProgramScenePreparationRequest
     ) -> dict[str, Any]: ...
 
-    def read_run(self, program_run_id: str) -> dict[str, Any]: ...
+    def read_run(self, program_run_id: int) -> dict[str, Any]: ...
 
     def preview_node_correction(
-        self, program_run_id: str, request: ProgramNodeCorrectionPreviewRequest
-    ) -> dict[str, Any]: ...
-
-    def stop_run(
-        self,
-        program_run_id: str,
-        request: ProgramRunStopRequest,
-    ) -> dict[str, Any]: ...
-
-    def stop_motion(
-        self,
-        program_run_id: str,
-        request: ProgramSelectionStopRequest,
+        self, program_run_id: int, request: ProgramNodeCorrectionPreviewRequest
     ) -> dict[str, Any]: ...
 
     def resume_motion(
-        self, program_run_id: str, request: ProgramSelectionResumeRequest
+        self, program_run_id: int, request: ProgramSelectionResumeRequest
     ) -> dict[str, Any]: ...
 
     def start_motion(
-        self, program_run_id: str, request: ProgramSelectionStartRequest
+        self, program_run_id: int, request: ProgramSelectionStartRequest
     ) -> dict[str, Any]: ...
 
     def prepare_manual_handover(
         self,
-        program_run_id: str,
+        program_run_id: int,
         request: ProgramManualHandoverRequest,
     ) -> dict[str, Any]: ...
 
-    def full_stop(
+    def resume_halt(
         self,
-        program_run_id: str,
-        request: ProgramRunStopRequest,
-    ) -> dict[str, Any]: ...
-
-    def resume_full_stop(
-        self,
-        program_run_id: str,
-        request: ProgramFullStopResumeRequest,
-    ) -> dict[str, Any]: ...
-
-    def discard_full_stop(
-        self,
-        program_run_id: str,
-        request: ProgramFullStopResetRequest,
+        program_run_id: int,
+        request: ProgramHaltResumeRequest,
     ) -> dict[str, Any]: ...
 
     def reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]: ...
 
     def cycle_status(self) -> dict[str, Any]: ...
 
-    def read_runtime_controls(self, program_run_id: str) -> dict[str, Any]: ...
+    def read_runtime_controls(self, program_run_id: int) -> dict[str, Any]: ...
 
     def write_runtime_blackboard(
-        self, program_run_id: str, request: RuntimeBlackboardWriteRequest
+        self, program_run_id: int, request: RuntimeBlackboardWriteRequest
     ) -> dict[str, Any]: ...
 
     def stage_manual_result(
-        self, program_run_id: str, request: ManualResultStageRequest
+        self, program_run_id: int, request: ManualResultStageRequest
     ) -> dict[str, Any]: ...
 
     def read_persistent_values(self) -> dict[str, Any]: ...
@@ -336,13 +311,17 @@ class ProgramRunnerApplicationPort(Protocol):
 
     def reconcile_persistent_values(self) -> dict[str, Any]: ...
 
+    def run_command(
+        self, request_key: str | None, command: Callable[[], Any]
+    ) -> dict[str, Any]: ...
+
     def apply_recovery_action(
         self, request: CycleRecoveryActionRequest
     ) -> dict[str, Any]: ...
 
 
 def _status(code: str) -> int:
-    if code in {"program_run_started_then_failed", "program_run_superseded_by_stop"}:
+    if code == "program_run_started_then_failed":
         return 422
     if code.endswith("_not_found"):
         return 404
@@ -352,7 +331,6 @@ def _status(code: str) -> int:
         or code
         in {
             "authoring_not_ready",
-            "program_run_stopped_before_start",
             "program_run_already_active",
             "program_run_draft_applied_mismatch",
             "persistent_key_request_replayed",
@@ -372,7 +350,11 @@ def _status(code: str) -> int:
         or code == "execution_control_ingress_busy"
     ):
         return 503
-    if code.endswith("_invalid") or code.endswith("_failed"):
+    if (
+        code.endswith("_invalid")
+        or code.endswith("_failed")
+        or code == "request_key_required"
+    ):
         return 400
     return 500
 
@@ -391,13 +373,13 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
     except TypeError:
         control_state_source = None
 
-    async def control_call(callback, *, stop: bool = False):
+    async def control_call(callback):
         try:
-            lane = execution_controls.stop if stop else execution_controls.ordinary
-            # Keep JSON traversal/encoding in the bounded transport worker.
-            # Otherwise FastAPI performs it after the await on the shared ASGI
-            # loop, where unrelated work can delay an accepted Stop response.
-            return await lane(lambda: JSONResponse(content=callback()))
+            # Keep JSON traversal/encoding in the bounded transport worker,
+            # off the shared ASGI loop.
+            return await execution_controls.ordinary(
+                lambda: JSONResponse(content=callback())
+            )
         except ExecutionControlBusyError as error:
             raise ProgramRunnerError(
                 "execution_control_ingress_busy",
@@ -408,9 +390,19 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
                 },
             ) from error
 
+    async def command_call(request: Any, command):
+        # OD-214: answered once the command is accepted (or ended at once);
+        # the command runs on to its end under the runner's slot.
+        return await control_call(
+            lambda: runtime.run_command(request.request_key, command)
+        )
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         runtime.start()
+        # Started and not yet serving (OD-234): no run exists, so the pause
+        # of the full collection falls before any command.
+        settle_heap("start")
         try:
             yield
         finally:
@@ -423,7 +415,7 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
 
     app = FastAPI(
         title="ManyForge Program Runner",
-        version="0.2.1",
+        version="0.3.0",
         lifespan=lifespan,
     )
     app.add_middleware(
@@ -473,7 +465,7 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
 
     @app.post("/api/program/runs")
     async def start_run(request: ProgramRunStartRequest) -> dict[str, Any]:
-        return await control_call(lambda: runtime.start_run(request))
+        return await command_call(request, lambda: runtime.start_run(request))
 
     @app.post("/api/program/scene-preparations")
     async def prepare_applied_scene(
@@ -483,152 +475,93 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
 
     @app.get("/api/program/runs/{program_run_id}")
     def read_run(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
     ) -> dict[str, Any]:
         return runtime.read_run(program_run_id)
 
     @app.post("/api/program/runs/{program_run_id}/node-correction-previews")
     def preview_node_correction(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
         request: ProgramNodeCorrectionPreviewRequest,
     ) -> dict[str, Any]:
         """Effect-free preview intent of one held motion node; not a control."""
         return runtime.preview_node_correction(program_run_id, request)
 
-    @app.post("/api/program/runs/{program_run_id}/stop")
-    async def stop_run(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: ProgramRunStopRequest,
-    ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
-            raise ProgramRunnerError(
-                "program_run_path_invalid",
-                "Program-run identity in path and body must match",
-            )
-        return await control_call(
-            lambda: runtime.stop_run(program_run_id, request),
-            stop=True,
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/motion-stop")
-    async def stop_motion(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: ProgramSelectionStopRequest,
-    ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
-            raise ProgramRunnerError(
-                "program_run_path_invalid",
-                "Program-run identity in path and body must match",
-            )
-        return await control_call(
-            lambda: runtime.stop_motion(program_run_id, request),
-            stop=True,
-        )
-
     @app.post("/api/program/runs/{program_run_id}/motion-resume")
     async def resume_motion(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
         request: ProgramSelectionResumeRequest,
     ) -> dict[str, Any]:
         if request.program_run_id != program_run_id:
             raise ProgramRunnerError(
                 "program_run_path_invalid", "Program-run path and body must match"
             )
-        return await control_call(
-            lambda: runtime.resume_motion(program_run_id, request)
+        return await command_call(
+            request, lambda: runtime.resume_motion(program_run_id, request)
         )
 
     @app.post("/api/program/runs/{program_run_id}/motion-start")
     async def start_motion(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
         request: ProgramSelectionStartRequest,
     ) -> dict[str, Any]:
         if request.program_run_id != program_run_id:
             raise ProgramRunnerError(
                 "program_run_path_invalid", "Program-run path and body must match"
             )
-        return await control_call(
-            lambda: runtime.start_motion(program_run_id, request)
+        return await command_call(
+            request, lambda: runtime.start_motion(program_run_id, request)
         )
 
     @app.post("/api/program/runs/{program_run_id}/manual-handover")
     async def prepare_manual_handover(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
         request: ProgramManualHandoverRequest,
     ) -> dict[str, Any]:
         if request.program_run_id != program_run_id:
             raise ProgramRunnerError(
                 "program_run_path_invalid", "Program-run path and body must match"
             )
-        return await control_call(
-            lambda: runtime.prepare_manual_handover(program_run_id, request)
+        return await command_call(
+            request, lambda: runtime.prepare_manual_handover(program_run_id, request)
         )
 
-    @app.post("/api/program/runs/{program_run_id}/full-stop")
-    async def full_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: ProgramRunStopRequest,
+    @app.post("/api/program/runs/{program_run_id}/resume-halt")
+    async def resume_halt(
+        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
+        request: ProgramHaltResumeRequest,
     ) -> dict[str, Any]:
         if request.program_run_id != program_run_id:
             raise ProgramRunnerError(
                 "program_run_path_invalid",
                 "Program-run identity in path and body must match",
             )
-        return await control_call(
-            lambda: runtime.full_stop(program_run_id, request),
-            stop=True,
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/resume-full-stop")
-    async def resume_full_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: ProgramFullStopResumeRequest,
-    ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
-            raise ProgramRunnerError(
-                "program_run_path_invalid",
-                "Program-run identity in path and body must match",
-            )
-        return await control_call(
-            lambda: runtime.resume_full_stop(program_run_id, request)
-        )
-
-    @app.post("/api/program/runs/{program_run_id}/discard-full-stop")
-    async def discard_full_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        request: ProgramFullStopResetRequest,
-    ) -> dict[str, Any]:
-        if request.program_run_id != program_run_id:
-            raise ProgramRunnerError(
-                "program_run_path_invalid",
-                "Program-run identity in path and body must match",
-            )
-        return await control_call(
-            lambda: runtime.discard_full_stop(program_run_id, request)
+        return await command_call(
+            request, lambda: runtime.resume_halt(program_run_id, request)
         )
 
     @app.get("/api/program/runs/{program_run_id}/runtime-controls")
     def read_runtime_controls(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
     ) -> dict[str, Any]:
         return runtime.read_runtime_controls(program_run_id)
 
     @app.post("/api/program/runs/{program_run_id}/blackboard-values")
     async def write_runtime_blackboard(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
         request: RuntimeBlackboardWriteRequest,
     ) -> dict[str, Any]:
-        return await control_call(
-            lambda: runtime.write_runtime_blackboard(program_run_id, request)
+        return await command_call(
+            request, lambda: runtime.write_runtime_blackboard(program_run_id, request)
         )
 
     @app.post("/api/program/runs/{program_run_id}/manual-result")
     async def stage_manual_result(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
         request: ManualResultStageRequest,
     ) -> dict[str, Any]:
-        return await control_call(
-            lambda: runtime.stage_manual_result(program_run_id, request)
+        return await command_call(
+            request, lambda: runtime.stage_manual_result(program_run_id, request)
         )
 
     # Values of the Applied Scenario project; an edit names the project
@@ -641,19 +574,19 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
     async def set_persistent_value(
         request: PersistentKeyValueSetRequest,
     ) -> dict[str, Any]:
-        return await control_call(lambda: runtime.set_persistent_value(request))
+        return await command_call(request, lambda: runtime.set_persistent_value(request))
 
     @app.post("/api/program/persistent-values/reset")
     async def reset_persistent_value(
         request: PersistentKeyValueResetRequest,
     ) -> dict[str, Any]:
-        return await control_call(lambda: runtime.reset_persistent_value(request))
+        return await command_call(request, lambda: runtime.reset_persistent_value(request))
 
     @app.post("/api/program/persistent-values/clear")
     async def clear_persistent_values(
         request: PersistentKeyValuesClearRequest,
     ) -> dict[str, Any]:
-        return await control_call(lambda: runtime.clear_persistent_values(request))
+        return await command_call(request, lambda: runtime.clear_persistent_values(request))
 
     @app.post("/api/program/persistent-values/reconcile")
     async def reconcile_persistent_values() -> dict[str, Any]:
@@ -665,11 +598,11 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
     async def apply_recovery_action(
         request: CycleRecoveryActionRequest,
     ) -> dict[str, Any]:
-        return await control_call(lambda: runtime.apply_recovery_action(request))
+        return await command_call(request, lambda: runtime.apply_recovery_action(request))
 
     @app.post("/api/program/cycle/reset")
     async def reset_cycle(request: ProgramCycleResetRequest) -> dict[str, Any]:
-        return await control_call(lambda: runtime.reset_cycle(request))
+        return await command_call(request, lambda: runtime.reset_cycle(request))
 
     @app.get("/api/cycle/status")
     def cycle_status() -> dict[str, Any]:
@@ -681,16 +614,6 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
             await websocket.close(code=1008, reason="Program control state unavailable")
             return
         await _serve_program_control_state(websocket, control_state_source)
-
-    @app.get("/api/program/liveness/status")
-    def liveness_status() -> dict[str, Any]:
-        read = getattr(runtime, "liveness_status", None)
-        if not callable(read):
-            raise ProgramRunnerError(
-                "program_runner_manager_liveness_unavailable",
-                "Manager-presence liveness status is unavailable",
-            )
-        return read()
 
     return app
 

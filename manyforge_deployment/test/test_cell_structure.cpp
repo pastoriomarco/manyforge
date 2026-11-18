@@ -834,6 +834,42 @@ struct BindingSpec final {
   });
 }
 
+// The ros2_control host's configuration for these structural tests: the
+// build-owned empty-host values plus what a real hosted component carries,
+// one controller profile and its measured_joints stream per hosted (bound)
+// component. The bindings here are observation-only, so no joints, initial
+// positions or motion limits, and no gripper target (no gripper_feedback).
+[[nodiscard]] CanonicalValue hosted_test_configuration(
+    const std::vector<BindingSpec>& control_bindings) {
+  std::set<std::string, std::less<>> hosted;
+  for (const auto& binding : control_bindings) hosted.insert(binding.component_id);
+  CanonicalValue::Array profiles;
+  CanonicalValue::Array streams;
+  for (const auto& component_id : hosted) {
+    streams.emplace_back(CanonicalValue::Object{
+        {"budget_ns", CanonicalValue(1e9)},
+        {"controllable_component_id", CanonicalValue(component_id)},
+        {"stream_id", CanonicalValue(std::string(
+                          ros2_control_execution_runtime_contract::kMeasuredJointsStreamId))},
+    });
+    profiles.emplace_back(CanonicalValue::Object{
+        {"controllable_component_id", CanonicalValue(component_id)},
+        {"description", CanonicalValue("<robot name=\"test\"/>")},
+        {"frame_prefix", CanonicalValue("")},
+        {"gripper_joint_name", CanonicalValue("test_joint")},
+        {"lane", CanonicalValue("mock")},
+        {"lane_row", CanonicalValue(R"({"adapter":"mock"})")},
+        {"model_family_id", CanonicalValue("test_family")},
+    });
+  }
+  auto configuration =
+      ros2_control_execution_runtime_contract::empty_host_configuration().as_object();
+  for (auto& [name, value] : configuration)
+    if (name == "controller_profiles") value = CanonicalValue(std::move(profiles));
+  configuration.emplace_back("component_streams", CanonicalValue(std::move(streams)));
+  return CanonicalValue(std::move(configuration));
+}
+
 [[nodiscard]] GraphRevisionVerifiedCellGraph graph_for(
     std::vector<ModelSpec> models, std::vector<ComponentSpec> components,
     std::vector<AttachmentSpec> attachments = {},
@@ -1057,7 +1093,7 @@ struct BindingSpec final {
                          {"dependency_runtime_unit_ids",
                           CanonicalValue(CanonicalValue::Array{})},
                          {"configuration",
-                          CanonicalValue(CanonicalValue::Object{})},
+                          hosted_test_configuration(control_bindings)},
                      })})
                : CanonicalValue(CanonicalValue::Array{})},
           {"model_instances", CanonicalValue(std::move(model_rows))},

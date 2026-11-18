@@ -25,4 +25,12 @@ describe('Reset-then-Apply Activity notice', () => {
     const resetting = resetApplyNotice({ plan, phase: { kind: 'resetting' } } as ResetApplySequence, vi.fn());
     expect(resetting.busy).toBe(true);
   });
+
+  it('names a Revert that follows the Reset', () => {
+    const revert = { ...plan, action: 'revert' } as ResetApplyPlan;
+    expect(resetApplyNotice({ plan: revert, phase: { kind: 'resetting' } } as ResetApplySequence, vi.fn()).title)
+      .toBe('Resetting the run to Revert the Program');
+    expect(resetApplyNotice({ plan: revert, phase: { kind: 'applied', apply: null } } as ResetApplySequence, vi.fn()).title)
+      .toBe('Program Reverted after Reset');
+  });
 });

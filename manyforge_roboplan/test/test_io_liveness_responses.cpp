@@ -29,7 +29,7 @@ TEST(IoLivenessResponseTest,
         std::nullopt,
         mode};
     core::IoSignalCatalogDTO catalog{
-        core::RequestOwnerEpoch("host.1"), 1U, {descriptor}, {}};
+        1U, {descriptor}, {}};
     if (mode == core::IoSignalLivenessMode::kInProcess)
       catalog.authoritative_synthetic_sources.push_back(source);
     auto created = core::IoSignalSubsystem::Create(
@@ -69,7 +69,7 @@ TEST(IoLivenessResponseTest, OutputHasNoInputLivenessDeclaration) {
       core::ResourceId("resource.output"),
       std::nullopt};
   auto created = core::IoSignalSubsystem::Create(
-      {core::RequestOwnerEpoch("host.1"), 1U, {descriptor}, {}},
+      {1U, {descriptor}, {}},
       {1, 1, 8, 8, 512, 1024}, clock);
   ASSERT_TRUE(created.ok());
   const auto observed = created.value()->ReadSignal(id);

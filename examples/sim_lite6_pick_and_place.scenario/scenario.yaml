@@ -13,7 +13,7 @@
   "saved_status": {
     "checked_content_digest": "sha256:60dcd63f4302a3f016ecf103c9925c7a6a6cba67505885594120957f7c79a312",
     "last_known_status": "unknown",
-    "manyforge_version": "0.2.0"
+    "manyforge_version": "0.3.0"
   },
   "scenario_id": "sim_lite6_pick_and_place",
   "source_snapshot": {

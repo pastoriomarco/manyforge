@@ -68,7 +68,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   /// backends retain ordinary preparation/dispatch behavior unchanged.
   virtual Result<PreparedMotionReplacementSourceDTO> CaptureReplacementSource(
       std::uint64_t /*execution_id*/, std::uint64_t /*execution_generation*/,
-      const ExecutionGoalKey& /*goal*/, const ContentDigest& /*digest*/) const {
+      const ControllerGoalId& /*goal*/, const ContentDigest& /*digest*/) const {
     return Result<PreparedMotionReplacementSourceDTO>::Err(ErrorCode::kUnsupportedCapability);
   }
 
@@ -100,7 +100,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   virtual PreparedMotionReplacementDispatchDTO DispatchReplacement(
       const PreparedMotionReplacementSourceDTO& /*source*/, std::uint64_t /*candidate_id*/,
       const PreparedOperationParticipantDTO& /*participant*/,
-      const ExecutionGoalKey& /*successor_goal*/, std::int64_t /*preparation_deadline_ns*/,
+      const ControllerGoalId& /*successor_goal*/, std::int64_t /*preparation_deadline_ns*/,
       const ReplacementSendRecheck& /*recheck_before_send*/ = {}) {
     return {{ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kUnsupported,
              ErrorDTO{kErrorUnsupportedCapability, "Motion replacement is unsupported", {}}},
@@ -112,11 +112,20 @@ class IExecutionBackend : public IControlDomainExecutionPort {
     return Result<PreparedMotionReplacementObservationDTO>::Err(ErrorCode::kUnsupportedCapability);
   }
 
-  virtual Result<void> AdoptReplacement(const PreparedMotionReplacementSourceDTO& /*source*/,
-                                        std::uint64_t /*candidate_id*/,
-                                        PreparedMotionReplacementCommitDTO /*commit*/) {
+  /// The take-over's "prove" step (OD-175 D1): every adoption check that can
+  /// fail, under the participant's own locks, with no Kernel lock held. It
+  /// changes no ownership; `ApplyReplacement` follows only after the Kernel
+  /// decided the hand-over.
+  virtual Result<void> ProveReplacement(const PreparedMotionReplacementSourceDTO& /*source*/,
+                                        std::uint64_t /*candidate_id*/) {
     return Result<void>::Err(ErrorCode::kUnsupportedCapability);
   }
+
+  /// The take-over's "apply" step (OD-175 D1): the participant's swaps for a
+  /// candidate `ProveReplacement` proved and the Kernel then decided. It has
+  /// no refusal. Not noexcept: a defect that throws here leaves the Kernel's
+  /// close step to run during unwinding.
+  virtual void ApplyReplacement(std::uint64_t /*candidate_id*/) {}
 
   /// The apply-tool-context action of a new (non-replacement) goal, run
   /// by the Kernel before the motion counts as running and before `Dispatch`:
@@ -131,8 +140,7 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   /// Exact repetition returns the same goal-bound handle and never sends a
   /// second transport command.
   virtual ExecutionHandle Dispatch(const PreparedOperationParticipantDTO& participant,
-                                   const ControllerGoalId& controller_goal_id,
-                                   ControllerGoalGeneration controller_goal_generation) = 0;
+                                   const ControllerGoalId& controller_goal_id) = 0;
 
   /// Execute a trajectory
   ///
@@ -220,6 +228,11 @@ class IExecutionBackend : public IControlDomainExecutionPort {
   /// completion for the exact backend dispatch generation.
   virtual ExecutionProgressHazardClaimResult claim_execution_progress_hazard(
       std::uint64_t execution_generation) noexcept = 0;
+
+  /// The take-over's "decide" step closes the exact generation's hazard
+  /// authority (OD-175 D2): false when a claim won first or the generation is
+  /// not current. Atomics only, no lock.
+  virtual bool close_execution_progress_hazard(std::uint64_t execution_generation) noexcept = 0;
 
   /// Update the runtime velocity scale used by active execution.
   ///

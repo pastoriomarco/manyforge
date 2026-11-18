@@ -214,9 +214,7 @@ struct OfflineModel final {
       {"manyforge_example_models/models/ur5e_robotiq_2f_85/"
        "ur5e_robotiq_2f_85.urdf",
        ur, "robotiq_85_left_knuckle_joint", 0U},
-      {"manyforge_deployment/resources/maintained/model_sources/ur5_roboplan/"
-       "ur5_gripper.structural.urdf",
-       ur, std::nullopt, 0U},
+      {"manyforge_example_models/models/ur5e/ur5e.urdf", ur, std::nullopt, 0U},
   };
 }
 

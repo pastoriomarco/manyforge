@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-11-09 11:41:15 UTC
+  Last regenerated: 2026-11-14 12:33:24 UTC
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -16,6 +16,8 @@ Each action delegates to the listed existing REST route. Supply its exact body a
 Requests are limited to 1 MiB; owner response/query bounds also apply. Configure `MANYFORGE_MCP_ALLOWED_HOSTS` for remote Host names/IPs and `MANYFORGE_CORS_ORIGINS` for browser origins. Default MCP hosts are loopback. These are transport bounds, not caller authorization. Use the deployment's trusted network/perimeter; request attribution is not authentication.
 
 JSON route bodies are returned as text with `isError` for HTTP failures; viewer snapshots return MCP image content and require an existing matching viewer. Tools list only configured routes; capability availability is still determined by their owners. This is the current wire contract, not full historical-functional or provider qualification. Historical v0 signatures are preserved in git at `08222188293df8e12f90dc72e204c21f22f92ea1`.
+
+The MCP library would turn NaN, Infinity or a number too large to hold (such as `1e999`) into an empty value, so a tool call holding a repeated member or such a number is refused as an invalid request (HTTP 400, JSON-RPC `-32600`) and nothing is carried out. A Stop holding such a number is not refused: a `manyforge_kernel` `stop` or `stop_all` whose body holds one is sent on with an empty body and becomes Stop all; a Stop command sent with `manyforge_cycle_control` whose payload holds one is sent on with an empty payload and becomes Stop all (a Halt stays a Halt).
 
 **Real robot.** `manyforge_components` reads component states (the machine's controller mode, state, error and motors in `details`), faults, the cell latch and readiness, and runs component actions. A failed Apply or Load names its cause (e.g. `site_settings_unavailable`). Ask the operator for the site settings file, a workbench restart, robot power and network, the e-stop and an attended session. See [Real robot setup](../operations/REAL_ROBOT_SETUP.md).
 
@@ -267,41 +269,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "BoxShapeRequest",
         "type": "object"
       },
-      "CallerAttributionRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "correlation_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Correlation Id"
-          },
-          "request_id": {
-            "title": "Request Id",
-            "type": "string"
-          },
-          "request_owner_epoch": {
-            "title": "Request Owner Epoch",
-            "type": "string"
-          },
-          "source_label": {
-            "title": "Source Label",
-            "type": "string"
-          }
-        },
-        "required": [
-          "request_id",
-          "request_owner_epoch",
-          "source_label"
-        ],
-        "title": "CallerAttributionRequest",
-        "type": "object"
-      },
       "CarriedObjectGraspLostBound": {
         "additionalProperties": false,
         "description": "Attach-node bound around the attach-time carried offset.",
@@ -515,6 +482,17 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "additionalProperties": false,
         "description": "Scene-owner request with a Draft fence only for authored mutations.",
         "properties": {
+          "application_start_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Application Start Id"
+          },
           "expected_admission_generation": {
             "anyOf": [
               {
@@ -634,7 +612,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Program Reset Scene Authorization"
           },
           "request_context": {
-            "$ref": "#/$defs/CallerAttributionRequest"
+            "$ref": "#/$defs/RequestContext"
           }
         },
         "required": [
@@ -882,8 +860,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "description": "Exact runtime-node attribution; the Kernel checks the sealed owner API.",
         "properties": {
           "node_attempt_id": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
             "title": "Node Attempt Id",
-            "type": "string"
+            "type": "integer"
           },
           "node_instance_id": {
             "title": "Node Instance Id",
@@ -904,16 +884,13 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "integer"
           },
           "program_run_id": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
             "title": "Program Run Id",
-            "type": "string"
-          },
-          "program_runner_owner_epoch": {
-            "title": "Program Runner Owner Epoch",
-            "type": "string"
+            "type": "integer"
           }
         },
         "required": [
-          "program_runner_owner_epoch",
           "program_run_id",
           "parent_program_cycle_claim_generation",
           "node_instance_id",
@@ -921,6 +898,52 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "owner_api"
         ],
         "title": "ProgramNodeAdmissionEvidenceRequest",
+        "type": "object"
+      },
+      "ProgramResetAcceptedResetRequest": {
+        "additionalProperties": false,
+        "description": "The accepted Reset occurrence named by the runner's cycle status.",
+        "properties": {
+          "reload_initial_scene": {
+            "title": "Reload Initial Scene",
+            "type": "boolean"
+          },
+          "request_key": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Request Key",
+            "type": "string"
+          },
+          "request_payload_digest": {
+            "pattern": "^sha256:[0-9a-f]{64}$",
+            "title": "Request Payload Digest",
+            "type": "string"
+          },
+          "reset_claim_generation": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reset Claim Generation"
+          },
+          "reset_robot_position": {
+            "title": "Reset Robot Position",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "request_key",
+          "request_payload_digest",
+          "reload_initial_scene",
+          "reset_robot_position",
+          "reset_claim_generation"
+        ],
+        "title": "ProgramResetAcceptedResetRequest",
         "type": "object"
       },
       "ProgramResetClaimSceneAuthorizationRequest": {
@@ -932,20 +955,17 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Cycle Generation",
             "type": "integer"
           },
-          "program_runner_owner_epoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Program Runner Owner Epoch",
-            "type": "string"
+          "program_cycle_status": {
+            "$ref": "#/$defs/ProgramResetCycleStatusRequest"
           },
           "reset_claim": {
             "$ref": "#/$defs/ProgramResetClaimSceneContextRequest"
           }
         },
         "required": [
-          "program_runner_owner_epoch",
           "cycle_generation",
-          "reset_claim"
+          "reset_claim",
+          "program_cycle_status"
         ],
         "title": "ProgramResetClaimSceneAuthorizationRequest",
         "type": "object"
@@ -953,16 +973,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "ProgramResetClaimSceneContextRequest": {
         "additionalProperties": false,
         "properties": {
-          "request_id": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Request Id",
-            "type": "string"
-          },
-          "request_owner_epoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Request Owner Epoch",
+          "request_key": {
+            "pattern": "^[0-9a-f]{32}$",
+            "title": "Request Key",
             "type": "string"
           },
           "request_payload_digest": {
@@ -978,12 +991,94 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           }
         },
         "required": [
-          "request_owner_epoch",
-          "request_id",
+          "request_key",
           "request_payload_digest",
           "reset_claim_generation"
         ],
         "title": "ProgramResetClaimSceneContextRequest",
+        "type": "object"
+      },
+      "ProgramResetCycleStatusRequest": {
+        "additionalProperties": false,
+        "description": "The Program runner's current cycle status, carried by a Reset proof so\nthe Kernel validates it in memory. The same six facts the runner publishes\nto its liveness probe.",
+        "properties": {
+          "accepted_reset": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProgramResetAcceptedResetRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "cycle_claim_generation": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cycle Claim Generation"
+          },
+          "cycle_generation": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Cycle Generation",
+            "type": "integer"
+          },
+          "program_run_id": {
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Program Run Id"
+          },
+          "state": {
+            "enum": [
+              "idle_after_reset",
+              "starting",
+              "running",
+              "terminal_awaiting_reset",
+              "intervention_or_recovery",
+              "resetting",
+              "recovery_required"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "terminal_or_settlement_reference": {
+            "anyOf": [
+              {
+                "pattern": "^sha256:[0-9a-f]{64}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Terminal Or Settlement Reference"
+          }
+        },
+        "required": [
+          "cycle_generation",
+          "state",
+          "program_run_id",
+          "cycle_claim_generation",
+          "terminal_or_settlement_reference",
+          "accepted_reset"
+        ],
+        "title": "ProgramResetCycleStatusRequest",
         "type": "object"
       },
       "ProgramResetSceneAuthorizationRequest": {
@@ -996,13 +1091,14 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Cycle Claim Generation",
             "type": "integer"
           },
-          "program_run_id": {
-            "title": "Program Run Id",
-            "type": "string"
+          "program_cycle_status": {
+            "$ref": "#/$defs/ProgramResetCycleStatusRequest"
           },
-          "program_runner_owner_epoch": {
-            "title": "Program Runner Owner Epoch",
-            "type": "string"
+          "program_run_id": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Program Run Id",
+            "type": "integer"
           },
           "terminal_or_settlement_reference": {
             "pattern": "^sha256:[0-9a-f]{64}$",
@@ -1011,10 +1107,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           }
         },
         "required": [
-          "program_runner_owner_epoch",
           "program_run_id",
           "cycle_claim_generation",
-          "terminal_or_settlement_reference"
+          "terminal_or_settlement_reference",
+          "program_cycle_status"
         ],
         "title": "ProgramResetSceneAuthorizationRequest",
         "type": "object"
@@ -1091,6 +1187,32 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "scene_resource_id"
         ],
         "title": "RemoveSceneObjectRequest",
+        "type": "object"
+      },
+      "RequestContext": {
+        "additionalProperties": false,
+        "description": "The request context of one request: ``{request_key, source_label}``.\n\nAt HTTP ingress ``request_key`` is the client's 32-hex key, unchecked\nhere: Headless forms the key (class 3, or a Headless key for a Stop) and\nrefuses a missing or invalid one with its own typed code. Downstream\nevery request context carries the formed key.",
+        "properties": {
+          "request_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Key"
+          },
+          "source_label": {
+            "title": "Source Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_label"
+        ],
+        "title": "RequestContext",
         "type": "object"
       },
       "SceneResourceSceneFrameRequest": {
@@ -1608,7 +1730,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
 
 ## manyforge_program_load
 
-Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.
+Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `apply` returns at acceptance with the Apply's row (`manyforge.apply_command_reply.v1`). The outcome is that row's `end` (null while it runs) in `apply_commands` of `apply_status`, found by `request_key`; it ends once the Manager accepted the Apply, named by the row's `step_source`.
 
 ```json
 {
@@ -1618,12 +1740,16 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     "openWorldHint": false,
     "readOnlyHint": false
   },
-  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
+  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `apply` returns at acceptance with the Apply's row (`manyforge.apply_command_reply.v1`). The outcome is that row's `end` (null while it runs) in `apply_commands` of `apply_status`, found by `request_key`; it ends once the Manager accepted the Apply, named by the row's `step_source`.",
   "inputSchema": {
     "$defs": {
       "ApplyDraftRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "correlationId": {
             "anyOf": [
               {
@@ -1667,16 +1793,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expectedworkspacerevision",
             "type": "integer"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -1684,8 +1802,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision"
         ],
@@ -1695,6 +1813,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "NewDraftRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "confirmDiscard": {
             "default": false,
             "title": "Confirmdiscard",
@@ -1730,16 +1852,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expectedworkspacerevision",
             "type": "integer"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -1747,8 +1861,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision"
         ],
@@ -1758,6 +1872,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "OpenDraftRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "confirmDiscard": {
             "default": false,
             "title": "Confirmdiscard",
@@ -1799,16 +1917,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Path",
             "type": "string"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -1816,8 +1926,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision",
           "path"
@@ -1880,6 +1990,20 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "body"
         ],
         "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "GET /api/deployment/workspace",
+        "properties": {
+          "action": {
+            "const": "apply_status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
       }
     ],
     "type": "object"
@@ -1906,6 +2030,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "DraftMutationRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "arguments": {
             "additionalProperties": true,
             "title": "Arguments",
@@ -1947,16 +2075,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Mutation",
             "type": "string"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -1964,8 +2084,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision",
           "mutation",
@@ -2088,7 +2208,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
 
 ## manyforge_cycle_control
 
-Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.
+Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `command` returns at acceptance: the receipt (`manyforge.execution_command_receipt.v3`) names the command's `request_key` and, for a Program command, the runner's row in `command`. The outcome is that row's `end` (null while it runs) in `runner_commands` of `status`, found by `request_key`.
 
 ```json
 {
@@ -2098,7 +2218,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     "openWorldHint": false,
     "readOnlyHint": false
   },
-  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
+  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `command` returns at acceptance: the receipt (`manyforge.execution_command_receipt.v3`) names the command's `request_key` and, for a Program command, the runner's row in `command`. The outcome is that row's `end` (null while it runs) in `runner_commands` of `status`, found by `request_key`.",
   "inputSchema": {
     "$defs": {
       "ControlFreshnessContextDTO": {
@@ -2118,14 +2238,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Issued Server Sequence",
             "type": "string"
           },
-          "receiver_incarnation": {
-            "title": "Receiver Incarnation",
-            "type": "string"
-          },
-          "semantic_owner_epoch": {
-            "title": "Semantic Owner Epoch",
-            "type": "string"
-          },
           "valid_for_ns": {
             "const": 750000000,
             "title": "Valid For Ns",
@@ -2134,8 +2246,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         },
         "required": [
           "context_id",
-          "receiver_incarnation",
-          "semantic_owner_epoch",
           "execution_control_revision",
           "issued_server_sequence",
           "valid_for_ns"
@@ -2163,11 +2273,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               "program_motion_start",
               "program_motion_stop",
               "program_motion_resume",
-              "program_full_stop",
-              "program_stop",
               "program_reset",
-              "program_resume_full_stop",
-              "program_discard_full_stop",
+              "program_resume_halt",
+              "program_discard_halt",
               "program_runtime_blackboard_write",
               "program_manual_result_stage",
               "program_manual_handover",
@@ -2175,27 +2283,26 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               "operation_stop",
               "operation_reset",
               "operation_acknowledge_completed",
-              "cell_full_stop",
+              "stop_all",
+              "halt",
               "execution_recovery",
               "runtime_scale"
             ],
             "title": "Command Kind",
             "type": "string"
           },
-          "control_session_id": {
+          "control_session_number": {
             "anyOf": [
               {
-                "type": "string"
+                "maximum": 9007199254740991.0,
+                "minimum": 1.0,
+                "type": "integer"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Control Session Id"
-          },
-          "correlation_id": {
-            "title": "Correlation Id",
-            "type": "string"
+            "title": "Control Session Number"
           },
           "expected_execution_control_revision": {
             "maximum": 9007199254740991.0,
@@ -2203,15 +2310,11 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expected Execution Control Revision",
             "type": "integer"
           },
-          "expected_semantic_owner_epoch": {
-            "title": "Expected Semantic Owner Epoch",
-            "type": "string"
-          },
           "freshness": {
             "$ref": "#/$defs/ControlFreshnessContextDTO"
           },
           "schema_version": {
-            "const": "manyforge.execution_command.v1",
+            "const": "manyforge.execution_command.v2",
             "title": "Schema Version",
             "type": "string"
           },
@@ -2223,33 +2326,11 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "required": [
           "schema_version",
           "command_kind",
-          "correlation_id",
           "source_label",
           "freshness",
-          "expected_semantic_owner_epoch",
           "expected_execution_control_revision"
         ],
         "title": "ExecutionCommandEnvelopeDTO",
-        "type": "object"
-      },
-      "ExecutionCommandRequestDTO": {
-        "additionalProperties": false,
-        "description": "One strict metadata envelope plus one command-specific strict payload.",
-        "properties": {
-          "command_envelope": {
-            "$ref": "#/$defs/ExecutionCommandEnvelopeDTO"
-          },
-          "payload": {
-            "additionalProperties": true,
-            "title": "Payload",
-            "type": "object"
-          }
-        },
-        "required": [
-          "command_envelope",
-          "payload"
-        ],
-        "title": "ExecutionCommandRequestDTO",
         "type": "object"
       }
     },
@@ -2277,12 +2358,43 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "string"
           },
           "body": {
-            "$ref": "#/$defs/ExecutionCommandRequestDTO"
+            "additionalProperties": false,
+            "description": "One strict metadata envelope plus one command-specific strict payload.",
+            "properties": {
+              "command_envelope": {
+                "$ref": "#/$defs/ExecutionCommandEnvelopeDTO"
+              },
+              "payload": {
+                "additionalProperties": true,
+                "title": "Payload",
+                "type": "object"
+              }
+            },
+            "required": [
+              "command_envelope",
+              "payload"
+            ],
+            "title": "ExecutionCommandRequestDTO",
+            "type": "object"
           }
         },
         "required": [
           "action",
           "body"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "GET /api/cycle/status",
+        "properties": {
+          "action": {
+            "const": "status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
         ],
         "type": "object"
       }
@@ -2464,7 +2576,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
 
 ## manyforge_intervention
 
-Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.
+Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `recover`, `manual_result` and `blackboard` return at acceptance with the runner's row (`manyforge.program_command_reply.v1`). The outcome is that row's `end` (null while it runs) in `runner_commands` of `state`, found by the row's `request_key`.
 
 ```json
 {
@@ -2474,7 +2586,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     "openWorldHint": false,
     "readOnlyHint": false
   },
-  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
+  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `recover`, `manual_result` and `blackboard` return at acceptance with the runner's row (`manyforge.program_command_reply.v1`). The outcome is that row's `end` (null while it runs) in `runner_commands` of `state`, found by the row's `request_key`.",
   "inputSchema": {
     "$defs": {
       "CycleRecoveryActionRequest": {
@@ -2494,7 +2606,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Action Id",
             "type": "string"
           },
-          "client_sequence": {
+          "application_start_id": {
             "anyOf": [
               {
                 "type": "string"
@@ -2503,22 +2615,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "type": "null"
               }
             ],
-            "title": "Client Sequence"
-          },
-          "correlation_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Correlation Id"
-          },
-          "expected_owner_epoch": {
-            "title": "Expected Owner Epoch",
-            "type": "string"
+            "title": "Application Start Id"
           },
           "offer_id": {
             "pattern": "^sha256:[0-9a-f]{64}$",
@@ -2542,15 +2639,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             ],
             "title": "Reason"
           },
-          "request_id": {
-            "title": "Request Id",
-            "type": "string"
-          },
-          "request_owner_epoch": {
-            "title": "Request Owner Epoch",
-            "type": "string"
-          },
-          "session_id": {
+          "request_key": {
             "anyOf": [
               {
                 "type": "string"
@@ -2559,7 +2648,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "type": "null"
               }
             ],
-            "title": "Session Id"
+            "title": "Request Key"
           },
           "source_label": {
             "title": "Source Label",
@@ -2567,10 +2656,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           }
         },
         "required": [
-          "request_id",
-          "request_owner_epoch",
           "source_label",
-          "expected_owner_epoch",
           "offer_id",
           "offer_revision",
           "action_id"
@@ -2581,7 +2667,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "ManualResultStageRequest": {
         "additionalProperties": false,
         "properties": {
-          "client_sequence": {
+          "application_start_id": {
             "anyOf": [
               {
                 "type": "string"
@@ -2590,22 +2676,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "type": "null"
               }
             ],
-            "title": "Client Sequence"
-          },
-          "correlation_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Correlation Id"
-          },
-          "expected_owner_epoch": {
-            "title": "Expected Owner Epoch",
-            "type": "string"
+            "title": "Application Start Id"
           },
           "expected_run_revision": {
             "maximum": 9007199254740991.0,
@@ -2614,8 +2685,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "integer"
           },
           "node_attempt_id": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
             "title": "Node Attempt Id",
-            "type": "string"
+            "type": "integer"
           },
           "node_instance_id": {
             "title": "Node Instance Id",
@@ -2633,18 +2706,12 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Output"
           },
           "program_run_id": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
             "title": "Program Run Id",
-            "type": "string"
+            "type": "integer"
           },
-          "request_id": {
-            "title": "Request Id",
-            "type": "string"
-          },
-          "request_owner_epoch": {
-            "title": "Request Owner Epoch",
-            "type": "string"
-          },
-          "session_id": {
+          "request_key": {
             "anyOf": [
               {
                 "type": "string"
@@ -2653,7 +2720,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "type": "null"
               }
             ],
-            "title": "Session Id"
+            "title": "Request Key"
           },
           "source_label": {
             "title": "Source Label",
@@ -2661,11 +2728,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           }
         },
         "required": [
-          "request_id",
-          "request_owner_epoch",
           "source_label",
           "program_run_id",
-          "expected_owner_epoch",
           "expected_run_revision",
           "node_instance_id",
           "node_attempt_id",
@@ -2678,13 +2742,22 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "additionalProperties": false,
         "description": "Effect-free native preview of one held motion node with proposed inputs.\n\nThe Program runner resolves the node's inputs exactly as a fresh attempt\nwould and replaces the proposed paths. Binding, robot, capability and\nlifecycle come from the captured run; this request cannot select them.",
         "properties": {
-          "expected_owner_epoch": {
-            "title": "Expected Owner Epoch",
-            "type": "string"
+          "application_start_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Application Start Id"
           },
           "node_attempt_id": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
             "title": "Node Attempt Id",
-            "type": "string"
+            "type": "integer"
           },
           "node_instance_id": {
             "title": "Node Instance Id",
@@ -2705,8 +2778,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "string"
           },
           "program_run_id": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
             "title": "Program Run Id",
-            "type": "string"
+            "type": "integer"
           },
           "proposed_inputs": {
             "items": {
@@ -2716,21 +2791,26 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Proposed Inputs",
             "type": "array"
           },
-          "request_id": {
-            "title": "Request Id",
-            "type": "string"
+          "request_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Key"
           },
           "schema_version": {
-            "const": "manyforge.program_node_correction_preview_request.v1",
+            "const": "manyforge.program_node_correction_preview_request.v2",
             "title": "Schema Version",
             "type": "string"
           }
         },
         "required": [
           "schema_version",
-          "request_id",
           "program_run_id",
-          "expected_owner_epoch",
           "program_id",
           "program_revision",
           "program_binding_id",
@@ -2764,7 +2844,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "RuntimeBlackboardWriteRequest": {
         "additionalProperties": false,
         "properties": {
-          "client_sequence": {
+          "application_start_id": {
             "anyOf": [
               {
                 "type": "string"
@@ -2773,22 +2853,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "type": "null"
               }
             ],
-            "title": "Client Sequence"
-          },
-          "correlation_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Correlation Id"
-          },
-          "expected_owner_epoch": {
-            "title": "Expected Owner Epoch",
-            "type": "string"
+            "title": "Application Start Id"
           },
           "expected_run_revision": {
             "maximum": 9007199254740991.0,
@@ -2801,18 +2866,12 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "string"
           },
           "program_run_id": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
             "title": "Program Run Id",
-            "type": "string"
+            "type": "integer"
           },
-          "request_id": {
-            "title": "Request Id",
-            "type": "string"
-          },
-          "request_owner_epoch": {
-            "title": "Request Owner Epoch",
-            "type": "string"
-          },
-          "session_id": {
+          "request_key": {
             "anyOf": [
               {
                 "type": "string"
@@ -2821,7 +2880,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "type": "null"
               }
             ],
-            "title": "Session Id"
+            "title": "Request Key"
           },
           "source_label": {
             "title": "Source Label",
@@ -2832,11 +2891,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           }
         },
         "required": [
-          "request_id",
-          "request_owner_epoch",
           "source_label",
           "program_run_id",
-          "expected_owner_epoch",
           "expected_run_revision",
           "key",
           "value"
@@ -2931,6 +2987,24 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "required": [
               "program_run_id"
             ],
+            "type": "object"
+          },
+          "query": {
+            "additionalProperties": false,
+            "properties": {
+              "application_start_id": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Application Start Id"
+              }
+            },
+            "required": [],
             "type": "object"
           }
         },
@@ -3064,6 +3138,24 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               "program_run_id"
             ],
             "type": "object"
+          },
+          "query": {
+            "additionalProperties": false,
+            "properties": {
+              "application_start_id": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Application Start Id"
+              }
+            },
+            "required": [],
+            "type": "object"
           }
         },
         "required": [
@@ -3092,6 +3184,24 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "required": [
               "operation_id"
             ],
+            "type": "object"
+          },
+          "query": {
+            "additionalProperties": false,
+            "properties": {
+              "application_start_id": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Application Start Id"
+              }
+            },
+            "required": [],
             "type": "object"
           }
         },
@@ -3192,6 +3302,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 ],
                 "title": "Alarm Phase"
               },
+              "application_start_id": {
+                "anyOf": [
+                  {
+                    "maxLength": 16,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Application Start Id"
+              },
               "before_sequence": {
                 "anyOf": [
                   {
@@ -3504,19 +3626,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "title": "Severities",
                 "type": "array"
               },
-              "source_owner_epoch": {
-                "anyOf": [
-                  {
-                    "maxLength": 1024,
-                    "minLength": 1,
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "title": "Source Owner Epoch"
-              },
               "start_ns": {
                 "anyOf": [
                   {
@@ -3543,7 +3652,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 ],
                 "title": "Start Utc Ns"
               },
-              "stop_id": {
+              "stop_event_id": {
                 "anyOf": [
                   {
                     "maxLength": 1024,
@@ -3554,7 +3663,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                     "type": "null"
                   }
                 ],
-                "title": "Stop Id"
+                "title": "Stop Event Id"
               }
             },
             "required": [],
@@ -3634,6 +3743,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 ],
                 "title": "Alarm Phase"
               },
+              "application_start_id": {
+                "anyOf": [
+                  {
+                    "maxLength": 16,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Application Start Id"
+              },
               "before_sequence": {
                 "anyOf": [
                   {
@@ -3946,19 +4067,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "title": "Severities",
                 "type": "array"
               },
-              "source_owner_epoch": {
-                "anyOf": [
-                  {
-                    "maxLength": 1024,
-                    "minLength": 1,
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "title": "Source Owner Epoch"
-              },
               "start_ns": {
                 "anyOf": [
                   {
@@ -3985,7 +4093,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 ],
                 "title": "Start Utc Ns"
               },
-              "stop_id": {
+              "stop_event_id": {
                 "anyOf": [
                   {
                     "maxLength": 1024,
@@ -3996,7 +4104,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                     "type": "null"
                   }
                 ],
-                "title": "Stop Id"
+                "title": "Stop Event Id"
               }
             },
             "required": [],
@@ -4075,6 +4183,18 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                   }
                 ],
                 "title": "Alarm Phase"
+              },
+              "application_start_id": {
+                "anyOf": [
+                  {
+                    "maxLength": 16,
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Application Start Id"
               },
               "before_sequence": {
                 "anyOf": [
@@ -4375,19 +4495,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 "title": "Severities",
                 "type": "array"
               },
-              "source_owner_epoch": {
-                "anyOf": [
-                  {
-                    "maxLength": 1024,
-                    "minLength": 1,
-                    "type": "string"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ],
-                "title": "Source Owner Epoch"
-              },
               "start_ns": {
                 "anyOf": [
                   {
@@ -4414,7 +4521,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                 ],
                 "title": "Start Utc Ns"
               },
-              "stop_id": {
+              "stop_event_id": {
                 "anyOf": [
                   {
                     "maxLength": 1024,
@@ -4425,7 +4532,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
                     "type": "null"
                   }
                 ],
-                "title": "Stop Id"
+                "title": "Stop Event Id"
               }
             },
             "required": [],
@@ -4670,6 +4777,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "SaveDraftAsRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "confirmOverwrite": {
             "default": false,
             "title": "Confirmoverwrite",
@@ -4711,16 +4822,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Path",
             "type": "string"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -4728,8 +4831,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision",
           "path"
@@ -4740,6 +4843,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "SaveDraftRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "draftId": {
             "maxLength": 256,
             "minLength": 1,
@@ -4770,16 +4877,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expectedworkspacerevision",
             "type": "integer"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -4787,8 +4886,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision"
         ],
@@ -4908,7 +5007,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
 
 ## manyforge_deployment
 
-Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.
+Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `apply` and `revert` return at acceptance with the Apply's row (`manyforge.apply_command_reply.v1`). The outcome is that row's `end` (null while it runs) in `apply_commands` of `workspace`, found by `request_key`.
 
 ```json
 {
@@ -4918,12 +5017,16 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     "openWorldHint": false,
     "readOnlyHint": false
   },
-  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
+  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `apply` and `revert` return at acceptance with the Apply's row (`manyforge.apply_command_reply.v1`). The outcome is that row's `end` (null while it runs) in `apply_commands` of `workspace`, found by `request_key`.",
   "inputSchema": {
     "$defs": {
       "AddComponentsRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "attachments": {
             "items": {
               "additionalProperties": true,
@@ -4973,16 +5076,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expectedworkspacerevision",
             "type": "integer"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -4990,8 +5085,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision",
           "components"
@@ -5003,6 +5098,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "additionalProperties": false,
         "description": "Apply and Revert: the ``scope`` of the Preview the user confirmed.\n\nWhen present, the Apply is refused before any effect if the activation\ninput changed since that Preview (``activation_input_changed_after_confirmation``).",
         "properties": {
+          "request_key": {
+            "title": "Request Key",
+            "type": "string"
+          },
           "scope": {
             "anyOf": [
               {
@@ -5016,12 +5115,19 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Scope"
           }
         },
+        "required": [
+          "request_key"
+        ],
         "title": "ConfirmedApplyRequest",
         "type": "object"
       },
       "DiscardDeploymentRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "draftId": {
             "maxLength": 256,
             "minLength": 1,
@@ -5052,16 +5158,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expectedworkspacerevision",
             "type": "integer"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -5069,8 +5167,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision"
         ],
@@ -5080,6 +5178,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "OpenDeploymentRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "confirmDiscard": {
             "default": false,
             "title": "Confirmdiscard",
@@ -5121,16 +5223,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Path",
             "type": "string"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -5138,8 +5232,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision",
           "path"
@@ -5150,6 +5244,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "SaveDeploymentAsRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "confirmOverwrite": {
             "default": false,
             "title": "Confirmoverwrite",
@@ -5191,16 +5289,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Path",
             "type": "string"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -5208,8 +5298,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision",
           "path"
@@ -5220,6 +5310,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "SaveDeploymentRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "draftId": {
             "maxLength": 256,
             "minLength": 1,
@@ -5250,16 +5344,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expectedworkspacerevision",
             "type": "integer"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -5267,8 +5353,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision"
         ],
@@ -5285,6 +5371,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "UpdateControlledStopRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "command_target_id": {
             "maxLength": 256,
             "minLength": 1,
@@ -5339,16 +5429,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             ],
             "title": "Profile"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -5356,8 +5438,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision",
           "controllable_component_id",
@@ -5370,6 +5452,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "UpdateDeploymentRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "draftId": {
             "maxLength": 256,
             "minLength": 1,
@@ -5426,16 +5512,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Path",
             "type": "array"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           },
           "value": {
@@ -5446,8 +5524,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision",
           "path"
@@ -5458,6 +5536,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "UpdateMotionTargetLimitRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "command_target_id": {
             "maxLength": 256,
             "minLength": 1,
@@ -5506,16 +5588,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Maximum Tcp Linear Speed Mps",
             "type": "number"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -5523,8 +5597,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision",
           "controllable_component_id",
@@ -5831,7 +5905,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
 
 ## manyforge_scenario
 
-Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.
+Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `load` and `new` return at acceptance with the Apply's row (`manyforge.apply_command_reply.v1`). The outcome is that row's `end` (null while it runs) in `apply_commands` of `status`, found by `request_key`.
 
 ```json
 {
@@ -5841,7 +5915,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     "openWorldHint": false,
     "readOnlyHint": false
   },
-  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
+  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `load` and `new` return at acceptance with the Apply's row (`manyforge.apply_command_reply.v1`). The outcome is that row's `end` (null while it runs) in `apply_commands` of `status`, found by `request_key`.",
   "inputSchema": {
     "$defs": {
       "ScenarioEmptyRequest": {
@@ -5852,8 +5926,15 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "default": false,
             "title": "Discard Unsaved",
             "type": "boolean"
+          },
+          "request_key": {
+            "title": "Request Key",
+            "type": "string"
           }
         },
+        "required": [
+          "request_key"
+        ],
         "title": "ScenarioEmptyRequest",
         "type": "object"
       },
@@ -5871,10 +5952,15 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "minLength": 1,
             "title": "Path",
             "type": "string"
+          },
+          "request_key": {
+            "title": "Request Key",
+            "type": "string"
           }
         },
         "required": [
-          "path"
+          "path",
+          "request_key"
         ],
         "title": "ScenarioLoadRequest",
         "type": "object"
@@ -5914,6 +6000,20 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "required": [
           "action",
           "body"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "GET /api/deployment/workspace",
+        "properties": {
+          "action": {
+            "const": "status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
         ],
         "type": "object"
       }
@@ -6268,7 +6368,9 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "program_run_id": {
             "anyOf": [
               {
-                "type": "string"
+                "maximum": 9007199254740991.0,
+                "minimum": 1.0,
+                "type": "integer"
               },
               {
                 "type": "null"
@@ -6323,41 +6425,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "value_rad"
         ],
         "title": "AngularPositionRequest",
-        "type": "object"
-      },
-      "CallerAttributionRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "correlation_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Correlation Id"
-          },
-          "request_id": {
-            "title": "Request Id",
-            "type": "string"
-          },
-          "request_owner_epoch": {
-            "title": "Request Owner Epoch",
-            "type": "string"
-          },
-          "source_label": {
-            "title": "Source Label",
-            "type": "string"
-          }
-        },
-        "required": [
-          "request_id",
-          "request_owner_epoch",
-          "source_label"
-        ],
-        "title": "CallerAttributionRequest",
         "type": "object"
       },
       "CapabilityCommandParticipantRequest": {
@@ -6627,26 +6694,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "DefaultTcpOfTargetSelectorRequest",
         "type": "object"
       },
-      "FullStopIntentRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "expected_stop_generation": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expected Stop Generation",
-            "type": "integer"
-          },
-          "request_context": {
-            "$ref": "#/$defs/CallerAttributionRequest"
-          }
-        },
-        "required": [
-          "request_context",
-          "expected_stop_generation"
-        ],
-        "title": "FullStopIntentRequest",
-        "type": "object"
-      },
       "GripperPositionCommandValueRequest": {
         "additionalProperties": false,
         "properties": {
@@ -6855,26 +6902,23 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Claim Generation",
             "type": "integer"
           },
-          "program_run_id": {
-            "title": "Program Run Id",
-            "type": "string"
-          },
-          "program_runner_owner_epoch": {
-            "title": "Program Runner Owner Epoch",
-            "type": "string"
-          },
-          "selection_revision": {
+          "hold_revision": {
             "maximum": 9007199254740991.0,
             "minimum": 0.0,
-            "title": "Selection Revision",
+            "title": "Hold Revision",
+            "type": "integer"
+          },
+          "program_run_id": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Program Run Id",
             "type": "integer"
           }
         },
         "required": [
-          "program_runner_owner_epoch",
           "program_run_id",
           "claim_generation",
-          "selection_revision"
+          "hold_revision"
         ],
         "title": "ManualProgramHandoverContext",
         "type": "object"
@@ -7313,6 +7357,17 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "OperationIntentRequest": {
         "additionalProperties": false,
         "properties": {
+          "application_start_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Application Start Id"
+          },
           "coordination_policy": {
             "enum": [
               "independent",
@@ -7371,11 +7426,20 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "string"
           },
           "program_run_id": {
-            "title": "Program Run Id",
-            "type": "string"
+            "anyOf": [
+              {
+                "maximum": 9007199254740991.0,
+                "minimum": 1.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Program Run Id"
           },
           "request_context": {
-            "$ref": "#/$defs/CallerAttributionRequest"
+            "$ref": "#/$defs/RequestContext"
           }
         },
         "required": [
@@ -7383,7 +7447,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "program_id",
           "program_revision",
           "program_binding_id",
-          "program_run_id",
           "expected_graph_revision",
           "expected_retained_bundle_id",
           "expected_scene_revision",
@@ -7449,6 +7512,17 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "additionalProperties": false,
         "description": "Targeted operation Reset.",
         "properties": {
+          "application_start_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Application Start Id"
+          },
           "expected_operation_revision": {
             "maximum": 9007199254740991.0,
             "minimum": 1.0,
@@ -7456,8 +7530,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "integer"
           },
           "operation_id": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
             "title": "Operation Id",
-            "type": "string"
+            "type": "integer"
           },
           "reason": {
             "anyOf": [
@@ -7471,7 +7547,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Reason"
           },
           "request_context": {
-            "$ref": "#/$defs/CallerAttributionRequest"
+            "$ref": "#/$defs/RequestContext"
           }
         },
         "required": [
@@ -7604,6 +7680,32 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "QuaternionRequest",
         "type": "object"
       },
+      "RequestContext": {
+        "additionalProperties": false,
+        "description": "The request context of one request: ``{request_key, source_label}``.\n\nAt HTTP ingress ``request_key`` is the client's 32-hex key, unchecked\nhere: Headless forms the key (class 3, or a Headless key for a Stop) and\nrefuses a missing or invalid one with its own typed code. Downstream\nevery request context carries the formed key.",
+        "properties": {
+          "request_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Request Key"
+          },
+          "source_label": {
+            "title": "Source Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "source_label"
+        ],
+        "title": "RequestContext",
+        "type": "object"
+      },
       "RuntimeObjectReferenceBindingRequest": {
         "additionalProperties": false,
         "properties": {
@@ -7646,6 +7748,17 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "RuntimeScaleControlRequest": {
         "additionalProperties": false,
         "properties": {
+          "application_start_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Application Start Id"
+          },
           "expected_control_generation": {
             "maximum": 9007199254740991.0,
             "minimum": 0.0,
@@ -7653,7 +7766,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "integer"
           },
           "request_context": {
-            "$ref": "#/$defs/CallerAttributionRequest"
+            "$ref": "#/$defs/RequestContext"
           },
           "scale": {
             "maximum": 1.0,
@@ -7857,78 +7970,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "StopComponentTargetRequest",
         "type": "object"
       },
-      "StopIntentRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "components": {
-            "anyOf": [
-              {
-                "items": {
-                  "$ref": "#/$defs/StopComponentTargetRequest"
-                },
-                "maxItems": 4096,
-                "minItems": 1,
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Components"
-          },
-          "operations": {
-            "anyOf": [
-              {
-                "items": {
-                  "$ref": "#/$defs/StopOperationTargetRequest"
-                },
-                "maxItems": 4096,
-                "minItems": 1,
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Operations"
-          },
-          "reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Reason"
-          },
-          "request_context": {
-            "$ref": "#/$defs/CallerAttributionRequest"
-          },
-          "resources": {
-            "anyOf": [
-              {
-                "items": {
-                  "$ref": "#/$defs/StopResourceTargetRequest"
-                },
-                "maxItems": 4096,
-                "minItems": 1,
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Resources"
-          }
-        },
-        "required": [
-          "request_context"
-        ],
-        "title": "StopIntentRequest",
-        "type": "object"
-      },
       "StopOperationTargetRequest": {
         "additionalProperties": false,
         "properties": {
@@ -7938,21 +7979,16 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expected Operation Revision",
             "type": "integer"
           },
-          "expected_stop_generation": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expected Stop Generation",
-            "type": "integer"
-          },
           "operation_id": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
             "title": "Operation Id",
-            "type": "string"
+            "type": "integer"
           }
         },
         "required": [
           "operation_id",
-          "expected_operation_revision",
-          "expected_stop_generation"
+          "expected_operation_revision"
         ],
         "title": "StopOperationTargetRequest",
         "type": "object"
@@ -7970,12 +8006,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expected Operation Resource Generation",
             "type": "integer"
           },
-          "expected_stop_generation": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expected Stop Generation",
-            "type": "integer"
-          },
           "resource_id": {
             "title": "Resource Id",
             "type": "string"
@@ -7984,8 +8014,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "required": [
           "resource_id",
           "expected_graph_revision",
-          "expected_operation_resource_generation",
-          "expected_stop_generation"
+          "expected_operation_resource_generation"
         ],
         "title": "StopResourceTargetRequest",
         "type": "object"
@@ -8170,6 +8199,24 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               "operation_id"
             ],
             "type": "object"
+          },
+          "query": {
+            "additionalProperties": false,
+            "properties": {
+              "application_start_id": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Application Start Id"
+              }
+            },
+            "required": [],
+            "type": "object"
           }
         },
         "required": [
@@ -8220,7 +8267,87 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "string"
           },
           "body": {
-            "$ref": "#/$defs/StopIntentRequest"
+            "additionalProperties": false,
+            "properties": {
+              "application_start_id": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Application Start Id"
+              },
+              "components": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "$ref": "#/$defs/StopComponentTargetRequest"
+                    },
+                    "maxItems": 4096,
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Components"
+              },
+              "operations": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "$ref": "#/$defs/StopOperationTargetRequest"
+                    },
+                    "maxItems": 4096,
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Operations"
+              },
+              "reason": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Reason"
+              },
+              "request_context": {
+                "$ref": "#/$defs/RequestContext"
+              },
+              "resources": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "$ref": "#/$defs/StopResourceTargetRequest"
+                    },
+                    "maxItems": 4096,
+                    "minItems": 1,
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Resources"
+              }
+            },
+            "required": [
+              "request_context"
+            ],
+            "title": "StopIntentRequest",
+            "type": "object"
           }
         },
         "required": [
@@ -8231,14 +8358,25 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       {
         "additionalProperties": false,
-        "description": "POST /api/execution/full-stop",
+        "description": "POST /api/execution/stop-all",
         "properties": {
           "action": {
-            "const": "full_stop",
+            "const": "stop_all",
             "type": "string"
           },
           "body": {
-            "$ref": "#/$defs/FullStopIntentRequest"
+            "additionalProperties": false,
+            "description": "Body of Stop all and Halt: names no run and no operation, so it\ncarries no ``A``.",
+            "properties": {
+              "request_context": {
+                "$ref": "#/$defs/RequestContext"
+              }
+            },
+            "required": [
+              "request_context"
+            ],
+            "title": "FullStopIntentRequest",
+            "type": "object"
           }
         },
         "required": [
@@ -8342,7 +8480,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
 
 ## manyforge_session
 
-Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.
+Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `revert` returns at acceptance with the Apply's row (`manyforge.apply_command_reply.v1`). The outcome is that row's `end` (null while it runs) in `apply_commands` of `apply_status`, found by `request_key`; it ends once the Manager accepted the Apply, named by the row's `step_source`.
 
 ```json
 {
@@ -8352,12 +8490,16 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     "openWorldHint": false,
     "readOnlyHint": false
   },
-  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
+  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema. `revert` returns at acceptance with the Apply's row (`manyforge.apply_command_reply.v1`). The outcome is that row's `end` (null while it runs) in `apply_commands` of `apply_status`, found by `request_key`; it ends once the Manager accepted the Apply, named by the row's `step_source`.",
   "inputSchema": {
     "$defs": {
       "DiscardDraftRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "draftId": {
             "maxLength": 256,
             "minLength": 1,
@@ -8388,16 +8530,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expectedworkspacerevision",
             "type": "integer"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -8405,8 +8539,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision"
         ],
@@ -8416,6 +8550,10 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "RevertDraftRequest": {
         "additionalProperties": false,
         "properties": {
+          "applicationStartId": {
+            "title": "Applicationstartid",
+            "type": "string"
+          },
           "draftId": {
             "maxLength": 256,
             "minLength": 1,
@@ -8446,16 +8584,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Expectedworkspacerevision",
             "type": "integer"
           },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
+          "requestKey": {
+            "title": "Requestkey",
             "type": "string"
           }
         },
@@ -8463,8 +8593,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "draftId",
           "expectedDraftRevision",
           "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
+          "applicationStartId",
+          "requestKey",
           "expectedWorkspaceEpoch",
           "expectedWorkspaceRevision"
         ],
@@ -8520,6 +8650,20 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "required": [
           "action",
           "body"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "GET /api/deployment/workspace",
+        "properties": {
+          "action": {
+            "const": "apply_status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
         ],
         "type": "object"
       }

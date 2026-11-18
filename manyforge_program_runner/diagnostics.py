@@ -128,6 +128,6 @@ class ProgramDiagnosticPublisher:
             self._condition.notify_all()
             thread = self._thread
         if thread is not None:
-            thread.join(timeout=2.0)
-            if thread.is_alive():
-                raise RuntimeError("Program diagnostic transport exceeded its shutdown bound")
+            # The one in-flight delivery ends by Headless's answer or by its
+            # connection failing; no time limit decides it (OD-309).
+            thread.join()

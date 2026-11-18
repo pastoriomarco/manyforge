@@ -30,7 +30,7 @@ struct OperationControlEffectHandle final {
 /// subordinate effect and is settled by the aggregate owner directly.
 struct OperationControlEffectRequest final {
   IResolvedParticipantExecutionEngine* engine{};
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationParticipantId participant_id;
   OperationRevision operation_revision{0U};
   OperationControlKind control{OperationControlKind::kReset};
@@ -41,7 +41,7 @@ struct OperationControlEffectRequest final {
 };
 
 struct OperationControlEffectResult final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationParticipantId participant_id;
   OperationRevision operation_revision{0U};
   OperationControlKind control{OperationControlKind::kReset};
@@ -121,11 +121,20 @@ class BoundedOperationControlExecutor final {
   [[nodiscard]] bool prequalified_ready() const noexcept;
   /// Includes completion callbacks after their result slot was released.
   [[nodiscard]] bool has_active_calls() const noexcept;
-  /// Under the Kernel's configuration fence, retain workers for unchanged
-  /// engines and retire/add only changed lanes. No effect or unreleased handle
-  /// may be present; a refusal leaves the old set intact.
-  [[nodiscard]] OperationControlLaneUpdateStatus ReconfigureEngines(
-      std::vector<IResolvedParticipantExecutionEngine*> engines) noexcept;
+  /// A lane update retains workers for unchanged engines and retires/adds only
+  /// changed lanes, in three steps so that no thread is started or joined
+  /// under a Kernel lock. One update at a time (the Kernel's lane
+  /// reconfiguration flag and its submission lock).
+  /// StageEngines (before the Kernel state lock): starts the workers of the
+  /// lanes `engines` adds and waits until each runs; nothing is published.
+  void StageEngines(std::vector<IResolvedParticipantExecutionEngine*> engines) noexcept;
+  /// CommitStagedEngines (under the Kernel state lock, memory only): no effect
+  /// or unreleased handle may be present; swaps the staged lanes in and moves
+  /// the retired ones out. A refusal leaves the old set intact.
+  [[nodiscard]] OperationControlLaneUpdateStatus CommitStagedEngines() noexcept;
+  /// ReleaseLaneUpdate (after the Kernel state lock): stops and joins the
+  /// retired lanes and any staged lane the commit did not use.
+  void ReleaseLaneUpdate() noexcept;
   [[nodiscard]] OperationControlEffectStartResult TryStart(
       OperationControlEffectRequest request) noexcept;
   [[nodiscard]] OperationControlEffectTakeResult TryTake(

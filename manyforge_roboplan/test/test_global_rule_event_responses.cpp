@@ -20,7 +20,7 @@ std::shared_ptr<core::IoActivationRuleCatalogDTO> Catalog() {
     throw std::runtime_error("projection condition fixture refused");
   auto catalog = std::make_shared<core::IoActivationRuleCatalogDTO>(
       core::IoActivationRuleCatalogDTO{
-          {core::RequestOwnerEpoch("kernel.owner"), UINT64_MAX,
+          {UINT64_MAX,
            core::ActiveBundlePublicationGeneration(3U),
            core::RetainedBundleId("bundle.actual"),
            core::GraphRevision("graph.actual")},
@@ -40,8 +40,7 @@ std::shared_ptr<core::IoActivationRuleCatalogDTO> Catalog() {
 std::shared_ptr<core::IoRuleWaitingForProgramCatalogDTO> WaitingCatalog() {
   return std::make_shared<core::IoRuleWaitingForProgramCatalogDTO>(
       core::IoRuleWaitingForProgramCatalogDTO{
-          {core::RequestOwnerEpoch("kernel.owner"),
-           core::ActiveBundlePublicationGeneration(3U),
+          {core::ActiveBundlePublicationGeneration(3U),
            core::RetainedBundleId("bundle.actual"),
            core::GraphRevision("graph.actual")},
           {{core::InterruptPolicyId("global.waiting"), nullptr, {},
@@ -62,11 +61,10 @@ TEST(GlobalRuleEventResponseTest,
   const auto fields = InterruptRuleEventMetadataFields(
       core::IoRuleStateProjectionDTO{
           core::IoRuleStateProjectionStatusDTO::kPending, std::nullopt,
-          catalog},
-      catalog->context.owner_epoch);
+          catalog});
   EXPECT_EQ(fields.size(), 2U);
   const auto &metadata = Field(fields, "interrupt_rule_catalog");
-  EXPECT_EQ(metadata.as_object().size(), 7U);
+  EXPECT_EQ(metadata.as_object().size(), 6U);
   EXPECT_EQ(metadata.find_object_member("catalog_generation")->as_string(),
             "18446744073709551615");
   EXPECT_EQ(
@@ -87,27 +85,25 @@ TEST(GlobalRuleEventResponseTest,
   EXPECT_EQ(pending.find_object_member("snapshot"), nullptr);
 }
 TEST(GlobalRuleEventResponseTest,
-     ReadyUsesExactCutAndPreservesActualCausalCursor) {
+     ReadyCarriesTheStatesWithoutACutAndPreservesActualCausalCursor) {
   const auto catalog = Catalog();
   const core::InterruptSourceId source("program.blackboard");
   core::IoRuleStateBaselineDTO baseline{
       catalog->context,
-      9U,
       {{catalog->rules.front().policy_id, core::IoGlobalRuleState::kTripped,
         core::IoRuleAcquisitionKeyDTO{
             source,
             core::IoSourceIncarnation("bb.epoch"),
             UINT64_MAX,
-            {catalog->context.owner_epoch, UINT64_MAX, source, UINT64_MAX}}}}};
+            {UINT64_MAX, source, UINT64_MAX}}}}};
   const auto fields = InterruptRuleEventMetadataFields(
       core::IoRuleStateProjectionDTO{
-          core::IoRuleStateProjectionStatusDTO::kReady, baseline, catalog},
-      catalog->context.owner_epoch);
+          core::IoRuleStateProjectionStatusDTO::kReady, baseline, catalog});
   const auto &ready = Field(fields, "interrupt_rule_state_baseline");
   EXPECT_EQ(ready.find_object_member("status")->as_string(), "ready");
   const auto &snapshot = *ready.find_object_member("snapshot");
-  EXPECT_EQ(snapshot.as_object().size(), 7U);
-  EXPECT_EQ(snapshot.find_object_member("through_sequence")->as_number(), 9.0);
+  EXPECT_EQ(snapshot.as_object().size(), 5U);
+  EXPECT_EQ(snapshot.find_object_member("through_sequence"), nullptr);
   const auto &row = snapshot.find_object_member("states")->as_array().front();
   EXPECT_EQ(row.find_object_member("state")->as_string(), "tripped");
   const auto &acquired = *row.find_object_member("triggering_acquisition");
@@ -121,20 +117,17 @@ TEST(GlobalRuleEventResponseTest,
 TEST(GlobalRuleEventResponseTest,
      VerifiedEmptyUsesOnlyActualAppliedContextWithoutCatalogOrBaseline) {
   const core::IoRuleAppliedContextDTO context{
-      core::RequestOwnerEpoch("kernel.owner"),
       core::ActiveBundlePublicationGeneration(9'007'199'254'740'991ULL),
       core::RetainedBundleId("bundle.actual"),
       core::GraphRevision("graph.actual")};
   core::IoRuleStateProjectionDTO empty{
       core::IoRuleStateProjectionStatusDTO::kReady, std::nullopt, {}, context};
   const auto fields =
-      InterruptRuleEventMetadataFields(empty, context.owner_epoch);
+      InterruptRuleEventMetadataFields(empty);
   const auto &metadata = Field(fields, "interrupt_rule_catalog");
-  ASSERT_EQ(metadata.as_object().size(), 5U);
+  ASSERT_EQ(metadata.as_object().size(), 4U);
   EXPECT_EQ(metadata.find_object_member("status")->as_string(),
             "verified_empty");
-  EXPECT_EQ(metadata.find_object_member("owner_epoch")->as_string(),
-            "kernel.owner");
   EXPECT_EQ(
       metadata.find_object_member("active_publication_generation")->as_number(),
       9'007'199'254'740'991.0);
@@ -144,66 +137,53 @@ TEST(GlobalRuleEventResponseTest,
   EXPECT_TRUE(Field(fields, "interrupt_rule_state_baseline").is_null());
   EXPECT_EQ(metadata.find_object_member("catalog_generation"), nullptr);
   EXPECT_EQ(metadata.find_object_member("rule_ids"), nullptr);
-  EXPECT_THROW((void)InterruptRuleEventMetadataFields(
-                   empty, core::RequestOwnerEpoch("foreign")),
-               std::exception);
+  // A verified-empty product is never pending.
   empty.status = core::IoRuleStateProjectionStatusDTO::kPending;
-  const auto pending = InterruptRuleEventMetadataFields(empty, context.owner_epoch);
-  EXPECT_EQ(Field(pending, "interrupt_rule_catalog"), metadata);
-  const auto &pending_baseline = Field(pending, "interrupt_rule_state_baseline");
-  ASSERT_EQ(pending_baseline.as_object().size(), 1U);
-  EXPECT_EQ(pending_baseline.find_object_member("status")->as_string(),
-            "projection_pending");
-  EXPECT_EQ(pending_baseline.find_object_member("snapshot"), nullptr);
+  EXPECT_THROW((void)InterruptRuleEventMetadataFields(empty), std::exception);
   empty.status = static_cast<core::IoRuleStateProjectionStatusDTO>(255);
-  EXPECT_THROW((void)InterruptRuleEventMetadataFields(empty, context.owner_epoch),
+  EXPECT_THROW((void)InterruptRuleEventMetadataFields(empty),
                std::exception);
   empty.status = core::IoRuleStateProjectionStatusDTO::kReady;
   empty.catalog = Catalog();
   EXPECT_THROW(
-      (void)InterruptRuleEventMetadataFields(empty, context.owner_epoch),
+      (void)InterruptRuleEventMetadataFields(empty),
       std::exception);
   empty.catalog.reset();
-  empty.baseline = core::IoRuleStateBaselineDTO{Catalog()->context, 0U, {}};
+  empty.baseline = core::IoRuleStateBaselineDTO{Catalog()->context, {}};
   EXPECT_THROW(
-      (void)InterruptRuleEventMetadataFields(empty, context.owner_epoch),
+      (void)InterruptRuleEventMetadataFields(empty),
       std::exception);
   empty.baseline.reset();
   empty.verified_empty->active_publication_generation =
       core::ActiveBundlePublicationGeneration(0U);
   EXPECT_THROW(
-      (void)InterruptRuleEventMetadataFields(empty, context.owner_epoch),
+      (void)InterruptRuleEventMetadataFields(empty),
       std::exception);
   empty.verified_empty->active_publication_generation =
       core::ActiveBundlePublicationGeneration(9'007'199'254'740'992ULL);
   EXPECT_THROW(
-      (void)InterruptRuleEventMetadataFields(empty, context.owner_epoch),
+      (void)InterruptRuleEventMetadataFields(empty),
       std::exception);
   empty.verified_empty = context;
   empty.verified_empty->retained_bundle_id = core::RetainedBundleId("");
   EXPECT_THROW(
-      (void)InterruptRuleEventMetadataFields(empty, context.owner_epoch),
+      (void)InterruptRuleEventMetadataFields(empty),
       std::exception);
 }
 TEST(GlobalRuleEventResponseTest,
      NullMeansOnlyAbsentCatalogAndMixedSnapshotsRefuse) {
   const auto catalog = Catalog();
   const auto absent = InterruptRuleEventMetadataFields(
-      std::nullopt, catalog->context.owner_epoch);
+      std::nullopt);
   EXPECT_TRUE(Field(absent, "interrupt_rule_catalog").is_null());
   EXPECT_TRUE(Field(absent, "interrupt_rule_state_baseline").is_null());
   core::IoRuleStateProjectionDTO pending{
       core::IoRuleStateProjectionStatusDTO::kPending, std::nullopt, {}};
   EXPECT_THROW((void)InterruptRuleEventMetadataFields(
-                   pending, catalog->context.owner_epoch),
-               std::exception);
-  pending.catalog = catalog;
-  EXPECT_THROW((void)InterruptRuleEventMetadataFields(
-                   pending, core::RequestOwnerEpoch("foreign")),
+                   pending),
                std::exception);
   core::IoRuleStateBaselineDTO baseline{
       catalog->context,
-      0U,
       {{catalog->rules.front().policy_id, core::IoGlobalRuleState::kClear,
         std::nullopt}}};
   baseline.context.active_publication_generation =
@@ -211,16 +191,14 @@ TEST(GlobalRuleEventResponseTest,
   EXPECT_THROW(
       (void)InterruptRuleEventMetadataFields(
           core::IoRuleStateProjectionDTO{
-              core::IoRuleStateProjectionStatusDTO::kReady, baseline, catalog},
-          catalog->context.owner_epoch),
+              core::IoRuleStateProjectionStatusDTO::kReady, baseline, catalog}),
       std::exception);
   baseline.context = catalog->context;
   baseline.states.clear();
   EXPECT_THROW(
       (void)InterruptRuleEventMetadataFields(
           core::IoRuleStateProjectionDTO{
-              core::IoRuleStateProjectionStatusDTO::kReady, baseline, catalog},
-          catalog->context.owner_epoch),
+              core::IoRuleStateProjectionStatusDTO::kReady, baseline, catalog}),
       std::exception);
 }
 TEST(GlobalRuleEventResponseTest,
@@ -229,15 +207,12 @@ TEST(GlobalRuleEventResponseTest,
   const auto fields = InterruptRuleEventMetadataFields(
       core::IoRuleStateProjectionDTO{
           core::IoRuleStateProjectionStatusDTO::kPending, std::nullopt, {},
-          std::nullopt, waiting},
-      waiting->context.owner_epoch);
+          std::nullopt, waiting});
   ASSERT_EQ(fields.size(), 2U);
   const auto &metadata = Field(fields, "interrupt_rule_catalog");
-  ASSERT_EQ(metadata.as_object().size(), 7U);
+  ASSERT_EQ(metadata.as_object().size(), 6U);
   EXPECT_EQ(metadata.find_object_member("status")->as_string(),
             "waiting_for_program");
-  EXPECT_EQ(metadata.find_object_member("owner_epoch")->as_string(),
-            waiting->context.owner_epoch.value());
   EXPECT_EQ(metadata.find_object_member("active_publication_generation")
                 ->as_number(),
             3.0);
@@ -277,7 +252,7 @@ TEST(GlobalRuleEventResponseTest,
       std::nullopt, waiting};
   const auto refused = [&] {
     EXPECT_THROW((void)InterruptRuleEventMetadataFields(
-                     projection, waiting->context.owner_epoch),
+                     projection),
                  std::exception);
   };
   projection.status = core::IoRuleStateProjectionStatusDTO::kReady;
@@ -289,7 +264,7 @@ TEST(GlobalRuleEventResponseTest,
   projection.verified_empty = waiting->context;
   refused();
   projection.verified_empty.reset();
-  projection.baseline = core::IoRuleStateBaselineDTO{Catalog()->context, 0U, {}};
+  projection.baseline = core::IoRuleStateBaselineDTO{Catalog()->context, {}};
   refused();
   projection.baseline.reset();
   waiting->rules.front().waiting_for_program_keys = {"ready", "permit"};
@@ -305,9 +280,6 @@ TEST(GlobalRuleEventResponseTest,
       core::InterruptSourceId("source.requires.service")};
   refused();
   waiting->rules.front().required_signal_sources.clear();
-  EXPECT_THROW((void)InterruptRuleEventMetadataFields(
-                   projection, core::RequestOwnerEpoch("foreign.owner")),
-               std::exception);
 }
 
 TEST(GlobalRuleEventResponseTest,
@@ -335,9 +307,9 @@ TEST(GlobalRuleEventResponseTest,
   core::IoRuleStateProjectionDTO projection{
       core::IoRuleStateProjectionStatusDTO::kPending, std::nullopt, catalog};
   const auto fields = InterruptRuleEventMetadataFields(
-      projection, catalog->context.owner_epoch);
+      projection);
   const auto &metadata = Field(fields, "interrupt_rule_catalog");
-  ASSERT_EQ(metadata.as_object().size(), 8U);
+  ASSERT_EQ(metadata.as_object().size(), 7U);
   EXPECT_EQ(metadata.find_object_member("status"), nullptr);
   EXPECT_EQ(metadata.find_object_member("catalog_generation")->as_string(),
             "18446744073709551615");
@@ -364,11 +336,11 @@ TEST(GlobalRuleEventResponseTest,
   // the separately checked signal sibling already has qualified state.
   projection.status = core::IoRuleStateProjectionStatusDTO::kReady;
   projection.baseline = core::IoRuleStateBaselineDTO{
-      catalog->context, 0U,
+      catalog->context,
       {{catalog->rules[0].policy_id, core::IoGlobalRuleState::kClear, std::nullopt},
        {catalog->rules[1].policy_id, core::IoGlobalRuleState::kClear, std::nullopt}}};
   EXPECT_THROW((void)InterruptRuleEventMetadataFields(
-                   projection, catalog->context.owner_epoch),
+                   projection),
                std::exception);
 }
 
@@ -376,14 +348,11 @@ TEST(GlobalRuleEventResponseTest, NotifyUnknownIncludesTypedReasonAndCatalogIden
   const auto catalog = Catalog();
   catalog->rules.front().on_trip = core::IoRuleOnTripDTO::kNotify;
   core::IoRuleStateBaselineDTO baseline{
-      catalog->context, 2U,
+      catalog->context,
       {{catalog->rules.front().policy_id, core::IoGlobalRuleState::kUnknown,
         std::nullopt, core::ErrorDTO{"io_watch_bound_exceeded", "watch unavailable", {{"limit", "4"}}}}}};
   const auto fields = InterruptRuleEventMetadataFields(
-      core::IoRuleStateProjectionDTO{core::IoRuleStateProjectionStatusDTO::kReady, baseline, catalog},
-      catalog->context.owner_epoch);
-  const auto &metadata = Field(fields, "interrupt_rule_catalog");
-  EXPECT_EQ(metadata.find_object_member("notify_rule_ids")->as_array().front().as_string(), "global.door");
+      core::IoRuleStateProjectionDTO{core::IoRuleStateProjectionStatusDTO::kReady, baseline, catalog});
   const auto &row = Field(fields, "interrupt_rule_state_baseline")
                         .find_object_member("snapshot")->find_object_member("states")->as_array().front();
   EXPECT_EQ(row.find_object_member("state")->as_string(), "unknown");

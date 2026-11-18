@@ -12,9 +12,9 @@ import py_trees
 
 @dataclass(frozen=True, slots=True)
 class OperatorMotionStopSnapshot:
-    """Scheduling-only projection of one current Kernel selection revision."""
+    """Scheduling-only projection of the Kernel's holds at one hold revision."""
 
-    selection_revision: int = 0
+    hold_revision: int = 0
     held_nodes: frozenset[str] = frozenset()
     stopping_nodes: frozenset[str] = frozenset()
     faulted_nodes: frozenset[str] = frozenset()
@@ -70,8 +70,8 @@ class OperatorMotionStopState:
     ) -> None:
         if (
             not isinstance(snapshot, OperatorMotionStopSnapshot)
-            or type(snapshot.selection_revision) is not int
-            or snapshot.selection_revision < 0
+            or type(snapshot.hold_revision) is not int
+            or snapshot.hold_revision < 0
             or not isinstance(snapshot.held_nodes, frozenset)
             or not snapshot.held_nodes <= self._node_ids
             or not isinstance(snapshot.ready_nodes, frozenset)
@@ -84,14 +84,16 @@ class OperatorMotionStopState:
         ):
             raise ValueError("operator Stop projection is outside its captured scope")
         with self._lock:
-            if self._initial_ready_nodes is None and snapshot.selection_revision == 0:
-                self._initial_ready_nodes = snapshot.ready_nodes
             first_snapshot = not self._has_snapshot
+            if first_snapshot:
+                # The hold revision counts for the whole application start:
+                # the run's first published view is its initial one.
+                self._initial_ready_nodes = snapshot.ready_nodes
             self._has_snapshot = True
             if not first_snapshot:
-                if snapshot.selection_revision < self._snapshot.selection_revision:
+                if snapshot.hold_revision < self._snapshot.hold_revision:
                     return
-                if snapshot.selection_revision == self._snapshot.selection_revision:
+                if snapshot.hold_revision == self._snapshot.hold_revision:
                     if snapshot.held_nodes != self._snapshot.held_nodes:
                         raise ValueError(
                             "operator Stop projection changed without a revision"
@@ -100,7 +102,7 @@ class OperatorMotionStopState:
                         raise ValueError("operator hold cause changed without a revision")
                     # Within one selection, settlement is monotonic. A crossing
                     # older read cannot put settled work back into Stopping or
-                    # erase a fault. Release/reset has a new selection revision.
+                    # erase a fault. Release/reset has a new hold revision.
                     if (
                         not snapshot.stopping_nodes
                         <= self._snapshot.stopping_nodes

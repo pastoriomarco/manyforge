@@ -1,46 +1,16 @@
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
 #include <manyforge_core/types/operation_runtime.hpp>
-#include <manyforge_core/types/prepared_participant_stop_plan.hpp>
 #include <optional>
 #include <span>
 #include <string_view>
-#include <variant>
 #include <vector>
 
 namespace manyforge::core {
 
-inline constexpr std::size_t kMaximumStopScopeSnapshotOperations = 4096U;
-// One bounded fence per maximum retained request, plus current and crossing
-// Program-run identities that may not yet have an operation row.
-inline constexpr std::size_t kMaximumStopScopeSnapshotProgramRuns = 4098U;
-inline constexpr std::size_t kMaximumStopScopeSnapshotComponents = 4096U;
-inline constexpr std::size_t kMaximumStopScopeSnapshotResources = 4096U;
-inline constexpr std::size_t kMaximumStopScopeMembershipRows = 65536U;
-
-/// One immutable Kernel-owned operation row used only for bounded Stop-scope
-/// resolution. Any operation that can still have an effect must carry its
-/// complete current component/resource closure.
-struct StopScopeOperationSnapshotDTO final {
-  OperationId operation_id;
-  ProgramRunId program_run_id;
-  OperationRevision operation_revision;
-  StopGeneration stop_generation;
-  OperationStateKind state{OperationStateKind::kResolving};
-  bool scope_complete{};
-  bool effect_uncertain{};
-  std::vector<ControllableComponentId> controllable_components;
-  std::vector<ResourceId> resources;
-  /// Exact Kernel-owned attachment; manual work retains its own Run identity.
-  std::optional<ProgramRunId> parent_program_run_id{};
-
-  friend bool operator==(const StopScopeOperationSnapshotDTO&,
-                         const StopScopeOperationSnapshotDTO&) = default;
-};
-
-/// Current commandable-resource membership of one semantic component.
+/// Current commandable-resource membership of one semantic component (the
+/// Kernel's component scope, sorted by component id).
 struct StopScopeComponentSnapshotDTO final {
   ControllableComponentId controllable_component_id;
   ComponentLifecycleGeneration component_lifecycle_generation;
@@ -50,128 +20,48 @@ struct StopScopeComponentSnapshotDTO final {
                          const StopScopeComponentSnapshotDTO&) = default;
 };
 
-/// Current resource row. `effect_uncertain` covers retained external/orphan
-/// work that must remain containable even when no live operation row owns it.
-struct StopScopeResourceSnapshotDTO final {
-  ResourceId resource_id;
-  StopGeneration stop_generation;
-  bool effect_uncertain{};
-
-  friend bool operator==(const StopScopeResourceSnapshotDTO&,
-                         const StopScopeResourceSnapshotDTO&) = default;
+/// Stop target resolution (stop state model §3.2 S4, §5.4). Pure,
+/// allocation-free: the Kernel calls it under its lock while it walks its own
+/// resident operations, so no snapshot is built.
+enum class StopTargetResolution : std::uint8_t {
+  /// The target names current scope with current metadata.
+  kExact = 0,
+  /// The target's expected operation revision is old: its current scope is
+  /// stopped and a stale diagnostic is reported.
+  kStaleMetadata,
+  /// The target is known and terminal: nothing to contain for it.
+  kNoEffect,
+  /// The target names nothing known: the request is invalid (PD-1 widening).
+  kUnknown,
 };
 
-/// One same-host immutable capture. Multi-host fan-out can later aggregate
-/// equivalent owner captures without changing public semantic selectors.
-struct StopScopeResolverSnapshotDTO final {
-  RequestOwnerEpoch request_owner_epoch;
-  GraphRevision graph_revision;
-  std::uint64_t operation_resource_generation{};
-  StopGeneration cell_stop_generation;
-  std::vector<StopScopeOperationSnapshotDTO> operations;
-  std::vector<StopScopeComponentSnapshotDTO> components;
-  std::vector<StopScopeResourceSnapshotDTO> resources;
-  /// Program runs already published by the Program owner or currently
-  /// crossing Execute admission. This lets an exact run-scoped Stop close an
-  /// idle/pending run without treating its absence from the operation table
-  /// as an unknown selector.
-  std::vector<ProgramRunId> known_program_runs;
+/// The field that makes a parsed Stop intent unusable as a normalized
+/// request (its reason text excepted), or nullopt. Such a request is widened
+/// (`StopWidenReason::kMalformed`). Called by the Kernel entries before the
+/// Kernel lock is taken.
+[[nodiscard]] std::optional<std::string_view> NormalizedStopIntentFieldError(
+    const StopIntentDTO& intent);
 
-  friend bool operator==(const StopScopeResolverSnapshotDTO&,
-                         const StopScopeResolverSnapshotDTO&) = default;
-};
+/// An operation needs containment when it is not terminal, or terminal with
+/// an uncertain effect (`requires_containment`, unchanged).
+[[nodiscard]] bool stop_requires_containment(OperationStateKind state,
+                                             bool effect_uncertain) noexcept;
 
-struct StopScopeResolutionDTO final {
-  StopResolutionDispositionDTO disposition{StopResolutionDispositionDTO::kExact};
-  StopScopeResolutionReasonDTO reason{StopScopeResolutionReasonDTO::kExactCurrentScope};
-  bool full_stop{};
-  std::vector<OperationId> operations;
-  std::vector<ControllableComponentId> controllable_components;
-  std::vector<ResourceId> resources;
-  std::vector<StopScopeStaleDiagnosticDTO> stale_diagnostics;
+/// One operation target against the operation it names: `current_revision`
+/// is the resident operation's revision (absent when not resident),
+/// `known_historical` whether it is in the retained history.
+[[nodiscard]] StopTargetResolution classify_stop_operation_target(
+    const StopOperationTargetDTO& target, std::optional<OperationRevision> current_revision,
+    bool requires_containment, bool known_historical) noexcept;
 
-  friend bool operator==(const StopScopeResolutionDTO&, const StopScopeResolutionDTO&) = default;
-};
+/// The component in the Kernel's sorted component scope, or null.
+[[nodiscard]] const StopScopeComponentSnapshotDTO* find_stop_component(
+    std::span<const StopScopeComponentSnapshotDTO> components,
+    const ControllableComponentId& component) noexcept;
 
-/// One exact predecessor supplied to aggregate acceptance construction. The
-/// acceptance is immutable owner truth.
-struct StopAcceptedPredecessorInput final {
-  StopAcceptedDTO acceptance;
-};
-
-/// Validates the immutable resolution snapshot, including complete scope for
-/// every nonterminal or effect-uncertain operation and unique component
-/// ownership of every commandable resource.
-[[nodiscard]] std::optional<std::string_view> stop_scope_snapshot_field_error(
-    const StopScopeResolverSnapshotDTO& snapshot);
-
-/// Pure bounded ordinary-Stop resolution. Malformed normalized ordinary
-/// intent is conservatively promoted; an invalid owner snapshot is an
-/// invariant error and cannot be used to issue any effect.
-[[nodiscard]] Result<StopScopeResolutionDTO> resolve_stop_scope(
-    const StopIntentDTO& intent, const StopScopeResolverSnapshotDTO& snapshot);
-
-/// Pure bounded Full-Stop capture over all current nonterminal/effect-
-/// uncertain work in the same immutable snapshot.
-[[nodiscard]] Result<StopScopeResolutionDTO> resolve_full_stop_scope(
-    const FullStopIntentDTO& intent, const StopScopeResolverSnapshotDTO& snapshot);
-
-/// Canonical content identities used by the emergency acceptance reserve and
-/// immutable StopAcceptedDTO. The selector digest covers only the requested
-/// semantic selector/expectations, never request attribution or diagnostics.
-[[nodiscard]] Result<ContentDigest> ComputeRequestedStopSelectorDigest(const StopIntentDTO& intent);
-[[nodiscard]] Result<ContentDigest> ComputeRequestedStopSelectorDigest(
-    const FullStopIntentDTO& intent);
-[[nodiscard]] Result<ContentDigest> ComputeRequestedStopSelectorDigest(
-    const MalformedStopIngressDTO& ingress);
-
-/// Canonical identity of the complete normalized caller-owned Stop intent.
-/// Receiving-adapter attribution is compared separately by the emergency
-/// reserve and is deliberately not caller-controlled digest input.
-[[nodiscard]] Result<ContentDigest> ComputeNormalizedStopIntentDigest(const StopIntentDTO& intent);
-[[nodiscard]] Result<ContentDigest> ComputeNormalizedStopIntentDigest(
-    const FullStopIntentDTO& intent);
-
-/// Canonical digest of the exact resolved operation/component/resource capture
-/// and its scoped-vs-Full classification. Diagnostics and disposition do not
-/// alter the accepted physical scope identity.
-[[nodiscard]] Result<ContentDigest> ComputeCapturedStopScopeDigest(
-    const StopScopeResolutionDTO& resolution);
-
-/// Construct one immutable Stop acceptance from an already-resolved scope.
-/// The constructor derives both content identities. No Stop budget is
-/// accepted: each robot's deadlines come from its own profile and lane
-/// at stage dispatch.
-[[nodiscard]] Result<StopAcceptedDTO> MakeStopAccepted(
-    const StopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,
-    StopScopeResolutionDTO resolution,
-    std::vector<StopAffectedOperationRevisionDTO> affected_operation_revisions,
-    std::int64_t accepted_at_ns);
-
-[[nodiscard]] Result<StopAcceptedDTO> MakeStopAccepted(
-    const FullStopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,
-    StopScopeResolutionDTO resolution,
-    std::vector<StopAffectedOperationRevisionDTO> affected_operation_revisions,
-    std::int64_t accepted_at_ns);
-
-/// Construct one promoted aggregate Full Stop. Predecessor revisions are
-/// inherited exactly; only `newly_affected_operation_revisions` describe
-/// freshly fenced scope.
-[[nodiscard]] Result<StopAcceptedDTO> MakeAggregatedStopAccepted(
-    const StopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,
-    StopScopeResolutionDTO resolution,
-    std::vector<StopAffectedOperationRevisionDTO> newly_affected_operation_revisions,
-    std::int64_t accepted_at_ns, std::span<const StopAcceptedPredecessorInput> predecessors);
-
-[[nodiscard]] Result<StopAcceptedDTO> MakeAggregatedStopAccepted(
-    const FullStopIntentDTO& intent, StopId stop_id, StopGeneration stop_generation,
-    StopScopeResolutionDTO resolution,
-    std::vector<StopAffectedOperationRevisionDTO> newly_affected_operation_revisions,
-    std::int64_t accepted_at_ns, std::span<const StopAcceptedPredecessorInput> predecessors);
-
-/// Reuse the resolver's canonical diagnostic ordering after owner-local alias
-/// resolution adds stale caller metadata. This grants no scope authority.
-void canonicalize_stop_scope_stale_diagnostics(
-    std::vector<StopScopeStaleDiagnosticDTO>& diagnostics);
+/// The component of the applied cell that owns `resource`, or null (a
+/// resource target naming no commandable resource is unknown).
+[[nodiscard]] const StopScopeComponentSnapshotDTO* find_stop_resource_owner(
+    std::span<const StopScopeComponentSnapshotDTO> components, const ResourceId& resource) noexcept;
 
 }  // namespace manyforge::core

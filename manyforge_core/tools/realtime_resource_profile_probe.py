@@ -274,7 +274,18 @@ def _expected_policy(environment: Mapping[str, str]) -> str:
 def evaluate_composer(
     observation: ProcessObservation,
     environment: Mapping[str, str],
+    robots: int | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
+    """Check the execution host's real-time role threads and NRT confinement.
+
+    Every strict-profile scheduler has one real-time thread per required role;
+    each robot's collision-check scheduler adds one RuntimeSafety thread with
+    the same profile. A role thread is a thread of the role's name with
+    exactly the role's policy, priority and CPUs. Threads of the same name
+    with SCHED_OTHER are idle lanes: ordinary threads, confined like any other
+    to the NRT CPUs. With `robots` known, RuntimeSafety must have exactly one
+    thread per scheduler (the ControllerCommand count) plus one per robot.
+    """
     expected_nrt = _required_cpu_set(environment, "MANYFORGE_NRT_CPU_AFFINITY")
     policy = _expected_policy(environment)
     role_specs = {
@@ -303,26 +314,34 @@ def evaluate_composer(
     failures: list[str] = []
     role_evidence: dict[str, Any] = {}
     named_rt_threads: set[int] = set()
+    role_counts: dict[str, int] = {}
     for role, (thread_name, priority, affinity) in role_specs.items():
-        matches = [thread for thread in observation.threads if thread.name == thread_name]
-        if len(matches) != 1:
-            failures.append(
-                f"{role}: expected one {thread_name} thread, found {len(matches)}"
-            )
-            role_evidence[role] = {"expected_thread_name": thread_name, "actual": []}
-            continue
-        thread = matches[0]
-        named_rt_threads.add(thread.tid)
-        accepted = (
-            thread.policy == policy
+        named_rt = [
+            thread
+            for thread in observation.threads
+            if thread.name == thread_name and thread.policy != "SCHED_OTHER"
+        ]
+        accepted_threads = [
+            thread
+            for thread in named_rt
+            if thread.policy == policy
             and thread.priority == priority
             and thread.affinity == affinity
-        )
-        if not accepted:
+        ]
+        for thread in named_rt:
+            if thread not in accepted_threads:
+                failures.append(
+                    f"{role}: {thread_name}:{thread.tid} expected "
+                    f"{policy}/{priority}/{affinity}, got "
+                    f"{thread.policy}/{thread.priority}/{thread.affinity}"
+                )
+        if not accepted_threads:
             failures.append(
-                f"{role}: expected {policy}/{priority}/{affinity}, got "
-                f"{thread.policy}/{thread.priority}/{thread.affinity}"
+                f"{role}: expected a {thread_name} thread with "
+                f"{policy}/{priority}/{affinity}, found none"
             )
+        named_rt_threads.update(thread.tid for thread in accepted_threads)
+        role_counts[role] = len(accepted_threads)
         role_evidence[role] = {
             "expected": {
                 "thread_name": thread_name,
@@ -330,9 +349,26 @@ def evaluate_composer(
                 "priority": priority,
                 "affinity": list(affinity),
             },
-            "actual": asdict(thread),
-            "accepted": accepted,
+            "actual": [asdict(thread) for thread in named_rt],
+            "accepted": bool(accepted_threads) and len(accepted_threads) == len(named_rt),
         }
+    schedulers = role_counts["controller_command"]
+    if role_counts["stop_control"] != schedulers:
+        failures.append(
+            f"stop_control: expected one thread per scheduler ({schedulers}), "
+            f"found {role_counts['stop_control']}"
+        )
+    expected_safety = None if robots is None else schedulers + robots
+    if expected_safety is not None and role_counts["runtime_safety"] != expected_safety:
+        failures.append(
+            f"runtime_safety: expected {schedulers} scheduler thread(s) plus "
+            f"{robots} robot check thread(s), found {role_counts['runtime_safety']}"
+        )
+    elif role_counts["runtime_safety"] < schedulers:
+        failures.append(
+            f"runtime_safety: expected at least one thread per scheduler "
+            f"({schedulers}), found {role_counts['runtime_safety']}"
+        )
 
     # OD-59: the strict profile locks the execution host's memory.
     memory_locked = observation.locked_memory_bytes > 0
@@ -370,6 +406,9 @@ def evaluate_composer(
         )
     return failures, {
         "roles": role_evidence,
+        "schedulers": schedulers,
+        "robots": robots,
+        "robot_check_threads": role_counts["runtime_safety"] - schedulers,
         "expected_nrt_affinity": list(expected_nrt),
         "unexpected_rt_threads": [asdict(item) for item in unexpected_rt],
         "nrt_threads_outside_reservation": [
@@ -477,11 +516,12 @@ def build_evidence(
     target: str,
     observation: ProcessObservation,
     environment: Mapping[str, str],
+    robots: int | None = None,
 ) -> dict[str, Any]:
     if environment.get("MANYFORGE_RT_RESOURCE_PROFILE") != "strict":
         raise ValueError("target process does not declare the strict RT profile")
     if target == "composer":
-        failures, contract = evaluate_composer(observation, environment)
+        failures, contract = evaluate_composer(observation, environment, robots)
     elif target == "controller-manager":
         failures, contract = evaluate_controller_manager(observation, environment)
     else:
@@ -516,6 +556,12 @@ def main() -> int:
     selector = parser.add_mutually_exclusive_group(required=True)
     selector.add_argument("--pid", type=int)
     selector.add_argument("--command-line-token")
+    parser.add_argument(
+        "--robots",
+        type=int,
+        help="robots in the applied cell (composer): each has one RuntimeSafety "
+        "collision-check thread; without it, the count is reported, not checked",
+    )
     parser.add_argument("--json-only", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
@@ -524,10 +570,13 @@ def main() -> int:
         pid = args.pid or find_process(args.command_line_token)
         process_root = Path("/proc") / str(pid)
         environment = _read_environ(process_root / "environ")
+        if args.robots is not None and args.robots < 0:
+            raise ValueError("--robots must not be negative")
         evidence = build_evidence(
             args.target,
             observe_process(pid),
             environment,
+            args.robots,
         )
     except Exception as exc:  # noqa: BLE001 - malformed evidence fails closed.
         evidence = {

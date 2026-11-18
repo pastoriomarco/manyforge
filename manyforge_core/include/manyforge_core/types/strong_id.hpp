@@ -165,10 +165,7 @@ MANYFORGE_DECLARE_STRONG_STRING(CarriedObjectAttachmentId);
 MANYFORGE_DECLARE_STRONG_STRING(CarriedObjectAttachmentRevision);
 MANYFORGE_DECLARE_STRONG_STRING(ProjectionLeaseId);
 
-MANYFORGE_DECLARE_STRONG_STRING(RequestOwnerEpoch);
-MANYFORGE_DECLARE_STRONG_STRING(RequestId);
 MANYFORGE_DECLARE_STRONG_STRING(BootstrapId);
-MANYFORGE_DECLARE_STRONG_STRING(ApplyId);
 MANYFORGE_DECLARE_STRONG_STRING(LifecycleTransactionId);
 MANYFORGE_DECLARE_STRONG_STRING(LifecycleFactId);
 MANYFORGE_DECLARE_STRONG_STRING(ConfigurationFenceId);
@@ -181,19 +178,15 @@ MANYFORGE_DECLARE_STRONG_STRING(ChannelRoleId);
 MANYFORGE_DECLARE_STRONG_STRING(ProgramId);
 MANYFORGE_DECLARE_STRONG_STRING(ProgramRevision);
 MANYFORGE_DECLARE_STRONG_STRING(ProgramBindingId);
-MANYFORGE_DECLARE_STRONG_STRING(ProgramRunId);
 MANYFORGE_DECLARE_STRONG_STRING(MoveId);
 
-MANYFORGE_DECLARE_STRONG_STRING(OperationId);
-MANYFORGE_DECLARE_STRONG_STRING(OperationParticipantId);
 MANYFORGE_DECLARE_STRONG_STRING(ValidationRevision);
-MANYFORGE_DECLARE_STRONG_STRING(ControllerGoalId);
-MANYFORGE_DECLARE_STRONG_STRING(StopId);
-MANYFORGE_DECLARE_STRONG_STRING(StopCertificateId);
 
 MANYFORGE_DECLARE_STRONG_COUNTER(ProjectionStageGeneration);
 MANYFORGE_DECLARE_STRONG_COUNTER(ActiveBundlePublicationGeneration);
 MANYFORGE_DECLARE_STRONG_COUNTER(BootstrapGeneration);
+/// The Manager's Apply number, minted per application start (contract 1.16.1).
+MANYFORGE_DECLARE_STRONG_COUNTER(ApplyId);
 MANYFORGE_DECLARE_STRONG_COUNTER(ApplyGeneration);
 MANYFORGE_DECLARE_STRONG_COUNTER(LifecycleTransactionGeneration);
 MANYFORGE_DECLARE_STRONG_COUNTER(ComponentLifecycleGeneration);
@@ -202,11 +195,62 @@ MANYFORGE_DECLARE_STRONG_COUNTER(AdmissionGeneration);
 MANYFORGE_DECLARE_STRONG_COUNTER(CellAdmissionClaimGeneration);
 MANYFORGE_DECLARE_STRONG_COUNTER(ActiveControlConfigurationGeneration);
 MANYFORGE_DECLARE_STRONG_COUNTER(OperationRevision);
-MANYFORGE_DECLARE_STRONG_COUNTER(ControllerGoalGeneration);
-MANYFORGE_DECLARE_STRONG_COUNTER(StopGeneration);
-MANYFORGE_DECLARE_STRONG_COUNTER(StopCertificateRevision);
+/// Kernel-minted per-start numbers (OD-122 (14)): from 1, never 0 once minted.
+/// One accepted Stop request (stop state model §2.4): replaces the former
+/// Stop number and Stop generation.
+MANYFORGE_DECLARE_STRONG_COUNTER(StopEventId);
+MANYFORGE_DECLARE_STRONG_COUNTER(OperationNumber);
+MANYFORGE_DECLARE_STRONG_COUNTER(PreviewNumber);
+/// A Program run (contract 1.5): the Program runner's number, from 1, never
+/// 0 once minted. An operation without one is manual work.
+MANYFORGE_DECLARE_STRONG_COUNTER(ProgramRunNumber);
+/// A Program node attempt (contract 1.5): the behaviour layer's per-run
+/// counter, from 1, never 0 once minted.
+MANYFORGE_DECLARE_STRONG_COUNTER(NodeAttemptNumber);
 MANYFORGE_DECLARE_STRONG_COUNTER(RuntimeScaleGeneration);
 MANYFORGE_DECLARE_STRONG_COUNTER(RuntimeScaleControlGeneration);
+
+/// One participant of an operation (contract 1.5): the Kernel-minted
+/// operation number and the participant's ordinal in it, from 1. Trivially
+/// copyable, so goal callbacks and feedback paths copy it without allocating.
+struct OperationParticipantId final {
+  OperationNumber operation_id{0U};
+  std::uint32_t ordinal{0U};
+
+  [[nodiscard]] constexpr bool nonzero() const noexcept {
+    return operation_id.nonzero() && ordinal != 0U;
+  }
+  friend constexpr bool operator==(const OperationParticipantId&,
+                                   const OperationParticipantId&) = default;
+  friend constexpr auto operator<=>(const OperationParticipantId&,
+                                    const OperationParticipantId&) = default;
+};
+
+/// One controller goal of a participant (contract 1.5): the participant's
+/// operation number and ordinal, and the goal generation, from 1. A Stop
+/// replacement keeps the participant and takes the next generation.
+struct ControllerGoalId final {
+  OperationNumber operation_id{0U};
+  std::uint32_t ordinal{0U};
+  std::uint32_t generation{0U};
+
+  [[nodiscard]] constexpr OperationParticipantId participant() const noexcept {
+    return {operation_id, ordinal};
+  }
+  [[nodiscard]] constexpr bool nonzero() const noexcept {
+    return operation_id.nonzero() && ordinal != 0U && generation != 0U;
+  }
+  friend constexpr bool operator==(const ControllerGoalId&, const ControllerGoalId&) = default;
+  friend constexpr auto operator<=>(const ControllerGoalId&, const ControllerGoalId&) = default;
+};
+
+inline std::ostream& operator<<(std::ostream& stream, const OperationParticipantId& value) {
+  return stream << value.operation_id.value() << '/' << value.ordinal;
+}
+
+inline std::ostream& operator<<(std::ostream& stream, const ControllerGoalId& value) {
+  return stream << value.operation_id.value() << '/' << value.ordinal << '/' << value.generation;
+}
 
 #undef MANYFORGE_DECLARE_STRONG_COUNTER
 #undef MANYFORGE_DECLARE_STRONG_STRING

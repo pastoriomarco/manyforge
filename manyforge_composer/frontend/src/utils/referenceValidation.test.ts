@@ -10,10 +10,9 @@ describe('reference validation capture', () => {
   const response = { reference_validation: { schema_version: 'manyforge.program_reference_validation_response.v2',
     workspace_generation: generation, program_content_digest: digest, diagnostics: [row], total_count: 2, truncated: true, selector_facts: { components: [], targets: [], signals: [], frames: [], bodies: [], rules: [] } } };
   it('preserves diagnostics and bounded count for the same capture', () => {
-    expect(referenceResult(response, digest, generation)).toEqual({ issues: [row], total: 2, truncated: true, selectorFacts: { components: [], targets: [], signals: [], frames: [], bodies: [], rules: [] } });
+    expect(referenceResult(response, generation)).toEqual({ issues: [row], total: 2, truncated: true, selectorFacts: { components: [], targets: [], signals: [], frames: [], bodies: [], rules: [] } });
   });
-  it('rejects stale generation and mismatched body digest', () => {
-    expect(() => referenceResult(response, digest, { ...generation, workspace_revision: 2 })).toThrow();
-    expect(() => referenceResult(response, `sha256:${'b'.repeat(64)}`, generation)).toThrow();
+  it('rejects a stale generation', () => {
+    expect(() => referenceResult(response, { ...generation, workspace_revision: 2 })).toThrow();
   });
 });

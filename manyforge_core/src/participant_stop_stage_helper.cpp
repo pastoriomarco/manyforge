@@ -211,7 +211,7 @@ struct ParticipantStopStageHelper::Run {
   std::optional<ControlledStopResultDTO> outcome;
   bool dispatched{false};
   /// Goal whose terminal result is goal-terminal evidence.
-  std::optional<ExecutionGoalKey> finish_goal;
+  std::optional<ControllerGoalId> finish_goal;
   /// Trip measured positions (stop distance diagnostic).
   std::vector<double> trip_measured_positions;
   /// Hard stop observability (`main`'s `hard_stop` keys).
@@ -269,18 +269,17 @@ void ParticipantStopStageHelper::BindDispatchedGoal(
   goal_ = std::move(goal);
 }
 
-void ParticipantStopStageHelper::ForgetKnownUnsent(const ExecutionGoalKey& key) {
+void ParticipantStopStageHelper::ForgetKnownUnsent(const ControllerGoalId& key) {
   std::lock_guard lock(mutex_);
   if (!goal_ || goal_->key != key || sent_.size() != 1U || sent_.front().key != key) return;
   sent_.clear();
   goal_.reset();
 }
 
-ExecutionGoalKey ParticipantStopStageHelper::NextKey() const {
+ControllerGoalId ParticipantStopStageHelper::NextKey() const {
   std::lock_guard lock(mutex_);
   auto key = sent_.back().key;
-  key.controller_goal_generation =
-      ControllerGoalGeneration(key.controller_goal_generation.value() + 1U);
+  ++key.generation;
   return key;
 }
 
@@ -291,14 +290,14 @@ void ParticipantStopStageHelper::Record(SentGoal goal) {
 }
 
 std::optional<std::uint64_t> ParticipantStopStageHelper::SourceExecutionId(
-    const ExecutionGoalKey& key) const {
+    const ControllerGoalId& key) const {
   std::lock_guard lock(mutex_);
   const auto it = std::find_if(sent_.rbegin(), sent_.rend(),
                                [&](const SentGoal& goal) { return goal.key == key; });
   return it != sent_.rend() && it->cancel ? it->cancel->execution_id : std::nullopt;
 }
 
-bool ParticipantStopStageHelper::ReserveReplacement(const ExecutionGoalKey& source) {
+bool ParticipantStopStageHelper::ReserveReplacement(const ControllerGoalId& source) {
   std::lock_guard lock(mutex_);
   if (!goal_ || goal_->key != source || sent_.size() != 1U || sent_.front().key != source ||
       sent_.front().moving_replacement)
@@ -308,7 +307,7 @@ bool ParticipantStopStageHelper::ReserveReplacement(const ExecutionGoalKey& sour
 }
 
 void ParticipantStopStageHelper::RecordReplacement(
-    ExecutionGoalKey key, TrajectoryDTO trajectory,
+    ControllerGoalId key, TrajectoryDTO trajectory,
     std::shared_ptr<ExecutionSampleAssociation> association,
     double planned_controller_offset_s, std::shared_ptr<GoalCancelAttempt> cancel) noexcept {
   std::lock_guard lock(mutex_);
@@ -316,7 +315,7 @@ void ParticipantStopStageHelper::RecordReplacement(
                            std::move(association), true, {}, planned_controller_offset_s, std::move(cancel)});
 }
 
-void ParticipantStopStageHelper::RetireSettledReplacement(const ExecutionGoalKey& key) noexcept {
+void ParticipantStopStageHelper::RetireSettledReplacement(const ControllerGoalId& key) noexcept {
   std::lock_guard lock(mutex_);
   const auto found = std::find_if(sent_.begin(), sent_.end(), [&](const auto& goal) {
     return goal.moving_replacement && goal.key == key;
@@ -330,7 +329,7 @@ bool ParticipantStopStageHelper::HasPendingReplacement() const {
                      [](const auto& goal) { return goal.moving_replacement; });
 }
 
-bool ParticipantStopStageHelper::CanCompleteNaturally(const ExecutionGoalKey& source) const {
+bool ParticipantStopStageHelper::CanCompleteNaturally(const ControllerGoalId& source) const {
   std::lock_guard lock(mutex_);
   const bool pending = std::any_of(sent_.begin(), sent_.end(),
                                    [](const auto& goal) { return goal.moving_replacement; });
@@ -356,7 +355,7 @@ bool ParticipantStopStageHelper::CanCompleteNaturally(const ExecutionGoalKey& so
 }
 
 ExecutionPortCommandResultDTO ParticipantStopStageHelper::CancelExactGoal(
-    const ExecutionGoalKey& key, std::shared_ptr<GoalCancelAttempt> attempt,
+    const ControllerGoalId& key, std::shared_ptr<GoalCancelAttempt> attempt,
     std::chrono::steady_clock::time_point deadline) {
   bool first;
   {
@@ -498,8 +497,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStageImpl
                          clock_.now() - started);
   };
   if (stage.stage_index >= stage.participant_stop_plan.stage_commands.size() ||
-      budget.stop_id != stage.stop_id || budget.stop_generation != stage.stop_generation ||
-      budget.elapsed_since_stop_ns < 0 ||
+      budget.stop_event_id != stage.stop_event_id || budget.elapsed_since_stop_ns < 0 ||
       (budget.stop_ingress_age_ns &&
        (*budget.stop_ingress_age_ns < 0 || *budget.stop_ingress_age_ns > kMaximumStopDurationNs)) ||
       (budget.remaining_controlled_deadline_ns.has_value() &&
@@ -521,8 +519,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::TranslateStopStageImpl
     std::lock_guard lock(mutex_);
     goal = goal_;
   }
-  if (!goal.has_value() || goal->key.controller_goal_id != stage.controller_goal_id ||
-      goal->key.controller_goal_generation != stage.controller_goal_generation) {
+  if (!goal.has_value() || goal->key != stage.controller_goal_id) {
     return refuse("resolved_stop_stage_dispatch_membership_unavailable",
                   "Stop cannot prove this stage belongs to the dispatched goal generation");
   }
@@ -791,7 +788,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::Succeed(Run& run,
         {
           JsonObjectDTO goal_observation{
               {"finish_basis", JsonValueDTO{finish_basis}},
-              {"mechanism_goal_id", JsonValueDTO{finish_goal->mechanism_goal_id.value()}}};
+              {"mechanism_goal_id", JsonValueDTO{MechanismGoalIdHex(finish_goal->mechanism_goal_id)}}};
           if (finish_goal->terminal_local_receipt_stamp.has_value()) {
             goal_observation.emplace(
                 "terminal_local_receipt_stamp_ns",
@@ -1503,7 +1500,7 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::HoldFor
 }
 
 ParticipantStopStageResultDTO ParticipantStopStageHelper::FinishReplacement(
-    Run& run, const ExecutionPortCommandResultDTO& sent, const ExecutionGoalKey& next,
+    Run& run, const ExecutionPortCommandResultDTO& sent, const ControllerGoalId& next,
     TrajectoryDTO sent_trajectory, std::optional<StopReplacementCursorMapDTO> cursor_map,
     const std::optional<ExecutionControllerSampleDTO>& baseline, const TimePoint dispatched_at,
     const ExecutionControllerSampleDTO& trip, const std::string& mode,
@@ -1712,7 +1709,7 @@ ParticipantStopStageResultDTO ParticipantStopStageHelper::RunEndedGoalHold(Run& 
   run.finish_goal = run.goal.key;
   run.hard_stop_level = "goal_already_terminal";
   TimePoint ended_at = run.started;
-  std::optional<ExecutionGoalKey> newest;
+  std::optional<ControllerGoalId> newest;
   std::shared_ptr<ExecutionSampleAssociation> association;
   std::vector<SentGoal> sent;
   {
@@ -2018,6 +2015,11 @@ std::optional<ParticipantStopStageResultDTO> ParticipantStopStageHelper::TryCont
     return std::nullopt;
   }
   if (!finished) {
+    // F3: the brake never reported its finish. Send the cancel of every goal
+    // that may still run before failing, so the stage fails with the cancel
+    // sent; the failure still escalates.
+    const auto live = LiveGoals();
+    if (!live.empty()) (void)CancelGoals(live, run.leaf_deadline);
     return Fail(run, stage_error("stop_evidence_phase_expired",
                                  "The controlled hard stop got no finishing report within a "
                                  "normal motion's bound"));

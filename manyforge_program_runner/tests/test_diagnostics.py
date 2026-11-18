@@ -1,4 +1,4 @@
-from threading import Event
+from threading import Event, Thread
 
 import pytest
 
@@ -150,3 +150,32 @@ def test_thread_start_failure_cannot_fail_program_transition(monkeypatch):
     assert publisher.health()["lost_count"] == "1"
     assert publisher.health()["enqueued_count"] == 0
     publisher.close()
+
+
+def test_close_waits_for_the_in_flight_delivery_and_counts_pending_as_lost():
+    """OD-309: close joins without a limit; the delivery's end ends the wait."""
+    entered, answer = Event(), Event()
+    records = []
+
+    def send(record):
+        entered.set()
+        answer.wait()
+        records.append(record)
+        return {"recorded": True}
+
+    publisher = ProgramDiagnosticPublisher(send, capacity=2)
+    publisher.submit({"state": "failed", "label": "in_flight"})
+    assert entered.wait(5)
+    publisher.submit({"state": "succeeded", "label": "pending"})
+    closer = Thread(target=publisher.close, name="test-diagnostics-close")
+    closer.start()
+    with publisher._condition:
+        assert publisher._condition.wait_for(lambda: publisher._closed, timeout=5)
+    # Held by the in-flight delivery alone; the pending one is dropped.
+    assert closer.is_alive()
+    assert publisher.health()["lost_count"] == "1"
+    answer.set()
+    closer.join(5)
+    assert not closer.is_alive()
+    assert [record["label"] for record in records] == ["in_flight"]
+    assert not publisher._thread.is_alive()

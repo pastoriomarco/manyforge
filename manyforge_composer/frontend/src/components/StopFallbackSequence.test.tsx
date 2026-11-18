@@ -131,7 +131,8 @@ function intentDocument(stop: Record<string, JsonValue>): Record<string, JsonVal
 function controller(document: Record<string, JsonValue>): DeploymentWorkspaceController {
   return {
     workspace: {
-      schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+      schemaVersion: 'manyforge.composer_deployment_workspace.v2',
+      applyCommands: { inProgress: null, ended: [] },
       authoringWorkspace: {
         workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
         programDraftId: 'draft-1', programDraftRevision: 1,
@@ -159,7 +160,7 @@ function controller(document: Record<string, JsonValue>): DeploymentWorkspaceCon
     documentUnavailableReason: null,
     refresh: vi.fn(), clearFeedback: vi.fn(), dismissError: vi.fn(), open: vi.fn(), mutate: vi.fn(),
     updateControlledStop: vi.fn(), updateMotionTargetLimit: vi.fn(), revert: vi.fn(), save: vi.fn(),
-    saveAs: vi.fn(), discard: vi.fn(), applyDraft: vi.fn(), applyConfirmedScope: vi.fn(), confirmApply: vi.fn(),
+    saveAs: vi.fn(), discard: vi.fn(), applyDraft: vi.fn(), applyConfirmedScope: vi.fn(), confirmApply: vi.fn(async () => null),
     cancelApplyConfirmation: vi.fn(),
   } as unknown as DeploymentWorkspaceController;
 }

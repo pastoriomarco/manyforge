@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <map>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string_view>
@@ -15,6 +16,7 @@
 #include <manyforge_deployment/program_contract.hpp>
 
 #include "program_io_condition_compiler_internal.hpp"
+#include "program_reference_probe_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -804,6 +806,116 @@ private:
     }
   }
 
+  // The run-time TCP rule (`select_robot_tcp`) applied to each selector the
+  // Program writes; Current and key-sourced selectors resolve at run time.
+  void tcp_selectors(const CanonicalValue &definitions,
+                     const CanonicalValue &parameters, const std::string &path,
+                     const std::string &instance) {
+    if (!map_) return;
+    const auto robot = string_reference(parameters.find_object_member("target"), "command_target_id");
+    if (!robot) return;
+    for (const auto &definition : definitions.as_array()) {
+      const auto *ref = definition.find_object_member("schema_ref");
+      if (const auto *nested = definition.find_object_member("schema"); nested && nested->is_object())
+        ref = nested->find_object_member("schema_ref");
+      if (!ref || !ref->is_string() || ref->as_string() != "#/schema_types/tcp_selector") continue;
+      const auto &id = member(definition, "id").as_string();
+      const auto *selector = parameters.find_object_member(id);
+      const auto *kind = selector && selector->is_object() ? selector->find_object_member("kind") : nullptr;
+      if (!kind || !kind->is_string() || kind->as_string() == "current") continue;
+      const auto target = string_reference(selector->find_object_member("target"), "command_target_id");
+      if (!target) continue;
+      const ProgramReferenceLocation location{path + "/parameters/" + pointer_token(id), instance, id};
+      std::optional<core::TcpEntryReferenceDTO> entry;
+      if (kind->as_string() == "default_of_target") {
+        const auto *tcp = map_->kinematic_index().default_tcp_of(target->component_id);
+        if (!tcp) {
+          emit("default_tcp_unavailable", location,
+               {{"component_id", text(target->component_id.value())},
+                {"command_target_id", text(target->command_target_id.value())}});
+          continue;
+        }
+        entry = core::TcpEntryReferenceDTO{{target->component_id, tcp->command_target_id},
+                                           {target->component_id, tcp->frame_role_id}};
+      } else {
+        const auto *frame = selector->find_object_member("frame");
+        const auto *fc = frame && frame->is_object() ? frame->find_object_member("component_id") : nullptr;
+        const auto *fi = frame && frame->is_object() ? frame->find_object_member("frame_id") : nullptr;
+        if (!fc || !fi || !fc->is_string() || !fi->is_string() || !has_component(fc->as_string()))
+          continue;
+        entry = core::TcpEntryReferenceDTO{
+            *target, {core::ControllableComponentId(fc->as_string()), core::FrameRoleId(fi->as_string())}};
+        // A frame outside its target is the frame reference's own finding.
+        if (!entry_frame_of_target(*entry)) continue;
+      }
+      const auto rows = robot_tcps(*robot);
+      if (!rows) continue;
+      const auto selected = select_robot_tcp(*map_, robot->component_id, *rows, *entry);
+      if (selected.ok()) continue;
+      CanonicalValue::Object payload{
+          {"component_id", text(entry->frame.component_id.value())},
+          {"frame_id", text(entry->frame.frame_id.value())},
+          {"target_component_id", text(robot->component_id.value())},
+          {"command_target_id", text(robot->command_target_id.value())}};
+      emit(selected.error().details.at("reason"), location, std::move(payload));
+    }
+  }
+
+  // A gripper whose owner holds no command state (display-only, or valves
+  // written as mapped I/O) cannot answer a status node.
+  void gripper_status(const CanonicalValue &parameters, const std::string &path,
+                      const std::string &instance) {
+    const auto target = string_reference(parameters.find_object_member("target"), "command_target_id");
+    if (target && gripper_status_unavailable(bundle_.value().cell_graph, *target))
+      emit("gripper_status_unavailable", {path + "/parameters/target", instance, std::string("target")},
+           {{"component_id", text(target->component_id.value())},
+            {"command_target_id", text(target->command_target_id.value())}});
+  }
+
+  // An existing target of an existing component, else nothing to check.
+  std::optional<core::ProgramTargetReferenceDTO> string_reference(const CanonicalValue *value,
+                                                                  std::string_view field) {
+    const auto *component = value && value->is_object() ? value->find_object_member("component_id") : nullptr;
+    const auto *target = value && value->is_object() ? value->find_object_member(field) : nullptr;
+    if (!component || !target || !component->is_string() || !target->is_string() ||
+        !has_component(component->as_string()) ||
+        target_status(component->as_string(), target->as_string()))
+      return std::nullopt;
+    return core::ProgramTargetReferenceDTO{core::ControllableComponentId(component->as_string()),
+                                           core::CommandTargetId(target->as_string())};
+  }
+
+  bool entry_frame_of_target(const core::TcpEntryReferenceDTO &entry) const {
+    const auto *target = map_->find_target(entry.target.component_id, entry.target.command_target_id);
+    return target && map_->kinematic_index().carries(entry.target.component_id, entry.frame.component_id) &&
+           std::any_of(target->frames.begin(), target->frames.end(), [&](const auto &frame) {
+             const auto *model = std::get_if<CompositionComponentModelFrame>(&frame.frame);
+             return model && model->controllable_component_id == entry.frame.component_id &&
+                    frame.frame_role_id == entry.frame.frame_id;
+           });
+  }
+
+  // The moving robot's TCP list; none for a target that does not move.
+  const std::vector<RobotTcp> *robot_tcps(const core::ProgramTargetReferenceDTO &robot) {
+    const auto key = std::pair{robot.component_id.value(), robot.command_target_id.value()};
+    if (const auto found = robot_tcps_.find(key); found != robot_tcps_.end())
+      return found->second ? &*found->second : nullptr;
+    const auto *descriptor = core::find_builtin_capability_definition("execution.trajectory.execute");
+    if (!descriptor) invalid("unknown catalog capability");
+    const core::ProgramCapabilityRequirementDTO motion{
+        core::CapabilityId("execution.trajectory.execute"),
+        core::CapabilityDefinitionRevision(std::string(descriptor->capability_definition_revision)),
+        core::ProgramCapabilityDisposition::kRequired};
+    std::optional<std::vector<RobotTcp>> rows;
+    if (!capability_status(key.first, key.second, motion))
+      rows = reference_probe::compile_robot_tcps(
+          bundle_.value(), *map_, robot.component_id, robot.command_target_id,
+          reference_probe::load_qualified_catalog_closure(bundle_.value(), source_).capabilities,
+          source_);
+    const auto &stored = robot_tcps_.emplace(key, std::move(rows)).first->second;
+    return stored ? &*stored : nullptr;
+  }
+
   void node(const CanonicalValue &value, const std::string &path,
             std::size_t depth) {
     if (depth > 256U || ++nodes_ > core::kMaxProgramTreeNodes)
@@ -899,6 +1011,10 @@ private:
                        instance.as_string(), std::string("touch_bodies")});
     }
     node_capabilities(found->second, parameters, path, instance.as_string());
+    tcp_selectors(definitions, parameters, path, instance.as_string());
+    if (node_id.as_string() == "gripper.check_status" ||
+        node_id.as_string() == "gripper.wait_for_status")
+      gripper_status(parameters, path, instance.as_string());
     if (node_id.as_string() == "io.clear_outside_change") {
       const auto *selected = parameters.find_object_member("signal");
       const auto *component = selected ? selected->find_object_member("component_id") : nullptr;
@@ -938,6 +1054,7 @@ private:
            std::optional<ProgramBindingUnresolvedReason>>
       capability_status_;
   std::map<std::string, bool> cell_capability_status_;
+  std::map<std::pair<std::string, std::string>, std::optional<std::vector<RobotTcp>>> robot_tcps_;
   std::set<std::string> scene_ids_;
   std::size_t nodes_{};
   std::vector<ProgramReferenceDiagnostic> rows_;

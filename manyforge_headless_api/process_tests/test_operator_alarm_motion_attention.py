@@ -23,16 +23,16 @@ import pytest
 
 from manyforge_headless_api.alarm_attention import (
     KERNEL_FRESHNESS_SECONDS,
-    PUBLICATION_DEADLINE_SECONDS,
     PUBLICATION_PERIOD_SECONDS,
     OperatorAlarmAttentionPublisher,
 )
 from manyforge_headless_api.cell_admission import (
-    EXECUTION_CONTROL_SOCKET_FILE,
+    EXECUTION_COMPONENT_SOCKET_FILE,
     MAXIMUM_RESPONSE_BYTES,
     CellAdmissionClient,
 )
 from manyforge_headless_api.execution import ExecutionCommandClient, ExecutionEventPump
+from manyforge_headless_api.manager_status_stream import ManagerStatusFollower
 from manyforge_headless_api.native import HeadlessApiConfig, NativeHeadlessCore
 from manyforge_headless_api.process_tests.test_process_stack import (
     keep_failure_evidence,
@@ -55,15 +55,16 @@ _PUBLISH_COMMAND = b'"command":"cell_admission_publish_operator_alarm_attention"
 
 
 class _KernelRelay:
-    """Same-user relay in front of the real native host's control socket.
+    """Same-user relay in front of the real native host's component socket.
 
-    The attention heartbeat is published beside Stop on the control socket,
-    so that is the socket the relay serves and forwards to.
+    The attention heartbeat is published on the component socket, so that is
+    the socket the relay serves and forwards to.
 
     It forwards every packet unchanged and records, for each publication, when
     the request arrived and when the Kernel's acceptance came back. A
     configurable delay holds the publication before the Kernel sees it, which
-    is a Kernel that answers late; abandoned client sockets are tolerated.
+    is a Kernel that answers late; client sockets the publisher's shutdown
+    ended are tolerated.
     """
 
     def __init__(self, upstream: Path, run_root: Path) -> None:
@@ -71,7 +72,7 @@ class _KernelRelay:
         run_root.mkdir(mode=0o700)
         self.run_root = run_root
         self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-        path = run_root / EXECUTION_CONTROL_SOCKET_FILE
+        path = run_root / EXECUTION_COMPONENT_SOCKET_FILE
         self._listener.bind(str(path))
         os.chmod(path, 0o600)
         self._listener.listen(16)
@@ -127,7 +128,7 @@ class _KernelRelay:
             try:
                 connection.send(response)
             except OSError:
-                pass  # the publisher abandoned this exchange at its deadline
+                pass  # the publisher's shutdown ended this exchange
 
     def mark(self) -> tuple[int, int]:
         with self.lock:
@@ -230,48 +231,61 @@ def _native_host_stack() -> Iterator[ProcessStack]:
                 stack.close()
 
 
-def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
+def test_attention_publication_stays_within_freshness_on_the_real_core_and_kernel(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Real Headless core + real native host: P + D < F under adversity.
+    """Real Headless core + real native host: receipts far inside F under
+    adversity, with no publication deadline (OD-307).
 
     The publisher reads the real core while other threads hold its
     coordination lock with source refreshes, while the Kernel answers late,
     and is shut down with one exchange outstanding.
     """
-    period, deadline = PUBLICATION_PERIOD_SECONDS, PUBLICATION_DEADLINE_SECONDS
+    period = PUBLICATION_PERIOD_SECONDS
+    # Qualification margin for one exchange on a loaded machine; a measure
+    # of this test only, not a limit of the publisher.
+    slack = 0.2
     with _native_host_stack() as stack:
         relay = _KernelRelay(
-            stack.execution_run_root / EXECUTION_CONTROL_SOCKET_FILE,
+            stack.execution_run_root / EXECUTION_COMPONENT_SOCKET_FILE,
             stack.root / "attention-relay-run",
         )
         core = NativeHeadlessCore(
             HeadlessApiConfig(
-                projection_root=stack.publication_root,
                 install_root=stack.package_root,
                 artifact_root=stack.artifact_root,
                 node_catalog_path=NODE_CATALOG,
                 node_environment_manifest_path=NODE_ENVIRONMENT_MANIFEST,
                 alarm_catalog_path=CATALOG,
-                historian_database_path=stack.history_database,
+                historian_directory=stack.history_directory,
                 manager_run_root=stack.manager_run_root,
                 execution_run_root=stack.execution_run_root,
                 cell_id=CELL_ID,
-                owner_id="headless-api.attention-qualification",
+                application_start_id=stack.application_start_id,
                 freshness_milliseconds=120_000,
             )
         )
         source = _TimedAttentionSource(core)
-        # Production composition: the event pump drives the alarm-source
-        # refresh; the publisher reaches the Kernel through the relay.
+        # Production composition: the Manager status follower keeps the
+        # core's Manager mirror current (OD-216), the event pump drives the
+        # alarm-source refresh; the publisher reaches the Kernel through the
+        # relay.
+        manager_status = ManagerStatusFollower(
+            core,
+            stack.manager_run_root,
+            silence_seconds=120.0,
+            on_control_change=lambda: None,
+            on_viewer_change=lambda: None,
+        )
         pump = ExecutionEventPump(
             core,
             ExecutionCommandClient(stack.execution_run_root, timeout_seconds=1.0),
+            application_start_id=stack.application_start_id,
             poll_seconds=0.1,
         )
         publisher = OperatorAlarmAttentionPublisher(
             source,
-            CellAdmissionClient(relay.run_root, timeout_seconds=deadline),
+            CellAdmissionClient(relay.run_root, timeout_seconds=1.0),
         )
         report: list[str] = []
         load_stop = threading.Event()
@@ -305,6 +319,7 @@ def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
             return requested, accepted
 
         loaders: list[threading.Thread] = []
+        manager_status.start()
         pump.start()
         try:
             publisher.start()
@@ -315,7 +330,7 @@ def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
                 "a reconciled motion-attention projection",
             )
             _requested, baseline = phase("baseline", 16)
-            assert max(_intervals(baseline)) < period + deadline
+            assert max(_intervals(baseline)) < period + slack
 
             loaders = [
                 threading.Thread(target=core_load, name=f"core-load-{index}", daemon=True)
@@ -327,22 +342,24 @@ def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
             _requested, contended = phase("core-lock contention (4 refresh loops)", 40)
             contended_reads = source.read_seconds[reads:]
             assert load_calls[0] > 100
-            assert max(contended_reads) < deadline
-            assert max(_intervals(contended)) < period + deadline
+            assert max(contended_reads) < slack
+            assert max(_intervals(contended)) < period + slack
             assert source.last is not None and source.last["reconciled"] is True
 
-            relay.delay_seconds = deadline / 2
-            _requested, delayed = phase(f"Kernel answers after {deadline / 2:.2f}s", 16)
-            assert max(_intervals(delayed)) < period + deadline
+            relay.delay_seconds = 0.1
+            _requested, delayed = phase("Kernel answers after 0.10s", 16)
+            assert max(_intervals(delayed)) < period + slack
             before = publisher.counts
-            relay.delay_seconds = deadline + 0.15
-            requested, late = phase(f"Kernel answers after {deadline + 0.15:.2f}s (> D)", 12)
+            late_delay = 0.35  # later than the period and the former 200 ms deadline
+            relay.delay_seconds = late_delay
+            _requested, late = phase(f"Kernel answers after {late_delay:.2f}s (> P)", 12)
             after = publisher.counts
-            abandoned = after.abandoned - before.abandoned
-            report.append(f"abandoned at D in the late phase: {abandoned}")
-            assert abandoned >= 10
-            # An abandoned publication never delays the next period's start.
-            assert max(_intervals(requested)) < period + 0.1
+            # A late answer is waited for and acknowledged, never abandoned:
+            # receipts follow the Kernel's answer time, still far inside F.
+            assert after.failed == before.failed
+            assert after.published - before.published >= 12
+            assert max(_intervals(late)) < late_delay + slack
+            assert max(_intervals(late)) < KERNEL_FRESHNESS_SECONDS / 4
             load_stop.set()
             for loader in loaders:
                 loader.join(timeout=10.0)
@@ -355,19 +372,20 @@ def test_attention_publication_meets_its_deadline_on_the_real_core_and_kernel(
             publisher.shutdown()
             shutdown_seconds = time.monotonic() - started
             report.append(f"shutdown with an outstanding exchange: {shutdown_seconds * 1000:.1f}ms")
-            assert shutdown_seconds <= deadline + 0.1
+            # The publisher's stop ends the held exchange at once.
+            assert shutdown_seconds < 1.0
         finally:
             load_stop.set()
             publisher.shutdown()
             pump.shutdown()
+            manager_status.shutdown()
             core.shutdown()
             relay.close()
         counts = publisher.counts
         with capsys.disabled():
             print(
                 "\nalarm attention real-path qualification "
-                f"(P={period}s D={deadline}s F={KERNEL_FRESHNESS_SECONDS}s, "
-                f"P+D={period + deadline:.2f}s < F):"
+                f"(P={period}s F={KERNEL_FRESHNESS_SECONDS}s, no publication deadline):"
             )
             for line in report:
                 print("  " + line)

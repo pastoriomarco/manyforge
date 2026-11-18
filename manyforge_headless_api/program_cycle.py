@@ -12,7 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .control_protocol import AllowedExecutionCommandDTO
 
-PROGRAM_CONTROL_STATE_SCHEMA = "manyforge.program_control_state.v2"
+PROGRAM_CONTROL_STATE_SCHEMA = "manyforge.program_control_state.v4"
+# The reply of every runner command route answered at acceptance (OD-214).
+PROGRAM_COMMAND_REPLY_SCHEMA = "manyforge.program_command_reply.v1"
+# Ended command rows the runner keeps (OD-214): one command at a time, so a
+# few cover a client's reconnect window.
+MAXIMUM_ENDED_COMMAND_ROWS = 8
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 _MAXIMUM_OPERATION_FAILURES = 4_096
 
@@ -67,13 +72,11 @@ def program_operation_failures(run: dict[str, Any] | None) -> list[dict[str, Any
                 "terminal_facts",
             }
             or not _failure_text(row["node_instance_id"], 128)
-            or not _failure_text(row["node_attempt_id"], 512)
+            or not _failure_counter(row["node_attempt_id"])
             or not _failure_counter(row["operator_facing_run_revision"])
             or not isinstance(operation, dict)
-            or set(operation)
-            != {"source_owner_epoch", "operation_id", "operation_revision"}
-            or not _failure_text(operation["source_owner_epoch"], 2048)
-            or not _failure_text(operation["operation_id"], 2048)
+            or set(operation) != {"operation_id", "operation_revision"}
+            or not _failure_counter(operation["operation_id"])
             or not _failure_counter(operation["operation_revision"])
             or not isinstance(resources, list)
             or not resources
@@ -103,7 +106,6 @@ def program_cycle_control_key(cycle: dict[str, Any]) -> tuple[Any, ...]:
     return tuple(
         cycle.get(field)
         for field in (
-            "program_runner_owner_epoch",
             "cycle_generation",
             "execution_control_revision",
         )
@@ -146,6 +148,112 @@ def program_cycle_event_class(
 
 Revision = Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
 Identity = Annotated[str, Field(min_length=1, max_length=256)]
+# The Program runner's command kinds (its request kinds, plus the scene
+# preparation, which records no request).
+RunnerCommandKind = Literal[
+    "start",
+    "reset",
+    "scene_preparation",
+    "runtime_blackboard_write",
+    "manual_result_stage",
+    "recovery_action",
+    "resume_halt",
+    "start_motion",
+    "resume_motion",
+    "prepare_manual_handover",
+    "persistent_value_set",
+    "persistent_value_reset",
+    "persistent_values_clear",
+]
+# The stages a runner command publishes (OD-214); each kind uses a closed
+# subset (contract od214 §1.3). The Reset tokens are the cycle's `reset_phase`.
+RunnerCommandStep = Literal[
+    "admitting",
+    "claiming",
+    "starting_run",
+    "applying",
+    "recovering",
+    "resuming",
+    "stopping",
+    "settling",
+    "restoring_scene",
+    "restoring_position",
+    "releasing",
+    "preparing_scene",
+]
+CommandOutcome = Literal["succeeded", "refused", "failed", "unknown", "interrupted"]
+# Wall-clock ns since the Unix epoch, as canonical decimal text (beyond a
+# JSON-safe integer), at most the int64 maximum.
+_EPOCH_NS = Annotated[str, Field(pattern=r"^(0|[1-9][0-9]{0,18})$")]
+
+
+class CommandEndDTO(BaseModel):
+    """How one command ended: its outcome and, unless it succeeded, its typed
+    code with the error's own details (no text: the catalogue gives it)."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    outcome: CommandOutcome
+    code: Identity | None
+    details: dict[str, Any] | None
+    finished_at_ns: _EPOCH_NS
+
+    @model_validator(mode="after")
+    def code_unless_succeeded(self) -> "CommandEndDTO":
+        if (self.outcome == "succeeded") != (self.code is None):
+            raise ValueError("a command end has a code exactly when it did not succeed")
+        if self.outcome == "succeeded" and self.details is not None:
+            raise ValueError("a succeeded command end carries no details")
+        return self
+
+
+class RunnerCommandRowDTO(BaseModel):
+    """One runner command from taking the runner to its end (OD-214)."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    kind: RunnerCommandKind
+    request_key: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
+    step: RunnerCommandStep | None
+    accepted_at_ns: _EPOCH_NS | None
+    end: CommandEndDTO | None
+
+    @model_validator(mode="after")
+    def accepted_before_steps(self) -> "RunnerCommandRowDTO":
+        if self.accepted_at_ns is None and self.step is not None:
+            raise ValueError("a command not yet accepted has no step")
+        if (self.accepted_at_ns is None and self.end is not None
+                and self.end.outcome not in {"refused", "unknown"}):
+            raise ValueError("a command ended before acceptance was refused or unknown")
+        return self
+
+
+class RunnerCommandsDTO(BaseModel):
+    """The command holding the runner and the last ended ones, newest first."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    in_progress: RunnerCommandRowDTO | None
+    ended: Annotated[
+        list[RunnerCommandRowDTO], Field(max_length=MAXIMUM_ENDED_COMMAND_ROWS)
+    ]
+
+    @model_validator(mode="after")
+    def ends_where_they_belong(self) -> "RunnerCommandsDTO":
+        if self.in_progress is not None and self.in_progress.end is not None:
+            raise ValueError("the command in progress has not ended")
+        if any(row.end is None for row in self.ended):
+            raise ValueError("an ended command row requires its end")
+        return self
+
+
+class ProgramCommandReplyDTO(BaseModel):
+    """A runner command's reply: its row at acceptance (or a replay)."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["manyforge.program_command_reply.v1"]
+    command: RunnerCommandRowDTO
 
 
 class _ProgramResetSelectorsDTO(BaseModel):
@@ -162,8 +270,7 @@ class ProgramResetOptionsDTO(_ProgramResetSelectorsDTO):
 class AcceptedProgramResetDTO(_ProgramResetSelectorsDTO):
     """Private heartbeat proof of the original accepted Reset occurrence."""
 
-    request_owner_epoch: Identity
-    request_id: Identity
+    request_key: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")]
     request_payload_digest: Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")]
     reset_claim_generation: Revision | None
 
@@ -193,27 +300,26 @@ class ProgramCycleStatusDTO(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    program_runner_owner_epoch: Identity
     cycle_generation: Revision
     state: Literal[
         "idle_after_reset",
         "starting",
         "running",
-        "stopping",
         "resetting",
         "terminal_awaiting_reset",
         "recovery_required",
     ]
-    program_run_id: Identity | None
+    program_run_id: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)] | None
     cycle_claim_generation: Revision | None
     terminal_or_settlement_reference: (
         Annotated[str, Field(pattern=r"^sha256:[0-9a-f]{64}$")] | None
     )
     execution_control_revision: Revision
-    causal_correlation_id: Identity | None
-    causal_session_id: Identity | None
-    causal_client_sequence: Annotated[str, Field(pattern=r"^[1-9][0-9]{0,19}$")] | None
+    # The key of the request that caused the current command (1.15.3).
+    causal_request_key: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$")] | None
     current_command_kind: Identity | None
+    # OD-144/OD-214: the runner command in progress and the last ended ones.
+    runner_commands: RunnerCommandsDTO
     failure: dict[str, Any] | None
     reset_phase: Identity | None
     reset_options: ProgramResetOptionsDTO | None
@@ -232,7 +338,12 @@ class ProgramCycleStatusDTO(BaseModel):
             ):
                 raise ValueError("Program cycle has the wrong Idle shape")
         elif self.program_run_id is None:
-            if self.state not in {"resetting", "recovery_required"}:
+            # A run number is announced only after its Kernel claim (K-6), so
+            # a start in its window has neither run nor claim yet (1.15.5).
+            if self.state == "starting":
+                if self.cycle_claim_generation is not None:
+                    raise ValueError("starting Program cycle has no claim before its run")
+            elif self.state not in {"resetting", "recovery_required"}:
                 raise ValueError("active Program cycle requires its run identity")
             if (self.state == "resetting" or self.reset_options is not None) and not (
                 self.cycle_claim_generation is None
@@ -256,13 +367,6 @@ class ProgramCycleStatusDTO(BaseModel):
             and self.terminal_or_settlement_reference is None
         ):
             raise ValueError("terminal Program cycle requires its reference")
-        if (self.causal_session_id is None) != (self.causal_client_sequence is None):
-            raise ValueError("causal session and client sequence must be paired")
-        if (
-            self.causal_client_sequence is not None
-            and int(self.causal_client_sequence) > 2**64 - 1
-        ):
-            raise ValueError("causal client sequence exceeds uint64")
         if self.state == "resetting" and self.reset_phase is None:
             raise ValueError("Resetting Program cycle requires its phase")
         if self.state == "recovery_required" and self.failure is None:
@@ -303,10 +407,6 @@ class ProgramCycleFrameDTO(ProgramCycleStatusDTO):
                 or capture.get("program_run_id") != self.program_run_id
                 or self.run.get("run_revision") != self.run_revision
                 or self.run.get("node_status_revision") != self.node_status_revision
-                or (
-                    self.state not in {"terminal_awaiting_reset", "resetting"}
-                    and self.run.get("owner_epoch") != self.program_runner_owner_epoch
-                )
             ):
                 raise ValueError("Program run does not match its cycle")
         if self.runtime_controls is None:
@@ -318,8 +418,6 @@ class ProgramCycleFrameDTO(ProgramCycleStatusDTO):
                 self.run is None
                 or not isinstance(state, dict)
                 or self.runtime_controls.get("program_run_id") != self.program_run_id
-                or self.runtime_controls.get("owner_epoch")
-                != self.program_runner_owner_epoch
                 or self.runtime_controls.get("run_revision") != self.run_revision
                 or state.get("runtime_control_revision")
                 != self.runtime_control_revision

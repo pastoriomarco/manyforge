@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/ports/iexecution_port.hpp>
+#include <manyforge_core/types/application_identity.hpp>
 #include <manyforge_core/types/prepared_operation_participant.hpp>
 #include <memory>
 #include <mutex>
@@ -20,14 +21,17 @@ class VolatileMotionTrace final {
 public:
   using Goal = control_msgs::action::FollowJointTrajectory::Goal;
   struct Context {
-    std::string operation_id, participant_id, program_run_id,
-        program_binding_id, component_id;
+    core::OperationNumber operation_id{0U};
+    core::OperationParticipantId participant_id{};
+    /// Absent for manual work.
+    std::optional<core::ProgramRunNumber> program_run_id;
+    std::string program_binding_id, component_id;
     std::uint64_t operation_revision{};
   };
   struct Token final {
     std::string action;
     core::ExecutionBindingEpoch epoch;
-    core::ExecutionGoalKey key;
+    core::ControllerGoalId key;
     std::optional<Context> context;
     std::shared_ptr<void> allocation_charge{};
   };
@@ -41,10 +45,10 @@ public:
 
   void Preregister(
       const std::string &action, core::ExecutionBindingEpoch epoch,
-      const core::ExecutionGoalKey &key,
+      const core::ControllerGoalId &key,
       const core::PreparedOperationParticipantDTO &participant) noexcept;
   TokenPtr Begin(const std::string &action, core::ExecutionBindingEpoch epoch,
-                 const core::ExecutionGoalKey &key, const TokenPtr &predecessor,
+                 const core::ControllerGoalId &key, const TokenPtr &predecessor,
                  core::TimePoint attempted_at, Garbage &garbage) noexcept;
   void Attach(const TokenPtr &token, Goal &&goal, core::TimePoint returned_at,
               core::ExecutionPortDispatch disposition,
@@ -57,11 +61,14 @@ public:
   void PublishedScale(const std::string &action,
                       core::ExecutionBindingEpoch epoch, core::TimePoint when,
                       double value) noexcept;
+  // `application_start_id` is written once, at the trace's top level, as
+  // its 16-hex wire form.
   core::Result<content_identity::CanonicalValue>
-  Snapshot(const core::RequestOwnerEpoch &owner,
+  Snapshot(core::ApplicationStartId application_start_id,
            std::size_t allowance_bytes) const;
   core::Result<content_identity::CanonicalValue>
-  SnapshotFile(const core::RequestOwnerEpoch &owner, std::size_t allowance_bytes,
+  SnapshotFile(core::ApplicationStartId application_start_id,
+               std::size_t allowance_bytes,
                const std::filesystem::path &directory) const;
 
 private:

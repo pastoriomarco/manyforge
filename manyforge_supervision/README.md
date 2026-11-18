@@ -6,7 +6,7 @@ used to live.
 Process supervision belongs to the Manager (`manyforge_component_manager`):
 it starts and stops the execution host, observes its runtime units
 (`runtime_observation`, `manager_active_runtime_coordinator`,
-`retained_posix_runtime_unit_adapter`) and converges them to the applied
+`retained_execution_host_unit_adapter`) and converges them to the applied
 Deployment. The execution host supervises the processes of its components
 (drivers, bridges, `ros2_control.launch.py`). Component health is each
 component's `ComponentState`, served by the Headless API (`GET /api/components`).

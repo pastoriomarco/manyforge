@@ -132,7 +132,14 @@ export type LatchCauseKind = typeof LATCH_CAUSE_KINDS[number];
 
 export interface CellLatch {
   latched: boolean;
-  causes: { component_id: string; kind: LatchCauseKind; fault?: Fault; stop?: ComponentStop }[];
+  causes: {
+    component_id: string;
+    kind: LatchCauseKind;
+    fault?: Fault;
+    stop?: ComponentStop;
+    /** Why its activity is unknown, e.g. `stop_unconfirmed` after a Stop that ended uncontained. */
+    reason?: CodedError;
+  }[];
 }
 
 export const RECOVERY_ELIGIBILITIES = ['ready', 'recover', 'blocked', 'unknown', 'excluded'] as const;

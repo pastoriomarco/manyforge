@@ -19,13 +19,14 @@ from manyforge_headless_api.native import (
 
 def _config(root: Path, reports: Path | None) -> HeadlessApiConfig:
     return HeadlessApiConfig(
-        projection_root=root / "projection", install_root=root / "install",
+        install_root=root / "install",
         artifact_root=root / "artifacts", node_catalog_path=root / "nodes.json",
         node_environment_manifest_path=root / "environment.json",
         alarm_catalog_path=root / "alarms.json",
-        historian_database_path=root / "history.sqlite3",
+        historian_directory=root / "history",
         manager_run_root=root / "manager-run", execution_run_root=root / "execution-run",
-        cell_id="cell_a", workbench_previous_session_reports_root=reports,
+        cell_id="cell_a", application_start_id="3f9a0000000000a1",
+        workbench_previous_session_reports_root=reports,
     )
 
 
@@ -43,7 +44,7 @@ def native(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 
     class Core:
         def __init__(self, *args: object) -> None:
-            assert len(args) == 13  # No constructor vector or single-report side path.
+            assert len(args) == 12  # No constructor vector or single-report side path.
 
         def append_workbench_previous_session_report(self, payload: str) -> str:
             value = json.loads(payload)
@@ -79,10 +80,13 @@ def test_serve_passes_report_root_to_config(tmp_path: Path, monkeypatch: pytest.
     observed = []
     monkeypatch.setattr(cli, "create_app", lambda config: observed.append(config) or object())
     monkeypatch.setattr(cli.uvicorn, "run", lambda *_args, **_kwargs: None)
-    args = ["serve", "--cell-id", "cell_a", "--workbench-previous-session-id", "a" * 32]
+    args = [
+        "serve", "--cell-id", "cell_a", "--application-start-id", "3f9a0000000000a1",
+        "--workbench-previous-session-id", "a" * 32,
+    ]
     for flag in (
-        "projection-root", "install-root", "artifact-root", "node-catalog-path",
-        "node-environment-manifest-path", "alarm-catalog-path", "historian-database-path",
+        "install-root", "artifact-root", "node-catalog-path",
+        "node-environment-manifest-path", "alarm-catalog-path", "historian-directory",
         "manager-run-root", "execution-run-root", "workbench-previous-session-reports-root",
     ):
         args += [f"--{flag}", str(tmp_path / flag)]
@@ -211,9 +215,8 @@ def test_registers_only_current_report_after_durable_replay(tmp_path: Path, nati
     reports, _ = _pending(tmp_path, "a" * 32)
     _pending(tmp_path, "b" * 32)
     native.registration_status = status
-    core = NativeHeadlessCore(replace(_config(tmp_path, reports), workbench_previous_session_id="a" * 32))
+    NativeHeadlessCore(replace(_config(tmp_path, reports), workbench_previous_session_id="a" * 32))
     assert native.observed == ["a" * 32]
-    assert core.workbench_previous_session_registration == {"session_id": "a" * 32, "status": status}
     NativeHeadlessCore(replace(_config(tmp_path, reports), workbench_previous_session_id="a" * 32))
     assert native.observed == ["a" * 32, "a" * 32]
     assert len(native.calls) == 2  # Finalized reports are not bulk-replayed.
@@ -221,9 +224,8 @@ def test_registers_only_current_report_after_durable_replay(tmp_path: Path, nati
 
 def test_registration_without_current_identity_stays_absent(tmp_path: Path, native: SimpleNamespace) -> None:
     reports, _ = _pending(tmp_path)
-    core = NativeHeadlessCore(_config(tmp_path, reports))
+    NativeHeadlessCore(_config(tmp_path, reports))
     assert native.observed == []
-    assert core.workbench_previous_session_registration is None
 
 
 @pytest.mark.parametrize("failure", ["missing", "wrong_identity", "symlink", "bad_receipt", "query_failure"])
@@ -254,19 +256,3 @@ def test_config_refuses_invalid_current_archive_identity(tmp_path: Path, identit
 def test_config_requires_report_root_for_current_identity(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         replace(_config(tmp_path, None), workbench_previous_session_id="a" * 32)
-
-
-def test_existing_health_projects_only_completed_native_registration() -> None:
-    from manyforge_headless_api.service import HeadlessService
-    receipt = {"session_id": "a" * 32, "status": "acknowledged"}
-    core = SimpleNamespace(
-        alarm_snapshot=lambda **_: {"health": {"state": "available"}, "reconciled": True},
-        historian_health=lambda: {"available": True},
-        workbench_previous_session_registration=receipt,
-    )
-    service = HeadlessService(core, SimpleNamespace())
-    service.runtime = lambda: {"complete": True}
-    service.node_environment = lambda: {"source": {"available": True, "freshness": "fresh", "known_gaps": []}}
-    assert service.health()["workbench_previous_session_registration"] == receipt
-    core.workbench_previous_session_registration = None
-    assert "workbench_previous_session_registration" not in service.health()

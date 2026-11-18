@@ -2,8 +2,6 @@
 
 #include "manager_liveness_rpc_internal.hpp"
 #include <array>
-#include <manyforge_core/time/fake_clock.hpp>
-#include <manyforge_core/time/manual_scheduler.hpp>
 
 namespace manyforge::component_manager::detail {
 namespace {
@@ -14,15 +12,40 @@ constexpr std::string_view kDigest =
     "sha256:1111111111111111111111111111111111111111111111111111111111111111";
 constexpr std::string_view kDigest2 =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+// A Scene id is an exact sha256 digest (SceneRevision::valid).
+constexpr std::string_view kSceneId =
+    "sha256:3333333333333333333333333333333333333333333333333333333333333333";
+constexpr std::string_view kEmptySceneId =
+    "sha256:4444444444444444444444444444444444444444444444444444444444444444";
+
+ActiveBundlePublicationReceiptDTO ApplyPublication() {
+  const ProjectionRevisionDTO projection{
+      RetainedBundleId("bundle.1"), GraphRevision("graph.1"),
+      {SceneId(std::string(kSceneId)), 2U, ContentDigest(std::string(kDigest2))}};
+  return {{NamedApplyPublicationTransactionDTO{ApplyId(5U), ApplyGeneration(1U)},
+           projection, projection.retained_bundle_id, projection.graph_revision,
+           ActiveBundlePublicationGeneration(3U), ContentDigest(std::string(kDigest2))},
+          ActiveBundlePublicationGeneration(4U),
+          ContentDigest(std::string(kDigest))};
+}
+
+ActiveBundlePublicationReceiptDTO BootstrapPublication() {
+  const ProjectionRevisionDTO projection{
+      RetainedBundleId("bundle.empty"), GraphRevision("graph.empty"),
+      {SceneId(std::string(kEmptySceneId)), 1U, ContentDigest(std::string(kDigest2))}};
+  return {{BootstrapPublicationTransactionDTO{BootstrapId("bootstrap.1"),
+                                              BootstrapGeneration(1U)},
+           projection, projection.retained_bundle_id, projection.graph_revision,
+           std::nullopt, ContentDigest(std::string(kDigest2))},
+          ActiveBundlePublicationGeneration(1U),
+          ContentDigest(std::string(kDigest))};
+}
 
 ManagerLivenessTransportRequestDTO Request() {
   const ManagerLivenessPolicyDTO policy{
       RuntimePolicyId("policy.native"),
       RuntimePolicyRevision(std::string(kDigest)),
-      250,
-      1000,
-      ProductContractId("safe.native"),
-      ProductContractRevision(std::string(kDigest2))};
+      250};
   std::vector<RequiredManagerLivenessReceiverDTO> receivers{
       {RuntimeUnitId("native.a"), RuntimeEpoch("epoch.a"),
        policy.runtime_policy_id, policy.runtime_policy_revision},
@@ -33,41 +56,18 @@ ManagerLivenessTransportRequestDTO Request() {
                                     RetainedBundleId("bundle.1"),
                                     set_digest,
                                     RuntimeUnitId("manager.1"),
-                                    RuntimeEpoch("manager-epoch.1"),
-                                    RequestOwnerEpoch("manager-owner.1"),
                                     std::move(receivers)};
   return {set.required_receivers.front().runtime_unit_id,
-          ActiveBundlePublicationGeneration(4U),
-          GraphRevision("graph.1"),
-          ContentDigest(std::string(kDigest)),
+          ApplyPublication(),
           set,
           policy,
           ManagerHeartbeatDTO{
-              set.cell_id, set.manager_runtime_unit_id,
-              set.manager_runtime_epoch, set.manager_owner_epoch, 7U,
+              set.cell_id, set.manager_runtime_unit_id, 7U,
               policy.runtime_policy_id, policy.runtime_policy_revision},
           ManagerLivenessReconciliationAck{
               set.cell_id, set.manager_runtime_unit_id,
-              set.manager_runtime_epoch, set.manager_owner_epoch,
               set.active_bundle_id, set.required_runtime_set_digest,
               ContentDigest(std::string(kDigest2))}};
-}
-
-ManagerLivenessLossIntentDTO LossIntent(std::uint64_t sequence = 3U) {
-  const auto request = Request();
-  const auto &receiver = request.required_set.required_receivers.front();
-  return {request.required_set.cell_id,
-          request.required_set.active_bundle_id,
-          request.required_set.required_runtime_set_digest,
-          receiver.runtime_unit_id,
-          receiver.runtime_epoch,
-          receiver.runtime_policy_id,
-          receiver.runtime_policy_revision,
-          request.required_set.manager_runtime_unit_id,
-          request.required_set.manager_runtime_epoch,
-          request.required_set.manager_owner_epoch,
-          sequence,
-          ManagerLivenessLossKindDTO::kExpiry};
 }
 
 class LivenessObservations final : public IManagerLivenessObservationPort {
@@ -81,16 +81,6 @@ public:
   std::vector<ManagerLivenessObservationDTO> values;
 };
 
-class CountingContainment final : public IManagerLivenessFailSafePort {
-public:
-  void LatchAndContain(
-      const ManagerLivenessLossIntentDTO &intent) noexcept override {
-    intents.push_back(intent);
-  }
-
-  std::vector<ManagerLivenessLossIntentDTO> intents;
-};
-
 ManagerLivenessReceiverConfig ReceiverConfig() {
   const auto request = Request();
   const auto &receiver = request.required_set.required_receivers.front();
@@ -98,133 +88,53 @@ ManagerLivenessReceiverConfig ReceiverConfig() {
           receiver.runtime_unit_id,
           receiver.runtime_epoch,
           request.required_set.manager_runtime_unit_id,
-          request.required_set.manager_runtime_epoch,
-          request.required_set.manager_owner_epoch,
           request.policy,
           request.required_set.active_bundle_id,
           request.required_set.required_runtime_set_digest};
 }
 
-TEST(ManagerLivenessCommandAdmission,
-     IsInitiallyClosedAndStaleReconciliationCannotReopenAfterLoss) {
+TEST(ManagerLivenessCommandAdmission, IsInitiallyClosedAndOpens) {
   ManagerLivenessCommandAdmission admission;
   EXPECT_FALSE(admission.open());
   EXPECT_FALSE(admission.Allows(ManagerLivenessCommandClass::kEffectful));
   EXPECT_TRUE(admission.Allows(ManagerLivenessCommandClass::kStop));
   EXPECT_TRUE(admission.Allows(ManagerLivenessCommandClass::kReadOnly));
-  const auto first_generation = admission.generation();
-  admission.OpenIfUnchanged(first_generation);
+  admission.Open();
   ASSERT_TRUE(admission.open());
-
-  const auto evidence = admission.CloseAndAttest(LossIntent());
-  EXPECT_FALSE(admission.open());
-  EXPECT_TRUE(manyforge::content_identity::is_sha256_digest(evidence.value()));
-  admission.OpenIfUnchanged(first_generation);
-  EXPECT_FALSE(admission.open());
-
-  const auto current_generation = admission.generation();
-  admission.OpenIfUnchanged(current_generation);
-  EXPECT_TRUE(admission.open());
-  EXPECT_NE(admission.CloseAndAttest(LossIntent(4U)), evidence);
-  EXPECT_FALSE(admission.open());
+  EXPECT_TRUE(admission.Allows(ManagerLivenessCommandClass::kEffectful));
 }
 
-TEST(ManagerLivenessCommandAdmission,
-     RequiredSetRebindInvalidatesPredecessorOpenGeneration) {
+TEST(ManagerLivenessCommandAdmission, RequiredSetRebindCloses) {
   ManagerLivenessCommandAdmission admission;
-  const auto predecessor = admission.generation();
-  admission.OpenIfUnchanged(predecessor);
+  admission.Open();
   ASSERT_TRUE(admission.open());
 
   admission.CloseForRequiredSetRebind();
   EXPECT_FALSE(admission.open());
-  admission.OpenIfUnchanged(predecessor);
-  EXPECT_FALSE(admission.open());
 }
 
 TEST(ManagerLivenessCommandAdmission,
-     ExactLeaseOpensThenExpiryClosesBeforeExactlyOneContainment) {
-  auto clock = std::make_shared<FakeClock>();
-  auto scheduler = std::make_unique<ManualScheduler>();
-  auto *const scheduler_observer = scheduler.get();
+     ExactReportOpensAndAQuietManagerNeverClosesOrContains) {
   LivenessObservations observations;
-  CountingContainment containment;
   ManagerLivenessCommandAdmission admission;
-  ChildOwnedManagerLivenessReceiver child_lifetime(clock, std::move(scheduler));
-  child_lifetime.Install(
-      ReceiverConfig(),
-      [&](const ManagerLivenessLossIntentDTO &intent) {
-        EXPECT_TRUE(admission.open());
-        return admission.CloseAndAttest(intent);
-      },
-      containment, observations);
+  ChildOwnedManagerLivenessReceiver child_lifetime;
+  child_lifetime.Install(ReceiverConfig(), observations);
   auto *const receiver = child_lifetime.get();
   ASSERT_NE(receiver, nullptr);
 
   const auto request = Request();
-  const auto admission_generation = admission.generation();
   ASSERT_TRUE(receiver->Renew(request.heartbeat).ok());
   ASSERT_TRUE(receiver->CompleteReconciliation(*request.reconciliation).ok());
-  admission.OpenIfUnchanged(admission_generation);
+  admission.Open();
   ASSERT_TRUE(admission.Allows(ManagerLivenessCommandClass::kEffectful));
-
-  clock->set(request.policy.expiry_timeout_ns);
-  scheduler_observer->advance_to(request.policy.expiry_timeout_ns);
-  EXPECT_FALSE(admission.Allows(ManagerLivenessCommandClass::kEffectful));
-  ASSERT_EQ(containment.intents.size(), 1U);
-  EXPECT_EQ(containment.intents.front().kind,
-            ManagerLivenessLossKindDTO::kExpiry);
-  scheduler_observer->advance_to(request.policy.expiry_timeout_ns * 2);
-  EXPECT_EQ(containment.intents.size(), 1U);
-  admission.OpenIfUnchanged(admission_generation);
-  EXPECT_FALSE(admission.open());
-}
-
-TEST(ManagerLivenessCommandAdmission,
-     ChildOwnedWatchdogSurvivesCompositionReplacementAndRejectsStaleManager) {
-  auto clock = std::make_shared<FakeClock>();
-  auto scheduler = std::make_unique<ManualScheduler>();
-  auto *const scheduler_observer = scheduler.get();
-  LivenessObservations observations;
-  CountingContainment containment;
-  ManagerLivenessCommandAdmission admission;
-  ChildOwnedManagerLivenessReceiver child_lifetime(clock, std::move(scheduler));
-  child_lifetime.Install(
-      ReceiverConfig(),
-      [&](const ManagerLivenessLossIntentDTO &intent) {
-        return admission.CloseAndAttest(intent);
-      },
-      containment, observations);
-  auto *const receiver = child_lifetime.get();
-  const auto request = Request();
-  const auto generation = admission.generation();
-  ASSERT_TRUE(receiver->Renew(request.heartbeat).ok());
-  ASSERT_TRUE(receiver->CompleteReconciliation(*request.reconciliation).ok());
-  admission.OpenIfUnchanged(generation);
-  ASSERT_TRUE(admission.open());
-
-  auto composition = std::make_unique<int>(1);
-  composition.reset();
-  ASSERT_TRUE(
-      receiver
-          ->BeginManagerEpochReplacement(RuntimeUnitId("manager.1"),
-                                         RuntimeEpoch("manager-epoch.2"),
-                                         RequestOwnerEpoch("manager-owner.2"))
-          .ok());
-  EXPECT_FALSE(admission.open());
-  ASSERT_EQ(containment.intents.size(), 1U);
-  EXPECT_FALSE(receiver->Renew(request.heartbeat).ok());
-  EXPECT_FALSE(receiver->CompleteReconciliation(*request.reconciliation).ok());
-  admission.OpenIfUnchanged(generation);
-  EXPECT_FALSE(admission.open());
-
-  clock->set(request.policy.expiry_timeout_ns * 2);
-  scheduler_observer->advance_to(request.policy.expiry_timeout_ns * 2);
-  EXPECT_EQ(containment.intents.size(), 1U);
+  auto next = request.heartbeat;
+  ++next.heartbeat_sequence;
+  ASSERT_TRUE(receiver->Renew(next).ok());
+  EXPECT_TRUE(admission.Allows(ManagerLivenessCommandClass::kEffectful));
 }
 
 TEST(ManagerLivenessBatchPolicy,
-     NativeSubsetCarriesFullCrossTransportSetAndFailureWithholdsFullExpiry) {
+     NativeSubsetCarriesFullCrossTransportSetAndOneBatchDeadline) {
   std::array requests{Request(), Request()};
   const auto &native_policy = requests[0].policy;
   for (auto &request : requests) {
@@ -253,54 +163,6 @@ TEST(ManagerLivenessBatchPolicy,
               RuntimeUnitId("program-runner.external"));
   }
 
-  const auto started = ManagerLivenessBatchDeadline::Clock::time_point(
-      std::chrono::nanoseconds(100));
-  const ManagerLivenessBatchDeadline deadline(started,
-                                              std::chrono::nanoseconds(750));
-  const std::array receiver_deadlines{deadline.value(), deadline.value()};
-  EXPECT_EQ(receiver_deadlines[0], started + std::chrono::nanoseconds(750));
-  EXPECT_EQ(receiver_deadlines[1], receiver_deadlines[0]);
-
-  ManagerLivenessRetryGate retry_gate;
-  ASSERT_TRUE(retry_gate.attempt_allowed(100U));
-  retry_gate.RecordFailure(100U, 1000U);
-  for (std::size_t receiver = 0U; receiver < 2U; ++receiver) {
-    SCOPED_TRACE(receiver);
-    EXPECT_FALSE(retry_gate.attempt_allowed(100U));
-    EXPECT_FALSE(retry_gate.attempt_allowed(1099U));
-  }
-  EXPECT_TRUE(retry_gate.attempt_allowed(1100U));
-  retry_gate.RecordSuccess();
-  EXPECT_FALSE(retry_gate.failed());
-  EXPECT_TRUE(retry_gate.attempt_allowed(1100U));
-}
-
-TEST(ManagerLivenessRpcInternal,
-     RetryPolicyUsesNativeBatchCertaintyNotUnrelatedReceiverFailure) {
-  constexpr std::uint64_t origin = 31ULL * 365ULL * 86400ULL * 1'000'000'000ULL;
-  for (const auto progress : {ManagerLivenessBatchProgress::kNotStarted,
-                              ManagerLivenessBatchProgress::kInFlight,
-                              ManagerLivenessBatchProgress::kValidated}) {
-    ManagerLivenessRetryGate gate;
-    gate.RecordFailure(origin, 1000);
-    EXPECT_FALSE(gate.attempt_allowed(origin + 999));
-    EXPECT_TRUE(gate.attempt_allowed(origin + 1000));
-    gate.RecordAttemptFailure(progress, origin + 1000, 1000);
-    EXPECT_EQ(gate.failed(),
-              progress == ManagerLivenessBatchProgress::kInFlight);
-    EXPECT_EQ(gate.attempt_allowed(origin + 1001),
-              progress != ManagerLivenessBatchProgress::kInFlight);
-    EXPECT_TRUE(gate.attempt_allowed(origin + 2000));
-    gate.RecordSuccess(); // the same reset used for a successor publication
-    EXPECT_FALSE(gate.failed());
-    EXPECT_TRUE(gate.attempt_allowed(origin + 1001));
-  }
-  ManagerLivenessRetryGate gate;
-  const auto maximum = std::numeric_limits<std::uint64_t>::max();
-  gate.RecordAttemptFailure(ManagerLivenessBatchProgress::kInFlight,
-                            maximum - 2, 1000);
-  EXPECT_FALSE(gate.attempt_allowed(maximum - 1));
-  EXPECT_TRUE(gate.attempt_allowed(maximum));
 }
 
 TEST(ManagerLivenessRpcInternal,
@@ -321,9 +183,6 @@ TEST(ManagerLivenessRpcInternal,
   EXPECT_EQ(decoded_ack.cell_id, request_ack.cell_id);
   EXPECT_EQ(decoded_ack.manager_runtime_unit_id,
             request_ack.manager_runtime_unit_id);
-  EXPECT_EQ(decoded_ack.manager_runtime_epoch,
-            request_ack.manager_runtime_epoch);
-  EXPECT_EQ(decoded_ack.manager_owner_epoch, request_ack.manager_owner_epoch);
   EXPECT_EQ(decoded_ack.active_bundle_id, request_ack.active_bundle_id);
   EXPECT_EQ(decoded_ack.required_runtime_set_digest,
             request_ack.required_runtime_set_digest);
@@ -335,20 +194,16 @@ TEST(ManagerLivenessRpcInternal,
                                   receiver.runtime_unit_id,
                                   receiver.runtime_epoch,
                                   request.required_set.manager_runtime_unit_id,
-                                  request.required_set.manager_runtime_epoch,
-                                  request.required_set.manager_owner_epoch,
                                   request.policy.runtime_policy_id,
                                   request.policy.runtime_policy_revision,
                                   request.heartbeat.heartbeat_sequence,
                                   3U,
-                                  0,
                                   ManagerLivenessStateDTO::kCurrent,
                                   false,
                                   std::nullopt};
   ManagerLivenessObservationDTO observation{
       status, request.required_set.active_bundle_id,
-      request.required_set.required_runtime_set_digest,
-      ComputeManagerLivenessStatusDigest(status)};
+      request.required_set.required_runtime_set_digest};
   EXPECT_EQ(DecodeManagerLivenessRpcResponse(
                 EncodeManagerLivenessRpcResponse(observation)),
             observation);
@@ -391,11 +246,6 @@ TEST(ManagerLivenessRpcInternal,
       request.required_set.required_receivers.front());
   EXPECT_THROW(EncodeManagerLivenessRpcRequest(request), std::invalid_argument);
 
-  request = Request();
-  request.required_set.required_runtime_set_digest =
-      ContentDigest(std::string(kDigest2));
-  EXPECT_THROW(EncodeManagerLivenessRpcRequest(request), std::invalid_argument);
-
   auto sequence = EncodeManagerLivenessRpcRequest(Request());
   const auto position = sequence.find(" 7 ");
   ASSERT_NE(position, std::string::npos);
@@ -407,14 +257,24 @@ TEST(ManagerLivenessRpcInternal,
   request.receiver_runtime_unit_id = RuntimeUnitId("foreign.receiver");
   EXPECT_THROW(EncodeManagerLivenessRpcRequest(request), std::invalid_argument);
   request = Request();
-  request.active_publication_generation = ActiveBundlePublicationGeneration(0U);
+  request.active_publication.publication_generation = ActiveBundlePublicationGeneration(0U);
   EXPECT_THROW(EncodeManagerLivenessRpcRequest(request), std::invalid_argument);
   request = Request();
-  request.active_public_pointer_digest = ContentDigest("foreign");
+  request.active_publication.durable_public_pointer_content_digest = ContentDigest("foreign");
   EXPECT_THROW(EncodeManagerLivenessRpcRequest(request), std::invalid_argument);
 
   EXPECT_FALSE(IsManagerLivenessRpcPacket(
       "manyforge.manager-liveness.response.v1 foreign"));
+  // Requests of the earlier formats (v1 with the removed expiry field, v2
+  // with the removed Manager owner epoch) are refused.
+  for (const char *earlier_tag : {"manyforge.manager-liveness.request.v1",
+                                  "manyforge.manager-liveness.request.v2"}) {
+    auto earlier = EncodeManagerLivenessRpcRequest(Request());
+    earlier.replace(0U, kManagerLivenessRequestTag.size(), earlier_tag);
+    EXPECT_FALSE(IsManagerLivenessRpcPacket(earlier));
+    EXPECT_THROW(DecodeManagerLivenessRpcRequest(earlier),
+                 std::invalid_argument);
+  }
   EXPECT_THROW(DecodeManagerLivenessRpcResponse(
                    "manyforge.manager-liveness.response.v1 foreign"),
                std::invalid_argument);
@@ -425,6 +285,39 @@ TEST(ManagerLivenessRpcInternal,
   } catch (const ManagerLivenessRpcRejection &rejection) {
     EXPECT_EQ(rejection.reason(), "superseded_active_publication");
   }
+}
+
+// The request carries the Manager's whole publication receipt, for a named
+// Apply and for a bootstrap.
+TEST(ManagerLivenessRpcInternal, RoundTripsNamedApplyAndBootstrapPublication) {
+  for (const auto &publication : {ApplyPublication(), BootstrapPublication()}) {
+    ASSERT_TRUE(publication.valid());
+    auto request = Request();
+    request.active_publication = publication;
+    const auto bytes = EncodeManagerLivenessRpcRequest(request);
+    const auto decoded = DecodeManagerLivenessRpcRequest(bytes);
+    EXPECT_EQ(decoded, request);
+    EXPECT_EQ(EncodeManagerLivenessRpcRequest(decoded), bytes);
+  }
+}
+
+// The earlier layout with three publication tokens (generation, graph,
+// pointer digest) is refused by its field count.
+TEST(ManagerLivenessRpcInternal, RefusesTheEarlierThreeTokenPublicationLayout) {
+  const auto bytes = EncodeManagerLivenessRpcRequest(Request());
+  std::vector<std::string> tokens(1U);
+  for (const char c : bytes) {
+    if (c == ' ')
+      tokens.emplace_back();
+    else
+      tokens.back().push_back(c);
+  }
+  ASSERT_EQ(tokens.size(), 24U + 4U * Request().required_set.required_receivers.size());
+  std::string earlier = tokens[0] + ' ' + tokens[1] + ' ' + tokens[7] + ' ' + tokens[2];
+  for (std::size_t index = 13U; index < tokens.size(); ++index)
+    earlier += ' ' + tokens[index];
+  EXPECT_TRUE(IsManagerLivenessRpcPacket(earlier));
+  EXPECT_THROW(DecodeManagerLivenessRpcRequest(earlier), std::invalid_argument);
 }
 
 } // namespace
@@ -451,8 +344,22 @@ TEST(NativeShutdownRpc, ExactEpochClosedGrammarAndActualMilestonesRoundTrip) {
                std::invalid_argument);
   EXPECT_THROW(
       DecodeNativeShutdownRpcResponse(
-          "manyforge.native-shutdown.response.v1 epoch 99 0 0 0 0 0 0 0 0 -1"),
+          "manyforge.native-shutdown.response.v3 epoch 99 0 0 0 0 0 0 0 0 -1"),
       std::invalid_argument);
+  // The previous version is refused: no compatibility reading.
+  EXPECT_THROW(
+      DecodeNativeShutdownRpcResponse(
+          "manyforge.native-shutdown.response.v2 epoch 1 0 0 0 0 0 0 0 0 -1"),
+      std::invalid_argument);
+  // OD-187 (3): the planned Halt is a phase of its own.
+  NativeShutdownProgress halt{"host.epoch", NativeShutdownPhase::kPlannedHalt};
+  EXPECT_EQ(DecodeNativeShutdownRpcResponse(EncodeNativeShutdownRpcResponse(halt)),
+            halt);
+  EXPECT_EQ(EncodeNativeShutdownRpcResponse(halt).rfind(
+                "manyforge.native-shutdown.response.v3 host.epoch 14 ", 0),
+            0U);
+  EXPECT_EQ(NativeShutdownPhaseName(NativeShutdownPhase::kPlannedHalt),
+            "planned-halt");
   actual.drained_groups = 3U;
   EXPECT_THROW(EncodeNativeShutdownRpcResponse(actual), std::invalid_argument);
 }

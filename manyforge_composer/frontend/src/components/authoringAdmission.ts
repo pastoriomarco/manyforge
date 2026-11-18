@@ -12,8 +12,8 @@ import {
 export const AUTHORING_ADMISSION_TOOLTIP = 'The cell is finishing a background step; this is available again in a moment.';
 
 export interface ManualOperationAdmissionCopy {
-  ownerEpoch: string;
-  operationId: string;
+  applicationStartId: string;
+  operationId: number;
   targetName: string | null;
   modeLabel: string | null;
   title: string;
@@ -41,9 +41,9 @@ export function manualOperationAdmissionCopy(
     : modeLabel === null
       ? `Manual motion on ${targetName} is running.`
       : `${targetName} is moving (${modeLabel}).`;
-  const message = 'Program editing resumes when it ends.';
+  const message = 'Editing resumes when it ends.';
   return {
-    ownerEpoch: state.status?.ownerEpoch ?? 'unknown-owner',
+    applicationStartId: state.status?.applicationStartId ?? 'unknown-owner',
     operationId: operation.operationId,
     targetName,
     modeLabel,
@@ -77,7 +77,7 @@ export function authoringAdmissionTooltip(
 ): string {
   if (manualOperation !== null) return manualOperation.tooltip;
   if (backgroundStep) return AUTHORING_ADMISSION_TOOLTIP;
-  if (authoringCause === 'execution_active') return 'Program execution is active; Program editing resumes when it ends.';
+  if (authoringCause === 'execution_active') return 'A Program run is active; editing resumes after Reset or when the run ends.';
   return 'Authoring is currently unavailable.';
 }
 
@@ -85,12 +85,30 @@ export function authoringAdmissionTooltip(
  * Admission for New and Load. They wait while a background step (an Apply,
  * Reset or recovery) holds the cell, like any edit. A Program run whose
  * motion is all stopped doesn't block them: the server Resets it first
- * (maintainer, 2026-11-06). Moving robots block them separately.
+ * (maintainer, 2026-11-06). Nor does a failed or unknown-effect Apply that
+ * still holds the cell: New releases it first (maintainer, 2026-11-13); if
+ * the admission is also closed for another reason, the server refuses with
+ * its own reason. Moving robots block them separately.
  */
 export function replacementAdmissionAllowed(
   authoringAdmissionAllowed: boolean | null,
   authoringCause: AuthoringUnavailableCause | null,
+  failedApplyHoldsCell = false,
 ): boolean | null {
-  return authoringAdmissionAllowed === false && authoringCause === 'execution_active'
+  return authoringAdmissionAllowed === false
+    && (authoringCause === 'execution_active' || failedApplyHoldsCell)
     ? true : authoringAdmissionAllowed;
+}
+
+/**
+ * What blocks Apply: a run closes authoring, but Apply Resets that run first
+ * (AUD-4), and the Reset-and-Apply chain states its own reasons. Any other
+ * closed admission still blocks Apply.
+ */
+export function applyAdmissionBlock(
+  authoringBlock: string | null,
+  runExists: boolean,
+  authoringCause: AuthoringUnavailableCause | null,
+): string | null {
+  return runExists && authoringCause === 'execution_active' ? null : authoringBlock;
 }

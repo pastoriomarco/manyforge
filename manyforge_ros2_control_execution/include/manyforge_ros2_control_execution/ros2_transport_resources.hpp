@@ -156,11 +156,13 @@ public:
       release_retirement(state, std::move(record));
     });
   }
-  /// The first owner wait that exceeded its diagnostic bound, if any. The
-  /// immutable snapshot remains valid independently of the transport holder.
+  /// The current owner stall, if any: raised when an owner wait exceeds its
+  /// diagnostic bound, ended when the last caller whose wait exceeded it has
+  /// its task run (or the owner exited). Each stall has its own immutable
+  /// snapshot, valid independently of the transport holder.
   std::shared_ptr<const OwnerStallSnapshot> owner_stall() const noexcept;
   /// Fully qualified owner name captured when the node was constructed.
-  const std::string &owner_name() const noexcept { return owner_stall_snapshot_->owner; }
+  const std::string &owner_name() const noexcept { return owner_name_; }
   /// Context validity observed at construction and on context shutdown.
   bool cached_context_valid() const noexcept;
   /// Within an invoked body, distinguish owner execution from the existing
@@ -237,7 +239,10 @@ private:
     std::exception_ptr error;
     std::source_location site{};
   };
-  bool record_owner_stall_locked();
+  std::shared_ptr<const OwnerStallSnapshot>
+  record_owner_stall_locked(std::chrono::steady_clock::time_point wait_began);
+  std::shared_ptr<const OwnerStallSnapshot>
+  end_owner_stall_locked(bool owner_moved_on, std::chrono::steady_clock::duration &lasted);
   void check_rebuild_allowed();
   void check_replacement_healthy();
   bool record_executor_fault(const char *exception_text) noexcept;
@@ -288,8 +293,16 @@ private:
   bool owner_notification_pending_ = false;
   bool owner_notification_active_ = false;
   std::chrono::nanoseconds owner_wait_bound_{std::chrono::seconds(4)};
-  std::shared_ptr<OwnerStallSnapshot> owner_stall_snapshot_;
-  std::atomic<bool> owner_stall_published_{false};
+  std::string owner_name_;
+  // The current stall (null when none); readers load it without a lock.
+  std::atomic<std::shared_ptr<const OwnerStallSnapshot>> owner_stall_;
+  // Under `dispatch_mutex_`: the next stall's snapshot, allocated before it is
+  // needed (non-null exactly while no stall is current); the callers whose
+  // wait exceeded the bound and still wait; when the current stall's first
+  // such wait began.
+  std::shared_ptr<OwnerStallSnapshot> next_owner_stall_;
+  std::size_t owner_stall_waiters_ = 0;
+  std::chrono::steady_clock::time_point owner_stall_began_{};
   std::uint64_t next_fifo_ticket_ = 0;
   std::uint64_t serving_fifo_ticket_ = 0;
   std::uint64_t next_close_ticket_ = 0;

@@ -3154,10 +3154,19 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
       runtime->goal_late_cancel_slot = late_cancel_slot;
     }
     std::lock_guard lock(late_cancel_tracking_->mutex);
+    late_cancel_tracking_->entries.push_back({request.gripper_id, late_cancel_slot, runtime, ros,
+                                              request.prepared_session_pin});
+  }
+  {
+    // Settled entries are dropped right after the registration, under the
+    // tracking mutex alone: this walk (one step per goal whose late cancel is
+    // still tracked) never runs under the authority a Stop takes. This
+    // command's slot was Pending at registration and is kept, as before.
+    std::lock_guard lock(late_cancel_tracking_->mutex);
     auto &entries = late_cancel_tracking_->entries;
     for (auto it = entries.begin(); it != entries.end();) {
       bool settled = false;
-      {
+      if (it->slot != late_cancel_slot) {
         std::lock_guard slot_lock(it->slot->mutex);
         settled = it->slot->state == core::GripperLateCancelState::kSettled;
       }
@@ -3166,8 +3175,6 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
         it = entries.erase(it);
       } else ++it;
     }
-    entries.push_back({request.gripper_id, late_cancel_slot, runtime, ros,
-                       request.prepared_session_pin});
   }
   // Runtime state is generation-owned. Backend access is limited to cancelling
   // the owner-scheduled deadline; the retained host quiesces the ROS executor
@@ -3248,7 +3255,13 @@ core::GripperCommandResultDTO Ros2GripperCommandBackend::command_gripper(
         }
         runtime->lifecycle_condition.notify_all();
         ++runtime->revision;
-      } else if (runtime->cancel_pending || !runtime->executing) {
+      } else if (!runtime->executing && !runtime->cancel_pending) {
+        // The exact command already ended before this acceptance (e.g. its
+        // result deadline failed it). The late goal is only cancelled; the
+        // terminal state and its typed error stay.
+        handle_to_cancel = retained_goal;
+        action_client = ros->action_client;
+      } else if (runtime->cancel_pending) {
         lifecycle_handle = runtime->lifecycle_handle;
         runtime->lifecycle_handle.reset();
         ++runtime->lifecycle_schedule_generation;

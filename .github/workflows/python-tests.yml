@@ -20,6 +20,7 @@ on:
       - "manyforge_program_runner/**"
       - "manyforge_core/**"
       - "manyforge_content_identity/**"
+      - "manyforge_private_stream/**"
       - "manyforge_persistence/**"
       - "manyforge_deployment/**"
       - "manyforge_component_manager/**"
@@ -46,6 +47,7 @@ on:
       - "manyforge_program_runner/**"
       - "manyforge_core/**"
       - "manyforge_content_identity/**"
+      - "manyforge_private_stream/**"
       - "manyforge_persistence/**"
       - "manyforge_deployment/**"
       - "manyforge_component_manager/**"
@@ -144,11 +146,6 @@ jobs:
             trimesh==4.11.5 yourdfpy==0.0.60 fastapi==0.135.3 \
             "uvicorn[standard]==0.44.0" httpx==0.28.1 httpx2==2.12.0 \
             websockets==16.0 mcp==1.27.0
-      # The repository examples load the RoboPlan example models from the
-      # git-ignored .docker/roboplan (test_scenario_artifacts.py).
-      - name: Prepare pinned RoboPlan Docker context
-        if: matrix.suite == 'composer'
-        run: ./scripts/setup-docker.sh --prepare-only
       # One cache for the expression binding: every job restores it, the
       # behavior job saves it on push and on the nightly run.
       - name: Restore ccache

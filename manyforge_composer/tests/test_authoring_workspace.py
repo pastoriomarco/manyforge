@@ -696,7 +696,7 @@ def test_program_install_cannot_change_the_deployment_domain() -> None:
 
 
 def test_workspace_route_returns_the_single_owner_snapshot() -> None:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     response = TestClient(create_app(state)).get("/api/authoring/workspace")
 
     assert response.status_code == 200

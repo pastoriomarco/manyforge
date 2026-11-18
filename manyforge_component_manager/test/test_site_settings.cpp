@@ -8,7 +8,7 @@ namespace manyforge::component_manager {
 namespace {
 
 constexpr std::string_view kSample =
-    R"({"schema":"manyforge.site.v1","device_addresses":{"lite6_main":"192.168.1.31"}})";
+    R"({"schema":"manyforge.site.v2","device_addresses":{"lite6_main":"192.168.1.31"}})";
 
 std::string Replace(std::string value, std::string_view before,
                     std::string_view after) {
@@ -24,20 +24,20 @@ TEST(SiteSettings, PreservesDeviceAddresses) {
   const SiteSettings::DeviceAddresses expected{{"lite6_main", "192.168.1.31"}};
   EXPECT_EQ(settings.device_addresses(), expected);
   const auto hosts = ParseSiteSettings(
-      R"({"schema":"manyforge.site.v1","device_addresses":{"a.b_c-9":"robot-1.local","v6":"fe80::1"}})");
+      R"({"schema":"manyforge.site.v2","device_addresses":{"a.b_c-9":"robot-1.local","v6":"fe80::1"}})");
   EXPECT_EQ(hosts.device_addresses().at("a.b_c-9"), "robot-1.local");
   EXPECT_EQ(hosts.device_addresses().at("v6"), "fe80::1");
 }
 
 TEST(SiteSettings, AllowsNoDeviceAddresses) {
   EXPECT_TRUE(ParseSiteSettings(
-                  R"({"schema":"manyforge.site.v1","device_addresses":{}})")
+                  R"({"schema":"manyforge.site.v2","device_addresses":{}})")
                   .device_addresses()
                   .empty());
 }
 
 TEST(SiteSettings, DeviceAddressesAreOptionalForASimOnlyMachine) {
-  const auto settings = ParseSiteSettings(R"({"schema":"manyforge.site.v1"})");
+  const auto settings = ParseSiteSettings(R"({"schema":"manyforge.site.v2"})");
   EXPECT_TRUE(settings.device_addresses().empty());
   EXPECT_TRUE(settings.project_folders().empty());
   EXPECT_FALSE(ResolveSiteDeviceAddress(settings, "lite6_main").ok());
@@ -45,12 +45,12 @@ TEST(SiteSettings, DeviceAddressesAreOptionalForASimOnlyMachine) {
 
 TEST(SiteSettings, CarriesAbsoluteProjectFoldersInFileOrder) {
   const auto settings = ParseSiteSettings(
-      R"({"schema":"manyforge.site.v1","project_folders":["/home/op/cells","/data/projects"]})");
+      R"({"schema":"manyforge.site.v2","project_folders":["/home/op/cells","/data/projects"]})");
   EXPECT_EQ(settings.project_folders(),
             (std::vector<std::string>{"/home/op/cells", "/data/projects"}));
   EXPECT_TRUE(settings.device_addresses().empty());
   const auto both = ParseSiteSettings(
-      R"({"schema":"manyforge.site.v1","device_addresses":{"lite6_main":"192.168.1.31"},"project_folders":[]})");
+      R"({"schema":"manyforge.site.v2","device_addresses":{"lite6_main":"192.168.1.31"},"project_folders":[]})");
   EXPECT_EQ(both.device_addresses().at("lite6_main"), "192.168.1.31");
   EXPECT_TRUE(both.project_folders().empty());
 }
@@ -60,9 +60,17 @@ TEST(SiteSettings, RejectsMalformedAndNonClosedShapes) {
   const std::vector<std::string> invalid{
       "not: [valid",
       "[]",
-      Replace(sample, "manyforge.site.v1", "manyforge.site.v2"),
-      Replace(sample, R"("schema":"manyforge.site.v1",)", ""),
-      Replace(sample, R"("schema":"manyforge.site.v1")", R"("schema":1)"),
+      Replace(sample, "manyforge.site.v2", "manyforge.site.v3"),
+      Replace(sample, "}}", R"(},"disk_max_percent":0})"),
+      Replace(sample, "}}", R"(},"disk_max_percent":101})"),
+      Replace(sample, "}}", R"(},"disk_max_percent":10.5})"),
+      Replace(sample, "}}", R"(},"disk_max_percent":"10"})"),
+      Replace(sample, "}}", R"(},"disk_always_free_bytes":-1})"),
+      Replace(sample, "}}", R"(},"disk_always_free_bytes":9007199254740992})"),
+      Replace(sample, "}}", R"(},"disk_machine_minimum_bytes":-1})"),
+      Replace(sample, "}}", R"(},"disk_machine_minimum_bytes":true})"),
+      Replace(sample, R"("schema":"manyforge.site.v2",)", ""),
+      Replace(sample, R"("schema":"manyforge.site.v2")", R"("schema":1)"),
       Replace(sample, "}}", R"(},"project_folders":"/data/projects"})"),
       Replace(sample, "}}", R"(},"project_folders":["relative/projects"]})"),
       Replace(sample, "}}", R"(},"project_folders":[""]})"),
@@ -70,7 +78,7 @@ TEST(SiteSettings, RejectsMalformedAndNonClosedShapes) {
       Replace(sample, "}}", R"(},"project_folders":["/a","/a"]})"),
       Replace(sample, R"("schema":)", R"("unknown":0,"schema":)"),
       Replace(sample, R"("schema":)",
-              R"("schema":"manyforge.site.v1","schema":)"),
+              R"("schema":"manyforge.site.v2","schema":)"),
       Replace(sample, R"({"lite6_main")",
               R"({"lite6_main":"192.168.1.30","lite6_main")"),
       Replace(sample, R"({"lite6_main":"192.168.1.31"})", "[]"),
@@ -96,6 +104,33 @@ TEST(SiteSettings, RejectsMalformedAndNonClosedShapes) {
   }
   EXPECT_NO_THROW(static_cast<void>(ParseSiteSettings(
       Replace(sample, "192.168.1.31", std::string(253U, 'a')))));
+}
+
+TEST(SiteSettings, AcceptsAndIgnoresTheDiskLimits) {
+  const std::string sample(kSample);
+  const auto settings = ParseSiteSettings(Replace(
+      sample, "}}",
+      R"(},"disk_max_percent":100,"disk_always_free_bytes":0,"disk_machine_minimum_bytes":2000000000})"));
+  EXPECT_EQ(settings.device_addresses().at("lite6_main"), "192.168.1.31");
+  EXPECT_NO_THROW(static_cast<void>(ParseSiteSettings(
+      Replace(sample, "}}", R"(},"disk_max_percent":1})"))));
+}
+
+TEST(SiteSettings, ReadsVersionOneWithoutDiskLimits) {
+  const std::string version_one =
+      Replace(std::string(kSample), "manyforge.site.v2", "manyforge.site.v1");
+  EXPECT_EQ(ParseSiteSettings(version_one).device_addresses().at("lite6_main"),
+            "192.168.1.31");
+  try {
+    static_cast<void>(ParseSiteSettings(
+        Replace(version_one, "}}", R"(},"disk_always_free_bytes":0})")));
+    FAIL() << "a manyforge.site.v1 file with a disk limit was accepted";
+  } catch (const SiteSettingsError &error) {
+    EXPECT_STREQ(error.what(),
+                 "site settings disk_always_free_bytes needs schema "
+                 "manyforge.site.v2: change the first line's schema to "
+                 "manyforge.site.v2; no other change is needed");
+  }
 }
 
 TEST(SiteSettings, ResolvesOnlyConfiguredReferences) {

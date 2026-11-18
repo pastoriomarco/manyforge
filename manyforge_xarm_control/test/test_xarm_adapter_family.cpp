@@ -89,6 +89,9 @@ struct Host final {
     if (!rclcpp::ok()) rclcpp::init(0, nullptr);
     node = std::make_shared<rclcpp::Node>("xarm_family_test");
   }
+  /// Every test declares its Host after loading the family: ROS is shut
+  /// down here, before the family's library is unloaded, never at exit.
+  ~Host() { rclcpp::shutdown(); }
   /// A component's context on the real lane, with the machine's connection.
   [[nodiscard]] ComponentAdapterContext Context(const std::string &id, std::string role,
                                                 const std::string &row) const {

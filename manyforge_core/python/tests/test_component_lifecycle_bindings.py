@@ -31,7 +31,6 @@ def test_provider_domain_scope_has_real_driver_identity_without_motion_fields():
     assert actual.locally_valid()
     assert domain.provider == provider
     assert actual.provider.provider == provider
-    assert actual.provider.active_control_configuration is None
     assert actual.provider.output_resources == ()
     assert actual.provider.provider.lifecycle_command_timeout_ns == 30_000_000_000
     proof = core.ProviderConfigurationFenceOccurrenceDTO(
@@ -56,11 +55,18 @@ def test_provider_domain_scope_has_real_driver_identity_without_motion_fields():
 
 def test_program_node_admission_evidence_is_bound():
     evidence = core.ProgramNodeAdmissionEvidenceDTO(
-        core.RequestOwnerEpoch("runner.1"), core.ProgramRunId("run.1"),
-        core.CellAdmissionClaimGeneration(7), "enable", "enable.1", "cclc.lifecycle")
+        core.ProgramRunNumber(1),
+        core.CellAdmissionClaimGeneration(7), "enable", core.NodeAttemptNumber(1),
+        "scene.transaction")
     assert evidence.locally_valid()
+    assert evidence.node_attempt_id.value == 1
     assert evidence.parent_program_cycle_claim_generation.value == 7
     assert core.AdmissionGeneration(9).value == 9
+    refused = core.ProgramNodeAdmissionEvidenceDTO(
+        core.ProgramRunNumber(1),
+        core.CellAdmissionClaimGeneration(7), "enable", core.NodeAttemptNumber(1),
+        "cclc.lifecycle")
+    assert not refused.locally_valid()
 
 
 def _publication_receipt():
@@ -103,7 +109,7 @@ def _named_apply_publication_request():
     )
     return core.ActiveBundlePublicationRequestDTO(
         core.NamedApplyPublicationTransactionDTO(
-            core.ApplyId("apply-1"),
+            core.ApplyId(1),
             core.ApplyGeneration(2),
         ),
         projection,
@@ -114,76 +120,9 @@ def _named_apply_publication_request():
     )
 
 
-def _resolved_scope():
-    binding = core.ExpectedControlBindingRevisionDTO(
-        core.ControlBindingId("binding-1"),
-        core.ControlBindingRevision("binding-revision-1"),
-        core.ControlRouteId("shared-route"),
-    )
-    return core.ResolvedLifecycleControlDomainScopeDTO(
-        core.ControlDomainId("domain-1"),
-        core.ControlDomainRevision("domain-revision-1"),
-        core.ControllerTopologyId("topology-1"),
-        core.TopologyRevision("topology-revision-1"),
-        None,
-        (binding,),
-        (core.ResourceId("resource-1"),),
-    )
-
-
-def _provider_occurrence():
-    return core.ResolvedLifecycleProviderOccurrenceDTO(
-        core.ControlDomainId("domain-1"),
-        core.ControlDomainRevision("domain-revision-1"),
-        core.ProviderInstanceId("provider-1"),
-        core.ProviderManifestId("manifest-1"),
-        core.ProviderManifestRevision(_MANIFEST_REVISION),
-        core.RuntimeUnitId("runtime-1"),
-        core.RuntimeEpoch("runtime-epoch-1"),
-        core.ContentDigest("lifecycle-catalog-1"),
-    )
-
-
-def test_fact_union_rejects_cross_alternative_fields():
-    unknown = core.LifecycleFactValueDTO(core.LifecycleFactValueKindDTO.kUnknown)
-    token = core.LifecycleFactValueDTO(
-        core.LifecycleFactValueKindDTO.kToken,
-        token_value="automatic.ready",
-    )
-    invalid = core.LifecycleFactValueDTO(
-        core.LifecycleFactValueKindDTO.kUnknown,
-        boolean_value=False,
-    )
-
-    assert unknown.locally_valid()
-    assert token.locally_valid()
-    assert not invalid.locally_valid()
-
-
-def test_stop_certificate_reference_is_compact_and_exact():
-    reference = core.StopCertificateRefDTO(
-        core.StopCertificateId("certificate-1"),
-        core.StopCertificateRevision(1),
-        core.StopId("stop-1"),
-        core.StopGeneration(2),
-    )
-
-    assert reference.locally_valid()
-    assert reference.stop_id.value == "stop-1"
-
-
-def test_current_component_snapshot_projects_exact_immutable_owner_facts():
+def test_publication_receipt_keeps_its_transaction_kind():
     receipt = _publication_receipt()
     named_apply_request = _named_apply_publication_request()
-    snapshot = core.ComponentLifecycleCurrentSnapshotDTO(
-        core.ContentDigest("component-snapshot-1"),
-        core.ControllableComponentId("component-1"),
-        core.ComponentLifecycleGeneration(2),
-        core.ComponentLifecycleStateDTO.kActive,
-        receipt,
-        (_resolved_scope(),),
-        (_provider_occurrence(),),
-    )
 
     assert receipt.valid()
     assert named_apply_request.valid()
@@ -195,11 +134,3 @@ def test_current_component_snapshot_projects_exact_immutable_owner_facts():
         named_apply_request.transaction_ref,
         core.NamedApplyPublicationTransactionDTO,
     )
-    assert snapshot.locally_valid()
-    assert snapshot.active_publication_receipt.request.candidate_retained_bundle_id.value == (
-        "bundle-1"
-    )
-    assert isinstance(snapshot.domains, tuple)
-    assert isinstance(snapshot.provider_occurrences, tuple)
-    with pytest.raises(AttributeError):
-        snapshot.component_lifecycle_state = core.ComponentLifecycleStateDTO.kFaulted

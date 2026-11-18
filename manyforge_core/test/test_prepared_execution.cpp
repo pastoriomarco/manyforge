@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <limits>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/prepared_execution_membership.hpp>
+#include <manyforge_core/types/operation_member_id_json.hpp>
 #include <manyforge_core/types/prepared_execution.hpp>
+#include <type_traits>
 
 namespace manyforge::core {
 namespace {
@@ -12,13 +15,13 @@ namespace {
 }
 
 [[nodiscard]] PreparedOperationParticipantDTO PreparedParticipant() {
-  const OperationId operation_id("operation.1");
+  const OperationNumber operation_id(1U);
   const OperationRevision operation_revision(3U);
-  const OperationParticipantId participant_id("participant.1");
+  const OperationParticipantId participant_id{OperationNumber(1U), 1U};
   const ProgramId program_id("program.1");
   const ProgramRevision program_revision(Digest('1'));
   const ProgramBindingId program_binding_id(Digest('2'));
-  const ProgramRunId program_run_id("run.1");
+  const ProgramRunNumber program_run_id(1U);
   PreparedParticipantStopPlanDTO stop_plan{
       ContentDigest(Digest('3')),
       ResolvedStopBasePlanId(Digest('4')),
@@ -133,81 +136,76 @@ TEST(PreparedExecutionTest, RejectedPrepareRequiresStableErrorAndNoDigest) {
 
 TEST(PreparedExecutionTest, DispatchHandleRequiresExactPreparedGoalMembership) {
   const auto participant = PreparedParticipant();
-  const ControllerGoalId goal_id("goal.1");
-  const ControllerGoalGeneration goal_generation(7U);
+  const ControllerGoalId goal_id{OperationNumber(17U), 1U, 7U};
   const auto wait = [](std::int64_t) { return true; };
   const auto snapshot = [] { return ExecutionSnapshot{}; };
   ExecutionHandle handle{wait,    snapshot,        0U,
-                         goal_id, goal_generation, participant.prepared_contract_digest};
-  EXPECT_FALSE(prepared_execution_handle_field_error(handle, participant, goal_id, goal_generation)
+                         goal_id, participant.prepared_contract_digest};
+  EXPECT_FALSE(prepared_execution_handle_field_error(handle, participant, goal_id)
                    .has_value());
 
   auto wrong_goal = handle;
-  wrong_goal.controller_goal_id = ControllerGoalId("goal.other");
+  wrong_goal.controller_goal_id = ControllerGoalId{OperationNumber(901U), 1U, 1U};
   EXPECT_EQ(
-      prepared_execution_handle_field_error(wrong_goal, participant, goal_id, goal_generation),
+      prepared_execution_handle_field_error(wrong_goal, participant, goal_id),
       "prepared_execution_handle_membership_mismatch");
 
   auto wrong_generation = handle;
-  wrong_generation.controller_goal_generation = ControllerGoalGeneration(8U);
-  EXPECT_EQ(prepared_execution_handle_field_error(wrong_generation, participant, goal_id,
-                                                  goal_generation),
+  wrong_generation.controller_goal_id->generation = 8U;
+  EXPECT_EQ(prepared_execution_handle_field_error(wrong_generation, participant, goal_id),
             "prepared_execution_handle_membership_mismatch");
 
   auto wrong_digest = handle;
   wrong_digest.prepared_contract_digest = ContentDigest(Digest('f'));
   EXPECT_EQ(
-      prepared_execution_handle_field_error(wrong_digest, participant, goal_id, goal_generation),
+      prepared_execution_handle_field_error(wrong_digest, participant, goal_id),
       "prepared_execution_handle_membership_mismatch");
 
   auto missing_observer = handle;
   missing_observer.get_snapshot = {};
-  EXPECT_EQ(prepared_execution_handle_field_error(missing_observer, participant, goal_id,
-                                                  goal_generation),
+  EXPECT_EQ(prepared_execution_handle_field_error(missing_observer, participant, goal_id),
             "prepared_execution_handle_observer_missing");
 }
 
 TEST(PreparedExecutionTest, BackendStatusIsGoalAndBindingFenced) {
   const auto participant = PreparedParticipant();
-  const ControllerGoalId goal_id("goal.1");
-  const ControllerGoalGeneration goal_generation(7U);
-  const auto result = MakeExecutionBackendStatus(participant, goal_id, goal_generation,
+  const ControllerGoalId goal_id{OperationNumber(17U), 1U, 7U};
+  const auto result = MakeExecutionBackendStatus(participant, goal_id,
                                                  ExecutionBackendStateDTO::kExecuting, 0.25, 0.4,
                                                  12U, 50'000'000LL);
   ASSERT_TRUE(result.ok()) << result.error().message;
   EXPECT_FALSE(
-      execution_backend_status_field_error(result.value(), participant, goal_id, goal_generation)
+      execution_backend_status_field_error(result.value(), participant, goal_id)
           .has_value());
 
   auto forged = result.value();
-  forged.controller_goal_generation = ControllerGoalGeneration(8U);
-  EXPECT_EQ(execution_backend_status_field_error(forged, participant, goal_id, goal_generation),
+  forged.controller_goal_id.generation = 8U;
+  EXPECT_EQ(execution_backend_status_field_error(forged, participant, goal_id),
             "execution_backend_status_identity_invalid");
   forged = result.value();
   forged.resources = {ResourceId("resource.1")};
-  EXPECT_EQ(execution_backend_status_field_error(forged, participant, goal_id, goal_generation),
+  EXPECT_EQ(execution_backend_status_field_error(forged, participant, goal_id),
             "execution_backend_status_identity_invalid");
 }
 
 TEST(PreparedExecutionTest, BackendStatusEnforcesStateAndEvidencePresence) {
   const auto participant = PreparedParticipant();
-  const ControllerGoalId goal_id("goal.1");
-  const ControllerGoalGeneration goal_generation(7U);
+  const ControllerGoalId goal_id{OperationNumber(17U), 1U, 7U};
   const auto error =
       ErrorDTO{std::string(kErrorExecutionAborted), "controller execution failed", {}};
-  EXPECT_TRUE(MakeExecutionBackendStatus(participant, goal_id, goal_generation,
+  EXPECT_TRUE(MakeExecutionBackendStatus(participant, goal_id,
                                          ExecutionBackendStateDTO::kFailed, 0.5, 0.5, 13U,
                                          60'000'000LL, error)
                   .ok());
-  EXPECT_FALSE(MakeExecutionBackendStatus(participant, goal_id, goal_generation,
+  EXPECT_FALSE(MakeExecutionBackendStatus(participant, goal_id,
                                           ExecutionBackendStateDTO::kFailed, 0.5, 0.5, 13U,
                                           60'000'000LL)
                    .ok());
-  EXPECT_FALSE(MakeExecutionBackendStatus(participant, goal_id, goal_generation,
+  EXPECT_FALSE(MakeExecutionBackendStatus(participant, goal_id,
                                           ExecutionBackendStateDTO::kCompleted, 0.5, 1.0, 14U,
                                           70'000'000LL, error)
                    .ok());
-  EXPECT_FALSE(MakeExecutionBackendStatus(participant, goal_id, goal_generation,
+  EXPECT_FALSE(MakeExecutionBackendStatus(participant, goal_id,
                                           ExecutionBackendStateDTO::kExecuting, 0.5, 1.1, 15U,
                                           80'000'000LL)
                    .ok());
@@ -216,7 +214,7 @@ TEST(PreparedExecutionTest, BackendStatusEnforcesStateAndEvidencePresence) {
 TEST(PreparedExecutionMembershipTest, PendingReplacementKeepsCurrentAndRetiredHighWatermark) {
   auto original = PreparedParticipant();
   auto successor = original;
-  successor.operation_id = OperationId("operation.new");
+  successor.operation_id = OperationNumber(1001U);
   successor.prepared_contract_digest = ContentDigest(Digest('9'));
   PreparedExecutionMembership membership;
   ASSERT_FALSE(membership.prepare(10U, original));
@@ -291,12 +289,45 @@ TEST(PreparedExecutionMembershipTest, ClosingCancelledPreparationFencesItsDelaye
   EXPECT_TRUE(membership.prepare(7U, participant));
   ASSERT_FALSE(membership.prepare(8U, participant));
   auto other = participant;
-  other.operation_id = OperationId("another.operation");
+  other.operation_id = OperationNumber(1002U);
   EXPECT_TRUE(membership.prepare(8U, other));
   EXPECT_FALSE(membership.retire(9U));
   EXPECT_TRUE(membership.matches(participant));
   ASSERT_TRUE(membership.retire(8U));
   EXPECT_FALSE(membership.prepare(9U, other));
+}
+
+// Contract 1.5: participant and controller goal ids are plain integers in
+// memory (no allocation on goal callbacks) and closed objects on the wire.
+TEST(OperationMemberIdTest, IdsAreTriviallyCopyableAndRoundTripTheirJsonForms) {
+  static_assert(std::is_trivially_copyable_v<OperationParticipantId>);
+  static_assert(std::is_trivially_copyable_v<ControllerGoalId>);
+  const OperationParticipantId participant{OperationNumber(7U), 2U};
+  const ControllerGoalId goal{OperationNumber(7U), 2U, 3U};
+  EXPECT_EQ(goal.participant(), participant);
+  EXPECT_EQ(content_identity::canonical_json(OperationParticipantIdValue(participant)),
+            R"({"operation_id":7,"ordinal":2})");
+  EXPECT_EQ(content_identity::canonical_json(ControllerGoalIdValue(goal)),
+            R"({"generation":3,"operation_id":7,"ordinal":2})");
+  EXPECT_EQ(ParseOperationParticipantId(OperationParticipantIdValue(participant)), participant);
+  EXPECT_EQ(ParseControllerGoalId(ControllerGoalIdValue(goal)), goal);
+}
+
+TEST(OperationMemberIdTest, ParsersRefuseOtherShapes) {
+  using content_identity::parse_canonical_json;
+  EXPECT_FALSE(ParseOperationParticipantId(parse_canonical_json(R"("7.participant.1")")));
+  EXPECT_FALSE(ParseOperationParticipantId(parse_canonical_json(R"({"operation_id":0,"ordinal":1})")));
+  EXPECT_FALSE(ParseOperationParticipantId(parse_canonical_json(R"({"operation_id":7,"ordinal":0})")));
+  EXPECT_FALSE(ParseOperationParticipantId(parse_canonical_json(R"({"operation_id":7,"ordinal":1.5})")));
+  EXPECT_FALSE(ParseOperationParticipantId(
+      parse_canonical_json(R"({"extra":1,"operation_id":7,"ordinal":1})")));
+  EXPECT_FALSE(ParseOperationParticipantId(
+      parse_canonical_json(R"({"operation_id":7,"ordinal":4294967296})")));
+  EXPECT_FALSE(ParseControllerGoalId(parse_canonical_json(R"({"operation_id":7,"ordinal":1})")));
+  EXPECT_FALSE(
+      ParseControllerGoalId(parse_canonical_json(R"({"generation":0,"operation_id":7,"ordinal":1})")));
+  EXPECT_FALSE(ParseControllerGoalId(
+      parse_canonical_json(R"({"generation":1,"operation_id":9007199254740992,"ordinal":1})")));
 }
 
 }  // namespace

@@ -10,7 +10,7 @@ namespace manyforge::core {
 /// neither Stop feasibility nor arrival; successor dispatch still requires the
 /// same Stop certificate and exact local settlement.
 struct SpringBackReturnPointDTO final {
-  ExecutionGoalKey source_goal;
+  ControllerGoalId source_goal;
   ExecutionBindingEpoch binding_epoch{0U};
   ExecutionControllerSampleDTO trip;
   SoftOnPathResolvedInitialStateDTO initial;

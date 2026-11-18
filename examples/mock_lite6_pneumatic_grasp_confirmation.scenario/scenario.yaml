@@ -13,7 +13,7 @@
   "saved_status": {
     "checked_content_digest": "sha256:0a16bdf9fdd71c7b81b6d6bbb369b633f5bcbc8d3b97e7cef216802c33865cba",
     "last_known_status": "unknown",
-    "manyforge_version": "0.2.0"
+    "manyforge_version": "0.3.0"
   },
   "scenario_id": "mock_lite6_pneumatic_grasp_confirmation",
   "source_snapshot": {

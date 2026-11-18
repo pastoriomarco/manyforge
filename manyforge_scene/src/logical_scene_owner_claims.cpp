@@ -19,22 +19,16 @@ namespace manyforge::scene::logical_scene_owner_detail {
 }
 
 [[nodiscard]] core::CellAdmissionClaimIntentDTO AuthoredSceneClaimIntent(
-    const SceneTransactionRequestDTO &request,
-    const ContentDigest &request_digest) {
+    const SceneTransactionRequestDTO &request) {
   if (!request.expected_admission_generation.has_value()) {
     throw LogicalSceneOwnerConflictError(
         "authored scene mutation lacks its admission generation");
   }
   core::CellAdmissionClaimIntentDTO intent{
       core::CellAdmissionClaimKindDTO::kAuthoredScene,
-      core::CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner,
-      RequestOwnerEpoch(
-          request.expected_projection_revision.scene_revision.scene_id.value()),
-      request.request_context.request_id.value(),
-      // Scope replay to this exact request, including its rotating request
-      // epoch.
-      core::RequestId(request_digest.value()),
-      request_digest,
+      core::ApplicationRole::kAuthoredSceneOwner,
+      std::nullopt,
+      request.request_context.request_key,
       *request.expected_admission_generation,
       {},
       std::nullopt,
@@ -55,10 +49,8 @@ void ReleaseAuthoredSceneClaim(
     const core::CellAdmissionSettlementKindDTO settlement_kind) {
   const core::CellAdmissionClaimReleaseDTO release{
       claim.intent.owner_role,
-      claim.intent.owner_epoch,
       claim.intent.owner_transaction_id,
-      claim.intent.request_id,
-      claim.intent.request_payload_digest,
+      claim.intent.request_key,
       claim.acquired_admission_generation,
       claim.claim_generation,
       {settlement_kind, terminal_evidence},
@@ -84,19 +76,9 @@ void SettleAuthoredSceneClaimIfHeld(
        projection_status != SceneProjectionCommitStatusDTO::kNotAttempted)) {
     return;
   }
-  auto intent = AuthoredSceneClaimIntent(request, request_digest);
-  auto receipt = admission.GetCellAdmissionRecoveryReceipt(
+  const auto intent = AuthoredSceneClaimIntent(request);
+  const auto receipt = admission.GetCellAdmissionRecoveryReceipt(
       {intent, std::nullopt, std::nullopt});
-  if (receipt.ok() &&
-      receipt.value().status ==
-          core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown) {
-    // Pre-upgrade claims used the request epoch. Only recover that exact
-    // intent; new claims always use the stable Scene identity.
-    intent.owner_epoch = request.request_context.request_owner_epoch;
-    intent.request_id = request.request_context.request_id;
-    receipt = admission.GetCellAdmissionRecoveryReceipt(
-        {intent, std::nullopt, std::nullopt});
-  }
   if (!receipt.ok()) {
     ThrowCellAdmissionFailure("authored scene recovery lookup failed",
                               receipt.error());
@@ -121,22 +103,20 @@ void SettleAuthoredSceneClaimIfHeld(
               : core::CellAdmissionSettlementKindDTO::kProvenNoEffect);
 }
 
+// Every resident intent with a recorded outcome, in transaction order; an
+// already released or unknown claim is left as it is.
 void SettleRecoveredAuthoredSceneClaims(
-    sqlite3 *database, core::IKernelCellAdmissionPort &admission) {
-  Statement rows(
-      database,
-      "SELECT i.request_json,i.request_digest,o.success,o.projection_status "
-      "FROM logical_scene_transaction_intents i "
-      "JOIN logical_scene_request_outcomes o "
-      "ON o.request_owner_epoch=i.request_owner_epoch "
-      "AND o.request_id=i.request_id ORDER BY i.transaction_sequence");
-  while (rows.Step()) {
+    const SceneStoreMemory &memory, core::IKernelCellAdmissionPort &admission) {
+  for (const auto &intent : memory.transactions) {
+    const auto outcome = memory.outcomes.find(intent.request_key);
+    if (outcome == memory.outcomes.end()) {
+      continue;
+    }
     const auto request =
-        logical_scene_codec_internal::DecodeRequest(rows.Text(0));
-    const auto success = rows.Integer(2) == 1;
-    SettleAuthoredSceneClaimIfHeld(
-        admission, request, ContentDigest(rows.Text(1)), success,
-        DecodeProjectionStatus(rows.Text(3)));
+        logical_scene_codec_internal::DecodeRequest(intent.request_json);
+    SettleAuthoredSceneClaimIfHeld(admission, request, intent.request_digest,
+                                   outcome->second.success,
+                                   outcome->second.projection_status);
   }
 }
 
@@ -153,7 +133,8 @@ LogicalSceneOwner::ReconcileAuthoredSceneAdmissionClaims() {
          "authored scene admission owner is not configured", {}});
   }
   try {
-    SettleRecoveredAuthoredSceneClaims(impl_->database(),
+    impl_->RequireOpen();
+    SettleRecoveredAuthoredSceneClaims(impl_->memory_,
                                        *impl_->cell_admission_);
     return core::Result<void>::Ok();
   } catch (const CellAdmissionTemporarilyUnavailable &error) {
@@ -168,126 +149,6 @@ LogicalSceneOwner::ReconcileAuthoredSceneAdmissionClaims() {
          "authored scene admission reconciliation raised a non-standard "
          "exception",
          {}});
-  }
-}
-
-core::Result<void> ValidateAuthoredSceneCellAdmissionSettlementReadOnly(
-    const std::filesystem::path &database_path, const core::CellId &cell_id,
-    const core::CellAdmissionClaimDTO &claim,
-    const core::CellAdmissionClaimReleaseDTO &release) {
-  const auto rejected = [](std::string reason) {
-    return core::Result<void>::Err(core::ErrorDTO{
-        "invariant_violation",
-        "authored-scene cell-admission settlement is not owner-proven",
-        {{"reason", std::move(reason)}}});
-  };
-  if (!core::ValidateCellAdmissionClaimIntent(claim.intent).ok() ||
-      claim.intent.claim_kind !=
-          core::CellAdmissionClaimKindDTO::kAuthoredScene ||
-      claim.intent.owner_role !=
-          core::CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner ||
-      release.owner_role != claim.intent.owner_role ||
-      release.owner_epoch != claim.intent.owner_epoch ||
-      release.owner_transaction_id != claim.intent.owner_transaction_id ||
-      release.request_id != claim.intent.request_id ||
-      release.request_payload_digest != claim.intent.request_payload_digest ||
-      release.acquired_admission_generation !=
-          claim.acquired_admission_generation ||
-      release.claim_generation != claim.claim_generation) {
-    return rejected("authored_scene_release_identity_mismatch");
-  }
-
-  sqlite3 *database = nullptr;
-  const auto opened = sqlite3_open_v2(
-      database_path.string().c_str(), &database,
-      SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW,
-      nullptr);
-  if (opened != SQLITE_OK) {
-    if (database != nullptr) {
-      sqlite3_close(database);
-    }
-    return rejected("logical_scene_journal_unavailable");
-  }
-  try {
-    Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
-          "configure read-only scene-settlement timeout");
-    Exec(database, "PRAGMA query_only=ON");
-    std::optional<core::SceneTransactionRequestDTO> decoded_request;
-    std::string request_digest;
-    bool success = false;
-    std::optional<SceneProjectionCommitStatusDTO> decoded_projection_status;
-    {
-      // The statements are finalized before the close below: sqlite3_close
-      // leaves a connection with live statements open (SQLITE_BUSY), which
-      // leaked two descriptors per settlement in the execution host.
-      Transaction snapshot(database, "BEGIN");
-      if (ScalarInteger(database, "PRAGMA application_id") !=
-              kCanonicalEmptySceneSqliteApplicationId ||
-          ScalarInteger(database, "PRAGMA user_version") !=
-              kLogicalSceneStoreSchemaVersion) {
-        throw LogicalSceneOwnerIntegrityError(
-            "logical-scene settlement reader found a foreign schema");
-      }
-      Statement metadata(
-          database,
-          "SELECT cell_id FROM logical_scene_store_metadata WHERE singleton=1");
-      if (!metadata.Step() || metadata.Text(0) != cell_id.value() ||
-          metadata.Step()) {
-        throw LogicalSceneOwnerIntegrityError(
-            "logical-scene settlement reader found a foreign cell");
-      }
-      Statement row(
-          database,
-          "SELECT i.request_json,i.request_digest,o.success,o.projection_status "
-          "FROM logical_scene_transaction_intents i "
-          "JOIN logical_scene_request_outcomes o "
-          "ON o.request_owner_epoch=i.request_owner_epoch "
-          "AND o.request_id=i.request_id "
-          "WHERE i.request_digest=?");
-      row.Bind(1, claim.intent.request_payload_digest.value());
-      if (!row.Step()) {
-        throw LogicalSceneOwnerIntegrityError(
-            "authored-scene terminal outcome is absent");
-      }
-      decoded_request =
-          logical_scene_codec_internal::DecodeRequest(row.Text(0));
-      request_digest = row.Text(1);
-      success = row.Integer(2) == 1;
-      decoded_projection_status = DecodeProjectionStatus(row.Text(3));
-      if (row.Step()) {
-        throw LogicalSceneOwnerIntegrityError(
-            "authored-scene terminal outcome is not unique");
-      }
-      snapshot.Commit();
-    }
-    sqlite3_close(database);
-    database = nullptr;
-    const auto &request = *decoded_request;
-    const auto projection_status = *decoded_projection_status;
-    const auto expected_kind =
-        success ? core::CellAdmissionSettlementKindDTO::kOwnerCommit
-                : core::CellAdmissionSettlementKindDTO::kProvenNoEffect;
-    const auto intent =
-        AuthoredSceneClaimIntent(request, ContentDigest(request_digest));
-    auto legacy_intent = intent;
-    legacy_intent.owner_epoch = request.request_context.request_owner_epoch;
-    legacy_intent.request_id = request.request_context.request_id;
-    if ((!IsAuthoredSceneMutation(request) &&
-         !request.program_node_evidence.has_value()) ||
-        (claim.intent != intent && claim.intent != legacy_intent) ||
-        request_digest != claim.intent.request_payload_digest.value() ||
-        release.settlement.evidence_digest.value() != request_digest ||
-        release.settlement.settlement_kind != expected_kind ||
-        (!success &&
-         projection_status !=
-             SceneProjectionCommitStatusDTO::kRejectedRollbackProven &&
-         projection_status != SceneProjectionCommitStatusDTO::kNotAttempted)) {
-      return rejected("authored_scene_terminal_evidence_mismatch");
-    }
-    return core::Result<void>::Ok();
-  } catch (const std::exception &) {
-    sqlite3_close(database);
-    return rejected("logical_scene_journal_read_failed");
   }
 }
 

@@ -12,8 +12,7 @@ from manyforge_headless_api.native import HeadlessApiError
 
 def _query(kind="frame_pose"):
     return {
-        "schema_version": "manyforge.target_observation_query.v2",
-        "owner_epoch": "owner.1",
+        "schema_version": "manyforge.target_observation_query.v3",
         "program_binding_id": "sha256:" + "a" * 64,
         "target": {"component_id": "robot", "command_target_id":
                    "arm" if kind == "frame_pose" else "gripper"},
@@ -50,10 +49,10 @@ def _response(query, coordinate_kind="angular_rad"):
     return {
         "ok": True,
         "command": "query_target",
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "target_observation": {
             **query,
-            "schema_version": "manyforge.target_observation.v2",
+            "schema_version": "manyforge.target_observation.v3",
             "source_epoch": "source.1",
             "source_sequence": 7,
             "value": value,
@@ -88,7 +87,7 @@ def test_query_has_one_exact_read_and_preserves_typed_owner_evidence(kind, coord
     assert client.query_target(TargetObservationQuery.model_validate(query)) == response
     assert requests == [
         {
-            "api_version": "manyforge.execution_command.v3",
+            "api_version": "manyforge.execution_command.v4",
             "command": "query_target",
             "query": query,
         }
@@ -108,12 +107,12 @@ def test_frame_query_may_request_an_exact_relative_frame():
     "change",
     [
         {"kind": "dispatch"},
-        {"owner_epoch": ""},
-        {"owner_epoch": 123},
+        # Query v3 names no owner epoch (contract 1.16.4, rule 1).
+        {"owner_epoch": "owner.1"},
         {"program_binding_id": "other"},
         {"target": {"component_id": "", "command_target_id": "arm"}},
         {"frame": None},
-        {"request_id": "effect"},
+        {"request_key": "0" * 32},
         {"schema_version": "manyforge.target_observation_query.v1"},
     ],
 )
@@ -212,8 +211,7 @@ _FRAME = {"component_id": "robot.2", "frame_id": "tcp"}
 
 def _transform_query(**change):
     return {
-        "schema_version": "manyforge.target_observation_query.v2",
-        "owner_epoch": "owner.1",
+        "schema_version": "manyforge.target_observation_query.v3",
         "program_binding_id": "sha256:" + "a" * 64,
         "kind": "frame_transform",
         "pose": {
@@ -230,10 +228,10 @@ def _transform_response(query):
     return {
         "ok": True,
         "command": "query_target",
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "target_observation": {
             **query,
-            "schema_version": "manyforge.target_observation.v2",
+            "schema_version": "manyforge.target_observation.v3",
             "evaluated_at_ns": "18446744073",
             "scene_revision": {
                 "scene_id": "sha256:" + "c" * 64,

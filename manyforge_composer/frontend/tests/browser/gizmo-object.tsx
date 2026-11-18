@@ -19,7 +19,7 @@ function App() {
     <div ref={setInspector} />
     <StructuralViewer viewerActive manifest={{ status: 'loading' }} onRetry={() => undefined}
       inspectorTarget={inspector} sceneObjects={[object]} selectedSceneResourceId={object.scene_resource_id}
-      sceneOwnerIdentity={{ ownerEpoch: 'disposable-fixture', generation: 1 }}
+      sceneOwnerIdentity={{ applicationStartId: 'disposable-fixture', generation: 1 }}
       sceneMutationAvailability={{ 'test-box': {
         transform: true, shape: true, duplicate: false, remove: false, detach: false,
         transformReason: null, shapeReason: null, duplicateReason: null, removeReason: null, detachReason: null,

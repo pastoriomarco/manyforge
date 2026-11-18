@@ -13,12 +13,12 @@ vi.mock('../api/client', async (importOriginal) => ({
   api: { manager: { applyStatus: vi.fn(), acknowledgeApply: vi.fn() } },
 }));
 
-const identity = { applyId: 'apply-3', applyGeneration: 3 };
+const identity = { applyId: 3, applyGeneration: 3 };
 const digest = `sha256:${'a'.repeat(64)}`;
 function section(records: unknown[] = [record()]): HeadlessSourceSection {
   return {
     available: true, freshness: 'fresh', knownGaps: [], sourceGeneration: 1,
-    sourceOwnerEpoch: 'manager-epoch', sourceOwnerId: 'manager', receiverAgeNs: 0,
+    sourceOwnerId: 'manager', receiverAgeNs: 0,
     payload: { apply: { records, mutation_available: false, unavailable_reason_code: null } },
   };
 }
@@ -28,7 +28,7 @@ function status(
 ): ManagerApplyStatus {
   const phase = state === 'pending' ? 'accepted' : 'settled';
   return {
-    ...applyIdentity, apiVersion: 'manyforge.manager_command_response.v2', ok: true,
+    ...applyIdentity, apiVersion: 'manyforge.manager_command_response.v3', ok: true,
     state, phase, candidateProjectionRevision: null, error: null, failure: null,
     failureAcknowledgement: 'unavailable',
     lastProgress: { phase, recordDigest: digest },
@@ -37,7 +37,7 @@ function status(
       capturedInputDigest: digest, deploymentArtifactId: 'deployment.fixture',
       deploymentRevision: digest, programBindingId: digest, preparedActivationId: digest,
     },
-    requestId: 'request-3', requestOwnerEpoch: 'browser-epoch-3',
+    requestKey: `c0${'3'.repeat(30)}`,
   };
 }
 function failedStatus(
@@ -66,11 +66,11 @@ function failedStatus(
 let root: import('react-dom/client').Root;
 let latest: ReturnType<typeof useManagerApplyStatus>;
 let browser: EventTarget;
-function Harness({ manager, transport, applyIdentity }: {
+function Harness({ manager, transport, applyIdentity, start }: {
   manager: HeadlessSourceSection; transport: ControlTransportStatus;
-  applyIdentity: typeof identity;
+  applyIdentity: typeof identity; start: string;
 }) {
-  const result = useManagerApplyStatus(applyIdentity, manager, transport);
+  const result = useManagerApplyStatus(applyIdentity, manager, transport, start);
   useEffect(() => { latest = result; }, [result]);
   return null;
 }
@@ -78,8 +78,11 @@ async function render(
   manager = section(),
   transport: ControlTransportStatus = 'connected',
   applyIdentity = identity,
+  start = '3f9a0000000000a1',
 ) {
-  await act(async () => root.render(createElement(Harness, { manager, transport, applyIdentity })));
+  await act(async () => root.render(createElement(Harness, {
+    manager, transport, applyIdentity, start,
+  })));
 }
 
 beforeEach(async () => {
@@ -127,7 +130,7 @@ describe('Manager Apply owner observation', () => {
 
   it('ignores heartbeat counters, unrelated records and same-socket delay recovery', async () => {
     await render();
-    const next = section([record(), { ...record(), apply_id: 'unrelated' }]);
+    const next = section([record(), { ...record(), apply_id: 98 }]);
     next.sourceGeneration = 100;
     next.receiverAgeNs = 99;
     next.payload = { ...next.payload, runtime: { observed_units: [{ process_observation_sequence: 100 }] } };
@@ -146,7 +149,7 @@ describe('Manager Apply owner observation', () => {
     await render(section(), 'delayed');
     await render(section(), 'connected');
     expect(api.manager.applyStatus).toHaveBeenCalledTimes(3);
-    await render({ ...section(), sourceOwnerEpoch: 'new-owner' });
+    await render(section(), 'connected', identity, '3f9a0000000000a2');
     expect(api.manager.applyStatus).toHaveBeenCalledTimes(4);
     await render({ ...section(), available: false, freshness: 'unavailable' });
     expect(api.manager.applyStatus).toHaveBeenCalledTimes(5);
@@ -170,7 +173,7 @@ describe('Manager Apply owner observation', () => {
   });
 
   it('rejects mismatched HTTP identities and leaves lost reads explicitly unavailable', async () => {
-    vi.mocked(api.manager.applyStatus).mockResolvedValue({ ...status(), applyId: 'wrong' });
+    vi.mocked(api.manager.applyStatus).mockResolvedValue({ ...status(), applyId: 97 });
     await render();
     expect(latest.status).toBe(null);
     expect(latest.unavailable).toBe(true);
@@ -191,7 +194,7 @@ describe('Manager Apply owner observation', () => {
     await render(section([record('terminal', 'succeeded')]));
     await act(async () => resolveOld(status()));
     expect(latest.status?.state).toBe('succeeded');
-    expect(vi.mocked(api.manager.applyStatus).mock.calls[0][2]?.aborted).toBe(true);
+    expect(vi.mocked(api.manager.applyStatus).mock.calls[0][3]?.aborted).toBe(true);
   });
 
   it('confirms only an acknowledged enum and retains the failed terminal record', async () => {
@@ -211,14 +214,15 @@ describe('Manager Apply owner observation', () => {
     expect(latest.status?.failureAcknowledgement).toBe('acknowledged');
     expect(api.manager.acknowledgeApply).toHaveBeenCalledTimes(1);
     const acknowledgementArgs = vi.mocked(api.manager.acknowledgeApply).mock.calls[0];
-    expect(acknowledgementArgs?.[0]).toBe('apply-3');
+    expect(acknowledgementArgs?.[0]).toBe(3);
     expect(acknowledgementArgs?.[1]).toBe(3);
-    expect(acknowledgementArgs?.[2]).toMatchObject({
-      request_id: expect.stringMatching(/^composer-manager-apply-ack-/),
+    // The acknowledgement names the start it was read in and its own key.
+    expect(acknowledgementArgs?.[2]).toBe('3f9a0000000000a1');
+    expect(acknowledgementArgs?.[3]).toEqual({
+      request_key: expect.stringMatching(/^[0-9a-f]{32}$/),
       source_label: 'manyforge_composer',
     });
-    expect(acknowledgementArgs?.[2]).not.toHaveProperty('request_owner_epoch');
-    expect(acknowledgementArgs?.[2]).not.toHaveProperty('correlation_id');
+    expect(vi.mocked(api.manager.applyStatus).mock.calls[0][2]).toBe('3f9a0000000000a1');
     expect(api.manager.applyStatus).toHaveBeenCalledTimes(2);
   });
 
@@ -314,7 +318,7 @@ describe('Manager Apply owner observation', () => {
     await render();
     await act(async () => { await latest.acknowledgeFailure(); });
     expect(latest.status?.failureAcknowledgement).toBe('unavailable');
-    await render({ ...section(), sourceOwnerEpoch: 'new-manager-epoch' });
+    await render(section(), 'connected', identity, '3f9a0000000000a2');
     expect(latest.status?.failureAcknowledgement).toBe('acknowledged');
     expect(api.manager.acknowledgeApply).toHaveBeenCalledTimes(1);
     expect(api.manager.applyStatus).toHaveBeenCalledTimes(3);
@@ -336,7 +340,7 @@ describe('Manager Apply owner observation', () => {
   });
 
   it('does not carry an ambiguous acknowledgement hold to a different Apply identity', async () => {
-    const nextIdentity = { applyId: 'apply-4', applyGeneration: 4 };
+    const nextIdentity = { applyId: 4, applyGeneration: 4 };
     vi.mocked(api.manager.applyStatus)
       .mockResolvedValueOnce(failedStatus('available'))
       .mockRejectedValueOnce(new Error('status reply lost'))
@@ -414,7 +418,7 @@ describe('Manager Apply owner observation', () => {
     expect(latest.status?.failureAcknowledgement).toBe('available');
     expect(api.manager.acknowledgeApply).toHaveBeenCalledTimes(2);
     // A proven refusal may use a fresh request.
-    const ids = vi.mocked(api.manager.acknowledgeApply).mock.calls.map((call) => call[2].request_id);
+    const ids = vi.mocked(api.manager.acknowledgeApply).mock.calls.map((call) => call[3].request_key);
     expect(ids[0]).not.toBe(ids[1]);
   });
 

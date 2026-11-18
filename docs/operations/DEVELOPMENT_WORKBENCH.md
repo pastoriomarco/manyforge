@@ -103,16 +103,30 @@ them once, when it creates the container.
 
 ### Site settings
 
-Machine facts live in one JSON file, `manyforge.site.v1`, never in a
-Scenario: robot addresses (`device_addresses`) and the host project folders
-shown in Composer (`project_folders`). For example:
+Machine facts live in one JSON file, `manyforge.site.v2`, never in a
+Scenario: robot addresses (`device_addresses`), the host project folders
+shown in Composer (`project_folders`) and the [disk limits](#disk-limits).
+For example:
 
 ```json
-{"schema":"manyforge.site.v1","device_addresses":{"lite6_main":"192.168.1.31"},"project_folders":["/home/USER/Projects"]}
+{"schema":"manyforge.site.v2","device_addresses":{"lite6_main":"192.168.1.31"},"project_folders":["/home/USER/Projects"]}
 ```
 
-`schema` is required; `device_addresses` and `project_folders` are optional;
-no other field is accepted. A Scenario names a `device_addresses` key (for
+`schema` is required; every other member is optional, and no other field is
+accepted:
+
+| Member | Default | Meaning |
+| --- | --- | --- |
+| `device_addresses` | none | Robot addresses by key. |
+| `project_folders` | none | Host folders shown in Composer. |
+| `disk_max_percent` | `10` | The largest share of the disk ManyForge's own files may take, in percent; an integer from 1 to 100. |
+| `disk_always_free_bytes` | `10000000000` (10 GB) | The space that always stays free, in bytes; an integer from 0 to 9007199254740991. |
+| `disk_machine_minimum_bytes` | `0` | The space the machine itself needs besides ManyForge, in bytes, added to the free space a start needs; not determined yet. Same range. |
+
+A missing member takes its default, so a file only needs the members it
+changes; without a file every default applies. A `manyforge.site.v1` file is
+still accepted and uses the default disk limits; a file with a disk member
+must say `manyforge.site.v2`. A Scenario names a `device_addresses` key (for
 example `lite6_main`), never the address. Set `MANYFORGE_DEV_SITE_SETTINGS`
 to the file's absolute host path before `start`. The file is read when the
 workbench starts: after editing it, `stop` and `start` again. `start` refuses
@@ -293,18 +307,46 @@ or `docker start` on the previously claimed container. Start without
 `--project` when the rollout must not Load a Scenario. Frontend-only source
 updates use HMR and do not require a workbench restart.
 
+Inside the container the Manager is the one supervisor of the application:
+it starts Headless, the Program runner and Composer (Composer once its first
+empty baseline is ready), and owns the execution host. If any of them exits,
+the Manager ends the whole application and the workbench stops; the console
+shows `<process> exited with status N`, then
+`development_workbench_unavailable: Manager ended the application with status 72`. Nothing is restarted on its
+own: read the log, then start again. `stop`, and every other end of the
+application, first asks for a Halt of the cell and waits until it is
+complete, then stops Composer, the Program runner and Headless and waits for
+each to exit, then the execution host, and last the Manager writes its own
+records. No step has a time limit: the log shows the step being waited for
+(`application stop: waiting at <step>: …`, and the execution host's
+`native shutdown entering/waiting at <phase>`). A second stop request (a
+second SIGTERM or Ctrl+C to the workbench) ends the processes still running:
+the log names the step (`application_stop_forced`) and each process ended
+(`application_process_killed`), and the Manager still writes its own records.
+`compose-dev.sh stop` gives the container 30 s; Docker then ends whatever is
+left. A Halt that is refused or cannot be followed is logged as
+`manager_planned_stop_overrun` or `execution_host_planned_stop_overrun`;
+check that the robot has stopped before starting again. If a step of the stop
+did not complete, the Manager ends with status 74 and the next start reports
+that the shutdown was unclean or could not be verified.
+
 Runtime owners use `current/` below the mounted state root. Before they start,
 the launcher atomically moves the previous `current/` into
-`previous-sessions/<session-id>/`, preserving every journal and
+`previous-runs/<session-id>/`, preserving every journal and
 their WAL/SHM companions together. Archived files lose write permissions and
-are never passed to runtime owners. `history.sqlite3` and its companions stay
-at the stable state root; installation settings and persistent Program keys
-also retain their existing separate storage.
+are never passed to runtime owners. History stays in `history/` at the stable
+state root; installation settings and persistent Program keys also retain
+their existing separate storage. A state root that still holds
+`previous-sessions/` from an earlier build, or any other entry the launcher
+does not know, is refused and left unchanged; move that entry out of the
+state root, then start again.
 
-An unclosed previous session, or readable unresolved work, produces a named
-warning in the existing Workbench notification rail. An ordinary verified
-shutdown stays quiet when remaining journal evidence is opaque; History records
-the unknown families. These facts describe durable work and process shutdown,
+An unclosed previous session, or readable unresolved work, raises the alarm
+"ManyForge did not close correctly last time"
+(`manyforge.runtime.previous_session_unclean`) once Headless has filed the
+previous-session report at start. An ordinary verified shutdown stays quiet
+when remaining journal evidence is opaque; History records the unknown
+families. These facts describe durable work and process shutdown,
 not physical rest. History also records that old journal events may not have
 been imported. Reports are written durably to `session-reports/pending/`, then
 the existing historian appends each idempotently before moving it to
@@ -403,9 +445,10 @@ ownership; the mount inspection is a point-in-time check. Selected roots may hav
 ancestors; links leading to a unit folder remain protected, with an
 accounting-incomplete warning. Other independently eligible units can
 still rotate. Links inside a positively owned unit may be unlinked; their targets
-are never followed or deleted. The site
-settings are `MANYFORGE_LOG_EVIDENCE_MAX_DISK_PERCENT=10` and
-`MANYFORGE_LOG_EVIDENCE_MIN_FREE_BYTES=10000000000`. They are triggers for
+are never followed or deleted. The disk
+limits are the site settings' `disk_max_percent` (default 10) and
+`disk_always_free_bytes` (default 10 GB); see [Disk limits](#disk-limits).
+They are triggers for
 cleanup, not authority to delete useful traces. Usage accounts allocated
 log/evidence bytes across default roots under `.manyforge-dev/runtime/*` on
 the same filesystem; an explicit custom root is accounted separately. The
@@ -452,8 +495,45 @@ floor proves pressure, oldest observed first. Protected-only or unresolved
 pressure reports a warning and stops cleanup; it never gates motion or
 startup.
 
-Previous-session journals are not imported into History. The workbench
-normally keeps up to five previous sessions.
+Previous-run journals are not imported into History. Previous runs are
+pruned at each start, before the previous `current/` moves, to five runs,
+counting that `current/`, and to 2 GiB of archived runs and older History
+files together, oldest first; the newest archived run, the run the current
+report describes and the current History file are never deleted. See
+[Disk limits](#disk-limits) for the pruning above those limits.
+
+#### Disk limits
+
+ManyForge's own files under the runtime state root take at most
+`disk_max_percent` (default 10) percent of the disk, and
+`disk_always_free_bytes` (default 10 GB) always stay free; both are
+[site settings](#site-settings). While
+either limit is exceeded, the start also deletes previous runs and older
+History files below the five-run and 2 GiB limits, oldest first, at most
+eight per pass, with the same protections. While the workbench runs, it
+repeats this pass every 60 seconds, only when a limit is exceeded; the
+current run's files are never deleted. Each deletion is one line in the
+container log, naming the folder and the limits.
+
+After that pass, if the disk that holds the runtime state root (or its
+`history/`) has less free space than `disk_always_free_bytes` plus
+`disk_machine_minimum_bytes` (10 GB by default), or no free inodes, `start`
+stops before anything is written, with exit status 69:
+
+```text
+disk_space_below_floor: Not started: the disk that holds <path> has 4 GB free. ManyForge needs at least 10 GB free (10 GB plus 0 GB for the machine). Free 6 GB and start again.
+```
+
+`MANYFORGE_LOG_EVIDENCE_MAX_DISK_PERCENT` and
+`MANYFORGE_LOG_EVIDENCE_MIN_FREE_BYTES` are no longer read: `start` refuses
+to run while either is set and names the site settings member to use. The report of the previous run lists up to 64 of its
+unfinished operations, each marked `host_replaced`. In the execution host's
+operation journal it counts as unresolved an unfinished operation, an
+accepted Stop without a completion row, and a cell-admission claim with a
+`cell_claim_acquired` row but no `cell_claim_released` row. A journal whose
+`journal_metadata.records_lost` is 1 lost records during that run (the alarm
+"Operation records are being lost" was shown), so such counts can be
+incomplete or wrong.
 Unimported records, including safety records, are not guaranteed to survive
 retention. See the [session note](FRESH_CHECKOUT_CHECKLIST.md) for their
 location and what to preserve.
@@ -490,21 +570,24 @@ the top right) are installation-specific and survive stop/start. They are kept i
 `.manyforge-dev/state/composer/settings.json`, mounted into the workbench as
 `/var/lib/manyforge/composer` (`MANYFORGE_STATE_DIR=/var/lib/manyforge`).
 Values of `persistent` blackboard keys are owned by the Program runner and kept
-beside them in `.manyforge-dev/state/program-runner/persistent-keys.json`
-(mounted as `/var/lib/manyforge/program-runner`). These installation settings
+beside them in `.manyforge-dev/state/program-runner/` (mounted as
+`/var/lib/manyforge/program-runner`), in a file named by its format version,
+`persistent-keys.v<N>.json` (currently `persistent-keys.v5.json`). These installation settings
 remain separate from the persistent runtime root described above.
 Stored values survive `stop`/`start` while the applied Program still declares
 their key persistent with the same type and fields; a value whose key a
-committed Apply removed or restructured is dropped with a notice. The
-workbench Manager's state resets with the container, so the first Apply after
-a start begins a new publication history; the stored values are simply checked
-against that Program. A committed Apply the Program runner never observed
-keeps the values and is reported as `applied_program_not_observed` on the
-stored-values page and in the run audit: it is a defect to investigate. A
-register file written in another format is refused by name
-(`persistent_key_register_version_unsupported`) and never rewritten; resetting
-the register is a deliberate operator step: move the old file aside before the
-next start.
+committed Apply removed or restructured is dropped with a notice. The values
+follow the Program the runner actually activates: on every wake it checks them
+against the current committed activation, and an Apply a later one superseded
+before the runner activated it has no effect. Only
+the current format's file is opened or created. An earlier register file
+(`persistent-keys.json`, or a `persistent-keys.v<N>.json` with a lower number)
+is never opened, moved, rewritten or deleted; when the current file does not
+exist yet the stored values start empty and the Program runner logs one line
+naming the earlier file. A current-format file whose content names another
+format (a damaged or hand-edited file) is refused by name
+(`persistent_key_register_version_unsupported`) and never rewritten; move it
+aside before the next start to begin with no stored values.
 An unreadable settings file is never overwritten silently: Composer uses the
 defaults, keeps settings read-only and offers a reset that keeps the file as a
 `settings.json.bak-<time>` backup.
@@ -552,6 +635,27 @@ exported references. Do not use Save As as an asset-collection operation.
 - **Apply** (Deployment) makes the Draft the running configuration. Replaced
   and removed components are disabled and stopped first; affected components
   come back prepared. Apply is refused while a Program run is in progress.
+- **Apply** and **Revert**, of the Program or the Deployment, keep the live
+  Scene: objects stay where they are; only Load and New initialize it. The
+  confirmation offers **Reload initial scene** (off by default) on every
+  Deployment Apply and Revert, and on a Program Apply or Revert when the
+  Program's initial scene changes. Once the Apply or Revert is Applied, a
+  Reset with **Reload initial scene** follows, which puts every object back
+  to its start pose and returns persistent keys to their initial values.
+  While it waits for the cycle to be Idle, the notice **Initial scene reload
+  pending** is shown. If a run or another command starts first, the Reset is
+  not sent and **Initial scene not reloaded** stays until acknowledged. If
+  that Reset is refused or fails, the Apply stays and the Reset's error is
+  shown. An Apply or Revert that is refused or fails reloads nothing.
+  Without the option, the live cell keeps its current scene until a
+  Reset with **Reload initial scene**. While a finished, stopped or held run
+  exists, Apply and Revert Reset it first (**Reset run and Apply**, **Reset
+  run and Revert**).
+  - A Deployment Apply that removes a component carrying an object fails
+    (`configuration_preservation_failed`). Reset with **Reload initial
+    scene** first, then apply.
+  - Objects placed relative to a component that the Apply moves keep their
+    old cell pose until a Reset with **Reload initial scene**.
 - **Prepare** and **Enable** run on one component (its page) or on all of them
   (**Prepare all**, **Enable all** in the Components list). On a machine,
   Prepare the owner first; Enable acts on members. On a real xArm the motors
@@ -561,9 +665,10 @@ exported references. Do not use Save As as an asset-collection operation.
   offers **Activate and execute**: it prepares and enables every active
   component, then executes the Program once.
 - **Run** starts motion. A Program starts held: each motion group shows **Run**
-  in the Motion panel, and nothing moves until it is pressed. **Stop** holds a
-  group, **Resume** continues it, **Halt** stops all Program motion and halts
-  the tree, and **Reset** ends the run.
+  in the Motion panel, and nothing moves until it is pressed. **Stop** stops a
+  group, **Resume** continues it, the **All groups** row's **Stop** stops all
+  motion in the cell, **Halt** also pauses the tree, and **Reset** ends the
+  run ([Stop, Stop all and Halt](#stop-stop-all-and-halt)).
 - **Reset robot position** (a Reset option, and **Reset position** on a robot's
   component page) sets the robots to the Deployment's initial joint positions.
   It is offered where every robot's adapter supports it: Mock and Isaac,
@@ -595,6 +700,82 @@ cannot reach Isaac at all. In that case the simulator component stays Offline
 with `simulator_unreachable` and a warning; its state does not latch the cell
 or block Execute. Robot and tool health still follows their own reported
 states ([Troubleshooting](TROUBLESHOOTING.md#simulation-not-playing)).
+
+### Stop, Stop all and Halt
+
+ManyForge has three Stop levels. They are operational software stops, not
+safety functions: the cell's emergency stops belong to the integrator's
+safety controller.
+
+- **Stop** (a group's **Stop** in the Program panel) stops the Program motion
+  of the selected groups. A manual move in progress keeps moving, and the
+  Program tree keeps running; its motion in the stopped groups waits.
+  **Resume** on a group continues it.
+- **Stop all** (the **Stop** of the **All groups** row) stops all motion in
+  the cell: every group is stopped and every manual operation stops. The
+  Program tree keeps running, and each group waits for its Resume. Stop all
+  also works with no Program loaded, and a new manual move is allowed right
+  after it.
+- **Halt** is Stop all, and in addition pauses the Program tree and blocks
+  new manual moves until **Execute** or **Reset**. The **Halt** button sends
+  Stop all at once, then asks whether to halt the Program (*Confirm before
+  halting the Program*, under Layout and confirmations in the panel
+  settings, on by default; with it off, Halt follows at once). **Cancel**
+  leaves every group stopped, ready for Resume. After **Execute** the tree
+  continues, but motion stays stopped until **Run** or **Resume** on each
+  group. With no Program run, Halt stops everything and blocks nothing
+  afterwards, so it asks nothing.
+
+The **Stop** of the **All groups** row is enabled while something can move: a
+manual move, or Program motion that is running, starting or stopping. **Halt**
+is enabled then too, and also while a Program run is active, even with all
+its motion stopped. With nothing to stop, both are disabled and their tooltip
+says so (*Nothing is moving*, *Nothing is running*). While the live status feed
+is not connected and current, both stay enabled, since what the panel shows
+may be out of date.
+
+Output writes (**Set output** and a pneumatic gripper's valve writes), Scene
+nodes and **Set TCP** are atomic: a Stop never cuts them off. The node waits
+for its answer while the Program tree keeps ticking. If a Stop that holds the
+node, or a Halt, comes before the request was sent, it is not sent: the node
+stays running where it is and sends it once it runs again (after Run, Resume
+or Execute). If the request was already sent, it completes: the node returns
+its real result (success, or failure with the device's code), and the Halt,
+or the end of the run on Reset, takes effect only after that answer.
+
+A Stop is never refused. A Stop that names an unknown group, operation,
+component or resource, or whose request is invalid, is carried out as Stop
+all; an invalid Halt is still a Halt. Resume, Run, and Execute after a Halt
+are refused with `program_selection_manual_operation_active` while a manual
+move still runs on one of the robots they would release.
+
+If a Stop cannot confirm that a robot stopped (its last Stop stage failed),
+ManyForge raises a Halt by itself. That robot's component shows **Stop not
+confirmed** with activity unknown, and the cell stays latched, until its
+controller reports it idle again. Check the robot.
+
+A Program can stop the cell itself with the **Cell Stop** node
+(`kernel.cell_stop`): every operation in the cell stops, manual ones
+included, and the Program is not held. The node succeeds when that Stop is
+complete, and fails with `stop_not_contained` when a robot's Stop was not
+contained.
+
+No request from the Manager to the execution host has a time limit: its
+launch, its status, the Apply fence, cell admission, Host Apply, projection
+requests and the liveness reports all wait for the host's answer however long
+it takes. A slow answer halts nothing and does not make the execution host
+count as faulted. While one request waits, other requests to the host answer
+`execution_host_late` at once (refused before any effect; try again), and
+while it prepares projections, reads its component processes during an Apply
+or rebuilds a projection they answer `runtime_unit_launch_in_progress`. The
+Manager's own loop never waits on the host: it reads each status answer at a
+later tick. A request still unanswered at the Manager's next tick is logged as
+`execution_host_late_reply`, and its answer as
+`execution_host_late_reply_settled`. Stops never wait on these requests. A
+wait ends early only when the host exits (`execution_host_exited`; ManyForge
+stops the application) or ManyForge stops (`application_stopping`). An Apply has no overall time
+limit either; while one runs, a new Apply, New or a failed-Apply release
+answers `apply_busy` and nothing is done.
 
 ### Components and Deployment
 
@@ -684,7 +865,9 @@ one edit (action `add_components`); `POST /api/deployment/draft/mutations`
 changes or removes existing rows (action `mutate`); `POST
 /api/deployment/preview` returns the diff and `POST /api/deployment/apply`
 applies it. `POST /api/scenario/load` and `POST /api/scenario/new` are Load and
-New (MCP `manyforge_scenario`); `GET /api/components` and `POST
+New (MCP `manyforge_scenario`). Apply, Load and New answer when they are
+accepted; their outcome is the row with their `request_key` in `apply_commands`
+of `GET /api/deployment/workspace`. `GET /api/components` and `POST
 /api/components/{component_id}/actions` read states and run actions (MCP
 `manyforge_components`).
 

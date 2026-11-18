@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <map>
 #include <stdexcept>
 #include <limits>
@@ -39,19 +40,21 @@ InstalledInventoryRequest() {
           ActiveBundlePublicationGeneration(5U),
           ContentDigest(std::string(kDigestOne)),
           RuntimeUnitId("runtime.kernel"),
-          RuntimeEpoch("runtime-epoch-1"),
-          RuntimeEpoch("manager-epoch-1")};
+          RuntimeEpoch("runtime-epoch-1")};
 }
 
 [[nodiscard]] HostApplyRequest HostRequest() {
-  return {NamedApplyPublicationTransactionDTO{ApplyId("apply-1"), ApplyGeneration(2U)},
+  return {NamedApplyPublicationTransactionDTO{ApplyId(1U), ApplyGeneration(2U)},
           RetainedBundleId("bundle-1"),
           GraphRevision("graph-1"),
           {ControllableComponentId("arm.1"), ControllableComponentId("gripper.1"),
            ControllableComponentId("io.1")},
           {ControllableComponentId("arm.1")},
           {ControllableComponentId("camera.1")},
-          {ControlDomainId("camera.domain")}};
+          {ControlDomainId("camera.domain")},
+          HostApplyProgramSelection{ProgramId("program.1"),
+                                    ProgramRevision(std::string(kDigestTwo)),
+                                    ProgramBindingId(std::string(kDigestThree))}};
 }
 
 TEST(SelectedRuntimeCompositionRpcInternal, HostApplyRequestRoundTripsThroughTheRequestVariant) {
@@ -59,7 +62,7 @@ TEST(SelectedRuntimeCompositionRpcInternal, HostApplyRequestRoundTripsThroughThe
   ASSERT_TRUE(request.valid());
   const auto encoded = EncodeSelectedRuntimeCompositionRpcRequest(request);
   EXPECT_TRUE(IsSelectedRuntimeCompositionRpcPacket(encoded));
-  EXPECT_EQ(encoded.substr(0U, 8U), std::string("MFNSRC6\0", 8U));
+  EXPECT_EQ(encoded.substr(0U, 8U), std::string("MFNSRC7\0", 8U));
   const auto decoded = DecodeSelectedRuntimeCompositionRpcRequestVariant(encoded);
   ASSERT_TRUE(std::holds_alternative<HostApplyRequest>(decoded));
   EXPECT_EQ(std::get<HostApplyRequest>(decoded), request);
@@ -77,11 +80,48 @@ TEST(SelectedRuntimeCompositionRpcInternal, HostApplyRequestRoundTripsThroughThe
   trailing.push_back('\0');
   EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequestVariant(trailing),
                std::invalid_argument);
-  auto old_version = encoded;
-  old_version[6] = '4';
-  EXPECT_FALSE(IsSelectedRuntimeCompositionRpcPacket(old_version));
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequestVariant(old_version),
+  for (const char version : {'4', '6'}) {
+    auto old_version = encoded;
+    old_version[6] = version;
+    EXPECT_FALSE(IsSelectedRuntimeCompositionRpcPacket(old_version));
+    EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequestVariant(old_version),
+                 std::invalid_argument);
+  }
+}
+
+TEST(SelectedRuntimeCompositionRpcInternal, HostApplyRequestCarriesItsBoundProgramOrNone) {
+  const auto bound = HostRequest();
+  ASSERT_TRUE(bound.program.has_value());
+  const auto decoded = std::get<HostApplyRequest>(
+      DecodeSelectedRuntimeCompositionRpcRequestVariant(
+          EncodeSelectedRuntimeCompositionRpcRequest(bound)));
+  ASSERT_TRUE(decoded.program.has_value());
+  EXPECT_EQ(*decoded.program, *bound.program);
+  auto unbound = bound;
+  unbound.program.reset();
+  ASSERT_TRUE(unbound.valid());
+  const auto encoded = EncodeSelectedRuntimeCompositionRpcRequest(unbound);
+  EXPECT_EQ(std::get<HostApplyRequest>(
+                DecodeSelectedRuntimeCompositionRpcRequestVariant(encoded)),
+            unbound);
+  // The previous shape ended at the removed domains, without the Program member.
+  auto previous_shape = encoded;
+  previous_shape.pop_back();
+  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequestVariant(previous_shape),
                std::invalid_argument);
+  auto truncated_program = EncodeSelectedRuntimeCompositionRpcRequest(bound);
+  truncated_program.resize(truncated_program.size() - 1U);
+  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequestVariant(truncated_program),
+               std::invalid_argument);
+  for (auto field : {0, 1, 2}) {
+    auto empty = bound;
+    if (field == 0) empty.program->program_id = ProgramId("");
+    if (field == 1) empty.program->program_revision = ProgramRevision("");
+    if (field == 2) empty.program->program_binding_id = ProgramBindingId("");
+    EXPECT_FALSE(empty.valid());
+    EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcRequest(empty),
+                 std::invalid_argument);
+  }
 }
 
 TEST(SelectedRuntimeCompositionRpcInternal, HostApplyRequestRefusesNoncanonicalSets) {
@@ -106,7 +146,7 @@ TEST(SelectedRuntimeCompositionRpcInternal, HostApplyRequestRefusesNoncanonicalS
   empty_id.removed_domains = {ControlDomainId("")};
   refused(empty_id);
   auto no_apply = HostRequest();
-  no_apply.apply = NamedApplyPublicationTransactionDTO{ApplyId(""), ApplyGeneration(2U)};
+  no_apply.apply = NamedApplyPublicationTransactionDTO{ApplyId(0U), ApplyGeneration(2U)};
   refused(no_apply);
   auto zero_generation = HostRequest();
   zero_generation.apply.apply_generation = ApplyGeneration(0U);
@@ -143,53 +183,6 @@ TEST(SelectedRuntimeCompositionRpcInternal, HostApplyResultRoundTripsBothOutcome
   unknown_outcome[9] = 2;  // magic (8) + tag (1), then the outcome byte
   EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcResponse(unknown_outcome),
                std::invalid_argument);
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal, HostApplyTimeoutSumsBudgetsOfInstalledAndRemovedComponents) {
-  const auto request = HostRequest();
-  const std::map<std::string, std::int64_t, std::less<>> budgets{
-      {"arm.1", 50'000'000'000LL}, {"gripper.1", 3'000'000'000LL}};
-  constexpr auto kDefaultMs = kDefaultComponentInstallBudgetNs / 1'000'000;
-  constexpr auto kGraceMs = manyforge::core::kControllerLaunchStopGrace.count();
-  // arm.1 is retained; gripper.1 uses its budget, io.1 the default, and the
-  // removed camera.1 (absent from the candidate's budgets) the default; each
-  // of the three adds the host's stop grace.
-  EXPECT_EQ(HostApplyTimeout(request, budgets),
-            std::chrono::milliseconds(3'000 + 2 * kDefaultMs + 3 * kGraceMs));
-  // A remove-only Apply waits for every removed component's stop.
-  auto remove_only = request;
-  remove_only.components = {ControllableComponentId("arm.1")};
-  remove_only.removed_components = {ControllableComponentId("camera.1"),
-                                    ControllableComponentId("camera.2")};
-  ASSERT_TRUE(remove_only.valid());
-  EXPECT_EQ(HostApplyTimeout(remove_only, budgets),
-            std::chrono::milliseconds(2 * (kDefaultMs + kGraceMs)));
-  // An Apply that installs and removes nothing waits one default budget.
-  auto retain_only = remove_only;
-  retain_only.removed_components.clear();
-  EXPECT_EQ(HostApplyTimeout(retain_only, budgets), std::chrono::milliseconds(kDefaultMs));
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal, HostApplyTimeoutCoversALoneHungComponentsRetirement) {
-  // New after a one-arm Scenario whose arm node hangs. The host waits
-  // the stop grace, then SIGKILLs and reaps the group: the bound must exceed
-  // that, or the Manager shuts the execution host down mid-Apply.
-  auto request = HostRequest();
-  request.components = {};
-  request.retained_components = {};
-  request.removed_components = {ControllableComponentId("arm.1")};
-  ASSERT_TRUE(request.valid());
-  const auto bound = HostApplyTimeout(request, {});
-  // Grace, then a kill and reap of a few ms; one default budget of margin.
-  EXPECT_GE(bound, manyforge::core::kControllerLaunchStopGrace +
-                       std::chrono::nanoseconds(kDefaultComponentInstallBudgetNs));
-  // The same for a lone replaced arm (its predecessor launch retires first).
-  auto replace = HostRequest();
-  replace.components = {ControllableComponentId("arm.1")};
-  replace.retained_components = {};
-  replace.removed_components = {};
-  ASSERT_TRUE(replace.valid());
-  EXPECT_GT(HostApplyTimeout(replace, {}), manyforge::core::kControllerLaunchStopGrace);
 }
 
 // A component whose launch processes are all drained process
@@ -230,7 +223,7 @@ TEST(SelectedRuntimeCompositionRpcInternal, ComponentLaunchProcessesDrainedOnlyF
 }
 
 // Exact multiline identities captured from the mock controller launch producer.
-TEST(SelectedRuntimeCompositionRpcInternal, ActualMockLaunchIdentitiesRoundtripInventoryStopAndDrain) {
+TEST(SelectedRuntimeCompositionRpcInternal, ActualMockLaunchIdentitiesRoundtripInventory) {
   const std::string launches[]{
       "mock\nlite6_robot\nlite6_lite_gripper\n/manyforge/lite6_robot\nlite6_traj_controller\nlite_gripper_controller\n\nsha256:948e121935a4e7d66ca927d1945438e48332cce2bd820f60488fc049bb18d4b1\nsha256:61f01507a85d3a8d6539b8488d9a525dbaf115dca33338dc0d1702168d3b34a4\n",
       "mock\nur5e_robot\nur5e_robotiq_2f_85\n/manyforge/ur5e_robot\njoint_trajectory_controller\nrobotiq_gripper_controller\n\nsha256:02e2b9e7733647dc75eea1a518dda0289aa07603d668d07e16dc87c79ab970fc\nsha256:d5e2658bd13c5f16c8f23c699c70fc200a4e4b904e995571c3eda1718faffec6\n"};
@@ -239,129 +232,25 @@ TEST(SelectedRuntimeCompositionRpcInternal, ActualMockLaunchIdentitiesRoundtripI
   for (std::size_t i = 0U; i < 2U; ++i) {
     const auto &launch = launches[i];
     const std::string component = i == 0U ? "lite6_robot" : "ur5e_robot";
-    const auto existing = InstalledInventoryRequest();
-    ManagerComponentProcessStopRequestDTO stop{
-        {RequestId("process.stop.1"), RequestOwnerEpoch("owner.1"), "composer", std::nullopt},
-        existing.predecessor_projection_revision, existing.expected_predecessor_publication_generation,
-        existing.expected_predecessor_public_pointer_digest, existing.runtime_unit_id,
-        existing.runtime_epoch, existing.manager_runtime_epoch, ControllableComponentId(component), launch, 42};
-    ASSERT_TRUE(stop.valid());
-    EXPECT_EQ(std::get<ManagerComponentProcessStopRequestDTO>(DecodeSelectedRuntimeCompositionRpcRequestVariant(
-        EncodeSelectedRuntimeCompositionRpcRequest(stop))), stop);
-    EXPECT_EQ(std::get<ManagerComponentProcessStopReadRequestDTO>(DecodeSelectedRuntimeCompositionRpcRequestVariant(
-        EncodeSelectedRuntimeCompositionRpcRequest(ManagerComponentProcessStopReadRequestDTO{stop}))).request, stop);
-    ManagerComponentProcessStopResultDTO drained{stop, ControllerLaunchCleanupState::kDrained,
-        ControllerLaunchGroupDrainReceipt{42, component, launch, "2026-10-13T19:02:00Z"}, std::nullopt};
-    ASSERT_TRUE(drained.valid());
-    const auto drained_packet = DecodeSelectedRuntimeCompositionRpcResponse(
-        EncodeSelectedRuntimeCompositionRpcResponse(drained));
-    const auto &roundtrip = std::get<ManagerComponentProcessStopResultDTO>(drained_packet);
-    EXPECT_EQ(roundtrip.request, drained.request);
-    EXPECT_EQ(roundtrip.state, drained.state);
-    ASSERT_TRUE(roundtrip.receipt);
-    EXPECT_EQ(roundtrip.receipt->leader_pid, drained.receipt->leader_pid);
-    EXPECT_EQ(roundtrip.receipt->controllable_component_id, component);
-    EXPECT_EQ(roundtrip.receipt->launch_identity, launch);
-    EXPECT_EQ(roundtrip.receipt->observed_utc, drained.receipt->observed_utc);
-    EXPECT_FALSE(roundtrip.error);
     ManagerComponentProcessInventoryResultDTO inventory{InstalledInventoryRequest(),
         {{ControllableComponentId(component), launch, 42, ProcessPresenceState::kAbsent,
-          ControllerLaunchCleanupState::kDrained, drained.receipt, std::nullopt}}};
+          ControllerLaunchCleanupState::kDrained,
+          ControllerLaunchGroupDrainReceipt{42, component, launch, "2026-10-13T19:02:00Z"},
+          std::nullopt}}};
     ASSERT_TRUE(inventory.valid());
     EXPECT_EQ(std::get<ManagerComponentProcessInventoryResultDTO>(DecodeSelectedRuntimeCompositionRpcResponse(
         EncodeSelectedRuntimeCompositionRpcResponse(inventory))), inventory);
-    drained.receipt->launch_identity += "foreign";
-    EXPECT_FALSE(drained.valid());
     inventory.process_occurrences[0].receipt->launch_identity += "foreign";
     EXPECT_FALSE(inventory.valid());
-    stop.controllable_component_id = ControllableComponentId(std::string(129U, 'x'));
-    EXPECT_FALSE(stop.valid());
-    stop.controllable_component_id = ControllableComponentId(component);
-    stop.launch_identity.clear();
-    EXPECT_FALSE(stop.valid());
-    stop.launch_identity.assign(kMaximumSelectedRuntimeCompositionRpcPacketBytes, 'x');
-    ASSERT_TRUE(stop.valid()); // Field ceiling does not remove whole-packet overhead.
-    EXPECT_THROW(EncodeSelectedRuntimeCompositionRpcRequest(stop), std::invalid_argument);
-    inventory.process_occurrences[0].launch_identity = stop.launch_identity;
-    inventory.process_occurrences[0].receipt->launch_identity = stop.launch_identity;
+    // Field ceiling does not remove whole-packet overhead.
+    const std::string longest(kMaximumSelectedRuntimeCompositionRpcPacketBytes, 'x');
+    inventory.process_occurrences[0].launch_identity = longest;
+    inventory.process_occurrences[0].receipt->launch_identity = longest;
     ASSERT_TRUE(inventory.valid());
     EXPECT_THROW(EncodeSelectedRuntimeCompositionRpcResponse(inventory), std::invalid_argument);
-    stop.launch_identity.push_back('x');
-    EXPECT_FALSE(stop.valid());
     inventory.process_occurrences[0].launch_identity.push_back('x');
     EXPECT_FALSE(inventory.valid());
   }
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal, ProcessStopPreservesExactRequestAndReadWithoutAliases) {
-  const auto existing = InstalledInventoryRequest();
-  const ManagerComponentProcessStopRequestDTO stop{
-      {RequestId("process.stop.1"), RequestOwnerEpoch("owner.1"), "composer", std::string("close.1")},
-      existing.predecessor_projection_revision, existing.expected_predecessor_publication_generation,
-      existing.expected_predecessor_public_pointer_digest, existing.runtime_unit_id,
-      existing.runtime_epoch, existing.manager_runtime_epoch, ControllableComponentId("arm.1"),
-      "actual-launch-identity", 42};
-  ASSERT_TRUE(stop.valid());
-  const auto packet = EncodeSelectedRuntimeCompositionRpcRequest(stop);
-  EXPECT_EQ(std::get<ManagerComponentProcessStopRequestDTO>(
-      DecodeSelectedRuntimeCompositionRpcRequestVariant(packet)), stop);
-  const auto read = EncodeSelectedRuntimeCompositionRpcRequest(ManagerComponentProcessStopReadRequestDTO{stop});
-  EXPECT_NE(packet, read);
-  EXPECT_EQ(std::get<ManagerComponentProcessStopReadRequestDTO>(
-      DecodeSelectedRuntimeCompositionRpcRequestVariant(read)).request, stop);
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequestVariant(packet + "extra"), std::invalid_argument);
-  EXPECT_THROW((void)DecodeSelectedRuntimeCompositionRpcRequestVariant(packet.substr(0U, packet.size() - 1U)), std::invalid_argument);
-  auto other = stop;
-  other.runtime_epoch = RuntimeEpoch("replacement-host");
-  EXPECT_NE(EncodeSelectedRuntimeCompositionRpcRequest(other), packet);
-  other = stop;
-  other.leader_pid = 0;
-  EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcRequest(other), std::invalid_argument);
-  other = stop;
-  other.leader_pid = -1;
-  EXPECT_FALSE(other.valid());
-}
-
-TEST(SelectedRuntimeCompositionRpcInternal, ProcessStopDrainRequiresExactReceiptAndUncertaintyHasNoProof) {
-  const auto existing = InstalledInventoryRequest();
-  const ManagerComponentProcessStopRequestDTO stop{
-      {RequestId("process.stop.1"), RequestOwnerEpoch("owner.1"), "composer", std::nullopt},
-      existing.predecessor_projection_revision, existing.expected_predecessor_publication_generation,
-      existing.expected_predecessor_public_pointer_digest, existing.runtime_unit_id,
-      existing.runtime_epoch, existing.manager_runtime_epoch, ControllableComponentId("arm.1"),
-      "actual-launch-identity", 42};
-  ManagerComponentProcessStopResultDTO result{stop, ControllerLaunchCleanupState::kDrained,
-      ControllerLaunchGroupDrainReceipt{42, "arm.1", "actual-launch-identity", "2026-10-13T12:00:00Z"}};
-  ASSERT_TRUE(result.valid());
-  const auto decoded = DecodeSelectedRuntimeCompositionRpcResponse(
-      EncodeSelectedRuntimeCompositionRpcResponse(result));
-  const auto &roundtrip = std::get<ManagerComponentProcessStopResultDTO>(decoded);
-  EXPECT_EQ(roundtrip.request, stop);
-  EXPECT_EQ(roundtrip.receipt, result.receipt);
-  result.receipt->leader_pid = 43;
-  EXPECT_FALSE(result.valid());
-  result.receipt->leader_pid = 42;
-  result.receipt->launch_identity = "foreign-launch";
-  EXPECT_FALSE(result.valid());
-  result.receipt->launch_identity = "actual-launch-identity";
-  result.receipt->controllable_component_id = "other.component";
-  EXPECT_FALSE(result.valid());
-  result.receipt.reset();
-  EXPECT_FALSE(result.valid());
-  result.state = ControllerLaunchCleanupState::kUnknown;
-  result.error = ErrorDTO{"owner_unavailable", "original host unavailable", {}};
-  ASSERT_TRUE(result.valid());
-  const auto unknown = std::get<ManagerComponentProcessStopResultDTO>(
-      DecodeSelectedRuntimeCompositionRpcResponse(EncodeSelectedRuntimeCompositionRpcResponse(result)));
-  EXPECT_EQ(unknown.state, ControllerLaunchCleanupState::kUnknown);
-  EXPECT_FALSE(unknown.receipt);
-  EXPECT_EQ(unknown.error, result.error);
-  result.receipt = ControllerLaunchGroupDrainReceipt{42, "arm.1", "actual-launch-identity", "2026-10-13T12:00:00Z"};
-  EXPECT_FALSE(result.valid());
-  EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcResponse(result), std::invalid_argument);
-  result.receipt.reset();
-  result.state = static_cast<ControllerLaunchCleanupState>(255);
-  EXPECT_FALSE(result.valid());
 }
 
 TEST(SelectedRuntimeCompositionRpcInternal,
@@ -518,7 +407,7 @@ TEST(SelectedRuntimeCompositionRpcInternal, PhysicalInventoryDefaultPreservesExa
       {{ControllableComponentId("component-1"), "exact-launch", 105,
         ProcessPresenceState::kUnknown, ControllerLaunchCleanupState::kUnknown}}};
   const std::string golden(
-      "\x4d\x46\x4e\x53\x52\x43\x36\x00\x11\x00\x00\x00\x08\x62\x75\x6e"
+      "\x4d\x46\x4e\x53\x52\x43\x37\x00\x11\x00\x00\x00\x08\x62\x75\x6e"
       "\x64\x6c\x65\x2d\x30\x00\x00\x00\x07\x67\x72\x61\x70\x68\x2d\x30"
       "\x00\x00\x00\x47\x73\x68\x61\x32\x35\x36\x3a\x31\x31\x31\x31\x31"
       "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31"
@@ -537,12 +426,11 @@ TEST(SelectedRuntimeCompositionRpcInternal, PhysicalInventoryDefaultPreservesExa
       "\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31\x31"
       "\x31\x00\x00\x00\x0e\x72\x75\x6e\x74\x69\x6d\x65\x2e\x6b\x65\x72"
       "\x6e\x65\x6c\x00\x00\x00\x0f\x72\x75\x6e\x74\x69\x6d\x65\x2d\x65"
-      "\x70\x6f\x63\x68\x2d\x31\x00\x00\x00\x0f\x6d\x61\x6e\x61\x67\x65"
-      "\x72\x2d\x65\x70\x6f\x63\x68\x2d\x31\x00\x00\x00\x01\x00\x00\x00"
+      "\x70\x6f\x63\x68\x2d\x31\x00\x00\x00\x01\x00\x00\x00"
       "\x0b\x63\x6f\x6d\x70\x6f\x6e\x65\x6e\x74\x2d\x31\x00\x00\x00\x0c"
       "\x65\x78\x61\x63\x74\x2d\x6c\x61\x75\x6e\x63\x68\x00\x00\x00\x69"
       "\x00\x02\x00\x00\x00",
-      373U);
+      354U);
   EXPECT_EQ(EncodeSelectedRuntimeCompositionRpcResponse(result), golden);
   const auto decoded = std::get<ManagerComponentProcessInventoryResultDTO>(
       DecodeSelectedRuntimeCompositionRpcResponse(golden));
@@ -576,15 +464,6 @@ TEST(SelectedRuntimeCompositionRpcInternal, NoneInventoryRoundTripsActualOwnerWi
   EXPECT_EQ(none.process_presence, ProcessPresenceState::kAbsent);
   EXPECT_EQ(none.cleanup_state, ControllerLaunchCleanupState::kNotRequested);
   EXPECT_FALSE(none.receipt);
-  const auto request = result.request;
-  const ManagerComponentProcessStopRequestDTO impossible_stop{
-      {RequestId("stop-none"), RequestOwnerEpoch("owner"), "test", std::nullopt},
-      request.predecessor_projection_revision, request.expected_predecessor_publication_generation,
-      request.expected_predecessor_public_pointer_digest, request.runtime_unit_id,
-      request.runtime_epoch, request.manager_runtime_epoch, none.controllable_component_id,
-      none.launch_identity, none.leader_pid};
-  EXPECT_FALSE(impossible_stop.valid());
-  EXPECT_THROW((void)EncodeSelectedRuntimeCompositionRpcRequest(impossible_stop), std::invalid_argument);
   // Valid shape is observation only: foreign scope and owner identity remain
   // distinct values for the independent Manager predecessor/installed join.
   auto foreign = result;

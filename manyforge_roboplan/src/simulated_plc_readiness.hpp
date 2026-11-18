@@ -3,9 +3,11 @@
 #include <chrono>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
+#include <manyforge_core/types/error_code.hpp>
 #include <manyforge_roboplan/simulated_plc_launch.hpp>
 
 #include "component_runtime_pins.hpp"
@@ -53,5 +55,10 @@ using SimulatedPlcWait = std::function<SimulatedPlcReadiness(
     const IoProviderDriverGroup &drivers, bool borrowed_drivers,
     const std::shared_ptr<ControllerLaunchProcess> &installed_process,
     const SimulatedPlcWait &wait);
+
+/// The drivers' exit source of a simulated PLC process: its unexpected exit
+/// as `simulated_plc_exited` (nothing while it runs or after an ordered stop).
+[[nodiscard]] std::function<std::optional<core::ErrorDTO>()>
+SimulatedPlcFaultSource(std::shared_ptr<ControllerLaunchProcess> process);
 
 } // namespace manyforge::roboplan_backend::host_detail

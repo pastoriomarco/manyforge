@@ -133,30 +133,6 @@ def test_sink_rejects_invalid_stamps(sink_env) -> None:
             sink.record(stamp)
 
 
-def test_sink_reports_fault_at_once_with_bounded_detail(sink_env) -> None:
-    sink, node, _ = sink_env
-    sink.record(10)
-    sink.report_fault("isaac_simulation_stopped", "é" * 200)
-    fault = node.publisher.messages[-1]
-    assert fault.level == bytes([2])
-    assert fault.message == "isaac_simulation_stopped"
-    values = dict(fault.values)
-    assert values["stamp_ns"] == "0"
-    assert values["detail"] == "é" * 128
-    assert len(values["detail"].encode("utf-8")) == 256
-    sink.report_fault("isaac_simulation_stopped", "x" * 3 + "é" * 200)
-    detail = dict(node.publisher.messages[-1].values)["detail"]
-    assert detail == "xxx" + "é" * 126  # never splits a UTF-8 sequence
-
-
-def test_sink_rejects_invalid_fault_codes(sink_env) -> None:
-    sink, node, _ = sink_env
-    for code in ("", "Upper", "a-b", "x" * 65, None):
-        with pytest.raises(ValueError):
-            sink.report_fault(code, "")
-    assert node.publisher.messages == []
-
-
 def test_sink_rejects_invalid_identity(monkeypatch) -> None:
     monkeypatch.setattr(csh, "_ros_transport", lambda: (_Status, _key_value, "qos64"))
     with pytest.raises(ValueError):

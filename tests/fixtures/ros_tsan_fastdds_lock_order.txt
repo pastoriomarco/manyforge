@@ -1,0 +1,289 @@
+WARNING: ThreadSanitizer: lock-order-inversion (potential deadlock) (pid=1767)
+  Cycle in lock order graph: M0 (0xffff6f876808) => M1 (0xffff76828d70) => M2 (0xffff6e647d78) => M3 (0xffff6f85dc08) => M4 (0xffff7680ea00) => M5 (0xffff6e61f278) => M0
+
+  Mutex M1 acquired here while holding mutex M0 in thread T2369:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::EDPSimplePUBListener::on_new_cache_change_added() <null> (libfastdds.so.3.6+0x669efc)
+
+  Mutex M0 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::FlowControllerImpl::run() <null> (libfastdds.so.3.6+0x6e4c10)
+
+  Mutex M2 acquired here while holding mutex M1 in thread T2291:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::StatefulWriter::matched_reader_add_edp() <null> (libfastdds.so.3.6+0x7e5684)
+
+  Mutex M1 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::EDPSimpleSUBListener::on_new_cache_change_added() <null> (libfastdds.so.3.6+0x66ae78)
+
+  Mutex M3 acquired here while holding mutex M2 in main thread:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 std::unique_lock::lock() [clone .constprop.0] <null> (libfastdds.so.3.6+0x6d8d58)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Mutex M2 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::dds::DataWriterImpl::perform_create_new_change() <null> (libfastdds.so.3.6+0x352ec0)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Mutex M4 acquired here while holding mutex M3 in thread T2382:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::EDPSimplePUBListener::on_new_cache_change_added() <null> (libfastdds.so.3.6+0x669efc)
+
+  Mutex M3 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 std::unique_lock::lock() [clone .constprop.0] <null> (libfastdds.so.3.6+0x6d8d58)
+
+  Mutex M5 acquired here while holding mutex M4 in main thread:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::StatefulWriter::matched_reader_remove() <null> (libfastdds.so.3.6+0x7e4cf4)
+    #2 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #3 rclcpp::SubscriptionBase::~SubscriptionBase() <null> (librclcpp.so+0x27e2bc)
+    #4 void std::destroy_at() <null> (libmanyforge_ros2_control_execution.so+0x752bac)
+
+  Mutex M4 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::PDP::removeReaderProxyData() <null> (libfastdds.so.3.6+0x67bea0)
+    #2 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #3 rclcpp::SubscriptionBase::~SubscriptionBase() <null> (librclcpp.so+0x27e2bc)
+    #4 void std::destroy_at() <null> (libmanyforge_ros2_control_execution.so+0x752bac)
+
+  Mutex M0 acquired here while holding mutex M5 in main thread:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 std::unique_lock::lock() [clone .constprop.0] <null> (libfastdds.so.3.6+0x6d8d58)
+    #2 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #3 std::_Sp_counted_ptr_inplace::_M_dispose() <null> (librclcpp.so+0x253b6c)
+    #4 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #5 std::_Sp_counted_ptr_inplace::_M_dispose() <null> (librclcpp.so+0x1f4c28)
+    #6 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #7 rclcpp::node_interfaces::NodeParameters::~NodeParameters() <null> (librclcpp.so+0x1e8370)
+    #8 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #9 rclcpp::Node::~Node() <null> (librclcpp.so+0x1bce9c)
+    #10 void std::_Destroy() /usr/include/c++/13/bits/stl_construct.h:149 (libmanyforge_ros2_control_execution.so+0x8ce100)
+
+  Mutex M5 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::dds::DataWriterImpl::perform_create_new_change() <null> (libfastdds.so.3.6+0x352ec0)
+    #2 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #3 std::_Sp_counted_ptr_inplace::_M_dispose() <null> (librclcpp.so+0x253b6c)
+    #4 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #5 std::_Sp_counted_ptr_inplace::_M_dispose() <null> (librclcpp.so+0x1f4c28)
+    #6 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #7 rclcpp::node_interfaces::NodeParameters::~NodeParameters() <null> (librclcpp.so+0x1e8370)
+    #8 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #9 rclcpp::Node::~Node() <null> (librclcpp.so+0x1bce9c)
+    #10 void std::_Destroy() /usr/include/c++/13/bits/stl_construct.h:149 (libmanyforge_ros2_control_execution.so+0x8ce100)
+
+  Thread T2369 'dds.asyn.2.0' (tid=4141, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022  (libtsan.so.2+0x5dd98)
+    #1 eprosima::thread::start_thread_impl(int, void* ()(), void*) <null> (libfastdds.so.3.6+0x801550)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Thread T2291 'dds.asyn.0.0' (tid=4063, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022  (libtsan.so.2+0x5dd98)
+    #1 eprosima::thread::start_thread_impl(int, void* ()(), void*) <null> (libfastdds.so.3.6+0x801550)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Thread T2382 'dds.asyn.1.0' (tid=4154, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022  (libtsan.so.2+0x5dd98)
+    #1 eprosima::thread::start_thread_impl(int, void* ()(), void*) <null> (libfastdds.so.3.6+0x801550)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+SUMMARY: ThreadSanitizer: lock-order-inversion (potential deadlock) (/opt/ros/lyrical/lib/libfastdds.so.3.6+0x669efc) in eprosima::fastdds::rtps::EDPSimplePUBListener::on_new_cache_change_added(eprosima::fastdds::rtps::RTPSReader*, eprosima::fastdds::rtps::CacheChange_t const*)
+WARNING: ThreadSanitizer: lock-order-inversion (potential deadlock) (pid=1767)
+  Cycle in lock order graph: M0 (0xffff6e647d78) => M1 (0xffff6f85dc08) => M2 (0xffff71e08ca0) => M3 (0xffff6fe28968) => M4 (0xffff70401d1c) => M5 (0xffff76828d70) => M0
+
+  Mutex M1 acquired here while holding mutex M0 in main thread:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 std::unique_lock::lock() [clone .constprop.0] <null> (libfastdds.so.3.6+0x6d8d58)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Mutex M0 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::dds::DataWriterImpl::perform_create_new_change() <null> (libfastdds.so.3.6+0x352ec0)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Mutex M2 acquired here while holding mutex M1 in thread T2382:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::EDPSimplePUBListener::on_new_cache_change_added() <null> (libfastdds.so.3.6+0x669efc)
+
+  Mutex M1 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 std::unique_lock::lock() [clone .constprop.0] <null> (libfastdds.so.3.6+0x6d8d58)
+
+  Mutex M3 acquired here while holding mutex M2 in main thread:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::StatefulWriter::matched_reader_remove() <null> (libfastdds.so.3.6+0x7e4cf4)
+    #2 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #3 rclcpp::SubscriptionBase::~SubscriptionBase() <null> (librclcpp.so+0x27e2bc)
+    #4 void std::destroy_at() <null> (libmanyforge_ros2_control_execution.so+0x752bac)
+
+  Mutex M2 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::PDP::removeReaderProxyData() <null> (libfastdds.so.3.6+0x67bea0)
+    #2 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #3 rclcpp::SubscriptionBase::~SubscriptionBase() <null> (librclcpp.so+0x27e2bc)
+    #4 void std::destroy_at() <null> (libmanyforge_ros2_control_execution.so+0x752bac)
+
+  Mutex M4 acquired here while holding mutex M3 in main thread:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 std::unique_lock::lock() [clone .constprop.0] <null> (libfastdds.so.3.6+0x6d8d58)
+    #2 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #3 std::_Sp_counted_ptr_inplace::_M_dispose() <null> (librclcpp.so+0x253b6c)
+    #4 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #5 std::_Sp_counted_ptr_inplace::_M_dispose() <null> (librclcpp.so+0x1f4c28)
+    #6 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #7 rclcpp::node_interfaces::NodeParameters::~NodeParameters() <null> (librclcpp.so+0x1e8370)
+    #8 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #9 rclcpp::Node::~Node() <null> (librclcpp.so+0x1bce9c)
+    #10 void std::_Destroy() /usr/include/c++/13/bits/stl_construct.h:149 (libmanyforge_ros2_control_execution.so+0x8ce100)
+
+  Mutex M3 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::dds::DataWriterImpl::perform_create_new_change() <null> (libfastdds.so.3.6+0x352ec0)
+    #2 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #3 std::_Sp_counted_ptr_inplace::_M_dispose() <null> (librclcpp.so+0x253b6c)
+    #4 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #5 std::_Sp_counted_ptr_inplace::_M_dispose() <null> (librclcpp.so+0x1f4c28)
+    #6 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #7 rclcpp::node_interfaces::NodeParameters::~NodeParameters() <null> (librclcpp.so+0x1e8370)
+    #8 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #9 rclcpp::Node::~Node() <null> (librclcpp.so+0x1bce9c)
+    #10 void std::_Destroy() /usr/include/c++/13/bits/stl_construct.h:149 (libmanyforge_ros2_control_execution.so+0x8ce100)
+
+  Mutex M5 acquired here while holding mutex M4 in thread T2369:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::EDPSimplePUBListener::on_new_cache_change_added() <null> (libfastdds.so.3.6+0x669efc)
+
+  Mutex M4 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::FlowControllerImpl::run() <null> (libfastdds.so.3.6+0x6e4c10)
+
+  Mutex M0 acquired here while holding mutex M5 in thread T2291:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::StatefulWriter::matched_reader_add_edp() <null> (libfastdds.so.3.6+0x7e5684)
+
+  Mutex M5 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::EDPSimpleSUBListener::on_new_cache_change_added() <null> (libfastdds.so.3.6+0x66ae78)
+
+  Thread T2382 'dds.asyn.1.0' (tid=4154, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022  (libtsan.so.2+0x5dd98)
+    #1 eprosima::thread::start_thread_impl(int, void* ()(), void*) <null> (libfastdds.so.3.6+0x801550)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Thread T2369 'dds.asyn.2.0' (tid=4141, finished) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022  (libtsan.so.2+0x5dd98)
+    #1 eprosima::thread::start_thread_impl(int, void* ()(), void*) <null> (libfastdds.so.3.6+0x801550)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Thread T2291 'dds.asyn.0.0' (tid=4063, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022  (libtsan.so.2+0x5dd98)
+    #1 eprosima::thread::start_thread_impl(int, void* ()(), void*) <null> (libfastdds.so.3.6+0x801550)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+SUMMARY: ThreadSanitizer: lock-order-inversion (potential deadlock) (/opt/ros/lyrical/lib/libfastdds.so.3.6+0x6d8d58) in std::unique_lock<std::timed_mutex>::lock() [clone .constprop.0]
+WARNING: ThreadSanitizer: lock-order-inversion (potential deadlock) (pid=1767)
+  Cycle in lock order graph: M0 (0xffff6e60c948) => M1 (0xffff6e647d78) => M2 (0xffff6f85dc08) => M3 (0xffff71e08ca0) => M4 (0xffff6fe28968) => M5 (0xffff70401d1c) => M6 (0xffff76828d70) => M0
+
+  Mutex M1 acquired here while holding mutex M0 in main thread:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::dds::DataWriterImpl::get_publication_matched_status() <null> (libfastdds.so.3.6+0x347270)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Mutex M0 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::dds::DataWriterImpl::InnerDataWriterListener::on_writer_matched() <null> (libfastdds.so.3.6+0x347bdc)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Mutex M2 acquired here while holding mutex M1 in main thread:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 std::unique_lock::lock() [clone .constprop.0] <null> (libfastdds.so.3.6+0x6d8d58)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Mutex M1 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::dds::DataWriterImpl::perform_create_new_change() <null> (libfastdds.so.3.6+0x352ec0)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Mutex M3 acquired here while holding mutex M2 in thread T2382:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::EDPSimplePUBListener::on_new_cache_change_added() <null> (libfastdds.so.3.6+0x669efc)
+
+  Mutex M2 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 std::unique_lock::lock() [clone .constprop.0] <null> (libfastdds.so.3.6+0x6d8d58)
+
+  Mutex M4 acquired here while holding mutex M3 in main thread:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::StatefulWriter::matched_reader_remove() <null> (libfastdds.so.3.6+0x7e4cf4)
+    #2 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #3 rclcpp::SubscriptionBase::~SubscriptionBase() <null> (librclcpp.so+0x27e2bc)
+    #4 void std::destroy_at() <null> (libmanyforge_ros2_control_execution.so+0x752bac)
+
+  Mutex M3 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::PDP::removeReaderProxyData() <null> (libfastdds.so.3.6+0x67bea0)
+    #2 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #3 rclcpp::SubscriptionBase::~SubscriptionBase() <null> (librclcpp.so+0x27e2bc)
+    #4 void std::destroy_at() <null> (libmanyforge_ros2_control_execution.so+0x752bac)
+
+  Mutex M5 acquired here while holding mutex M4 in main thread:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 std::unique_lock::lock() [clone .constprop.0] <null> (libfastdds.so.3.6+0x6d8d58)
+    #2 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #3 std::_Sp_counted_ptr_inplace::_M_dispose() <null> (librclcpp.so+0x253b6c)
+    #4 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #5 std::_Sp_counted_ptr_inplace::_M_dispose() <null> (librclcpp.so+0x1f4c28)
+    #6 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #7 rclcpp::node_interfaces::NodeParameters::~NodeParameters() <null> (librclcpp.so+0x1e8370)
+    #8 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #9 rclcpp::Node::~Node() <null> (librclcpp.so+0x1bce9c)
+    #10 void std::_Destroy() /usr/include/c++/13/bits/stl_construct.h:149 (libmanyforge_ros2_control_execution.so+0x8ce100)
+
+  Mutex M4 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::dds::DataWriterImpl::perform_create_new_change() <null> (libfastdds.so.3.6+0x352ec0)
+    #2 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #3 std::_Sp_counted_ptr_inplace::_M_dispose() <null> (librclcpp.so+0x253b6c)
+    #4 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #5 std::_Sp_counted_ptr_inplace::_M_dispose() <null> (librclcpp.so+0x1f4c28)
+    #6 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #7 rclcpp::node_interfaces::NodeParameters::~NodeParameters() <null> (librclcpp.so+0x1e8370)
+    #8 std::_Sp_counted_base::_M_release() /usr/include/c++/13/bits/shared_ptr_base.h:361 (test_ros2_control_execution_backend+0x50aba0)
+    #9 rclcpp::Node::~Node() <null> (librclcpp.so+0x1bce9c)
+    #10 void std::_Destroy() /usr/include/c++/13/bits/stl_construct.h:149 (libmanyforge_ros2_control_execution.so+0x8ce100)
+
+  Mutex M6 acquired here while holding mutex M5 in thread T2369:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::EDPSimplePUBListener::on_new_cache_change_added() <null> (libfastdds.so.3.6+0x669efc)
+
+  Mutex M5 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::FlowControllerImpl::run() <null> (libfastdds.so.3.6+0x6e4c10)
+
+  Mutex M0 acquired here while holding mutex M6 in thread T2291:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::dds::DataWriterImpl::InnerDataWriterListener::on_writer_matched() <null> (libfastdds.so.3.6+0x347bdc)
+
+  Mutex M6 previously acquired by the same thread here:
+    #0 pthread_mutex_lock ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1341  (libtsan.so.2+0x5cc14)
+    #1 eprosima::fastdds::rtps::EDPSimpleSUBListener::on_new_cache_change_added() <null> (libfastdds.so.3.6+0x66ae78)
+
+  Thread T2382 'dds.asyn.1.0' (tid=4154, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022  (libtsan.so.2+0x5dd98)
+    #1 eprosima::thread::start_thread_impl(int, void* ()(), void*) <null> (libfastdds.so.3.6+0x801550)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Thread T2369 'dds.asyn.2.0' (tid=4141, finished) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022  (libtsan.so.2+0x5dd98)
+    #1 eprosima::thread::start_thread_impl(int, void* ()(), void*) <null> (libfastdds.so.3.6+0x801550)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+  Thread T2291 'dds.asyn.0.0' (tid=4063, running) created by main thread at:
+    #0 pthread_create ../../../../src/libsanitizer/tsan/tsan_interceptors_posix.cpp:1022  (libtsan.so.2+0x5dd98)
+    #1 eprosima::thread::start_thread_impl(int, void* ()(), void*) <null> (libfastdds.so.3.6+0x801550)
+    #2 void std::allocator_traits::construct() /usr/include/c++/13/bits/alloc_traits.h:661 (libmanyforge_ros2_control_execution.so+0x8c5fb0)
+
+SUMMARY: ThreadSanitizer: lock-order-inversion (potential deadlock) (/opt/ros/lyrical/lib/libfastdds.so.3.6+0x347270) in eprosima::fastdds::dds::DataWriterImpl::get_publication_matched_status(eprosima::fastdds::dds::PublicationMatchedStatus&)

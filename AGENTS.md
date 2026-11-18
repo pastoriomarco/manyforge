@@ -72,8 +72,10 @@ On a Jetson, `build` selects NVIDIA's `noble-jetpack` package suite by itself
 ### Configure
 
 - **Site settings** (machine facts, never in a Scenario): a JSON file
-  `{"schema":"manyforge.site.v1","device_addresses":{"lite6_main":"192.168.1.31"}}`,
-  optionally with `project_folders` (absolute host paths). Export its absolute
+  `{"schema":"manyforge.site.v2","device_addresses":{"lite6_main":"192.168.1.31"}}`,
+  optionally with `project_folders` (absolute host paths) and the disk limits
+  (`disk_max_percent`, `disk_always_free_bytes`, `disk_machine_minimum_bytes`;
+  built-in defaults apply when absent). Export its absolute
   path as `MANYFORGE_DEV_SITE_SETTINGS` before `start`; it is read only at
   start. A Real machine's card names the `device_addresses` key
   (`configuration.device_address_ref`), never the address.

@@ -19,17 +19,17 @@ MAXIMUM_HISTORY_PAGE: Final = 32
 READ_OPERATION_SCHEMAS: Final = MappingProxyType(
     {
         "health": "manyforge.headless_health.v1",
-        "runtime": "manyforge.headless_runtime_snapshot.v1",
-        "manager_status": "manyforge.manager_status_projection.v1",
-        "manager_graph": "manyforge.manager_graph_projection.v1",
-        "manager_diff": "manyforge.manager_diff_projection.v1",
-        "node_environment": "manyforge.node_environment_projection.v2",
-        "source_model": "manyforge.source_model_projection.v3",
-        "scene": "manyforge.scene_projection.v1",
-        "alarms": "manyforge.operator_alarm_snapshot.v2",
-        "alarm_metrics": "manyforge.operator_alarm_metrics.v1",
-        "history": "manyforge.historian_summary_page.v2",
-        "historian_health": "manyforge.async_historian_health.v1",
+        "runtime": "manyforge.headless_runtime_snapshot.v3",
+        "manager_status": "manyforge.manager_status_projection.v2",
+        "manager_graph": "manyforge.manager_graph_projection.v2",
+        "manager_diff": "manyforge.manager_diff_projection.v2",
+        "node_environment": "manyforge.node_environment_projection.v3",
+        "source_model": "manyforge.source_model_projection.v4",
+        "scene": "manyforge.scene_projection.v2",
+        "alarms": "manyforge.operator_alarm_snapshot.v3",
+        "alarm_metrics": "manyforge.operator_alarm_metrics.v2",
+        "history": "manyforge.historian_summary_page.v3",
+        "historian_health": "manyforge.async_historian_health.v2",
     }
 )
 ALARM_STATES: Final = frozenset(

@@ -26,6 +26,12 @@ from types import MappingProxyType
 from typing import Any, Callable, Final, Protocol
 
 from manyforge_behavior.program import ProgramValidationError, _program_direct_reference
+from manyforge_behavior.request_keys import (
+    Phase,
+    format_request_key,
+    model_attempt_phase,
+    program_key,
+)
 
 from manyforge_behavior.nodes.model import (
     ModelOutputValidationError,
@@ -533,21 +539,12 @@ def validate_program_snapshot_attachment(
             "image_sha256",
             "schema_version",
             "viewer_generation",
-            "viewer_owner_epoch",
             "width",
         },
         path="snapshot source",
     )
-    owner_epoch = source.get("viewer_owner_epoch")
-    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
     if (
-        source.get("schema_version") != "manyforge.program_snapshot_source.v1"
-        or not isinstance(owner_epoch, str)
-        or not owner_epoch
-        or len(owner_epoch.encode("utf-8")) > 256
-        or owner_epoch[0]
-        not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-        or any(character not in allowed for character in owner_epoch)
+        source.get("schema_version") != "manyforge.program_snapshot_source.v2"
         or type(source.get("viewer_generation")) is not int
         or not 0 <= source["viewer_generation"] <= _MAX_SAFE_INTEGER
         or type(source.get("width")) is not int
@@ -633,7 +630,7 @@ def _parse_assistant(value: Mapping[str, Any]) -> _AssistantContract:
         _text(row["external_resource_alias"], field="external_resource_alias")
         _text(row["model_id"], field="model_id", maximum_bytes=4_096)
         contract = dict(_mapping(row["request_contract"], field="request_contract"))
-        # EXPERIMENTAL `reasoning: on|off` and `sampling` apply to the
+        # `reasoning: on|off` and `sampling` apply to the
         # bridge's chat only.
         contract.pop("reasoning", None)
         contract.pop("sampling", None)
@@ -1260,7 +1257,7 @@ class HeadlessProgramSceneSource:
         if (
             not isinstance(projection, dict)
             or projection.get("schema_version")
-            != "manyforge.scene_projection.v1"
+            != "manyforge.scene_projection.v2"
         ):
             raise ProgramAssistantPortError(
                 "headless scene read returned an unsupported projection"
@@ -1448,6 +1445,7 @@ class ProgramAssistantPort:
         model_transport: ProgramModelTransport,
         scene_source: HeadlessProgramSceneSource,
         *,
+        application_start_id: str,
         audit_sink: ProgramModelAuditSink | None = None,
         snapshot_source: ProgramSnapshotSource | None = None,
         maximum_workers: int = 4,
@@ -1479,6 +1477,10 @@ class ProgramAssistantPort:
             raise ValueError("assistant port bounds are invalid")
         self._model_transport = model_transport
         self._scene_source = scene_source
+        # The start ``A`` named inside each model-attempt record (1.6).
+        self._application_start_id = _text(
+            application_start_id, field="application_start_id"
+        )
         self._audit_sink = audit_sink
         self._snapshot_source = snapshot_source
         self._executor = ThreadPoolExecutor(
@@ -1499,16 +1501,9 @@ class ProgramAssistantPort:
 
     @staticmethod
     def _task_id(identity: NodeAttemptIdentity) -> str:
-        digest = sha256(
-            "\x00".join(
-                (
-                    identity.program_run_id,
-                    identity.node_instance_id,
-                    identity.node_attempt_id,
-                )
-            ).encode("utf-8")
-        ).hexdigest()
-        return f"assistant-task:{digest}"
+        return format_request_key(
+            program_key(identity.program_run_id, identity.node_attempt_id, Phase.ASSISTANT_TASK)
+        )
 
     def bind(self, context: ProgramRunPortContext) -> None:
         if not isinstance(context, ProgramRunPortContext):
@@ -1558,7 +1553,7 @@ class ProgramAssistantPort:
                 raise ProgramAssistantPortError("assistant context retention is full")
             self._contexts[context.program_run_id] = parsed
 
-    def unbind(self, program_run_id: str) -> None:
+    def unbind(self, program_run_id: int) -> None:
         with self._lock:
             tasks = tuple(
                 (task_id, task)
@@ -1592,7 +1587,7 @@ class ProgramAssistantPort:
                     self._tasks.pop(task_id)
             self._contexts.pop(program_run_id, None)
 
-    def _context(self, program_run_id: str) -> _BoundContext:
+    def _context(self, program_run_id: int) -> _BoundContext:
         with self._lock:
             try:
                 return self._contexts[program_run_id]
@@ -1810,19 +1805,19 @@ class ProgramAssistantPort:
         raw_variables: Mapping[str, Any],
         attachment: Mapping[str, Any] | None,
     ) -> None:
-        attempt_id = "model-attempt:" + sha256(
-            "\x00".join(
-                (
-                    task.identity.program_run_id,
-                    task.identity.node_instance_id,
-                    task.identity.node_attempt_id,
-                    str(ordinal),
-                )
-            ).encode("utf-8")
-        ).hexdigest()
+        # One model call per (run, node attempt, ordinal): a class 2 key
+        # whose phase is the model-attempt base plus the ordinal (P-22 (a)).
+        attempt_id = format_request_key(
+            program_key(
+                task.identity.program_run_id,
+                task.identity.node_attempt_id,
+                model_attempt_phase(ordinal),
+            )
+        )
         record = {
-            "schema_version": "manyforge.program_model_attempt.v1",
+            "schema_version": "manyforge.program_model_attempt.v2",
             "model_attempt_id": attempt_id,
+            "application_start_id": self._application_start_id,
             "program_run_id": task.identity.program_run_id,
             "node_instance_id": task.identity.node_instance_id,
             "node_attempt_id": task.identity.node_attempt_id,

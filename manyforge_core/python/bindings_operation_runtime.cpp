@@ -42,7 +42,7 @@ void register_operation_runtime_bindings(py::module_& module) {
       .value("kStaleButUnambiguouslyResolved",
              StopResolutionDispositionDTO::kStaleButUnambiguouslyResolved)
       .value("kAlreadyTerminalNoEffect", StopResolutionDispositionDTO::kAlreadyTerminalNoEffect)
-      .value("kPromotedToFull", StopResolutionDispositionDTO::kPromotedToFull);
+      .value("kInvalid", StopResolutionDispositionDTO::kInvalid);
 
   py::enum_<StopScopeResolutionReasonDTO>(module, "StopScopeResolutionReasonDTO")
       .value("kExactCurrentScope", StopScopeResolutionReasonDTO::kExactCurrentScope)
@@ -51,43 +51,57 @@ void register_operation_runtime_bindings(py::module_& module) {
              StopScopeResolutionReasonDTO::kKnownTerminalOrIdleNoEffect)
       .value("kMalformedOrdinaryIntent", StopScopeResolutionReasonDTO::kMalformedOrdinaryIntent)
       .value("kUnknownOperation", StopScopeResolutionReasonDTO::kUnknownOperation)
-      .value("kUnknownProgramRun", StopScopeResolutionReasonDTO::kUnknownProgramRun)
       .value("kUnknownComponent", StopScopeResolutionReasonDTO::kUnknownComponent)
       .value("kUnknownResource", StopScopeResolutionReasonDTO::kUnknownResource)
-      .value("kRequestIdentityConflict", StopScopeResolutionReasonDTO::kRequestIdentityConflict)
-      .value("kOverlappingStopTransactions",
-             StopScopeResolutionReasonDTO::kOverlappingStopTransactions)
-      .value("kEmergencyReserveCoalesced", StopScopeResolutionReasonDTO::kEmergencyReserveCoalesced)
-      .value("kExplicitFullStop", StopScopeResolutionReasonDTO::kExplicitFullStop);
+      .value("kUnknownProgramRun", StopScopeResolutionReasonDTO::kUnknownProgramRun);
 
-  py::enum_<StopScopeStaleFieldDTO>(module, "StopScopeStaleFieldDTO")
-      .value("kRequestOwnerEpoch", StopScopeStaleFieldDTO::kRequestOwnerEpoch)
-      .value("kOperationRevision", StopScopeStaleFieldDTO::kOperationRevision)
-      .value("kOperationStopGeneration", StopScopeStaleFieldDTO::kOperationStopGeneration)
-      .value("kGraphRevision", StopScopeStaleFieldDTO::kGraphRevision)
-      .value("kComponentLifecycleGeneration", StopScopeStaleFieldDTO::kComponentLifecycleGeneration)
-      .value("kOperationResourceGeneration", StopScopeStaleFieldDTO::kOperationResourceGeneration)
-      .value("kResourceStopGeneration", StopScopeStaleFieldDTO::kResourceStopGeneration)
-      .value("kCellStopGeneration", StopScopeStaleFieldDTO::kCellStopGeneration);
+  py::enum_<StopKind>(module, "StopKind")
+      .value("kGroups", StopKind::kGroups)
+      .value("kStopAll", StopKind::kStopAll)
+      .value("kHalt", StopKind::kHalt)
+      .value("kOperation", StopKind::kOperation)
+      .value("kCellStop", StopKind::kCellStop)
+      .value("kRuleFailNode", StopKind::kRuleFailNode)
+      .value("kRuleHold", StopKind::kRuleHold)
+      .value("kInterruptRule", StopKind::kInterruptRule)
+      .value("kRunnerLoss", StopKind::kRunnerLoss)
+      .value("kProgramEnd", StopKind::kProgramEnd)
+      .value("kInternalFault", StopKind::kInternalFault)
+      .value("kTakeover", StopKind::kTakeover)
+      .value("kPartialDispatch", StopKind::kPartialDispatch)
+      .value("kRuntimeCollision", StopKind::kRuntimeCollision)
+      .value("kHoldTimeout", StopKind::kHoldTimeout)
+      .value("kOperationReset", StopKind::kOperationReset)
+      .value("kPreparedDispatchInvalid", StopKind::kPreparedDispatchInvalid)
+      .value("kPlannedStop", StopKind::kPlannedStop)
+      .value("kStopFailedHalt", StopKind::kStopFailedHalt);
 
-  py::class_<StopScopeStaleDiagnosticDTO>(module, "StopScopeStaleDiagnosticDTO", py::is_final())
-      .def(py::init<StopScopeStaleFieldDTO, StopScopeDiagnosticTargetDTO, StopScopeStaleValueDTO,
-                    StopScopeStaleValueDTO>(),
-           py::arg("field"), py::arg("target"), py::arg("expected"), py::arg("current"))
-      .def_readonly("field", &StopScopeStaleDiagnosticDTO::field)
-      .def_readonly("target", &StopScopeStaleDiagnosticDTO::target)
-      .def_readonly("expected", &StopScopeStaleDiagnosticDTO::expected)
-      .def_readonly("current", &StopScopeStaleDiagnosticDTO::current)
+  py::enum_<StopWidenReason>(module, "StopWidenReason")
+      .value("kNone", StopWidenReason::kNone)
+      .value("kUnknownTarget", StopWidenReason::kUnknownTarget)
+      .value("kMalformed", StopWidenReason::kMalformed)
+      .value("kKeyConflict", StopWidenReason::kKeyConflict)
+      .value("kStaleStart", StopWidenReason::kStaleStart)
+      .value("kUnreadableKind", StopWidenReason::kUnreadableKind);
+
+  py::class_<StopStaleDiagnosticDTO>(module, "StopStaleDiagnosticDTO", py::is_final())
+      .def(py::init<OperationNumber, OperationRevision, OperationRevision>(),
+           py::arg("operation_id"), py::arg("expected_operation_revision"),
+           py::arg("current_operation_revision"))
+      .def_readonly("operation_id", &StopStaleDiagnosticDTO::operation_id)
+      .def_readonly("expected_operation_revision",
+                    &StopStaleDiagnosticDTO::expected_operation_revision)
+      .def_readonly("current_operation_revision",
+                    &StopStaleDiagnosticDTO::current_operation_revision)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
   py::class_<StopOperationTargetDTO>(module, "StopOperationTargetDTO", py::is_final())
-      .def(py::init<OperationId, OperationRevision, StopGeneration>(), py::arg("operation_id"),
-           py::arg("expected_operation_revision"), py::arg("expected_stop_generation"))
+      .def(py::init<OperationNumber, OperationRevision>(), py::arg("operation_id"),
+           py::arg("expected_operation_revision"))
       .def_readonly("operation_id", &StopOperationTargetDTO::operation_id)
       .def_readonly("expected_operation_revision",
                     &StopOperationTargetDTO::expected_operation_revision)
-      .def_readonly("expected_stop_generation", &StopOperationTargetDTO::expected_stop_generation)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
@@ -103,20 +117,12 @@ void register_operation_runtime_bindings(py::module_& module) {
       .def(py::self != py::self);
 
   py::class_<StopResourceTargetDTO>(module, "StopResourceTargetDTO", py::is_final())
-      .def(py::init<ResourceId, GraphRevision, std::uint64_t, StopGeneration>(),
-           py::arg("resource_id"), py::arg("expected_graph_revision"),
-           py::arg("expected_operation_resource_generation"), py::arg("expected_stop_generation"))
+      .def(py::init<ResourceId, GraphRevision, std::uint64_t>(), py::arg("resource_id"),
+           py::arg("expected_graph_revision"), py::arg("expected_operation_resource_generation"))
       .def_readonly("resource_id", &StopResourceTargetDTO::resource_id)
       .def_readonly("expected_graph_revision", &StopResourceTargetDTO::expected_graph_revision)
       .def_readonly("expected_operation_resource_generation",
                     &StopResourceTargetDTO::expected_operation_resource_generation)
-      .def_readonly("expected_stop_generation", &StopResourceTargetDTO::expected_stop_generation)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<StopProgramRunTargetDTO>(module, "StopProgramRunTargetDTO", py::is_final())
-      .def(py::init<ProgramRunId>(), py::arg("program_run_id"))
-      .def_readonly("program_run_id", &StopProgramRunTargetDTO::program_run_id)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
@@ -150,16 +156,6 @@ void register_operation_runtime_bindings(py::module_& module) {
           },
           py::arg("request_context"), py::arg("resources"), py::arg("reason") = std::nullopt,
           py::arg("attribution") = RequestAttributionDTO{})
-      .def_static(
-          "for_program_runs",
-          [](PublicRequestContextDTO request_context,
-             std::vector<StopProgramRunTargetDTO> program_runs, std::optional<std::string> reason,
-             RequestAttributionDTO attribution) {
-            return make_stop_intent(std::move(request_context), std::move(program_runs),
-                                    std::move(reason), std::move(attribution));
-          },
-          py::arg("request_context"), py::arg("program_runs"), py::arg("reason") = std::nullopt,
-          py::arg("attribution") = RequestAttributionDTO{})
       .def_readonly("request_context", &StopIntentDTO::request_context)
       .def_readonly("reason", &StopIntentDTO::reason)
       .def_readonly("attribution", &StopIntentDTO::attribution)
@@ -172,10 +168,7 @@ void register_operation_runtime_bindings(py::module_& module) {
             if (std::holds_alternative<std::vector<StopComponentTargetDTO>>(value.selector)) {
               return std::string("components");
             }
-            if (std::holds_alternative<std::vector<StopResourceTargetDTO>>(value.selector)) {
-              return std::string("resources");
-            }
-            return std::string("program_runs");
+            return std::string("resources");
           })
       .def_property_readonly(
           "operations",
@@ -195,12 +188,6 @@ void register_operation_runtime_bindings(py::module_& module) {
                                    std::get_if<std::vector<StopResourceTargetDTO>>(&value.selector);
                                return rows == nullptr ? py::none() : py::cast(*rows);
                              })
-      .def_property_readonly(
-          "program_runs",
-          [](const StopIntentDTO& value) -> py::object {
-            const auto* rows = std::get_if<std::vector<StopProgramRunTargetDTO>>(&value.selector);
-            return rows == nullptr ? py::none() : py::cast(*rows);
-          })
       .def("field_error",
            [](const StopIntentDTO& value) {
              const auto error = stop_intent_field_error(value);
@@ -210,11 +197,9 @@ void register_operation_runtime_bindings(py::module_& module) {
       .def(py::self != py::self);
 
   py::class_<FullStopIntentDTO>(module, "FullStopIntentDTO", py::is_final())
-      .def(py::init<PublicRequestContextDTO, StopGeneration, RequestAttributionDTO>(),
-           py::arg("request_context"), py::arg("expected_stop_generation"),
+      .def(py::init<PublicRequestContextDTO, RequestAttributionDTO>(), py::arg("request_context"),
            py::arg("attribution") = RequestAttributionDTO{})
       .def_readonly("request_context", &FullStopIntentDTO::request_context)
-      .def_readonly("expected_stop_generation", &FullStopIntentDTO::expected_stop_generation)
       .def_readonly("attribution", &FullStopIntentDTO::attribution)
       .def("field_error",
            [](const FullStopIntentDTO& value) {
@@ -224,51 +209,50 @@ void register_operation_runtime_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
-  py::class_<StopAffectedOperationRevisionDTO>(module, "StopAffectedOperationRevisionDTO",
-                                               py::is_final())
-      .def(py::init<OperationId, OperationRevision>(), py::arg("operation_id"),
-           py::arg("operation_revision_after_acceptance"))
-      .def_readonly("operation_id", &StopAffectedOperationRevisionDTO::operation_id)
-      .def_readonly("operation_revision_after_acceptance",
-                    &StopAffectedOperationRevisionDTO::operation_revision_after_acceptance)
+  py::class_<ProgramRunEndIntentDTO>(module, "ProgramRunEndIntentDTO", py::is_final())
+      .def(py::init<PublicRequestContextDTO, ProgramRunNumber, RequestAttributionDTO>(),
+           py::arg("request_context"), py::arg("program_run_id"),
+           py::arg("attribution") = RequestAttributionDTO{})
+      .def_readonly("request_context", &ProgramRunEndIntentDTO::request_context)
+      .def_readonly("program_run_id", &ProgramRunEndIntentDTO::program_run_id)
+      .def_readonly("attribution", &ProgramRunEndIntentDTO::attribution)
+      .def("field_error",
+           [](const ProgramRunEndIntentDTO& value) {
+             const auto error = program_run_end_intent_field_error(value);
+             return error.has_value() ? py::cast(std::string(*error)) : py::none();
+           })
       .def(py::self == py::self)
       .def(py::self != py::self);
 
-  py::class_<StopPredecessorAcceptanceRefDTO>(module, "StopPredecessorAcceptanceRefDTO",
-                                              py::is_final())
-      .def(py::init<StopId, StopGeneration, ContentDigest>(), py::arg("predecessor_stop_id"),
-           py::arg("predecessor_stop_generation"), py::arg("captured_scope_digest"))
-      .def_readonly("predecessor_stop_id", &StopPredecessorAcceptanceRefDTO::predecessor_stop_id)
-      .def_readonly("predecessor_stop_generation",
-                    &StopPredecessorAcceptanceRefDTO::predecessor_stop_generation)
-      .def_readonly("captured_scope_digest",
-                    &StopPredecessorAcceptanceRefDTO::captured_scope_digest)
+  py::class_<StopCoveredParticipantDTO>(module, "StopCoveredParticipantDTO", py::is_final())
+      .def(py::init<OperationNumber, std::uint32_t, bool>(), py::arg("operation_id"),
+           py::arg("participant_ordinal"), py::arg("started"))
+      .def_readonly("operation_id", &StopCoveredParticipantDTO::operation_id)
+      .def_readonly("participant_ordinal", &StopCoveredParticipantDTO::participant_ordinal)
+      .def_readonly("started", &StopCoveredParticipantDTO::started)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
   py::class_<StopAcceptedDTO>(module, "StopAcceptedDTO", py::is_final())
-      .def(py::init<RequestId, RequestReplayStatusDTO, StopId, StopGeneration, ContentDigest,
-                    StopResolutionDispositionDTO, StopScopeResolutionReasonDTO,
-                    std::vector<StopScopeStaleDiagnosticDTO>, ContentDigest,
-                    std::vector<StopPredecessorAcceptanceRefDTO>,
-                    std::vector<StopAffectedOperationRevisionDTO>, std::int64_t>(),
-           py::arg("request_id"), py::arg("replay_status"), py::arg("stop_id"),
-           py::arg("stop_generation"), py::arg("requested_selector_digest"),
-           py::arg("resolution_disposition"), py::arg("resolution_reason"),
-           py::arg("stale_diagnostics"), py::arg("captured_scope_digest"),
-           py::arg("joined_predecessor_stops"), py::arg("affected_operation_revisions"),
-           py::arg("accepted_at_ns"))
-      .def_readonly("request_id", &StopAcceptedDTO::request_id)
+      .def(py::init<RequestKey, RequestReplayStatusDTO, StopEventId, StopKind, StopKind,
+                    StopWidenReason, std::optional<ProgramRunNumber>,
+                    std::vector<StopStaleDiagnosticDTO>, std::uint32_t,
+                    std::vector<StopCoveredParticipantDTO>, std::uint64_t, std::int64_t>(),
+           py::arg("request_key"), py::arg("replay_status"), py::arg("event_id"),
+           py::arg("requested"), py::arg("applied"), py::arg("widen_reason"),
+           py::arg("program_run_id"), py::arg("stale_diagnostics"), py::arg("stale_total"),
+           py::arg("covered"), py::arg("hold_revision"), py::arg("accepted_at_ns"))
+      .def_readonly("request_key", &StopAcceptedDTO::request_key)
       .def_readonly("replay_status", &StopAcceptedDTO::replay_status)
-      .def_readonly("stop_id", &StopAcceptedDTO::stop_id)
-      .def_readonly("stop_generation", &StopAcceptedDTO::stop_generation)
-      .def_readonly("requested_selector_digest", &StopAcceptedDTO::requested_selector_digest)
-      .def_readonly("resolution_disposition", &StopAcceptedDTO::resolution_disposition)
-      .def_readonly("resolution_reason", &StopAcceptedDTO::resolution_reason)
+      .def_readonly("event_id", &StopAcceptedDTO::event_id)
+      .def_readonly("requested", &StopAcceptedDTO::requested)
+      .def_readonly("applied", &StopAcceptedDTO::applied)
+      .def_readonly("widen_reason", &StopAcceptedDTO::widen_reason)
+      .def_readonly("program_run_id", &StopAcceptedDTO::program_run_id)
       .def_readonly("stale_diagnostics", &StopAcceptedDTO::stale_diagnostics)
-      .def_readonly("captured_scope_digest", &StopAcceptedDTO::captured_scope_digest)
-      .def_readonly("joined_predecessor_stops", &StopAcceptedDTO::joined_predecessor_stops)
-      .def_readonly("affected_operation_revisions", &StopAcceptedDTO::affected_operation_revisions)
+      .def_readonly("stale_total", &StopAcceptedDTO::stale_total)
+      .def_readonly("covered", &StopAcceptedDTO::covered)
+      .def_readonly("hold_revision", &StopAcceptedDTO::hold_revision)
       .def_readonly("accepted_at_ns", &StopAcceptedDTO::accepted_at_ns)
       .def("field_error",
            [](const StopAcceptedDTO& value) {

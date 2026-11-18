@@ -2,6 +2,7 @@
 
 #include "../src/program_reset_position_observation.hpp"
 #include <gtest/gtest.h>
+#include <manyforge_core/testing/request_key_fixture.hpp>
 
 #include <algorithm>
 #include <array>
@@ -1840,8 +1841,7 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
     SqliteOperationJournal journal(journal_path, cell_id, 16U);
     auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {gripper->registration()}, *clock, *scheduler, journal,
-        ResourceAddressedExecutionKernelConfig{
-            RequestOwnerEpoch("owner.native.gripper.route"), cell_id, 16U,
+        ResourceAddressedExecutionKernelConfig{kTestApplicationStartId, cell_id, 16U,
             {}, nullptr, graph_revision});
     auto& kernel = *kernel_heap_test_owner;
     RetainedGripperRoutePublicationOwner owner(gripper, clock, kernel);
@@ -1953,8 +1953,7 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
     SqliteOperationJournal journal(journal_path, cell_id, 16U);
     auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {gripper->registration()}, *clock, *scheduler, journal,
-        ResourceAddressedExecutionKernelConfig{
-            RequestOwnerEpoch("owner.native.gripper.restart"), cell_id, 16U,
+        ResourceAddressedExecutionKernelConfig{kTestApplicationStartId, cell_id, 16U,
             {}, nullptr, current_binding.value().graph_revision});
     auto& kernel = *kernel_heap_test_owner;
     RetainedGripperRoutePublicationOwner owner(
@@ -2041,8 +2040,7 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
     SqliteOperationJournal journal(journal_path, cell_id, 16U);
     auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(
         {gripper->registration()}, *clock, *scheduler, journal,
-        ResourceAddressedExecutionKernelConfig{
-            RequestOwnerEpoch("owner.native.gripper.restart.failure"), cell_id,
+        ResourceAddressedExecutionKernelConfig{kTestApplicationStartId, cell_id,
             16U, {}, nullptr, current_binding.value().graph_revision});
     auto& kernel = *kernel_heap_test_owner;
     RetainedGripperRoutePublicationOwner owner(
@@ -2630,7 +2628,6 @@ TEST(RetainedGripperRuntimeTest,
     EXPECT_EQ(registrations.value()[0].engine, registrations.value()[1].engine);
     EXPECT_FALSE(registrations.value()[1].intrinsic_direct_control);
     const auto cell = CellId("cell.gripper.alias.command");
-    const auto epoch = RequestOwnerEpoch("owner.gripper.alias.command");
     const auto path = std::filesystem::temp_directory_path() /
         ("manyforge-gripper-alias-command-" + std::to_string(
             std::chrono::steady_clock::now().time_since_epoch().count()) + ".sqlite");
@@ -2639,19 +2636,17 @@ TEST(RetainedGripperRuntimeTest,
       // This synthetic owner has no external heartbeat receivers. As in the
       // Core intrinsic-manual tests, cell readiness is explicit owner input.
       ResourceAddressedExecutionKernelConfig config{
-          epoch, cell, 16U, {}, nullptr, command.value().graph_revision};
+          kTestApplicationStartId, cell, 16U, {}, nullptr, command.value().graph_revision};
       config.manager_liveness_required_set = ManagerLivenessRequiredSetDTO{
           cell, command.value().retained_bundle_id,
-          ComputeRequiredRuntimeSetDigest({}), RuntimeUnitId("manager.gripper.alias"),
-          RuntimeEpoch("manager.gripper.alias.1"),
-          RequestOwnerEpoch("manager.gripper.alias.1"), {}};
+          ComputeRequiredRuntimeSetDigest({}), RuntimeUnitId("manager.gripper.alias"), {}};
       auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(registrations.value(), *clock, *scheduler,
           journal, config);
       auto& kernel = *kernel_heap_test_owner;
       ASSERT_FALSE(kernel.GetAuthoringAdmission().authoring_allowed);
       const CellAdmissionReadinessSnapshotDTO ready{
           true,
-          ProgramCycleStatusDTO{RequestOwnerEpoch("program.owner.gripper.alias"), 1U,
+          ProgramCycleStatusDTO{1U,
                                 ProgramCycleStateDTO::kIdleAfterReset, std::nullopt,
                                 std::nullopt, std::nullopt},
           true, 1U, 1U, true, true, 0U, 0U, 0U};
@@ -2661,9 +2656,10 @@ TEST(RetainedGripperRuntimeTest,
       const auto& value = command.value();
       const auto& schema = *value.command_schema;
       OperationIntentDTO intent{
-          {RequestId("request.feedback.command"), epoch, "alias owner test", std::nullopt},
+          {TestRequestKey("request.feedback.command"), "alias owner test"},
           value.program_id, value.program_revision, value.program_binding_id,
-          ProgramRunId("run.gripper.alias"), value.graph_revision, value.retained_bundle_id,
+          // Manual work: no Program run claims it, so it names none.
+          std::nullopt, value.graph_revision, value.retained_bundle_id,
           std::nullopt,
           {{{value.controllable_component_id, value.command_target_id}, feedback.value().capability_id,
             std::nullopt, CapabilityCommandIntentDTO{
@@ -2684,7 +2680,7 @@ TEST(RetainedGripperRuntimeTest,
 
       // The genuine command sibling remains registered with its exact schema;
       // the same real retained engine must prepare and dispatch it successfully.
-      intent.request_context.request_id = RequestId("request.primary.command");
+      intent.request_context.request_key = TestRequestKey("request.primary.command");
       intent.participants.front().required_capability_id = value.capability_id;
       const auto accepted = kernel.execute(intent);
       ASSERT_TRUE(accepted.ok()) << accepted.error().message;
@@ -2765,7 +2761,7 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
     {
       SqliteOperationJournal journal(path, cell, 16U);
       auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(installed, *clock, *scheduler, journal,
-          {RequestOwnerEpoch("owner.gripper.alias.recovery"), cell, 16U, {}, nullptr,
+          {kTestApplicationStartId, cell, 16U, {}, nullptr,
            current.value().graph_revision});
       auto& kernel = *kernel_heap_test_owner;
       auto peer_configuration = gripper_route_configuration(peer_binding);
@@ -2886,7 +2882,7 @@ TEST(RetainedGripperRoutePublicationOwnerTest,
   {
     SqliteOperationJournal journal(path, cell, 16U);
     auto kernel_heap_test_owner = manyforge::core::testing::make_heap_resource_addressed_kernel(before, *clock, *scheduler, journal,
-        {RequestOwnerEpoch("owner.gripper.alias.failed.recovery"), cell, 16U, {}, nullptr,
+        {kTestApplicationStartId, cell, 16U, {}, nullptr,
          current.value().graph_revision});
     auto& kernel = *kernel_heap_test_owner;
     int builder_calls = 0;

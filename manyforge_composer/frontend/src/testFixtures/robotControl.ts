@@ -1,16 +1,19 @@
 import { buildJointMotionIntent, initialRobotControlState, robotControlReducer } from '../state/robotControl';
 import type { CapabilityCommandPreviewReceipt, ExecutionOwnerStatus, MotionPreviewReceipt } from '../types/robotControl';
 
-export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerStatus {
+/** An HTTP request key as the browser mints it (32 lowercase hex). */
+export const FIXTURE_REQUEST_KEY = '00112233445566778899aabbccddeeff';
+
+export function statusFixture(applicationStartId = 'execution-owner-1'): ExecutionOwnerStatus {
   const status: ExecutionOwnerStatus = {
-    ownerEpoch,
+    applicationStartId,
     cellId: 'cell.1',
     activePublicationGeneration: 1,
     graphRevision: 'sha256:graph',
     retainedBundleId: 'sha256:bundle',
     directControl: {
       activeTcp: { entry: { componentId: 'robot-a', targetId: 'arm', frameComponentId: 'robot-a', frameRoleId: 'tcp' }, display: 'robot-a.tcp',
-        ownerEpoch, registrationGeneration: 1, sequence: 0 },
+        applicationStartId, registrationGeneration: 1, sequence: 0 },
       controllableComponentId: 'robot-a',
       commandTargetId: 'arm',
       baseFrame: { componentId: 'robot-a', frameId: 'base' },
@@ -26,7 +29,6 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
       programId: 'manyforge.direct_control.motion',
       programRevision: 'sha256:direct-program',
       programBindingId: 'sha256:direct-binding',
-      programRunId: 'direct-control-owner-1',
       joints: [
         {
           sourceJointName: 'joint1',
@@ -108,7 +110,6 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
       programId: 'manyforge.direct_control.gripper',
       programRevision: 'sha256:direct-gripper-program',
       programBindingId: 'sha256:direct-gripper-binding',
-      programRunId: 'direct-control-gripper-owner-1',
       commandSchemaId: 'gripper.command_position',
       commandSchemaRevision: 'sha256:gripper-schema',
       sourceCoordinateName: 'finger_joint',
@@ -174,8 +175,8 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
     cellStopAction: {
       available: true,
       unavailableReason: null,
-      expectedStopGeneration: 0,
-      latestTerminal: null,
+      lastEventId: null,
+      lastCompleted: null,
     },
     components: [],
     directControlTargets: [],
@@ -205,7 +206,7 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
 
 export function receiptFixture(
   status: ExecutionOwnerStatus,
-  requestId: string,
+  requestKey: string,
   positionsRad: number[],
 ): MotionPreviewReceipt {
   const motion = status.directControl;
@@ -216,16 +217,15 @@ export function receiptFixture(
   }
   const activeTcpEntry = activeTcp.entry;
   return {
-    schemaVersion: 'manyforge.direct_control_motion_preview.v4',
+    schemaVersion: 'manyforge.direct_control_motion_preview.v5',
     pathPreview: { sourceJointNames: status.directControl!.joints.map((joint) => joint.sourceJointName), pairs: [], samples: [] },
     receiptDigest: 'sha256:receipt',
     intentDigest: 'sha256:intent',
-    requestId,
-    requestOwnerEpoch: status.ownerEpoch,
+    requestKey,
     programId: status.directControl!.programId,
     programRevision: status.directControl!.programRevision,
     programBindingId: status.directControl!.programBindingId,
-    programRunId: status.directControl!.programRunId,
+    programRunId: null,
     graphRevision: status.graphRevision,
     retainedBundleId: status.retainedBundleId,
     sceneRevision: { scene_id: 'scene-1', revision_id: 3, content_hash: 'sha256:scene' },
@@ -239,7 +239,6 @@ export function receiptFixture(
         },
       },
       source: 'active_tcp',
-      ownerEpoch: activeTcp.ownerEpoch,
       registrationGeneration: activeTcp.registrationGeneration,
       sequence: activeTcp.sequence,
     },
@@ -269,7 +268,7 @@ export function readyState() {
     status,
   });
   state = robotControlReducer(state, { type: 'edit', positionsRad: positions });
-  const intent = buildJointMotionIntent(status, positions, 'request-1');
+  const intent = buildJointMotionIntent(status, positions, FIXTURE_REQUEST_KEY);
   state = robotControlReducer(state, {
     type: 'preview_started',
     generation: state.generation,
@@ -278,7 +277,7 @@ export function readyState() {
   state = robotControlReducer(state, {
     type: 'preview_resolved',
     generation: state.generation,
-    receipt: receiptFixture(status, 'request-1', positions),
+    receipt: receiptFixture(status, FIXTURE_REQUEST_KEY, positions),
   });
   return state;
 }
@@ -290,17 +289,16 @@ export function executingState() {
   );
   const status = structuredClone(approving.status!);
   status.manualOperations = [{
-    programRunId: status.directControl!.programRunId,
     controllableComponentId: status.directControl!.controllableComponentId,
     commandTargetId: status.directControl!.commandTargetId,
-    operationId: 'operation-1',
+    operationId: 1,
     operationRevision: 1,
     resident: true,
     state: 'queued',
     progress: 0,
-    activeStopId: null,
-    activeStopGeneration: null,
+    stopEventId: null,
     terminalError: null,
+    payloadKind: 'motion',
   }];
   return robotControlReducer(approving, {
     type: 'status_refreshed',
@@ -310,21 +308,20 @@ export function executingState() {
 
 export function gripperReceiptFixture(
   status: ExecutionOwnerStatus,
-  requestId: string,
+  requestKey: string,
   position: number,
 ): CapabilityCommandPreviewReceipt {
   const gripper = status.directControlGripper;
   if (gripper === null) throw new Error('gripper receipt fixture needs a gripper');
   return {
-    schemaVersion: 'manyforge.direct_control_capability_command_preview.v2',
+    schemaVersion: 'manyforge.direct_control_capability_command_preview.v3',
     receiptDigest: 'sha256:gripper-receipt',
     intentDigest: 'sha256:gripper-intent',
-    requestId,
-    requestOwnerEpoch: status.ownerEpoch,
+    requestKey,
     programId: gripper.programId,
     programRevision: gripper.programRevision,
     programBindingId: gripper.programBindingId,
-    programRunId: gripper.programRunId,
+    programRunId: null,
     graphRevision: status.graphRevision,
     retainedBundleId: status.retainedBundleId,
     target: { componentId: gripper.controllableComponentId, commandTargetId: gripper.commandTargetId },

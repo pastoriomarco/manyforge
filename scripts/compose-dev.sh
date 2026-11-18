@@ -30,21 +30,22 @@ read_project_folders() {
   project_folders=()
   [[ -n ${MANYFORGE_DEV_SITE_SETTINGS:-} ]] || return 0
   local reader_fd reader_pid
-  exec {reader_fd}< <(python3 - "$MANYFORGE_DEV_SITE_SETTINGS" <<'PY'
-import json, os, sys
+  exec {reader_fd}< <(python3 - "$MANYFORGE_DEV_SITE_SETTINGS" "$repo_root" <<'PY'
+import importlib.util, json, os, sys
 
 try:
     if not os.path.isabs(sys.argv[1]):
         raise ValueError("site settings path must be absolute")
     with open(sys.argv[1], encoding="utf-8") as stream:
         site = json.load(stream)
-    if not isinstance(site, dict):
-        raise ValueError("site settings must be a JSON object")
-    if site.get("schema") != "manyforge.site.v1":
-        raise ValueError("site settings schema must be manyforge.site.v1")
-    unknown = site.keys() - {"schema", "device_addresses", "project_folders"}
-    if unknown:
-        raise ValueError(f"site settings has unknown fields: {', '.join(sorted(unknown))}")
+    # The schema line, the members and the disk limits: the launchers' one
+    # Python reader (manyforge_operator/run_session.py), loaded by file.
+    spec = importlib.util.spec_from_file_location(
+        "manyforge_run_session", os.path.join(sys.argv[2], "manyforge_operator/run_session.py"))
+    run_session = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = run_session
+    spec.loader.exec_module(run_session)
+    run_session.site_disk_limits(site)
     folders = site.get("project_folders", [])
     if not isinstance(folders, list):
         raise ValueError("project_folders must be a list of absolute host paths")
@@ -231,7 +232,13 @@ run_native_build() {
 
 stop_with_evidence() {
   assert_owned_container || return $?
-  if ! docker stop --time 15 "$container_ref" >/dev/null; then
+  # The Manager's stop sequence has no time limit of its own (OD-187): the
+  # Halt, then each listed process and the execution host until it exits (the
+  # host gives each driver process group up to 10 s after its SIGINT), then
+  # the Manager's own records. A second SIGTERM to the workbench is passed on
+  # and forces it. These 30 s are the outer end: Docker then kills every process
+  # that is left, and the next start reports the shutdown as unverified.
+  if ! docker stop --time 30 "$container_ref" >/dev/null; then
     echo "Failed to stop the development workbench; no evidence was copied." >&2
     return 69
   fi
@@ -272,7 +279,9 @@ raise SystemExit(0 if pathlib.Path(sys.argv[1]).resolve().parent == pathlib.Path
     aggregate=(--default-roots "$cache_base/runtime")
   fi
   if assert_runtime_root_available; then
-    python3 "$retention_helper" rotate "$runtime_root" "${aggregate[@]}" || echo "WARNING ManyForge retention helper failed; runtime remains available" >&2
+    local -a site=()
+    [[ -z ${MANYFORGE_DEV_SITE_SETTINGS:-} ]] || site=(--site-settings "$MANYFORGE_DEV_SITE_SETTINGS")
+    python3 "$retention_helper" rotate "$runtime_root" "${aggregate[@]}" "${site[@]}" || echo "WARNING ManyForge retention helper failed; runtime remains available" >&2
   else
     echo "WARNING ManyForge retention skipped: state root has another live user or inspection failed" >&2
   fi
@@ -423,6 +432,14 @@ case "$command" in
       echo "--bootstrap-project requires ROS control and excludes --project." >&2
       exit 64
     fi
+    # Removed variables: the disk limits are site settings members now.
+    for removed in MANYFORGE_LOG_EVIDENCE_MAX_DISK_PERCENT:disk_max_percent \
+        MANYFORGE_LOG_EVIDENCE_MIN_FREE_BYTES:disk_always_free_bytes; do
+      if [[ -v ${removed%%:*} ]]; then
+        echo "${removed%%:*} is no longer read: set ${removed#*:} in the site settings file (MANYFORGE_DEV_SITE_SETTINGS) and unset the variable" >&2
+        exit 64
+      fi
+    done
     if docker inspect "$container_ref" >/dev/null 2>&1; then
       assert_owned_container || return $?
       if [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") == true ]]; then
@@ -494,7 +511,6 @@ case "$command" in
       serve_args+=(--operator-runtime --operator-install-root "$install_root"
         --operator-cell-id "${MANYFORGE_DEV_OPERATOR_CELL_ID:?original cell ID required}"
         --operator-instance-id "$operator_instance"
-        --operator-readiness-timeout "${MANYFORGE_DEV_OPERATOR_READINESS_TIMEOUT:-60}"
         --canonical-empty-admission-filename "${MANYFORGE_DEV_OPERATOR_ADMISSION:?qualified admission required}"
         --package-aggregate-sha256 "${MANYFORGE_DEV_OPERATOR_PACKAGE_SHA256:?qualified package digest required}"
         --composer-port 9000 --composer-bind-host 0.0.0.0)
@@ -518,7 +534,7 @@ case "$command" in
       operator_labels=(--log-driver json-file --label "manyforge.launch-instance=$operator_instance"
         --label "manyforge.launch-input-digest=$operator_digest")
     fi
-    # Generic machine site facts (manyforge.site.v1), independent of Isaac.
+    # Generic machine site facts (manyforge.site.v2), independent of Isaac.
     if [[ "$operator_mode" != true && -n ${MANYFORGE_DEV_SITE_SETTINGS:-} ]]; then
       path=$MANYFORGE_DEV_SITE_SETTINGS
       [[ "$path" == /* ]] || { echo "Development site settings must be an absolute path" >&2; exit 64; }
@@ -573,6 +589,7 @@ case "$command" in
     session_id=$(python3 -c 'import uuid;print(uuid.uuid4().hex)')
     session_proof=()
     [[ -z "$stopped_container_receipt" ]] || session_proof=(--stopped-container-receipt "$stopped_container_receipt")
+    [[ -z ${MANYFORGE_DEV_SITE_SETTINGS:-} ]] || session_proof+=(--site-settings "$MANYFORGE_DEV_SITE_SETTINGS")
     python3 "$session_helper" "$runtime_root" --session-id "$session_id" --lock-fd "$session_lock_fd" "${session_proof[@]}" >/dev/null
     session_environment=(-e "MANYFORGE_DEV_COLD_SESSION_ID=$session_id")
     # Motion-trace snapshots for the debug export are kept by default in the

@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import socket
 import threading
 import time
 from typing import Any
 
 import pytest
 
+from manyforge_headless_api import cell_admission
 from manyforge_headless_api.alarm_attention import (
     KERNEL_FRESHNESS_SECONDS,
-    PUBLICATION_DEADLINE_SECONDS,
     PUBLICATION_PERIOD_SECONDS,
     AttentionPublicationCounts,
     OperatorAlarmAttentionPublisher,
 )
+from manyforge_headless_api.cell_admission import CellAdmissionClient
 from manyforge_headless_api.execution import ExecutionEventPump
 from manyforge_headless_api.tests.paged_event_stream import paged_subscription
 
@@ -26,7 +30,7 @@ class _Core:
 
     def operator_alarm_motion_attention(self) -> dict[str, Any]:
         self.reads += 1
-        return {"generation": self.generation, "owner_epoch": "alarm.owner.1"}
+        return {"generation": self.generation}
 
 
 class _Kernel:
@@ -36,19 +40,19 @@ class _Kernel:
         self.failure: Exception | None = None
         self.wanted = wanted
         self.enough = threading.Event()
-        self.deadlines: list[float] = []
 
     def publish_operator_alarm_attention(
-        self, projection: dict[str, Any], *, deadline: float
+        self, projection: dict[str, Any], *, stop_fd: int | None
     ) -> dict[str, Any]:
-        self.deadlines.append(deadline)
+        # The publisher's stop pipe once started; none for a direct call.
+        assert stop_fd is None or isinstance(stop_fd, int)
         if self.failure is not None:
             raise self.failure
         self.published.append(projection)
         self.received_at.append(time.monotonic())
         if self.wanted and len(self.published) >= self.wanted:
             self.enough.set()
-        return {"generation": projection["generation"], "owner_epoch": "alarm.owner.1"}
+        return {"generation": projection["generation"]}
 
 
 def test_every_publication_carries_the_current_projection() -> None:
@@ -72,94 +76,117 @@ def test_failed_publication_is_retried_on_the_next_period() -> None:
     assert [row["generation"] for row in kernel.published] == [1]
 
 
-def test_publication_timing_is_bounded_by_the_kernel_freshness_contract() -> None:
-    # Production: D < P and P + D = 0.45 s < F = 2 s = 8 P.
-    assert PUBLICATION_DEADLINE_SECONDS < PUBLICATION_PERIOD_SECONDS
-    assert (
-        PUBLICATION_PERIOD_SECONDS + PUBLICATION_DEADLINE_SECONDS
-        < KERNEL_FRESHNESS_SECONDS
-    )
+def test_the_period_fits_the_kernel_freshness_bound() -> None:
+    # Production: F = 2 s = 8 P.
+    assert 4 * PUBLICATION_PERIOD_SECONDS <= KERNEL_FRESHNESS_SECONDS
     with pytest.raises(ValueError):
         OperatorAlarmAttentionPublisher(_Core(), _Kernel(), period_seconds=0.6)
-    with pytest.raises(ValueError):
-        # A deadline reaching the next period could delay that period.
-        OperatorAlarmAttentionPublisher(_Core(), _Kernel(), deadline_seconds=0.25)
 
 
-def test_each_publication_carries_one_deadline_from_its_start() -> None:
-    core, kernel = _Core(), _Kernel()
-    publisher = OperatorAlarmAttentionPublisher(core, kernel)
-    started = time.monotonic()
-    assert publisher.publish_once()
-    assert started < kernel.deadlines[0] <= time.monotonic() + PUBLICATION_DEADLINE_SECONDS
-    assert kernel.deadlines[0] - started <= PUBLICATION_DEADLINE_SECONDS + 0.05
+class _HeldKernel(_Kernel):
+    """A Kernel port whose first answer waits until the test releases it."""
 
-
-class _DeadlineKernel(_Kernel):
-    """A Kernel port that answers after ``delay`` unless the deadline ends first.
-
-    Like the real transport it never blocks past the caller's deadline.
-    """
-
-    def __init__(self, delay: float, wanted: int = 0) -> None:
-        super().__init__(wanted)
-        self.delay = delay
+    def __init__(self) -> None:
+        super().__init__()
         self.started_at: list[float] = []
         self.in_flight = threading.Event()
+        self.release = threading.Event()
+        self.second = threading.Event()
 
     def publish_operator_alarm_attention(
-        self, projection: dict[str, Any], *, deadline: float
+        self, projection: dict[str, Any], *, stop_fd: int | None
     ) -> dict[str, Any]:
-        started = time.monotonic()
-        self.started_at.append(started)
-        self.in_flight.set()
-        if started + self.delay > deadline:
-            time.sleep(max(0.0, deadline - started))
-            if self.wanted and len(self.started_at) >= self.wanted:
-                self.enough.set()
-            raise TimeoutError("cell-admission command deadline elapsed")
-        time.sleep(self.delay)
-        return super().publish_operator_alarm_attention(projection, deadline=deadline)
+        self.started_at.append(time.monotonic())
+        if len(self.started_at) == 1:
+            self.in_flight.set()
+            self.release.wait()
+        else:
+            self.second.set()
+        return super().publish_operator_alarm_attention(projection, stop_fd=stop_fd)
 
 
-def test_a_publication_past_its_deadline_is_abandoned_counted_and_keeps_the_period() -> None:
-    samples = 8
-    core = _Core()
-    kernel = _DeadlineKernel(delay=10.0, wanted=samples)
-    publisher = OperatorAlarmAttentionPublisher(core, kernel)
+def test_a_late_answer_is_waited_for_and_the_next_publication_follows_at_once() -> None:
+    """OD-307: no publication deadline; the Kernel's answer ends the wait."""
+    kernel = _HeldKernel()
+    publisher = OperatorAlarmAttentionPublisher(_Core(), kernel)
     publisher.start()
     try:
-        assert kernel.enough.wait(timeout=samples * PUBLICATION_PERIOD_SECONDS + 5.0)
+        assert kernel.in_flight.wait(timeout=5.0)
+        # Held well past one period (and past the former 200 ms deadline):
+        # nothing abandons it and no second publication starts meanwhile.
+        time.sleep(2 * PUBLICATION_PERIOD_SECONDS)
+        assert len(kernel.started_at) == 1
+        assert publisher.counts == AttentionPublicationCounts(0, 0)
+        answered = time.monotonic()
+        kernel.release.set()
+        assert kernel.second.wait(timeout=5.0)
     finally:
         publisher.shutdown()
-    counts = publisher.counts
-    assert counts.published == 0 and counts.failed == 0
-    assert counts.abandoned >= samples
-    starts = kernel.started_at[:samples]
-    intervals = [later - earlier for earlier, later in zip(starts, starts[1:])]
-    # Every abandoned publication ended inside its own period.
-    assert max(intervals) < PUBLICATION_PERIOD_SECONDS + 0.1
-    assert min(intervals) > PUBLICATION_PERIOD_SECONDS - 0.05
+    assert publisher.counts.published >= 1 and publisher.counts.failed == 0
+    # The overrun period publishes again at once rather than bursting.
+    assert kernel.started_at[1] - answered < PUBLICATION_PERIOD_SECONDS
 
 
-def test_failure_before_the_deadline_is_counted_separately() -> None:
+def test_failures_are_counted() -> None:
     core, kernel = _Core(), _Kernel()
     publisher = OperatorAlarmAttentionPublisher(core, kernel)
     kernel.failure = OSError("execution host unavailable")
     assert not publisher.publish_once()
     kernel.failure = None
     assert publisher.publish_once()
-    assert publisher.counts == AttentionPublicationCounts(1, 0, 1)
+    assert publisher.counts == AttentionPublicationCounts(1, 1)
 
 
-def test_shutdown_with_an_outstanding_publication_is_bounded_by_its_deadline() -> None:
-    kernel = _DeadlineKernel(delay=10.0)
-    publisher = OperatorAlarmAttentionPublisher(_Core(), kernel)
-    publisher.start()
-    assert kernel.in_flight.wait(timeout=5.0)
-    started = time.monotonic()
-    publisher.shutdown()
-    assert time.monotonic() - started <= PUBLICATION_DEADLINE_SECONDS + 0.1
+class _SilentKernelSocket:
+    """A real component socket whose peer accepts and reads but never answers."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        self.run_root = tmp_path / "run"
+        self.run_root.mkdir(mode=0o700)
+        path = self.run_root / cell_admission.EXECUTION_COMPONENT_SOCKET_FILE
+        self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
+        self._listener.bind(str(path))
+        os.chmod(path, 0o600)
+        self._listener.listen(1)
+        self.received = threading.Event()
+        self._done = threading.Event()
+        self._peer = threading.Thread(target=self._serve, name="test-silent-kernel")
+        self._peer.start()
+
+    def _serve(self) -> None:
+        connection, _address = self._listener.accept()
+        with connection:
+            connection.recv(cell_admission.MAXIMUM_PACKET_BYTES)
+            self.received.set()
+            self._done.wait()
+
+    def close(self) -> None:
+        self._done.set()
+        self._peer.join()
+        self._listener.close()
+
+
+def test_shutdown_ends_an_outstanding_publication_on_the_real_transport(
+    tmp_path: Path,
+) -> None:
+    """OD-307: the publisher's stop pipe ends the wait, not a deadline."""
+    kernel = _SilentKernelSocket(tmp_path)
+    try:
+        publisher = OperatorAlarmAttentionPublisher(
+            _Core(), CellAdmissionClient(kernel.run_root, timeout_seconds=1.0)
+        )
+        publisher.start()
+        assert publisher._stop_read_fd is not None  # noqa: SLF001
+        assert kernel.received.wait(timeout=5.0)
+        publisher.shutdown()
+        # The stop pipe is closed once the publisher thread has ended.
+        assert publisher._stop_read_fd is None  # noqa: SLF001
+        assert publisher._stop_write_fd is None  # noqa: SLF001
+        # Ended by the stop: neither published nor counted as failed.
+        assert publisher.counts == AttentionPublicationCounts(0, 0)
+        assert publisher.kernel_held_attention() is None
+    finally:
+        kernel.close()
 
 
 class _PumpCore:
@@ -183,8 +210,8 @@ class _BlockedSourceRefresh:
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
-        return paged_subscription(self, after_cursor, owner_epoch)
+    def subscribe_events(self, after_cursor: int):
+        return paged_subscription(self, after_cursor)
 
     def identity(self) -> dict[str, Any]:
         self.entered.set()
@@ -203,7 +230,9 @@ def test_publications_keep_their_period_while_the_event_pump_is_blocked(
     samples = 12
     core, kernel = _Core(), _Kernel(wanted=samples)
     source = _BlockedSourceRefresh()
-    pump = ExecutionEventPump(_PumpCore(), source, poll_seconds=0.1)  # type: ignore[arg-type]
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        _PumpCore(), source, application_start_id="3f9a0000000000a1", poll_seconds=0.1
+    )
     publisher = OperatorAlarmAttentionPublisher(core, kernel)
     loaded = threading.Event()
 
@@ -277,7 +306,6 @@ def test_the_kernel_held_copy_is_the_last_acknowledged_projection(
     assert publisher.kernel_held_attention() == {
         "active_configuration": {"graph_revision": "graph.1", "retained_bundle_id": "bundle.1"},
         "generation": 1,
-        "owner_epoch": "alarm.owner.1",
         "reconciled": False,
     }
     assert len(changes) == 1

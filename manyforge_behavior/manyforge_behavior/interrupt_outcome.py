@@ -5,10 +5,10 @@ evidence); the Runner maps them
 for `motion.move_until_signal` / `motion.probe_search`:
 
 - a trip contained by the rule's entry stage (``terminal_cause:
-  signal_trip``, ``stop_result: succeeded_nominal``; spring-back substitution
+  signal_trip``, ``stop_result: stopped``; spring-back substitution
   stays nominal) maps per ``on_signal`` (default success) with node outcome
   ``signal_trip``;
-- a trip contained by a later stage (``succeeded_escalated``) maps per
+- a trip contained by a later stage (``stopped_escalated``) maps per
   ``on_signal`` only when that stage is at or before the rule's
   ``success_through_stage_id`` in the robot's qualified Stop chain
   (omitted = only the entry stage counts). That is the requested response:
@@ -27,12 +27,24 @@ for `motion.move_until_signal` / `motion.probe_search`:
 
 An ordinary Stop (``terminal_cause: stopped``) is not an interrupt terminal:
 ``map_interrupt_result`` returns None and the existing Stop handling applies.
+So is a motion that did not run to its end (stopped, failed, intervention
+required, cancelled before dispatch) and left no rule result: no rule row,
+or one row with neither an end cause nor a Stop result (the removed rule of
+a cancelled take-over). A motion that completed without exactly one usable
+rule result stays ``motion_interrupt_result_missing``.
+So is a participant whose Stop has operator attribution (an operator Stop,
+Stop all, Halt, cell Stop or rule hold reached it first): an operator hold,
+not a rule outcome.
 
-The rule row itself names its Stop certificate, not the stage that contained
-it: the caller passes the robot's qualified stage order (``stop_chain``, per
-participant for a coordinated Stop) and the containing stage
-(``contained_stage_id``, or per participant, see
-``contained_stages_from_stop_terminal``).
+The containing stage is read from memory, from the operation read: each
+covered participant carries its ``stop`` object (phase, attribution, stop
+mode, the containing stage). A trip is judged against the rule's success
+threshold only when every covered participant stopped under an interrupt
+plan (mode ``interrupt``) with Program-own or rule attribution, also when
+it joined an earlier interrupt Stop of that participant; otherwise the node
+fails with ``interrupt_fault``. The caller passes the robot's qualified stage order
+(``stop_chain``, per participant for a coordinated Stop). While any covered
+participant is still ``stopping`` the caller waits (``interrupt_stop_pending``).
 """
 
 from __future__ import annotations
@@ -56,17 +68,29 @@ DEFAULT_ON_NO_SIGNAL: Final = {
 _TERMINAL_CAUSES: Final = frozenset(
     {"signal_trip", "no_signal_trip", "stopped", "failed", "interrupted_fault"}
 )
-_STOP_RESULTS: Final = frozenset(
-    {"succeeded_nominal", "succeeded_escalated", "partial", "failed_uncontained"}
+# The rule row's per-participant Stop result (``StopEventResult`` tokens).
+_STOP_RESULTS: Final = frozenset({"stopped", "stopped_escalated", "some_failed"})
+_UNCONTAINED: Final = frozenset({"some_failed"})
+_STOP_PHASES: Final = frozenset({"running", "stopping", "stopped", "failed"})
+_ATTRIBUTION_CLASSES: Final = frozenset({"program_own", "rule", "operator"})
+_STOP_FIELDS: Final = frozenset(
+    {
+        "phase",
+        "attempt",
+        "stop_event_id",
+        "mode",
+        "attribution_class",
+        "plan_digest",
+        "containing_stage_id",
+        "containing_stage_index",
+        "escalated",
+    }
 )
-_UNCONTAINED: Final = frozenset({"partial", "failed_uncontained"})
 _MAX_SAFE: Final = 9_007_199_254_740_991
 _MAX_UINT64: Final = 2**64 - 1
 _INT64: Final = (-(2**63), 2**63 - 1)
 _SCOPE_FIELDS: Final = frozenset(
     {
-        "owner_epoch",
-        "program_runner_owner_epoch",
         "program_binding_id",
         "active_publication_generation",
         "cycle_generation",
@@ -135,10 +159,9 @@ def _closed(value: Any, fields: frozenset[str]) -> Mapping[str, Any]:
     return value
 
 
-def _scope(value: Any, registration: Mapping[str, Any]) -> Mapping[str, Any]:
+def _scope(value: Any) -> Mapping[str, Any]:
     scope = _closed(value, _SCOPE_FIELDS)
-    for field in ("owner_epoch", "program_runner_owner_epoch", "program_binding_id"):
-        _text(scope[field])
+    _text(scope["program_binding_id"])
     _safe_positive(scope["active_publication_generation"])
     _safe_positive(scope["cycle_generation"])
     claim, run = scope["claim_generation"], scope["program_run_id"]
@@ -146,9 +169,7 @@ def _scope(value: Any, registration: Mapping[str, Any]) -> Mapping[str, Any]:
         raise _Malformed("claim and Run are both null or both present")
     if claim is not None:
         _safe_positive(claim)
-        _text(run)
-    if scope["owner_epoch"] != registration.get("owner_epoch"):
-        raise _Malformed("BB evidence names another Kernel owner")
+        _safe_positive(run)
     return scope
 
 
@@ -186,7 +207,7 @@ def _trip_blackboard(trip: Mapping[str, Any], registration: Mapping[str, Any]) -
     if "blackboard" not in trip:
         return None
     evidence = _closed(trip["blackboard"], _TRIP_BB_FIELDS)
-    _scope(evidence["scope"], registration)
+    _scope(evidence["scope"])
     source_id, source_epoch = _text(evidence["source_id"]), _text(evidence["source_epoch"])
     sequence = _decimal(evidence["message_sequence"], minimum=1)
     _decimal(evidence["received_at_ns"], minimum=0, maximum=2**63 - 1)
@@ -213,7 +234,7 @@ def _loss_blackboard(loss: Mapping[str, Any], registration: Mapping[str, Any]) -
     if "blackboard" not in loss:
         return None
     evidence = _closed(loss["blackboard"], _LOSS_BB_FIELDS)
-    _scope(evidence["scope"], registration)
+    _scope(evidence["scope"])
     if (
         _text(evidence["source_id"]) != loss.get("source_id")
         or _text(evidence["source_epoch"]) != loss.get("source_epoch")
@@ -230,107 +251,84 @@ def _loss_blackboard(loss: Mapping[str, Any], registration: Mapping[str, Any]) -
 # Stop stage threshold -----------------------------------------------------
 
 
-def contained_stages_from_stop_terminal(
-    row: Mapping[str, Any], terminal: Mapping[str, Any], *, operation_id: str
-) -> dict[str, str] | None:
-    """Per participant, the stage that contained this row's Stop, from the
-    existing detailed Stop terminal projection
-    (``manyforge.stop_terminal_projection.v1``, the ``stop_terminal_projected``
-    event row) of exactly the row's Stop id/generation and certificate; None
-    when that is not proven (another Stop or certificate, a truncated summary
-    without details, malformed rows): unresolved evidence never implies
-    success.
+ParticipantKey = tuple[int, int]
 
-    Only ``attempted_stages[]`` rows of this operation that are
-    ``authoritative``, ``succeeded`` and error-free count, and each must carry
-    the participant's own ``participant_stop_invocation_plan_digest`` from the
-    certificate's ``participant_settlement``. A coordinated Stop can contain
-    different participants at different stages, so the result is per
-    participant. A natural finish or pre-dispatch no-effect has no attempt and
-    so no containing stage (an empty mapping).
-    """
 
-    certificate_id = row.get("stop_certificate_id")
-    if (
-        type(certificate_id) is not str
-        or not certificate_id
-        or terminal.get("stop_certificate_id") != certificate_id
-        or terminal.get("stop_certificate_revision") != row.get("stop_certificate_revision")
-        or type(row.get("stop_id")) is not str
-        or terminal.get("stop_id") != row["stop_id"]
-        or type(row.get("stop_generation")) is not int
-        or terminal.get("stop_generation") != row["stop_generation"]
-        or terminal.get("details_truncated") is not False
-    ):
+def participant_key(value: Any) -> ParticipantKey | None:
+    """The ``(operation_id, ordinal)`` key of one participant id object
+    ``{operation_id, ordinal}`` (contract 1.5); None for any other shape."""
+
+    if not isinstance(value, Mapping) or set(value) != {"operation_id", "ordinal"}:
         return None
-    attempts = terminal.get("attempted_stages")
-    settlement = terminal.get("participant_settlement")
-    if not isinstance(attempts, list) or not isinstance(settlement, list):
+    operation_id, ordinal = value["operation_id"], value["ordinal"]
+    if type(operation_id) is not int or type(ordinal) is not int:
         return None
+    if operation_id < 1 or ordinal < 1:
+        return None
+    return operation_id, ordinal
 
-    def participant(scope_key: Any) -> str | None:
-        subject = scope_key.get("subject") if isinstance(scope_key, Mapping) else None
-        if (
-            not isinstance(subject, Mapping)
-            or subject.get("kind") != "participant"
-            or subject.get("operation_id") != operation_id
-            or type(subject.get("participant_id")) is not str
-        ):
-            return None
-        return subject["participant_id"]
 
-    digests = {
-        participant(entry.get("scope_key")): entry.get("participant_stop_invocation_plan_digest")
-        for entry in settlement
-        if isinstance(entry, Mapping)
-    }
-    contained: dict[str, tuple[int, str]] = {}
-    for attempt in attempts:
-        if not isinstance(attempt, Mapping):
-            return None
-        participant_id = participant(attempt.get("scope_key"))
-        stage = attempt.get("stage")
-        if (
-            participant_id is None
-            or attempt.get("operation_id") != operation_id
-            or attempt.get("participant_id") != participant_id
-            or attempt.get("authority") != "authoritative"
-            or attempt.get("outcome") != "succeeded"
-            or attempt.get("error") is not None
-        ):
+def participant_stops(operation: Mapping[str, Any]) -> dict[ParticipantKey, Mapping[str, Any]]:
+    """Per covered participant of the operation read, its ``stop`` object
+    (participants never covered by a Stop carry none). A malformed object
+    raises ``ValueError``."""
+
+    stops: dict[ParticipantKey, Mapping[str, Any]] = {}
+    for participant in operation.get("participants") or ():
+        if not isinstance(participant, Mapping):
             continue
-        digest = attempt.get("participant_stop_invocation_plan_digest")
+        stop = participant.get("stop")
+        if stop is None:
+            continue
+        key = participant_key(participant.get("participant_id"))
         if (
-            not isinstance(stage, Mapping)
-            or type(stage.get("stage_id")) is not str
-            or type(stage.get("stage_index")) is not int
-            or type(digest) is not str
-            or digests.get(participant_id) != digest
+            key is None
+            or not isinstance(stop, Mapping)
+            or set(stop) != _STOP_FIELDS
+            or stop["phase"] not in _STOP_PHASES
+            or stop["attribution_class"] not in _ATTRIBUTION_CLASSES
+            or type(stop["escalated"]) is not bool
+            or not (stop["plan_digest"] is None or type(stop["plan_digest"]) is str)
+            or not (
+                stop["containing_stage_id"] is None
+                or type(stop["containing_stage_id"]) is str
+            )
+        ):
+            raise ValueError("participant Stop state is malformed")
+        stops[key] = stop
+    return stops
+
+
+def interrupt_stop_pending(operation: Mapping[str, Any]) -> bool:
+    """True while a covered participant of the operation is still stopping:
+    the node waits and re-observes on its next tick."""
+
+    try:
+        stops = participant_stops(operation)
+    except ValueError:
+        return False
+    return any(stop["phase"] == "stopping" for stop in stops.values())
+
+
+def _interrupt_stages(
+    stops: Mapping[ParticipantKey, Mapping[str, Any]],
+) -> dict[ParticipantKey, str | None] | None:
+    """Per covered participant, the stage that contained it when every
+    covered participant is stopped under an interrupt plan (mode
+    ``interrupt``) with Program-own or rule attribution; None otherwise."""
+
+    if not stops:
+        return None
+    stages: dict[ParticipantKey, str | None] = {}
+    for key, stop in stops.items():
+        if (
+            stop["phase"] != "stopped"
+            or stop["attribution_class"] not in {"program_own", "rule"}
+            or stop["mode"] != "interrupt"
         ):
             return None
-        index = stage["stage_index"]
-        if participant_id not in contained or index > contained[participant_id][0]:
-            contained[participant_id] = (index, stage["stage_id"])
-    return {key: stage_id for key, (_index, stage_id) in contained.items()}
-
-
-def contained_stage_from_stop_terminal(
-    row: Mapping[str, Any],
-    terminal: Mapping[str, Any],
-    *,
-    operation_id: str,
-    participant_id: str | None = None,
-) -> str | None:
-    """The one participant's containing stage (``participant_id``, or the only
-    contained participant); None when not proven or when several participants
-    were contained (no single guessed stage)."""
-
-    stages = contained_stages_from_stop_terminal(row, terminal, operation_id=operation_id)
-    if not stages:
-        return None
-    if participant_id is not None:
-        return stages.get(participant_id)
-    return next(iter(stages.values())) if len(stages) == 1 else None
+        stages[key] = stop["containing_stage_id"]
+    return stages
 
 
 def _within_one(entry: Any, threshold: Any, chain: tuple[str, ...], contained: str) -> bool | None:
@@ -347,8 +345,8 @@ def _within_one(entry: Any, threshold: Any, chain: tuple[str, ...], contained: s
 
 def _within_success_threshold(
     parameters: Mapping[str, Any],
-    stop_chain: Sequence[str] | Mapping[str, Sequence[str]],
-    contained_stage_id: str | Mapping[str, str] | None,
+    stop_chain: Sequence[str] | Mapping[ParticipantKey, Sequence[str]],
+    contained_stage_id: str | Mapping[ParticipantKey, str | None] | None,
 ) -> bool | None:
     """True/False: every containing stage is / some is not at or before the
     rule's success threshold; None: not provable (no threshold counts as
@@ -407,19 +405,52 @@ def _rule_rows(operation: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     return rows
 
 
+# A participant's terminal state (Kernel ``OperationStateKind``) when its
+# motion did not run to its end: stopped, failed, intervention required,
+# interrupted, or cancelled before dispatch (``completed`` is the only other
+# terminal state).
+_NOT_COMPLETED_STATES: Final = frozenset(
+    {"stopped", "failed", "intervention_required", "interrupted", "cancelled_pre_dispatch"}
+)
+
+
+def _ended_before_completion(operation: Mapping[str, Any]) -> bool:
+    """The operation itself reports that its motion did not run to its end:
+    a participant's ``state`` is a terminal state other than ``completed``."""
+
+    return any(
+        isinstance(participant, Mapping)
+        and participant.get("state") in _NOT_COMPLETED_STATES
+        for participant in operation.get("participants") or ()
+    )
+
+
 def map_interrupt_result(
     node_id: str,
     parameters: Mapping[str, Any],
     operation: Mapping[str, Any],
     *,
-    stop_chain: Sequence[str] | Mapping[str, Sequence[str]] = (),
-    contained_stage_id: str | Mapping[str, str] | None = None,
+    stop_chain: Sequence[str] | Mapping[ParticipantKey, Sequence[str]] = (),
 ) -> InterruptNodeResult | None:
-    """Map the terminal operation's typed rule result for this node's rule."""
+    """Map the terminal operation's typed rule result for this node's rule.
+
+    Call only when ``interrupt_stop_pending`` is False."""
 
     on_signal = parameters.get("on_signal", DEFAULT_ON_SIGNAL)
     on_no_signal = parameters.get("on_no_signal", DEFAULT_ON_NO_SIGNAL[node_id])
     rows = _rule_rows(operation)
+    if _ended_before_completion(operation) and (
+        not rows
+        or (
+            len(rows) == 1
+            and rows[0].get("terminal_cause") is None
+            and rows[0].get("stop_result") is None
+        )
+    ):
+        # The motion did not run to its end and the rule left no result
+        # (never armed, or removed with a cancelled take-over): the rule
+        # played no part, the ordinary handling of that motion's end applies.
+        return None
     if len(rows) != 1:
         return _failure(
             "motion_interrupt_result_missing",
@@ -442,7 +473,18 @@ def map_interrupt_result(
             "the interrupt result is malformed",
             uncertain=True,
         )
-    if cause == "stopped":
+    try:
+        stops = participant_stops(operation)
+    except ValueError:
+        return _failure(
+            "motion_interrupt_result_invalid",
+            "the participant Stop state is malformed",
+            uncertain=True,
+        )
+    if cause == "stopped" or any(
+        stop["attribution_class"] == "operator" for stop in stops.values()
+    ):
+        # An ordinary Stop, or an operator hold: the existing Stop handling.
         return None
     trip = evidence.get("trip")
     losses = evidence.get("source_losses") or ()
@@ -462,7 +504,13 @@ def map_interrupt_result(
             uncertain=True,
         )
     tripped = f"rule {rule} tripped" + (f": {trip_text}" if trip_text else "")
-    if cause == "signal_trip" and trip is not None and stop_result == "succeeded_nominal":
+    other_plan = _failure(
+        "interrupt_fault",
+        f"{tripped}; the Stop that contained it was not an interrupt Stop",
+    )
+    if cause == "signal_trip" and trip is not None and stop_result == "stopped":
+        if _interrupt_stages(stops) is None:
+            return other_plan
         return _mapped(on_signal, "signal_trip", f"{tripped}; contained by the entry stage")
     if losses:
         source = losses[0].get("source_id") if isinstance(losses[0], Mapping) else None
@@ -473,7 +521,7 @@ def map_interrupt_result(
             + (f": {detail}" if detail else ""),
             uncertain=stop_result is None or stop_result in _UNCONTAINED,
         )
-    if cause == "signal_trip" and (trip is None or stop_result != "succeeded_escalated"):
+    if cause == "signal_trip" and (trip is None or stop_result != "stopped_escalated"):
         return _failure(
             "motion_interrupt_result_invalid",
             "a signal trip needs its trip evidence and a contained Stop",
@@ -484,15 +532,18 @@ def map_interrupt_result(
     if (
         cause in {"signal_trip", "failed"}
         and trip is not None
-        and stop_result == "succeeded_escalated"
+        and stop_result == "stopped_escalated"
         and evidence.get("evaluation_error") is None
     ):
-        within = _within_success_threshold(parameters, stop_chain, contained_stage_id)
+        contained = _interrupt_stages(stops)
+        if contained is None:
+            return other_plan
+        within = _within_success_threshold(parameters, stop_chain, contained)
         if within:
             stages = (
-                ", ".join(f"{key}: {value}" for key, value in sorted(contained_stage_id.items()))
-                if isinstance(contained_stage_id, Mapping)
-                else contained_stage_id
+                next(iter(contained.values()))
+                if len(contained) == 1
+                else ", ".join(f"{key}: {value}" for key, value in sorted(contained.items()))
             )
             return _mapped(
                 on_signal,
@@ -528,7 +579,9 @@ __all__ = [
     "DEFAULT_ON_NO_SIGNAL",
     "DEFAULT_ON_SIGNAL",
     "InterruptNodeResult",
-    "contained_stage_from_stop_terminal",
-    "contained_stages_from_stop_terminal",
+    "ParticipantKey",
+    "interrupt_stop_pending",
     "map_interrupt_result",
+    "participant_key",
+    "participant_stops",
 ]

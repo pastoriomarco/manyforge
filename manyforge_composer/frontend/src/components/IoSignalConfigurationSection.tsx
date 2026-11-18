@@ -5,6 +5,7 @@ import type { JsonValue } from '../types/api';
 import { DraftTextInput } from './common/DraftInputs';
 import {
   IO_DRIVER_FRESHNESS_NOTE,
+  IO_MAXIMUM_INGRESS_DEPTH,
   IO_LIVENESS_UNPROVEN_WARNING,
   IO_OUTPUT_PROFILE_LABELS,
   IO_SOURCE_PROFILE_LABELS,
@@ -349,8 +350,8 @@ function inputFieldProblem(
   }
   if (field === 'ingressDepth') {
     const depth = /^\d+$/.test(value) ? Number(value) : NaN;
-    return Number.isSafeInteger(depth) && depth >= 1 ? null
-      : `Ingress depth must be a whole number of samples from 1 to ${Number.MAX_SAFE_INTEGER}.`;
+    return Number.isSafeInteger(depth) && depth >= 1 && depth <= IO_MAXIMUM_INGRESS_DEPTH ? null
+      : `Ingress depth must be a whole number of samples from 1 to ${IO_MAXIMUM_INGRESS_DEPTH}.`;
   }
   if (field === 'echoDelayMs') {
     const delay = /^\d+$/.test(value) ? Number(value) : NaN;
@@ -741,7 +742,7 @@ export function IoSignalInputFields({
       <details>
         <summary>Advanced</summary>
         <div className="deployment-focused-form-grid">
-          {number('Ingress depth', 'ingressDepth', 'samples', 'Bounded samples queued per source (default 64).')}
+          {number('Ingress depth', 'ingressDepth', 'samples', 'Bounded samples queued per source (1 to 1024, default 64).')}
         </div>
       </details>
       {onRemove !== undefined && (

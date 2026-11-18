@@ -1,6 +1,8 @@
 #include "manyforge_component_manager/site_settings.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <string>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <utility>
 #include <vector>
@@ -49,6 +51,35 @@ const std::string &Text(const CanonicalValue &value, const std::string &label) {
          });
 }
 
+constexpr const char *kDiskMembers[] = {
+    "disk_max_percent", "disk_always_free_bytes", "disk_machine_minimum_bytes"};
+
+/// The one C++ decision on which site settings schema lines are accepted;
+/// true when the schema carries the disk limits. Decided exception: version 1
+/// files carry no disk limits and use the defaults.
+bool AcceptedSchemaHasDiskLimits(const std::string &schema) {
+  if (schema == "manyforge.site.v2")
+    return true;
+  if (schema == "manyforge.site.v1")
+    return false;
+  Fail("site settings schema must be manyforge.site.v2");
+}
+
+/// The disk limits are read by the launchers; here they are only validated
+/// (an integral JSON number in [low, high]).
+void RequireInteger(const CanonicalValue &root, const char *name, double low,
+                    double high) {
+  const auto *value = root.find_object_member(name);
+  if (value == nullptr)
+    return;
+  if (!value->is_number() || value->as_number() < low ||
+      value->as_number() > high ||
+      std::trunc(value->as_number()) != value->as_number())
+    Fail(std::string("site settings ") + name + " must be an integer from " +
+         std::to_string(static_cast<long long>(low)) + " to " +
+         std::to_string(static_cast<long long>(high)));
+}
+
 } // namespace
 
 SiteSettings::SiteSettings(DeviceAddresses device_addresses,
@@ -76,7 +107,9 @@ SiteSettings ParseSiteSettings(std::string_view bytes) {
   for (const auto &[name, ignored] : fields) {
     static_cast<void>(ignored);
     if (name != "schema" && name != "device_addresses" &&
-        name != "project_folders")
+        name != "project_folders" && name != "disk_max_percent" &&
+        name != "disk_always_free_bytes" &&
+        name != "disk_machine_minimum_bytes")
       Fail("site settings has unknown field " + name);
   }
   const auto *schema = root.find_object_member("schema");
@@ -84,8 +117,17 @@ SiteSettings ParseSiteSettings(std::string_view bytes) {
   const auto *folders = root.find_object_member("project_folders");
   if (schema == nullptr)
     Fail("site settings requires schema");
-  if (Text(*schema, "site settings schema") != "manyforge.site.v1")
-    Fail("site settings schema must be manyforge.site.v1");
+  if (!AcceptedSchemaHasDiskLimits(Text(*schema, "site settings schema"))) {
+    for (const char *name : kDiskMembers)
+      if (root.find_object_member(name) != nullptr)
+        Fail(std::string("site settings ") + name +
+             " needs schema manyforge.site.v2: change the first line's schema "
+             "to manyforge.site.v2; no other change is needed");
+  }
+  constexpr double kMaxExactInteger = 9007199254740991.0;  // 2^53 - 1
+  RequireInteger(root, "disk_max_percent", 1.0, 100.0);
+  RequireInteger(root, "disk_always_free_bytes", 0.0, kMaxExactInteger);
+  RequireInteger(root, "disk_machine_minimum_bytes", 0.0, kMaxExactInteger);
   SiteSettings::DeviceAddresses device_addresses;
   const auto entries =
       addresses == nullptr

@@ -848,7 +848,7 @@ TEST(ComponentSpec, IoProviderStreamOverrideEditRetainsEveryComponent) {
         return Reseal(source, [&](const auto &root) {
           return With(root, "component_streams",
                       encode_component_stream_overrides({core::StreamParameterOverrideDTO{
-                          id, "inputs", budget_ns, std::nullopt, std::nullopt}}));
+                          id, "inputs", budget_ns}}));
         });
       };
       const auto before = with_override(bundle, 500'000'000);

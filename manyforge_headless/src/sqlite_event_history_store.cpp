@@ -19,9 +19,11 @@
 #include <system_error>
 #include <unordered_map>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/types/application_identity.hpp>
 
 namespace manyforge::headless {
 namespace {
@@ -29,7 +31,7 @@ namespace {
 using content_identity::CanonicalValue;
 
 constexpr int kHistorianApplicationId = 0x4D464548;
-constexpr int kHistorianUserVersion = 6;
+constexpr int kHistorianUserVersion = 8;
 /// A maximal record (256-KiB payload plus its bounded envelope) always fits
 /// one capture, so a trigger is never dropped for its size.
 constexpr std::int64_t kMinimumCaptureBytes = 512LL * 1024LL;
@@ -50,6 +52,12 @@ constexpr std::int64_t kMaximumDatabasePageImageBytes = 512LL * 1024LL * 1024LL;
 // wall clock and fixed fields fit below 48 KiB even with 6-byte JSON escapes.
 constexpr std::size_t kMaximumSummaryBytes = 64U * 1024U;
 
+// ``historian_events.application_start_id`` is the start a row belongs to
+// (format 7): the start whose Headless wrote it, or, for the previous-session
+// report and the alarm rows that embed it, the start the report describes. It
+// is a filter of its own and scopes filters by ids minted inside a start.
+// Format 7 also keys a Stop by its event id (``stop_event_id``, stop state
+// model): the two rows of one Stop event and the operations it stopped share it.
 constexpr std::string_view kSchema = R"sql(
 CREATE TABLE historian_metadata (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -67,7 +75,8 @@ CREATE TABLE historian_events (
   occurred_at_wall TEXT NOT NULL,
   payload_json TEXT NOT NULL,
   payload_digest TEXT NOT NULL,
-  event_digest TEXT NOT NULL
+  event_digest TEXT NOT NULL,
+  application_start_id TEXT NOT NULL
 ) STRICT;
 CREATE INDEX historian_events_time_idx
   ON historian_events(occurred_at_ns DESC, sequence DESC);
@@ -75,6 +84,8 @@ CREATE INDEX historian_events_component_idx
   ON historian_events(component, sequence DESC);
 CREATE INDEX historian_events_type_idx
   ON historian_events(event_type, sequence DESC);
+CREATE INDEX historian_events_start_idx
+  ON historian_events(application_start_id, sequence DESC);
 )sql";
 
 // Secondary indexes live with the immutable event, never in another service.
@@ -102,9 +113,12 @@ CREATE TABLE historian_event_keys (
   sequence INTEGER NOT NULL REFERENCES historian_events(sequence) ON DELETE CASCADE,
   kind TEXT NOT NULL,
   value TEXT NOT NULL,
+  application_start_id TEXT NOT NULL,
   PRIMARY KEY(sequence,kind,value)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX historian_event_keys_lookup_idx ON historian_event_keys(kind,value,sequence DESC);
+CREATE INDEX historian_event_keys_run_idx ON historian_event_keys(application_start_id,length(value),value)
+  WHERE kind='program_run_id';
 )sql";
 
 // Storage revision 4: failure capture protects already-durable rows by
@@ -151,15 +165,40 @@ CREATE TABLE historian_capture_retention (
 INSERT INTO historian_capture_retention(singleton) VALUES(1);
 )sql";
 
+// List summaries stored with each event, digest-bound to its original.
+constexpr std::string_view kSummarySchema = R"sql(
+ALTER TABLE historian_events ADD COLUMN summary_json TEXT NOT NULL DEFAULT '';
+ALTER TABLE historian_events ADD COLUMN summary_digest TEXT NOT NULL DEFAULT '';
+)sql";
+
 constexpr std::string_view kCorrelationNames =
     "'program_run_id','operation_id','action_span_id','node_instance_id','node_attempt_id',"
     "'intervention_session_id','contact_policy_id','incident_id','condition_id','alarm_condition_id',"
-    "'activation_id','stop_id','resource_id','source_owner_epoch','phase','parent_node_attempt_id'";
+    "'activation_id','stop_event_id','resource_id','phase','parent_node_attempt_id'";
 // Error and reason codes at any depth are keyed for search only (revision 5;
 // revision 6 adds the incident cause and closure codes); they are not
 // correlation filters or discovery kinds.
 constexpr std::string_view kSearchCodeNames = "'code','reason','reason_code','cause_class','closure_reason'";
 const std::string kIndexedKeyNames = std::string(kCorrelationNames) + "," + std::string(kSearchCodeNames);
+// Ids minted inside one application start are integers (contract 1.5). They
+// are keyed as decimal text.
+constexpr std::string_view kStartMintedIdNames =
+    "'program_run_id','operation_id','node_attempt_id','parent_node_attempt_id','stop_event_id'";
+// Filters whose values restart at every start: the start-minted ids and the
+// action span (a node attempt's number as text). They match only rows of one
+// start (``historian_events.application_start_id``): the query's start, or
+// this store's own start when the query names none.
+const std::set<std::string> kStartScopedKeys{
+    "program_run_id", "operation_id", "action_span_id", "node_attempt_id", "parent_node_attempt_id",
+    "stop_event_id"};
+/// SQL condition on a ``json_tree`` row (columns prefixed by ``prefix``) that
+/// selects an indexed key: any indexed name with a text value, or a
+/// start-minted id with an integer value.
+std::string IndexedKeyCondition(const std::string &prefix) {
+  return "(" + prefix + "type='text' OR (" + prefix + "type='integer' AND " + prefix + "key IN (" +
+         std::string(kStartMintedIdNames) + "))) AND " + prefix + "key IN (" + kIndexedKeyNames +
+         ") AND length(CAST(" + prefix + "value AS BLOB)) BETWEEN 1 AND 1024 ";
+}
 // Storage revisions 5-6: search covers only human-readable text, never the
 // payload JSON. Its trigram index was most of the database; kind, subject and
 // time filters use the b-tree indexes above. External content keeps no copy:
@@ -192,7 +231,7 @@ const std::string kProgramDiagnosticSchemaList = [] {
 const std::set<std::string> kCorrelationKeys{
     "program_run_id", "operation_id", "action_span_id", "node_instance_id", "node_attempt_id",
     "intervention_session_id", "contact_policy_id", "incident_id", "condition_id", "alarm_condition_id",
-    "activation_id", "stop_id", "resource_id", "source_owner_epoch", "channel", "phase", "parent_node_attempt_id"};
+    "activation_id", "stop_event_id", "resource_id", "channel", "phase", "parent_node_attempt_id"};
 
 std::optional<std::string> RecordedClockOwner(const HistorianEvent &event) {
   if (!event.payload.is_object()) return std::nullopt;
@@ -203,12 +242,37 @@ std::optional<std::string> RecordedClockOwner(const HistorianEvent &event) {
     return result.empty() || result.size() > 1024U ? std::nullopt : std::optional(result);
   };
   if (auto explicit_owner = text("clock_owner")) return explicit_owner;
-  // Only this versioned native adapter proves which clock stamped the event.
-  // Arbitrary nested owner/session IDs are not a clock-domain assertion.
-  if (text("schema_version") == "manyforge.operation_history_event.v1") {
-    if (auto epoch = text("source_owner_epoch")) return "kernel:" + *epoch;
+  // Only this versioned native adapter proves which clock stamped the event:
+  // the Kernel of the application start it names. Arbitrary nested
+  // owner/session IDs are not a clock-domain assertion.
+  if (text("schema_version") == "manyforge.operation_history_event.v2") {
+    if (auto start = text("application_start_id")) return "kernel:" + *start;
   }
   return std::nullopt;
+}
+
+/// The start a row belongs to. The previous-session report and the
+/// ``previous_session_unclean`` alarm rows that embed it describe the previous
+/// start and are filed under the start the report names; a report that names
+/// none (its journal was unreadable, so it lists no operations) and every
+/// other row belong to the writing start.
+std::string RowStart(const HistorianEvent &event, const std::string &writing_start) {
+  const auto member = [](const CanonicalValue *object, std::string_view name) -> const CanonicalValue * {
+    return object != nullptr && object->is_object() ? object->find_object_member(name) : nullptr;
+  };
+  const auto text = [](const CanonicalValue *value) -> const std::string * {
+    return value == nullptr ? nullptr : std::get_if<std::string>(&value->storage());
+  };
+  const CanonicalValue *report = nullptr;
+  if (event.component == "manyforge.workbench" && event.event_type == "previous_session_report") {
+    report = &event.payload;
+  } else if (event.component == "manyforge.alarm") {
+    const auto *definition = text(member(&event.payload, "definition_id"));
+    if (definition != nullptr && *definition == "manyforge.runtime.previous_session_unclean")
+      report = member(member(&event.payload, "details"), "previous_session");
+  }
+  const auto *start = text(member(report, "application_start_id"));
+  return start != nullptr ? *start : writing_start;
 }
 
 [[noreturn]] void StoreFail(const std::string &code,
@@ -385,26 +449,6 @@ private:
   sqlite3_stmt *statement_{};
 };
 
-/// A batch holding an ERROR/CRITICAL condition or a previous-session report is synced to disk at
-/// commit; routine batches keep synchronous=NORMAL. Restored after the
-/// transaction ends (a failed restore only leaves later commits synced).
-class SynchronousScope final {
-public:
-  SynchronousScope(sqlite3 *database, const bool full) : database_(full ? database : nullptr) {
-    if (database_ != nullptr) Exec(database_, "PRAGMA synchronous=FULL");
-  }
-  ~SynchronousScope() {
-    if (database_ != nullptr) {
-      sqlite3_exec(database_, "PRAGMA synchronous=NORMAL", nullptr, nullptr, nullptr);
-    }
-  }
-  SynchronousScope(const SynchronousScope &) = delete;
-  SynchronousScope &operator=(const SynchronousScope &) = delete;
-
-private:
-  sqlite3 *database_{};
-};
-
 class Transaction final {
 public:
   explicit Transaction(sqlite3 *database) : database_(database) {
@@ -476,6 +520,42 @@ std::filesystem::path ValidatePath(std::filesystem::path path) {
   return path;
 }
 
+/// History files of an earlier format in ``directory``, listed once and never
+/// opened: the unversioned ``history.sqlite3`` (format unknown) and every
+/// ``history.v<M>.sqlite3`` with M below the current format, oldest first.
+/// At most one entry per earlier format, so the list is bounded.
+CanonicalValue::Array OlderHistoryFiles(const std::filesystem::path &directory) {
+  constexpr std::string_view prefix = "history.v";
+  constexpr std::string_view suffix = ".sqlite3";
+  std::vector<std::pair<int, std::string>> found;  // format 0: unversioned
+  std::error_code error;
+  for (std::filesystem::directory_iterator entry(directory, error), end; !error && entry != end;
+       entry.increment(error)) {
+    const auto name = entry->path().filename().string();
+    if (name == "history.sqlite3") {
+      found.emplace_back(0, name);
+      continue;
+    }
+    if (name.size() <= prefix.size() + suffix.size() || !name.starts_with(prefix) || !name.ends_with(suffix)) continue;
+    const auto digits = std::string_view(name).substr(prefix.size(), name.size() - prefix.size() - suffix.size());
+    if (digits.size() > 9U || digits.front() == '0' ||
+        !std::all_of(digits.begin(), digits.end(), [](const char c) { return c >= '0' && c <= '9'; }))
+      continue;
+    const int format = std::stoi(std::string(digits));
+    if (format < kHistorianUserVersion) found.emplace_back(format, name);
+  }
+  Require(!error, "historian_path_invalid", "historian directory cannot be listed");
+  std::sort(found.begin(), found.end());
+  CanonicalValue::Array files;
+  for (const auto &[format, name] : found) {
+    files.push_back(CanonicalValue(CanonicalValue::Object{
+        {"file_name", CanonicalValue(name)},
+        {"format", format == 0 ? CanonicalValue(nullptr) : CanonicalValue(std::to_string(format))},
+    }));
+  }
+  return files;
+}
+
 std::set<std::string> SchemaObjectNames(sqlite3 *database) {
   Statement statement(database,
                       "SELECT type || ':' || name FROM sqlite_schema "
@@ -507,6 +587,9 @@ void ValidateQuery(const HistorianQuery &query) {
                 content_identity::is_utf8_nfc(value),
             "historian_query_invalid", "unsupported or invalid history correlation");
   }
+  Require(!query.application_start_id ||
+              core::ParseApplicationStartId(*query.application_start_id).has_value(),
+          "historian_query_invalid", "history application_start_id must be 16 lowercase hex characters");
   Require(!query.clock_owner || (!query.clock_owner->empty() && query.clock_owner->size() <= 1024U &&
               content_identity::is_utf8_nfc(*query.clock_owner)),
           "historian_query_invalid", "invalid history clock owner");
@@ -603,10 +686,11 @@ CanonicalValue ReadStoredSummary(const Statement& row) {
   }
   return CanonicalValue(
       CanonicalValue::Object{{"sequence", CanonicalValue(static_cast<double>(sequence))},
-                             {"event", CanonicalValue(std::move(fields))}});
+                             {"event", CanonicalValue(std::move(fields))},
+                             {"application_start_id", CanonicalValue(row.Text(5))}});
 }
 
-HistorianStoredEvent ReadStoredEvent(const Statement &row, bool indexed = true) {
+HistorianStoredEvent ReadStoredEvent(const Statement &row) {
   const auto sequence = row.Integer(0);
   Require(sequence > 0 && static_cast<std::uint64_t>(sequence) <= kMaximumSafeInteger,
           "historian_storage_corrupt", "historian event sequence is invalid");
@@ -629,18 +713,14 @@ HistorianStoredEvent ReadStoredEvent(const Statement &row, bool indexed = true) 
           "historian_storage_corrupt", "historian event identity or digest is invalid");
   const auto utc = HistorianRecordedUtcNs(event.occurred_at_wall);
   const auto owner = RecordedClockOwner(event);
-  bool regressed = false;
-  if (indexed) {
-    const auto flag = row.Integer(12);
-    Require(utc.has_value() != row.IsNull(10) && (!utc || *utc == row.Integer(10)) &&
-                owner.has_value() != row.IsNull(11) && (!owner || *owner == row.Text(11)) &&
-                (flag == 0 || flag == 1) && row.Text(13) == HistorianConditionSeverity(event) &&
-                row.Integer(14) == RetentionPartition(event) &&
-                row.Integer(15) == static_cast<std::int64_t>(event_json.size()),
-            "historian_storage_corrupt", "historian query index does not match the original event");
-    regressed = flag == 1;
-  }
-  return {static_cast<std::uint64_t>(sequence), std::move(event), utc, owner, regressed};
+  const auto flag = row.Integer(12);
+  Require(utc.has_value() != row.IsNull(10) && (!utc || *utc == row.Integer(10)) &&
+              owner.has_value() != row.IsNull(11) && (!owner || *owner == row.Text(11)) &&
+              (flag == 0 || flag == 1) && row.Text(13) == HistorianConditionSeverity(event) &&
+              row.Integer(14) == RetentionPartition(event) &&
+              row.Integer(15) == static_cast<std::int64_t>(event_json.size()),
+          "historian_storage_corrupt", "historian query index does not match the original event");
+  return {static_cast<std::uint64_t>(sequence), std::move(event), utc, owner, flag == 1};
 }
 
 constexpr std::string_view kEventColumns =
@@ -707,9 +787,12 @@ bool IsFailureTrigger(const HistorianEvent &event) {
 
 class SqliteEventHistoryStore::Impl final {
 public:
-  Impl(std::filesystem::path database_path, const std::size_t record_retention,
-       HistorianCaptureLimits capture_limits, HistorianWriterClock writer_clock)
-      : database_path_(ValidatePath(std::move(database_path))),
+  Impl(const std::filesystem::path &directory, std::string application_start_id,
+       const std::size_t record_retention, HistorianCaptureLimits capture_limits,
+       HistorianWriterClock writer_clock)
+      : database_path_(ValidatePath(SqliteEventHistoryStore::DatabasePath(directory))),
+        older_history_files_(OlderHistoryFiles(database_path_.parent_path())),
+        application_start_id_(std::move(application_start_id)),
         record_retention_(record_retention),
         capture_limits_(capture_limits),
         writer_clock_(writer_clock ? std::move(writer_clock) : HistorianWriterClock([] {
@@ -756,8 +839,7 @@ public:
               "historian requires writable storage; read-only fallback is not healthy persistence");
       Configure();
       InitializeOrValidate();
-      // A migration can leave a log as large as its transaction; start every
-      // session from an empty log (no reader exists yet).
+      // Start every session from an empty log (no reader exists yet).
       Require(CheckpointWal(SQLITE_CHECKPOINT_TRUNCATE), "historian_storage_busy",
               "historian write-ahead log could not be reclaimed at open");
     } catch (...) {
@@ -788,15 +870,9 @@ public:
   IEventHistoryStore::AppendBatchResult AppendBatch(const std::span<const HistorianEvent> events) {
     IEventHistoryStore::AppendBatchResult result;
     if (events.empty()) return result;
-    const bool durable = std::any_of(events.begin(), events.end(), [](const auto &event) {
-      return IsFailureTrigger(event) ||
-             (event.component == "manyforge.workbench" &&
-              event.event_type == "previous_session_report");
-    });
     std::lock_guard lock(mutex_);
     RequireOpen();
     RequireReclaimableWal();
-    SynchronousScope synchronous(database_, durable);
     Transaction transaction(database_);
     RequireUnchanged();
     auto usage = usage_;
@@ -880,9 +956,9 @@ public:
     if (query.limit == 0U) {
       return {{}, false, std::nullopt};
     }
-    const std::string columns = summaries == nullptr ? kIndexedEventColumns
+    const std::string columns = summaries == nullptr ? kIndexedEventColumns + ",application_start_id"
                                                      : "sequence,summary_json,summary_digest,"
-                                                       "event_digest,wall_clock_regressed";
+                                                       "event_digest,wall_clock_regressed,application_start_id";
     std::string sql = "SELECT " + columns + " FROM historian_events WHERE 1=1";
     if (query.start_ns.has_value()) {
       sql += " AND occurred_at_ns>=?";
@@ -911,11 +987,18 @@ public:
       sql += kind == "channel" ? " AND component=?"
           : " AND sequence IN (SELECT sequence FROM historian_event_keys WHERE kind=? AND value=?)";
     }
+    // One start's rows: the named start, or, for a filter whose values
+    // restart at every start, this store's own start. The same number of
+    // another start in this file does not match.
+    const bool start_scoped = query.application_start_id.has_value() ||
+        std::any_of(query.correlations.begin(), query.correlations.end(),
+                    [](const auto &correlation) { return kStartScopedKeys.contains(correlation.first); });
+    if (start_scoped) sql += " AND application_start_id=?";
     if (query.alarm_phase) {
       sql += *query.alarm_phase == "raw" ? " AND component<>'manyforge.alarm'" : " AND component='manyforge.alarm'";
       if (*query.alarm_phase != "all" && *query.alarm_phase != "raw") {
         sql += *query.alarm_phase == "acknowledged"
-            ? " AND event_type IN ('operator_alarm_acknowledged','operator_alarms_acknowledged','operator_alarm_bulk_acknowledged')"
+            ? " AND event_type IN ('operator_alarm_acknowledged','operator_alarms_acknowledged')"
             : " AND event_type=?";
       }
     }
@@ -971,6 +1054,7 @@ public:
       if (kind != "channel") statement.Bind(parameter++, kind);
       statement.Bind(parameter++, value);
     }
+    if (start_scoped) statement.Bind(parameter++, query.application_start_id.value_or(application_start_id_));
     if (query.alarm_phase && *query.alarm_phase != "all" && *query.alarm_phase != "raw" && *query.alarm_phase != "acknowledged") {
       statement.Bind(parameter++, "operator_alarm_" + *query.alarm_phase);
     }
@@ -1031,10 +1115,12 @@ public:
         }
         export_bytes += next_bytes;
       }
-      if (summaries == nullptr)
+      if (summaries == nullptr) {
         events.push_back(ReadStoredEvent(statement));
-      else
+        events.back().application_start_id = statement.Text(16);
+      } else {
         summaries->push_back(ReadStoredSummary(statement));
+      }
       ++count;
       last = static_cast<std::uint64_t>(statement.Integer(0));
       budget.Check();
@@ -1058,28 +1144,55 @@ public:
     RequireUnchanged();
     QueryBudget budget(database_);
     Statement row(database_, "SELECT " + kIndexedEventColumns +
-                              " FROM historian_events WHERE sequence=?");
+                              ",application_start_id FROM historian_events WHERE sequence=?");
     row.Bind(1, static_cast<std::int64_t>(sequence));
     if (!row.Step()) {
       return std::nullopt;
     }
     auto stored = ReadStoredEvent(row);
+    stored.application_start_id = row.Text(16);
     budget.Check();
     return stored;
   }
 
-  CanonicalValue Discover(const std::string &kind, const std::string &after, std::size_t limit) {
-    Require((kind == "component" || kind == "event_type" || kCorrelationKeys.contains(kind)) &&
+  CanonicalValue Discover(const std::string &kind, const std::string &after, std::size_t limit,
+                          const std::optional<std::string> &application_start_id) {
+    HistorianQuery start_query;
+    start_query.application_start_id = application_start_id;
+    ValidateQuery(start_query);
+    Require((kind == "component" || kind == "event_type" || kind == "application_start_id" ||
+             kCorrelationKeys.contains(kind)) &&
                 after.size() <= 1024U && content_identity::is_utf8_nfc(after) && limit > 0 && limit <= 32,
             "historian_query_invalid", "invalid bounded history discovery query");
     // Channel is the historical UI name for the producing component, not
     // an unrelated string nested in a producer's payload.
     const std::string field = kind == "channel" ? "component" : kind;
     const bool column = field == "component" || field == "event_type";
-    // The only SQL identifiers are this closed, owner-defined pair. All
-    // caller-supplied values remain bound parameters.
-    const std::string sql = column
+    // Values that restart at every start are listed for one start (the
+    // named one, else this store's own), in number order: their canonical
+    // decimal text sorts by length, then by text. Other kinds span every
+    // start in text order. The only SQL identifiers are owner-defined; the
+    // kind of a start-scoped list is one of the closed names, inlined so the
+    // run list's partial index applies. Caller values stay bound parameters.
+    const bool start_scoped = kStartScopedKeys.contains(kind);
+    // The starts that have rows, newest first (by their first retained row).
+    // Each distinct start is found by one seek of the start index and its
+    // first row by another, so the cost grows with the number of starts,
+    // not of rows. The cursor is the last start listed.
+    const bool starts = kind == "application_start_id";
+    const std::string sql = starts
+        ? "WITH RECURSIVE ids(id) AS (SELECT (SELECT min(application_start_id) FROM historian_events) "
+          "UNION ALL SELECT (SELECT min(application_start_id) FROM historian_events WHERE application_start_id>ids.id) "
+          "FROM ids WHERE ids.id IS NOT NULL), "
+          "firsts(id,first) AS (SELECT id,(SELECT min(sequence) FROM historian_events WHERE application_start_id=ids.id) "
+          "FROM ids WHERE id IS NOT NULL) "
+          "SELECT id FROM firsts WHERE ?1='' OR first<(SELECT first FROM firsts WHERE id=?1) "
+          "ORDER BY first DESC LIMIT ?2"
+        : column
         ? "SELECT DISTINCT " + field + " FROM historian_events WHERE " + field + ">? AND length(CAST(" + field + " AS BLOB)) BETWEEN 1 AND 1024 ORDER BY " + field + " LIMIT ?"
+        : start_scoped
+        ? "SELECT DISTINCT value FROM historian_event_keys WHERE kind='" + kind + "' AND application_start_id=? "
+          "AND (length(value),value)>(length(?2),?2) ORDER BY length(value),value LIMIT ?"
         : "SELECT DISTINCT value FROM historian_event_keys WHERE kind=? AND value>? ORDER BY value LIMIT ?";
     std::lock_guard lock(mutex_);
     RequireOpen();
@@ -1088,7 +1201,8 @@ public:
     QueryBudget budget(database_);
     Statement rows(database_, sql);
     int parameter = 1;
-    if (!column) rows.Bind(parameter++, kind);
+    if (start_scoped) rows.Bind(parameter++, application_start_id.value_or(application_start_id_));
+    else if (!column && !starts) rows.Bind(parameter++, kind);
     rows.Bind(parameter++, after);
     rows.Bind(parameter, static_cast<std::int64_t>(limit + 1));
     CanonicalValue::Array values;
@@ -1141,8 +1255,8 @@ private:
     Statement insert(
         statements_, "INSERT INTO historian_events("
                      "event_id,component,event_type,severity,occurred_at_ns,"
-                     "occurred_at_wall,payload_json,payload_digest,event_digest) "
-                     "VALUES(?,?,?,?,?,?,?,?,?)");
+                     "occurred_at_wall,payload_json,payload_digest,event_digest,application_start_id) "
+                     "VALUES(?,?,?,?,?,?,?,?,?,?)");
     insert.Bind(1, event.event_id);
     insert.Bind(2, event.component);
     insert.Bind(3, event.event_type);
@@ -1152,13 +1266,15 @@ private:
     insert.Bind(7, payload_json);
     insert.Bind(8, payload_digest);
     insert.Bind(9, event_digest);
+    const auto row_start = RowStart(event, application_start_id_);
+    insert.Bind(10, row_start);
     Require(!insert.Step(), "historian_storage_corrupt",
             "historian insert returned an unexpected row");
     const auto sequence = sqlite3_last_insert_rowid(database_);
     Require(sequence > 0 && static_cast<std::uint64_t>(sequence) <= kMaximumSafeInteger,
             "historian_sequence_rollover_required", "historian sequence namespace requires replacement");
     const auto record_bytes = static_cast<std::int64_t>(event_json.size());
-    IndexEvent(sequence, event, payload_json, record_bytes, usage);
+    IndexEvent(sequence, event, payload_json, row_start, record_bytes, usage);
     StoreSummary(sequence, event_digest, summary_json);
     const auto epoch_first = epoch_first_sequence.value_or(sequence);
     CaptureAppend(sequence, event, record_bytes, epoch_first, usage);
@@ -1210,7 +1326,7 @@ private:
  }
 
   void IndexEvent(std::int64_t sequence, const HistorianEvent &event, const std::string &payload_json,
-                  std::int64_t record_bytes, RetainedUsage &usage) {
+                  const std::string &row_start, std::int64_t record_bytes, RetainedUsage &usage) {
     const auto utc = HistorianRecordedUtcNs(event.occurred_at_wall);
     const auto clock = RecordedClockOwner(event);
     bool regressed = false;
@@ -1224,8 +1340,8 @@ private:
       // Late ingest can also prove a regression at an already retained
       // successor. This is a sticky derived uncertainty flag; original event
       // bytes/digests and source order never change.
-      Statement next(statements_, std::string("SELECT sequence,occurred_at_utc_ns,retention_class,wall_clock_regressed,") +
-          (captures_ready_ ? "capture_refs" : "0") + " FROM historian_events "
+      Statement next(statements_, "SELECT sequence,occurred_at_utc_ns,retention_class,wall_clock_regressed,"
+          "capture_refs FROM historian_events "
           "WHERE clock_owner=? AND occurred_at_utc_ns IS NOT NULL AND occurred_at_ns>? ORDER BY occurred_at_ns,sequence LIMIT 1");
       next.Bind(1, *clock);
       next.Bind(2, event.occurred_at_ns);
@@ -1249,16 +1365,15 @@ private:
     time_index.Bind(7, sequence);
     Require(!time_index.Step(), "historian_storage_corrupt", "historian time index returned a row");
     Statement keys(statements_,
-                   "INSERT OR IGNORE INTO historian_event_keys(sequence,kind,value) "
-                   "SELECT ?1,key,value FROM json_tree(?2) WHERE type='text' AND key IN "
-                   "(" +
-                       kIndexedKeyNames +
-                       ") AND length(CAST(value AS BLOB)) BETWEEN 1 AND 1024 "
+                   "INSERT OR IGNORE INTO historian_event_keys(sequence,kind,value,application_start_id) "
+                   "SELECT ?1,key,CAST(value AS TEXT),?3 FROM json_tree(?2) WHERE " +
+                       IndexedKeyCondition("") +
                        "AND "
                        "(COALESCE(json_extract(?2,'$.schema_version'),'') NOT IN (" +
                        kProgramDiagnosticSchemaList + ") OR path='$')");
     keys.Bind(1, sequence);
     keys.Bind(2, payload_json);
+    keys.Bind(3, row_start);
     Require(!keys.Step(), "historian_storage_corrupt", "historian correlation index returned a row");
     Statement search(statements_, "INSERT INTO historian_search(rowid,component,event_type,details) "
         "SELECT sequence,component,event_type,details FROM historian_search_content WHERE sequence=?");
@@ -1278,8 +1393,8 @@ private:
         if (part.count <= static_cast<std::int64_t>(record_retention_) && part.bytes <= 16LL * 1024LL * 1024LL) break;
         // Rows protected by a live failure capture are charged to the
         // capture budget and are never selected by ordinary pruning.
-        Statement oldest(statements_, "SELECT " + kIndexedEventColumns + " FROM historian_events WHERE retention_class=?" +
-            std::string(captures_ready_ ? " AND capture_refs=0" : "") + " ORDER BY sequence LIMIT 1");
+        Statement oldest(statements_, "SELECT " + kIndexedEventColumns + " FROM historian_events WHERE retention_class=?"
+            " AND capture_refs=0 ORDER BY sequence LIMIT 1");
         oldest.Bind(1, partition);
         Require(oldest.Step(), "historian_storage_corrupt", "historian retention count has no record");
         const auto stored = ReadStoredEvent(oldest);
@@ -1343,7 +1458,6 @@ private:
     const auto prior_pruning_known = ScalarInteger(database_, "SELECT prior_pruning_known FROM historian_metadata WHERE singleton=1");
     Require(prior_pruning_known == 0 || prior_pruning_known == 1,
             "historian_storage_corrupt", "historian coverage metadata is invalid");
-    Require(captures_ready_, "historian_storage_corrupt", "historian capture schema is unavailable");
     const auto &protected_usage = usage_.at(kCaptureBucket);
     Statement capture_totals(database_, "SELECT (SELECT count(*) FROM historian_captures),"
         "(SELECT count(*) FROM historian_captures WHERE state='open'),"
@@ -1366,7 +1480,7 @@ private:
             ? CanonicalValue(nullptr) : CanonicalValue(std::to_string(capture_totals.Integer(5)))},
     });
     return CanonicalValue(CanonicalValue::Object{
-        {"schema_version", CanonicalValue("manyforge.historian_retention.v2")},
+        {"schema_version", CanonicalValue("manyforge.historian_retention.v3")},
         {"partitions", CanonicalValue(std::move(partitions))},
         {"captures", std::move(captures)},
         {"partition_row_limit", CanonicalValue(std::to_string(record_retention_))},
@@ -1374,6 +1488,7 @@ private:
         {"database_page_byte_limit", CanonicalValue("536870912")},
         {"duration_guaranteed", CanonicalValue(false)},
         {"prior_pruning_known", CanonicalValue(prior_pruning_known == 1)},
+        {"older_history_files", CanonicalValue(older_history_files_)},
     });
   }
 
@@ -1752,8 +1867,7 @@ private:
     // Write-ahead log: a commit appends the changed pages to the log without
     // waiting for the disk (synchronous=NORMAL); checkpoints sync them into
     // the database. Committed events survive a process crash; power loss can
-    // lose recent routine commits but never corrupts the store, and a batch
-    // with an ERROR/CRITICAL condition is synced at commit. The log is
+    // lose recent commits but never corrupts the store. The log is
     // bounded: a reader that prevents reclamation beyond
     // kMaximumWalBacklogBytes makes the next write fail through the existing
     // busy/full storage health instead of growing the log.
@@ -1782,48 +1896,6 @@ private:
                   static_cast<int>(512U * 1024U));
   }
 
-  struct LegacyLoss { std::int64_t cutoff{}, count{}, bytes{}; };
-
-  std::array<LegacyLoss, 2> ReclaimLegacyIndexSpace() {
-    RetainedUsage retained_usage{};
-    std::array<LegacyLoss, 2> loss{};
-    // Verify all originals before deleting any row. Keep each class's newest
-    // bounded suffix; the same transaction records exactly what was pruned.
-    {
-      Statement rows(database_, "SELECT " + std::string(kEventColumns) + " FROM historian_events ORDER BY sequence DESC");
-      while (rows.Step()) {
-        const auto stored = ReadStoredEvent(rows, false);
-        const auto bytes = static_cast<std::int64_t>(content_identity::canonical_json(HistorianPersistenceValue(stored.event)).size());
-        const auto partition = static_cast<std::size_t>(RetentionPartition(stored.event));
-        auto &kept = retained_usage.at(partition);
-        auto &pruned = loss.at(partition);
-        if (pruned.cutoff != 0 || kept.count >= static_cast<std::int64_t>(record_retention_) ||
-            kept.bytes + bytes > 16LL * 1024LL * 1024LL) {
-          if (pruned.cutoff == 0) pruned.cutoff = static_cast<std::int64_t>(stored.sequence);
-          ++pruned.count;
-          pruned.bytes += bytes;
-        } else {
-          ++kept.count;
-          kept.bytes += bytes;
-        }
-      }
-    }
-    const std::string condition = "(CASE WHEN json_extract(payload_json,'$.schema_version')='manyforge.client_incident_event.v1' "
-        "AND json_extract(payload_json,'$.original_severity') IN ('WARN','ERROR','CRITICAL') "
-        "THEN json_extract(payload_json,'$.original_severity') ELSE severity END)";
-    const std::string partition_sql = "CASE WHEN " + condition + " IN ('ERROR','CRITICAL') OR instr(event_type,'stop')>0 "
-        "OR instr(event_type,'acknowledged')>0 THEN 1 ELSE 0 END";
-    for (std::size_t partition = 0; partition < loss.size(); ++partition) {
-      if (loss[partition].cutoff == 0) continue;
-      Statement remove(database_, "DELETE FROM historian_events WHERE sequence<=? AND (" + partition_sql + ")=?");
-      remove.Bind(1, loss[partition].cutoff);
-      remove.Bind(2, static_cast<std::int64_t>(partition));
-      Require(!remove.Step() && sqlite3_changes64(database_) == loss[partition].count,
-              "historian_storage_corrupt", "legacy retention classification differs from verified records");
-    }
-    return loss;
-  }
-
   /// ``capture_refs`` is a derived index, not independent evidence: every
   /// row in a capture range is protected and every protected row's count
   /// equals the number of retained captures covering it.
@@ -1846,110 +1918,66 @@ private:
     Require(!triggers.Step(), "historian_storage_corrupt", "historian capture trigger lies outside its capture");
   }
 
+  /// A History file only ever holds its own format (``kHistorianUserVersion``,
+  /// which is also in its name): an empty file gets the current schema in one
+  /// step, and any other format is refused. No file is upgraded in place.
   void InitializeOrValidate() {
     std::lock_guard lock(mutex_);
     Transaction transaction(database_);
-    const auto objects = SchemaObjectNames(database_);
-    if (objects.empty()) {
+    if (SchemaObjectNames(database_).empty()) {
       Require(ScalarInteger(database_, "PRAGMA application_id") == 0 &&
                   ScalarInteger(database_, "PRAGMA user_version") == 0,
               "historian_storage_foreign",
               "schema-empty historian database has foreign identity");
       Exec(database_, std::string(kSchema));
+      Exec(database_, std::string(kQueryIndexSchema));
+      Exec(database_, kSearchSchema);
+      Exec(database_, std::string(kSummarySchema));
+      Exec(database_, std::string(kCaptureSchema));
       Exec(database_,
            "PRAGMA application_id=" + std::to_string(kHistorianApplicationId));
       Exec(database_,
-           "PRAGMA user_version=1");
+           "PRAGMA user_version=" + std::to_string(kHistorianUserVersion));
       Statement metadata(database_,
                          "INSERT INTO historian_metadata("
-                         "singleton,schema_id,schema_version,record_retention) "
-                         "VALUES(1,'manyforge.event_historian',1,?)");
-      metadata.Bind(1, static_cast<std::int64_t>(record_retention_));
+                         "singleton,schema_id,schema_version,record_retention,prior_pruning_known) "
+                         "VALUES(1,'manyforge.event_historian',?,?,1)");
+      metadata.Bind(1, static_cast<std::int64_t>(kHistorianUserVersion));
+      metadata.Bind(2, static_cast<std::int64_t>(record_retention_));
       Require(!metadata.Step(), "historian_storage_corrupt",
               "historian metadata insert returned a row");
     }
-    std::set<std::string> expected{
-        "index:historian_events_component_idx",
-        "index:historian_events_time_idx",
-        "index:historian_events_type_idx",
-        "table:historian_events",
-        "table:historian_metadata",
-    };
-    const auto version = ScalarInteger(database_, "PRAGMA user_version");
-    if (version == 1) {
-      Require(SchemaObjectNames(database_) == expected &&
-                  ScalarInteger(database_, "PRAGMA application_id") == kHistorianApplicationId,
-              "historian_storage_foreign", "legacy historian schema is invalid");
-      Statement metadata(database_, "SELECT schema_id,schema_version,record_retention FROM historian_metadata WHERE singleton=1");
-      Require(metadata.Step() && metadata.Text(0) == "manyforge.event_historian" && metadata.Integer(1) == 1 &&
-                  metadata.Integer(2) == static_cast<std::int64_t>(record_retention_) && !metadata.Step(),
-              "historian_storage_foreign", "legacy historian metadata is invalid");
-      const auto loss = ReclaimLegacyIndexSpace();
-      Exec(database_, std::string(kQueryIndexSchema));
-      Exec(database_, kSearchSchema);
-      for (std::size_t partition = 0; partition < loss.size(); ++partition) {
-        Statement record_loss(database_, "UPDATE historian_retention SET pruned_count=?,pruned_bytes=?,last_pruned_sequence=? WHERE partition=?");
-        record_loss.Bind(1, loss[partition].count);
-        record_loss.Bind(2, loss[partition].bytes);
-        if (loss[partition].cutoff) record_loss.Bind(3, loss[partition].cutoff); else record_loss.BindNull(3);
-        record_loss.Bind(4, static_cast<std::int64_t>(partition));
-        Require(!record_loss.Step(), "historian_storage_corrupt", "legacy prune accounting returned a row");
-      }
-      if (objects.empty()) Exec(database_, "UPDATE historian_metadata SET prior_pruning_known=1 WHERE singleton=1");
-      Statement rows(database_, "SELECT " + std::string(kEventColumns) + " FROM historian_events ORDER BY sequence");
-      while (rows.Step()) {
-        const auto stored = ReadStoredEvent(rows, false);
-        IndexEvent(static_cast<std::int64_t>(stored.sequence), stored.event, rows.Text(7),
-            static_cast<std::int64_t>(content_identity::canonical_json(HistorianPersistenceValue(stored.event)).size()), usage_);
-      }
-      Prune(usage_);
-      Exec(database_, "UPDATE historian_metadata SET schema_version=2 WHERE singleton=1");
-      Exec(database_, "PRAGMA user_version=2");
-    }
-    expected.insert({"index:historian_events_utc_idx", "index:historian_events_clock_idx", "index:historian_events_severity_idx",
+    const std::set<std::string> expected{
+        "index:historian_events_component_idx", "index:historian_events_time_idx",
+        "index:historian_events_type_idx", "index:historian_events_start_idx", "table:historian_events",
+        "table:historian_metadata", "index:historian_event_keys_run_idx",
+        "index:historian_events_utc_idx", "index:historian_events_clock_idx", "index:historian_events_severity_idx",
         "index:historian_event_keys_lookup_idx", "index:historian_events_retention_idx", "index:historian_events_coverage_idx",
         "table:historian_retention", "table:historian_event_keys", "table:historian_search", "view:historian_search_content",
-        "table:historian_search_data", "table:historian_search_idx", "table:historian_search_docsize", "table:historian_search_config"});
-    const std::set<std::string> capture_objects{
+        "table:historian_search_data", "table:historian_search_idx", "table:historian_search_docsize", "table:historian_search_config",
         "index:historian_events_prune_idx", "table:historian_captures",
         "table:historian_capture_triggers", "table:historian_capture_retention"};
-    const auto stored_version = ScalarInteger(database_, "PRAGMA user_version");
-    if (stored_version >= 4) expected.insert(capture_objects.begin(), capture_objects.end());
     Require(SchemaObjectNames(database_) == expected,
             "historian_storage_foreign",
             "historian database contains an unexpected schema");
     Require(ScalarInteger(database_, "PRAGMA application_id") == kHistorianApplicationId &&
-                stored_version >= 2 && stored_version <= kHistorianUserVersion,
+                ScalarInteger(database_, "PRAGMA user_version") == kHistorianUserVersion,
             "historian_storage_foreign", "historian SQLite identity is invalid");
     Statement metadata(database_,
                        "SELECT schema_id,schema_version,record_retention "
                        "FROM historian_metadata WHERE singleton=1");
     Require(metadata.Step() && metadata.Text(0) == "manyforge.event_historian" &&
-                metadata.Integer(1) == stored_version &&
+                metadata.Integer(1) == kHistorianUserVersion &&
                 metadata.Integer(2) == static_cast<std::int64_t>(record_retention_) &&
                 !metadata.Step(),
             "historian_storage_foreign", "historian metadata is invalid or configuration changed");
-    // There is no persisted usage counter that can authorize deleting rows.
-    // Rebuild the tiny writer cache from intact rows once, then change a local
-    // copy with each transaction and expose it only after commit.
-    const bool migrate_summaries = stored_version == 2;
-    if (migrate_summaries) {
-      Exec(database_,
-           "ALTER TABLE historian_events ADD COLUMN summary_json "
-           "TEXT NOT NULL DEFAULT '';"
-           "ALTER TABLE historian_events ADD COLUMN summary_digest "
-           "TEXT NOT NULL DEFAULT '';");
-    }
-    if (stored_version < 4) {
-      // Revision 4 adds only derived protection columns/tables. Original
-      // event bytes, digests and cumulative prune facts are unchanged.
-      Exec(database_, std::string(kCaptureSchema));
-    }
-    captures_ready_ = true;
     // A capture still open was interrupted by this writer's restart; its tail
     // cannot be completed on another process clock.
     Exec(database_, "UPDATE historian_captures SET state='closed_by_restart',close_reason='restart' WHERE state='open'");
     ValidateCaptureProtection();
+    // There is no persisted usage counter that can authorize deleting rows.
+    // Rebuild the tiny writer cache from intact rows once, then change a local
+    // copy with each transaction and expose it only after commit.
     usage_ = {};
     Statement retained(database_, "SELECT " + kIndexedEventColumns +
                                       ",summary_json,summary_digest,capture_refs FROM "
@@ -1958,91 +1986,42 @@ private:
       const auto stored = ReadStoredEvent(retained);
       AccumulateUsage(usage_, stored, retained.Integer(15), retained.Integer(18));
       const auto summary = SummaryJson(stored.event);
-      if (migrate_summaries)
-        StoreSummary(static_cast<std::int64_t>(stored.sequence), retained.Text(9), summary);
-      else
-        Require(summary == retained.Text(16) && SummaryDigest(retained.Integer(0), retained.Text(9),
-                                                              summary) == retained.Text(17),
-                "historian_storage_corrupt", "historian summary differs from original event");
+      Require(summary == retained.Text(16) && SummaryDigest(retained.Integer(0), retained.Text(9),
+                                                            summary) == retained.Text(17),
+              "historian_storage_corrupt", "historian summary differs from original event");
     }
     // Derived indexes are not independent evidence. Validate them against
     // intact originals once before any query can use their result.
-    const std::string all_keys =
-        "SELECT DISTINCT e.sequence,j.key,j.value FROM historian_events "
+    const std::string expected_keys =
+        "SELECT DISTINCT e.sequence,j.key,CAST(j.value AS TEXT),e.application_start_id FROM historian_events "
         "e,json_tree(e.payload_json) j "
-        "WHERE j.type='text' AND j.key IN (" +
-        kIndexedKeyNames + ") AND length(CAST(j.value AS BLOB)) BETWEEN 1 AND 1024 ";
-    const auto validate_keys = [&](bool producer_only) {
-      const std::string expected_keys =
-          all_keys + (producer_only
-                          ? "AND "
-                            "(COALESCE(json_extract(e.payload_json,'$.schema_version'),'')"
-                            " NOT IN (" + kProgramDiagnosticSchemaList + ") OR j.path='$')"
-                          : "");
-      for (const bool missing : {false, true}) {
-        const std::string actual = "SELECT sequence,kind,value FROM historian_event_keys";
-        Statement difference(database_, (missing ? expected_keys + " EXCEPT " + actual
-                                                 : actual + " EXCEPT " + expected_keys) +
-                                            " LIMIT 1");
-        Require(!difference.Step(), "historian_storage_corrupt",
-                "historian correlation index differs from original records");
-      }
-    };
-    const auto check_search = [&] {
-      try {
-        Exec(database_, "INSERT INTO historian_search(historian_search,rank) VALUES('integrity-check',1)");
-      } catch (const EventHistorianError &error) {
-        if (error.code() == "historian_storage_full") throw;
-        StoreFail("historian_storage_corrupt", "historian search index differs from original records: " + std::string(error.what()));
-      }
-    };
-    const bool migrate_search = version != 1 && stored_version != kHistorianUserVersion;
-    if (migrate_search) {
-      // Revisions 5 and 6 replace only the derived search text. Verify the
-      // old index as before, then drop it first: its pages are reused by the
-      // code keys and the new index, so a history near its page ceiling still
-      // migrates.
-      check_search();
-      Exec(database_, "DROP TABLE historian_search; DROP VIEW historian_search_content;");
-      // Revision 5 keys codes for search (revision 6 adds incident cause and
-      // closure codes). Derive only the code kinds here, with the predicate
-      // this revision's validation below expects; existing rows are kept.
-      Exec(database_, "INSERT OR IGNORE INTO historian_event_keys(sequence,kind,value) " + all_keys +
-                          "AND j.key IN (" + std::string(kSearchCodeNames) + ") " +
-                          (version == 2 ? "" : "AND (COALESCE(json_extract(e.payload_json,'$.schema_version'),'')"
-                                               " NOT IN (" + kProgramDiagnosticSchemaList + ") OR j.path='$')"));
+        "WHERE " + IndexedKeyCondition("j.") +
+        "AND (COALESCE(json_extract(e.payload_json,'$.schema_version'),'')"
+        " NOT IN (" + kProgramDiagnosticSchemaList + ") OR j.path='$')";
+    for (const bool missing : {false, true}) {
+      const std::string actual = "SELECT sequence,kind,value,application_start_id FROM historian_event_keys";
+      Statement difference(database_, (missing ? expected_keys + " EXCEPT " + actual
+                                               : actual + " EXCEPT " + expected_keys) +
+                                          " LIMIT 1");
+      Require(!difference.Step(), "historian_storage_corrupt",
+              "historian correlation index differs from original records");
     }
-    if (version == 2) {
-      // Committed v2 indexed nested diagnostic values as identities. Validate
-      // that historical derivation before changing only this derived subset.
-      // A v1 import above already built the current predicate from originals.
-      validate_keys(false);
-      Exec(database_,
-           "DELETE FROM historian_event_keys WHERE sequence IN "
-           "(SELECT sequence FROM historian_events "
-           "WHERE json_extract(payload_json,'$.schema_version') IN (" +
-               kProgramDiagnosticSchemaList + "))");
-      Exec(database_, "INSERT INTO historian_event_keys(sequence,kind,value) " + all_keys +
-                          "AND json_extract(e.payload_json,'$.schema_version') IN (" +
-                          kProgramDiagnosticSchemaList + ") AND j.path='$'");
+    try {
+      Exec(database_, "INSERT INTO historian_search(historian_search,rank) VALUES('integrity-check',1)");
+    } catch (const EventHistorianError &error) {
+      if (error.code() == "historian_storage_full") throw;
+      StoreFail("historian_storage_corrupt", "historian search index differs from original records: " + std::string(error.what()));
     }
-    validate_keys(true);
-    if (migrate_search) {
-      Exec(database_, kSearchSchema);
-      Exec(database_, "INSERT INTO historian_search(historian_search) VALUES('rebuild')");
-    }
-    check_search();
     static_cast<void>(Retention());
-    if (stored_version != kHistorianUserVersion) {
-      Exec(database_,
-           "UPDATE historian_metadata SET schema_version=" + std::to_string(kHistorianUserVersion) +
-           " WHERE singleton=1; PRAGMA user_version=" + std::to_string(kHistorianUserVersion) + ";");
-    }
     database_version_ = ScalarInteger(database_, "PRAGMA data_version");
     transaction.Commit();
   }
 
   std::filesystem::path database_path_;
+  CanonicalValue::Array older_history_files_;
+  /// The application start whose Headless writes through this store; every
+  /// row it appends records it.
+  std::string application_start_id_;
   std::size_t record_retention_;
   HistorianCaptureLimits capture_limits_;
   HistorianWriterClock writer_clock_;
@@ -2052,17 +2031,21 @@ private:
   StatementCache statements_{database_};
   std::int64_t wal_pages_{};
   bool closed_{};
-  bool captures_ready_{};
   RetainedUsage usage_{};
   std::int64_t database_version_{};
   std::int64_t delivery_loss_{};
   std::optional<std::int64_t> epoch_first_sequence_{};
 };
 
+std::filesystem::path SqliteEventHistoryStore::DatabasePath(const std::filesystem::path &directory) {
+  return directory / ("history.v" + std::to_string(kHistorianUserVersion) + ".sqlite3");
+}
+
 SqliteEventHistoryStore::SqliteEventHistoryStore(
-    std::filesystem::path database_path, const std::size_t record_retention,
-    HistorianCaptureLimits capture_limits, HistorianWriterClock writer_clock)
-    : impl_(std::make_unique<Impl>(std::move(database_path), record_retention,
+    const std::filesystem::path &directory, std::string application_start_id,
+    const std::size_t record_retention, HistorianCaptureLimits capture_limits,
+    HistorianWriterClock writer_clock)
+    : impl_(std::make_unique<Impl>(directory, std::move(application_start_id), record_retention,
                                    capture_limits, std::move(writer_clock))) {}
 
 void SqliteEventHistoryStore::ObserveDeliveryLoss(const std::uint64_t cumulative_losses) {
@@ -2098,8 +2081,9 @@ HistorianPage SqliteEventHistoryStore::QueryExport(const HistorianQuery& query) 
   return impl_->Query(query, nullptr, true);
 }
 
-CanonicalValue SqliteEventHistoryStore::Discover(const std::string &kind, const std::string &after, std::size_t limit) {
-  return impl_->Discover(kind, after, limit);
+CanonicalValue SqliteEventHistoryStore::Discover(const std::string &kind, const std::string &after, std::size_t limit,
+                                                 const std::optional<std::string> &application_start_id) {
+  return impl_->Discover(kind, after, limit, application_start_id);
 }
 
 std::optional<HistorianStoredEvent>

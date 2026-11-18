@@ -13,9 +13,8 @@ inline constexpr StopControlSlotIndex kInvalidStopControlSlot =
     std::numeric_limits<StopControlSlotIndex>::max();
 
 /// One physical preallocated StopControl work slot and its monotonic reuse
-/// generation. The emergency Stop reserve mints this token; a correlation
-/// slot uses [0, configured correlation capacity) and the non-evictable Full
-/// Stop slot uses exactly configured correlation capacity.
+/// generation: a Stop lane index and its generation (stop state model §2.2).
+/// The Kernel's lane free list mints it when a participant starts stopping.
 struct StopControlWorkToken final {
   StopControlSlotIndex slot{kInvalidStopControlSlot};
   std::uint64_t generation{};
@@ -28,7 +27,7 @@ struct StopControlWorkToken final {
                                    const StopControlWorkToken&) = default;
 };
 
-/// Kernel-owned Stop transaction progress receiver. It must outlive the
+/// Kernel-owned participant Stop progress receiver. It must outlive the
 /// executor and may be called repeatedly for one token: once for initial
 /// handoff and again when an armed deadline becomes due.
 class IStopControlWorkReceiver {
@@ -43,8 +42,7 @@ class IStopControlWorkReceiver {
 /// allocate, throw, or report ordinary queue pressure. A valid token maps to a
 /// dedicated preallocated slot, so exact repeats coalesce instead of consuming
 /// queue capacity. Invalid/out-of-capacity tokens are programming defects and
-/// have no effect; motion admission must prove the reserve/executor capacity
-/// join before exposing Stop ingress.
+/// have no effect.
 ///
 /// Publish may be called concurrently. ArmDeadline and CancelDeadline for one
 /// physical slot are serialized by the Kernel Stop owner; calls for disjoint

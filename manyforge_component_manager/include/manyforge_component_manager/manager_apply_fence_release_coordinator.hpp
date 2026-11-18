@@ -72,8 +72,7 @@ class ManagerApplyFenceReleaseCoordinator final {
   ManagerApplyFenceReleaseCoordinator(SqliteManagerApplyJournal& apply_journal,
                                       manyforge::core::IManagerKernelApplyFencePort& kernel_fence,
                                       manyforge::core::IManagerSceneProjectionMaintenancePort&
-                                          scene_owner,
-                                      manyforge::core::RuntimeEpoch manager_runtime_epoch);
+                                          scene_owner);
 
   [[nodiscard]] ManagerApplyFenceReleaseResult ReleaseOrRecover(
       const manyforge::core::ApplyId& apply_id, manyforge::core::ApplyGeneration apply_generation);
@@ -86,7 +85,6 @@ class ManagerApplyFenceReleaseCoordinator final {
   SqliteManagerApplyJournal& apply_journal_;
   manyforge::core::IManagerKernelApplyFencePort& kernel_fence_;
   manyforge::core::IManagerSceneProjectionMaintenancePort& scene_owner_;
-  manyforge::core::RuntimeEpoch manager_runtime_epoch_;
   std::mutex operation_mutex_;
 };
 

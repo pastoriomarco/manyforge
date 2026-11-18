@@ -374,21 +374,6 @@ export function usePublishWorkbenchNotices(
   useEffect(() => () => withdraw(source), [source, withdraw]);
 }
 
-/** Presentation handoff only: the existing alarm owner retains ACK authority. */
-export function previousSessionAlarmHandoff(
-  currentSessionId: string | null,
-  previousHandoff: string | null,
-  receipt: unknown,
-): string | null {
-  if (currentSessionId !== null && receipt !== null && typeof receipt === 'object'
-    && Object.keys(receipt).length === 2
-    && 'session_id' in receipt && receipt.session_id === currentSessionId
-    && 'status' in receipt
-    && (receipt.status === 'registered' || receipt.status === 'acknowledged'
-      || receipt.status === 'quiet')) return currentSessionId;
-  return previousHandoff;
-}
-
 /** How long a brief, event-triggered notice stays presented. */
 export const BRIEF_NOTICE_MS = 8_000;
 

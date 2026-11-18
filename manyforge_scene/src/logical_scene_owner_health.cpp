@@ -22,11 +22,6 @@ LogicalSceneOwner::ActiveProjectionHealth() const {
           maintenance->apply_id, maintenance->apply_generation,
           *state.active_projection};
     }
-    if (!state.migrated_structural_completions.empty()) {
-      const auto &completion = state.migrated_structural_completions.back();
-      return MaintenanceProjectionSetSourceDTO{
-          completion.apply_id, completion.apply_generation, completion.target};
-    }
     return BootstrapProjectionSetSourceDTO{state.accepted->bootstrap_id,
                                            state.accepted->bootstrap_generation,
                                            state.accepted->target};
@@ -96,19 +91,6 @@ LogicalSceneOwner::ActiveProjectionHealth() const {
         "active native projection set cannot form aggregate health");
   }
   return aggregate;
-}
-
-RequestOwnerEpoch LogicalSceneOwner::CurrentRequestOwnerEpoch() const {
-  std::lock_guard lock(impl_->mutex_);
-  const auto &cached = impl_->ReadSceneCommitState();
-  const auto &state = cached.durable_state;
-  if (!state.active_projection.has_value() ||
-      !state.active_scene_snapshot.has_value() ||
-      !cached.transaction_state.has_value()) {
-    throw LogicalSceneOwnerConflictError(
-        "logical-scene request owner epoch requires finalized bootstrap");
-  }
-  return cached.transaction_state->request_owner_epoch;
 }
 
 ProjectionRevisionDTO
@@ -262,10 +244,11 @@ core::Result<core::Pose3DTO> LogicalSceneOwner::GetObjectPose(
   }
 }
 
+namespace {
+
 CanonicalEmptySceneAccessStatus
-LogicalSceneOwner::ReadAccessStatus() const {
-  std::lock_guard lock(impl_->mutex_);
-  auto status = AccessStatus(impl_->ReadSceneCommitState().durable_state);
+ValidAccessStatus(const logical_scene_owner_detail::DurableState &state) {
+  auto status = AccessStatus(state);
   if (!status.valid()) {
     throw LogicalSceneOwnerIntegrityError(
         "durable state cannot form a valid access-gate status");
@@ -274,16 +257,15 @@ LogicalSceneOwner::ReadAccessStatus() const {
 }
 
 std::optional<LogicalSceneSnapshotRoot>
-LogicalSceneOwner::ReadActiveSnapshot() const {
-  std::lock_guard lock(impl_->mutex_);
-  const auto state = impl_->ReadSceneCommitState().durable_state;
+ActiveSnapshot(const logical_scene_owner_detail::DurableState &state,
+               const ProjectionBootstrapPrerequisiteQueryDTO &fixed_query) {
   if (!state.active_projection.has_value() ||
       !state.active_scene_snapshot.has_value()) {
     return std::nullopt;
   }
   if (state.active_scene_snapshot->revision !=
           state.active_projection->scene_revision ||
-      state.active_scene_snapshot->cell_id != impl_->fixed_query_.cell_id) {
+      state.active_scene_snapshot->cell_id != fixed_query.cell_id) {
     throw LogicalSceneOwnerIntegrityError(
         "active projection does not identify the durable logical-scene "
         "snapshot");
@@ -291,6 +273,30 @@ LogicalSceneOwner::ReadActiveSnapshot() const {
   return LogicalSceneSnapshotRoot(
       std::make_shared<const LogicalSceneSnapshotDTO>(
           *state.active_scene_snapshot));
+}
+
+} // namespace
+
+CanonicalEmptySceneAccessStatus
+LogicalSceneOwner::ReadAccessStatus() const {
+  std::lock_guard lock(impl_->mutex_);
+  return ValidAccessStatus(impl_->ReadSceneCommitState().durable_state);
+}
+
+std::optional<LogicalSceneSnapshotRoot>
+LogicalSceneOwner::ReadActiveSnapshot() const {
+  std::lock_guard lock(impl_->mutex_);
+  return ActiveSnapshot(impl_->ReadSceneCommitState().durable_state,
+                        impl_->fixed_query_);
+}
+
+LogicalScenePublicationRead LogicalSceneOwner::ReadPublication() const {
+  std::lock_guard lock(impl_->mutex_);
+  const auto &state = impl_->ReadSceneCommitState().durable_state;
+  auto access = ValidAccessStatus(state);
+  auto snapshot = ActiveSnapshot(state, impl_->fixed_query_);
+  return {++impl_->publication_read_sequence_, std::move(access),
+          std::move(snapshot)};
 }
 
 } // namespace manyforge::scene

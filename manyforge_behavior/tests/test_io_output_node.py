@@ -56,7 +56,7 @@ def _context(*, tree: Mapping[str, Any] | None = None):
         {"capability_id": "io.gpio.set_output", "command_schema": None},
     ])
     return ProgramRunPortContext(
-        program_run_id="run.1",
+        program_run_id=1,
         applied_record_digest=_D,
         scenario_id="io_scenario",
         source_document_digest=_A,
@@ -101,7 +101,7 @@ class _Transport:
 
     def identity(self) -> dict[str, Any]:
         return {"ok": True, "identity": {
-            "owner_epoch": "kernel.epoch.7", "graph_revision": _C, "retained_bundle_id": _B,
+            "graph_revision": _C, "retained_bundle_id": _B,
             "scene_revision": {"scene_id": _D, "revision_id": 4, "content_hash": _E},
         }}
 
@@ -120,7 +120,7 @@ class _Transport:
 
 
 def _identity(instance: str = "set-valve") -> NodeAttemptIdentity:
-    return NodeAttemptIdentity("run.1", instance, f"attempt:{instance}")
+    return NodeAttemptIdentity(1, instance, 1)
 
 
 def _inputs(value: Any = True, signal_name: str = "do_0") -> OwnerNodeInputs:

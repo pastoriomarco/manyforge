@@ -37,6 +37,7 @@ import {
   defaultMotionPoseValue,
   ProgramManualFillPreviewContext,
   ProgramSpecializedEditor,
+  isMotionReferenceSchema,
   supportsProgramSpecializedEditor,
   type ValueCommit,
 } from './ProgramSpecializedEditors';
@@ -44,6 +45,9 @@ import { SourceableLeaf, SourceableValue } from './ValueSourceField';
 import { NamespaceGroupOptions, useNamespaceGroups } from '../common/NamespaceGroupOptions';
 
 /** The node parameter a reference created from a picker is written to. */
+// One stable empty value: the reference editors reset their draft when the value changes.
+const OMITTED_REFERENCE: JsonValue = Object.freeze({}) as JsonValue;
+
 export interface ProgramReferenceSource {
   nodeId: string;
   parameterId: string;
@@ -116,10 +120,11 @@ function referenceKey(value: JsonValue | undefined, fields: readonly string[]): 
 function DirectReferenceEditor({ schema, value, disabled, context, path = 'value', onCommit, onInvalidChange }: ProgramSchemaValueEditorProps) {
   const semanticType = schema['x-manyforge-semantic-type']!;
   const fields = DIRECT_REFERENCE_FIELDS[semanticType];
+  const checked = context.directReferenceChoices !== undefined;
   const choices = context.directReferenceChoices?.[semanticType] ?? [];
   const selected = referenceKey(value, fields);
   const current = choices.find((choice) => referenceKey(choice.value, fields) === selected);
-  const issue = selected && (!current || current.reason) ? current?.reason ?? 'This reference is unavailable in the current Draft candidate.' : null;
+  const issue = checked && selected && (!current || current.reason) ? current?.reason ?? 'This reference is unavailable in the current Draft candidate.' : null;
   useInvalidReport(issue || null, onInvalidChange);
   return <select
     aria-label={`Choose ${semanticType.replaceAll('_', ' ')} for ${path.replaceAll('_', ' ')}`}
@@ -133,7 +138,7 @@ function DirectReferenceEditor({ schema, value, disabled, context, path = 'value
     }}
   >
     {!selected && <option value="" disabled>Select {semanticType.replaceAll('_', ' ')}</option>}
-    {selected && !current && <option value={selected} disabled>{selected} · unavailable in the current Draft candidate</option>}
+    {selected && !current && <option value={selected} disabled>{selected} · {checked ? 'unavailable in the current Draft candidate' : 'not checked yet'}</option>}
     {choices.map((choice) => <option key={referenceKey(choice.value, fields)} value={referenceKey(choice.value, fields)} disabled={Boolean(choice.reason)}>
       {choice.label}{choice.reason ? ` · ${choice.reason}` : ''}
     </option>)}
@@ -930,7 +935,7 @@ export function ProgramSchemaValueEditor(props: ProgramSchemaValueEditorProps) {
     return whole(
       <ProgramSpecializedEditor
         schema={schema}
-        value={value === undefined ? fallback : value}
+        value={value === undefined ? (isMotionReferenceSchema(schema) ? OMITTED_REFERENCE : fallback) : value}
         disabled={disabled}
         path={path}
         sourceJointInventory={props.context.sourceJointInventory}

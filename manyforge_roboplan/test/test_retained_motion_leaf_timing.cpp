@@ -4,6 +4,7 @@
 #include "retired_composition_release.hpp"
 #include <manyforge_ros2_control_execution/detail/leaf_timing.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/types/operation_member_id_json.hpp>
 #include <future>
 
 namespace manyforge::roboplan_backend {
@@ -79,8 +80,12 @@ void RunRetainedMotionLeafShutdown(ShutdownCase scenario) {
   core::SqliteOperationJournal journal(journal_path, core::CellId(kCellId), 16U);
   auto kernel_owner = core::testing::make_heap_resource_addressed_kernel(
       {Registration(binding, std::move(readiness), engine, stop_port)}, clock, scheduler, journal,
-      core::ResourceAddressedExecutionKernelConfig{core::RequestOwnerEpoch(kOwnerEpoch), core::CellId(kCellId), 16U});
+      ProgramCycleReadyConfig(
+          core::ResourceAddressedExecutionKernelConfig{core::ApplicationStartId{1U}, core::CellId(kCellId), 16U},
+          binding.value().retained_bundle_id));
   auto &kernel = *kernel_owner;
+  // Program work names the run the Kernel holds ("leaf-shutdown" is run 2).
+  HoldProgramRun(kernel, binding, core::ProgramRunNumber(2U));
   std::atomic<bool> handoff_succeeded{false};
   std::atomic<bool> owner_joined_during_handoff{true};
   std::string handoff_error_code;
@@ -206,7 +211,7 @@ void RunRetainedMotionLeafShutdown(ShutdownCase scenario) {
                               !epoch_owner->joined() && epoch_owner->cached_context_valid();
   timing::release_goal_admitted = true;
   const bool execution_returned = execution.wait_for(3s) == std::future_status::ready;
-  std::optional<core::OperationId> operation_id;
+  std::optional<core::OperationNumber> operation_id;
   if (execution_returned) {
     const auto result = execution.get();
     if (result.ok()) operation_id = result.value().operation_id;
@@ -225,7 +230,7 @@ void RunRetainedMotionLeafShutdown(ShutdownCase scenario) {
       EXPECT_EQ(retirement_logs.find("\"component\":\"retired-arm\"", first + 1),
                 std::string::npos);
     }
-    EXPECT_NE(retirement_logs.find("\"code\":\"component_owner_stalled\""), std::string::npos);
+    EXPECT_NE(retirement_logs.find("\"code\":\"component_quiesce_not_drained\""), std::string::npos);
     if (scenario == ShutdownCase::kRetiredRetry) {
       EXPECT_NE(retirement_logs.find("\"generation\":1"), std::string::npos);
     }
@@ -263,7 +268,7 @@ void RunRetainedMotionLeafShutdown(ShutdownCase scenario) {
   } else if (scenario == ShutdownCase::kStuck) {
     EXPECT_EQ(stopped.outcome, RetainedRos2ControlRuntimeHandle::HostQuiesceOutcome::kUnresolved);
     EXPECT_STREQ(stopped.stage, "leaf");
-    EXPECT_EQ(stopped.code, "component_owner_stalled");
+    EXPECT_EQ(stopped.code, "component_quiesce_not_drained");
     EXPECT_TRUE(owner_retained);
   }
   EXPECT_TRUE(handoff_succeeded.load());
@@ -273,21 +278,25 @@ void RunRetainedMotionLeafShutdown(ShutdownCase scenario) {
   const auto state = kernel.get_operation_state(*operation_id);
   ASSERT_TRUE(state.ok());
   ASSERT_EQ(state.value().participants.size(), 1U);
-  const auto participant_id = state.value().participants.front().participant_id.value();
-  const auto events = journal.ReadEvents(core::RequestOwnerEpoch(kOwnerEpoch), 0U);
-  ASSERT_TRUE(events.ok());
-  EXPECT_TRUE(std::any_of(events.value().events.begin(), events.value().events.end(), [&](const auto &row) {
-    if (!row.operation_id || *row.operation_id != *operation_id) return false;
-    const auto payload = manyforge::content_identity::parse_canonical_json(row.payload_json);
-    const auto *operation = payload.find_object_member("operation_state");
-    const auto *participants = operation ? operation->find_object_member("participants") : nullptr;
-    if (!participants || !participants->is_array()) return false;
-    return std::any_of(participants->as_array().begin(), participants->as_array().end(), [&](const auto &p) {
-      const auto *id = p.find_object_member("participant_id");
-      const auto *fact = p.find_object_member("terminal_fact");
-      const auto *effect = fact ? fact->find_object_member("effect") : nullptr;
-      return id && id->is_string() && id->as_string() == participant_id &&
-             effect && effect->is_string() && effect->as_string() == "effect_uncertain";
+  const auto participant_id =
+      core::OperationParticipantIdValue(state.value().participants.front().participant_id);
+  // The journal writer writes the row shortly after the action.
+  EXPECT_TRUE(fake::WaitUntil([&] {
+    const auto events = journal.ReadOperationalEvents(0U);
+    if (!events.ok()) return false;
+    return std::any_of(events.value().events.begin(), events.value().events.end(), [&](const auto &row) {
+      if (!row.operation_id || *row.operation_id != *operation_id) return false;
+      const auto payload = manyforge::content_identity::parse_canonical_json(row.payload_json);
+      const auto *operation = payload.find_object_member("operation_state");
+      const auto *participants = operation ? operation->find_object_member("participants") : nullptr;
+      if (!participants || !participants->is_array()) return false;
+      return std::any_of(participants->as_array().begin(), participants->as_array().end(), [&](const auto &p) {
+        const auto *id = p.find_object_member("participant_id");
+        const auto *fact = p.find_object_member("terminal_fact");
+        const auto *effect = fact ? fact->find_object_member("effect") : nullptr;
+        return id && *id == participant_id &&
+               effect && effect->is_string() && effect->as_string() == "effect_uncertain";
+      });
     });
   }));
   handle.reset(); // Kernel/journal hook remain live during final-owner cleanup.

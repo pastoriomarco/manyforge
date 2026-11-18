@@ -12,6 +12,38 @@ namespace manyforge::component_manager::detail {
 inline constexpr std::size_t kMaximumManagedRuntimeRpcPacketBytes =
     manyforge::core::kMaximumCellAdmissionPrivateBinaryBytes;
 
+/// `cell_admission_acquire` of a Program Reset claim: the Program runner's
+/// current cycle status travels beside the intent, never inside it, so intent
+/// equality and replay are unchanged (OD-139). Only the execution command
+/// socket carries it; the Manager-child binary channel refuses it.
+struct ProgramResetClaimAcquireRequest final {
+  manyforge::core::CellAdmissionClaimIntentDTO intent;
+  manyforge::core::ProgramCycleStatusDTO program_cycle_status;
+
+  friend bool operator==(const ProgramResetClaimAcquireRequest &,
+                         const ProgramResetClaimAcquireRequest &) = default;
+};
+
+/// `cell_admission_acquire` of a Manager-Apply claim: the candidate bundle the
+/// Apply installs travels beside the intent. Manager-child channel only.
+struct ManagerApplyClaimAcquireRequest final {
+  manyforge::core::CellAdmissionClaimIntentDTO intent;
+  manyforge::core::RetainedBundleId candidate_retained_bundle_id;
+
+  friend bool operator==(const ManagerApplyClaimAcquireRequest &,
+                         const ManagerApplyClaimAcquireRequest &) = default;
+};
+
+/// `cell_admission_release` of the claim a Manager Apply settles: the Apply's
+/// outcome travels beside the release. Manager-child channel only.
+struct ManagerApplyClaimReleaseRequest final {
+  manyforge::core::CellAdmissionClaimReleaseDTO release;
+  manyforge::core::ManagerApplyReleaseOutcomeDTO outcome;
+
+  friend bool operator==(const ManagerApplyClaimReleaseRequest &,
+                         const ManagerApplyClaimReleaseRequest &) = default;
+};
+
 /// Private, same-host forwarding protocol for the native execution child.
 /// The command strings are deliberately part of the wire format: unlike an
 /// enum, they make packet captures and malformed-command diagnostics
@@ -20,8 +52,10 @@ using KernelCellAdmissionRpcRequest =
     std::variant<std::monostate,
                  manyforge::core::CellAdmissionReadinessSnapshotDTO,
                  manyforge::core::CellAdmissionClaimIntentDTO,
+                 ProgramResetClaimAcquireRequest,
+                 ManagerApplyClaimAcquireRequest,
                  manyforge::core::CellAdmissionClaimReleaseDTO,
-                 manyforge::core::CellAdmissionReconcileDTO,
+                 ManagerApplyClaimReleaseRequest,
                  manyforge::core::CellAdmissionRecoveryReceiptQueryDTO,
                  manyforge::core::ProgramResetSceneAuthorizationDTO,
                  manyforge::core::ManagerLivenessObservationDTO,

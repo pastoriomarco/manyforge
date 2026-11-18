@@ -45,7 +45,7 @@ public:
   };
 
   static std::shared_ptr<HostIoSignalRuntime>
-  Create(const core::RequestOwnerEpoch &owner, std::uint64_t generation,
+  Create(std::uint64_t generation,
          std::map<core::InterruptSourceId, SourceInput> sources,
          std::shared_ptr<core::IClock> clock,
          std::shared_ptr<core::IScheduler> scheduler,
@@ -105,7 +105,7 @@ public:
                 (core::kMaxLifecycleErrorDetailKeyBytes +
                  core::kMaxLifecycleErrorDetailValueBytes),
         {}};
-    core::IoSignalCatalogDTO catalog{owner, generation, {}, {}};
+    core::IoSignalCatalogDTO catalog{generation, {}, {}};
     std::size_t drain_budget{};
     for (const auto &[source, input] : sources) {
       Require(!input.rows.empty() && input.driver &&
@@ -168,9 +168,8 @@ public:
               "I/O source has no actual runtime occurrence");
       const auto incarnation =
           core::IoSourceIncarnation(content_identity::framed_sha256(
-              "manyforge.host-io-source", "manyforge.host-io-source.v1",
+              "manyforge.host-io-source", "manyforge.host-io-source.v2",
               CanonicalValue(CanonicalValue::Object{
-                  {"owner_epoch", CanonicalValue(owner.value())},
                   {"generation", CanonicalValue(std::to_string(generation))},
                   {"source_id", CanonicalValue(source.value())},
                   {"runtime_unit_id",
@@ -187,9 +186,8 @@ public:
     if (system_source) {
       system_incarnation =
           core::IoSourceIncarnation(content_identity::framed_sha256(
-              "manyforge.host-io-source", "manyforge.host-io-source.v1",
+              "manyforge.host-io-source", "manyforge.host-io-source.v2",
               CanonicalValue(CanonicalValue::Object{
-                  {"owner_epoch", CanonicalValue(owner.value())},
                   {"generation", CanonicalValue(std::to_string(generation))},
                   {"source_id", CanonicalValue(system_source->value())}})));
       Require(signals->InstallSource(*system_source, *system_incarnation,
@@ -201,9 +199,8 @@ public:
     for (const auto &[source, rows] : adapter_sources) {
       const auto incarnation =
           core::IoSourceIncarnation(content_identity::framed_sha256(
-              "manyforge.host-io-source", "manyforge.host-io-source.v1",
+              "manyforge.host-io-source", "manyforge.host-io-source.v2",
               CanonicalValue(CanonicalValue::Object{
-                  {"owner_epoch", CanonicalValue(owner.value())},
                   {"generation", CanonicalValue(std::to_string(generation))},
                   {"source_id", CanonicalValue(source.value())}})));
       Require(signals->InstallSource(source, incarnation, std::nullopt).ok(),
@@ -291,7 +288,7 @@ public:
         const auto owner = actual.lock();
         if (!owner)
           return;
-        // Invoked with that actual record's delivery lock already held.
+        // Invoked by that record after it released its delivery lock.
         std::lock_guard lock(self->mutex_);
         for (auto &[key, entry] : self->node_simulations_)
           for (auto &change : entry.changes) {
@@ -319,8 +316,9 @@ public:
       if (!self)
         return core::Result<void>::Err(
             {"invalid_state_transition", "Input lifecycle owner expired", {}});
-      // The actual driver delivery barrier is held. Drain eligible prior
-      // evidence before declaring planned cessation, without a Kernel callback.
+      // Invoked by the driver record after it released its delivery lock.
+      // Drain eligible prior evidence before declaring planned cessation,
+      // without a Kernel callback.
       // Enable must also consume the prior Pause's queued loss while the old
       // arm fence remains in place; a stale pre-Pause sample cannot rearm.
       if (self->ingress_) {
@@ -412,8 +410,9 @@ public:
     return drained;
   }
 
-  // Installed once by the actual host. The callback acquires its existing
-  // owner call lease; it never borrows a raw replaceable component lifetime.
+  // Installed once by the actual host. The callback reaches the stable cell
+  // Kernel through a weak reference to the cell access; it never borrows a
+  // raw replaceable component lifetime.
   void SetRuleEvidenceProcessor(std::function<core::Result<bool>()> processor,
                                 InputLifecycleProcessor input_lifecycle = {}) {
     std::lock_guard lock(mutex_);
@@ -477,16 +476,14 @@ public:
     auto delivery_locks = AcquireProviderDeliveries();
     return signals_->ReleaseNodeWatches(scope);
   }
-  core::Result<void> ReleaseRunWatches(const core::RequestOwnerEpoch &owner,
-                                       const core::ProgramRunId &run) override {
+  core::Result<void> ReleaseRunWatches(const core::ProgramRunNumber &run) override {
     auto delivery_locks = AcquireProviderDeliveries();
-    const auto released = signals_->ReleaseRunWatches(owner, run);
+    const auto released = signals_->ReleaseRunWatches(run);
     if (released.ok()) {
       std::lock_guard lock(mutex_);
       for (auto it = node_simulations_.begin();
            it != node_simulations_.end();) {
-        if (std::get<0>(it->first) == owner.value() &&
-            std::get<1>(it->first) == run.value()) {
+        if (it->first.first == run.value()) {
           for (auto &change : it->second.changes)
             CancelChangeLocked(change);
           it = node_simulations_.erase(it);
@@ -494,7 +491,9 @@ public:
           ++it;
         }
       }
-      run_simulation_contexts_.erase({owner.value(), run.value()});
+      std::erase_if(run_simulation_contexts_, [&](const auto &entry) {
+        return entry.first == run.value();
+      });
     }
     return released;
   }
@@ -509,7 +508,6 @@ public:
              {{"reason", "io_global_rule_search_expectation_invalid"}}});
       return signals_->ArmRule(request);
     }
-    auto delivery_locks = AcquireProviderDeliveries();
     const auto armed = signals_->ArmRule(request);
     if (armed.ok()) RequestRuleEvidenceProcessing();
     return armed;
@@ -531,7 +529,6 @@ public:
   RetireRule(const core::IoRuleRegistrationDTO &token) override {
     if (std::holds_alternative<core::IoActivationRuleScopeDTO>(token.scope))
       return signals_->RetireRule(token);
-    auto delivery_locks = AcquireProviderDeliveries();
     const auto retired = signals_->RetireRule(token);
     if (retired.ok())
       RequestRuleEvidenceProcessing();
@@ -544,7 +541,8 @@ public:
       std::size_t maximum_node_entries) override {
     using Reply =
         core::Result<core::ProgramNodeMockSimulationAcknowledgementDTO>;
-    auto delivery_locks = AcquireProviderDeliveries();
+    // Start, End, pause and the Run's release are serialized by the Kernel's
+    // state lock, so the entry inserted below stays this start's own.
     const auto key = SimulationKey(request.scope);
     if (request.scope.node_start_index == 0U)
       return Reply::Err(SimulationError("mock_simulation_invalid",
@@ -581,8 +579,7 @@ public:
         const auto in_run =
             std::count_if(node_simulations_.begin(), node_simulations_.end(),
                           [&](const auto &row) {
-                            return std::get<0>(row.first) == std::get<0>(key) &&
-                                   std::get<1>(row.first) == std::get<1>(key);
+                            return row.first.first == key.first;
                           });
         if (static_cast<std::size_t>(in_run) >= maximum_node_entries)
           return Reply::Err(SimulationError("mock_simulation_invalid",
@@ -666,8 +663,6 @@ public:
               core::IoSignalDirection::kInput ||
           observed.value().descriptor.value_type !=
               core::IoSignalValueType::kBoolean ||
-          observed.value().cursor.owner_epoch !=
-              request.scope.request_owner_epoch ||
           observed.value().cursor.catalog_generation != generation_ ||
           proof.catalog_generation != generation_ ||
           proof.signal_descriptor_digest != digest.value() ||
@@ -738,49 +733,12 @@ public:
       return *entry->result;
     };
     try {
-      // Actual scheduler workers may dequeue before schedule returns. They
-      // cannot cross these delivery barriers until the retained result commits.
-      for (auto &change : entry->changes) {
-        if (node_paused)
-          break; // 136: even a zero-offset change waits for Resume
-        std::optional<core::TimePoint> deadline;
-        {
-          std::lock_guard lock(mutex_);
-          if (active_)
-            if (const auto *running =
-                    std::get_if<RunningSimulationDeadline>(&change.due))
-              deadline = running->value;
-        }
-        if (!deadline)
-          return fail(SimulationError("io_signal_service_unavailable",
-                                      "I/O runtime is retired"));
-        const auto handle = scheduler_->schedule(
-            *deadline,
-            [weak = weak_from_this(), key,
-             index = request.scope.node_start_index] {
-              if (const auto self = weak.lock())
-                self->ApplyDueNodeSimulation(key, index);
-            },
-            core::SchedulerPriority::RuntimeSafety);
-        bool active;
-        {
-          std::lock_guard lock(mutex_);
-          change.handle = handle;
-          active = active_;
-        }
-        if (!active)
-          return fail(SimulationError("io_signal_service_unavailable",
-                                      "I/O runtime is retired"));
-      }
       const auto publish = [&](const core::IoSignalId &signal,
                                bool value) -> core::Result<void> {
-        {
-          std::lock_guard lock(mutex_);
-          if (!active_)
-            return core::Result<void>::Err(SimulationError(
-                "io_signal_service_unavailable", "I/O runtime is retired"));
-        }
-        const auto result = PublishMockValueLocked(signal, value);
+        const auto result = PublishMockValue(
+            signal, value,
+            SimulationError("io_signal_service_unavailable",
+                            "I/O runtime is retired"));
         if (!result.ok())
           return core::Result<void>::Err(result.error());
         if (result.value().publication_error)
@@ -810,15 +768,37 @@ public:
         if (!published.ok())
           return fail(published.error());
       }
+      // Commit point. The timed changes are scheduled here, under the runtime
+      // mutex and after the start values: a timer that is due at once waits
+      // for this mutex and then finds the committed result.
       std::lock_guard lock(mutex_);
-      if (!active_) {
-        entry->result = Reply::Err(SimulationError(
-            "io_signal_service_unavailable", "I/O runtime is retired"));
+      const auto fail_locked = [&](core::ErrorDTO error) {
+        entry->result = Reply::Err(std::move(error));
         for (auto &change : entry->changes)
           CancelChangeLocked(change);
-      } else {
-        entry->result = std::move(success);
+        return *entry->result;
+      };
+      if (!active_)
+        return fail_locked(SimulationError("io_signal_service_unavailable",
+                                           "I/O runtime is retired"));
+      for (auto &change : entry->changes) {
+        if (node_paused)
+          break; // 136: even a zero-offset change waits for Resume
+        const auto *running =
+            std::get_if<RunningSimulationDeadline>(&change.due);
+        if (!running) // its driver cancelled it while the start ran
+          return fail_locked(SimulationError("io_signal_service_unavailable",
+                                             "I/O runtime is retired"));
+        change.handle = scheduler_->schedule(
+            running->value,
+            [weak = weak_from_this(), key,
+             index = request.scope.node_start_index] {
+              if (const auto self = weak.lock())
+                self->ApplyDueNodeSimulation(key, index);
+            },
+            core::SchedulerPriority::RuntimeSafety);
       }
+      entry->result = std::move(success);
       return *entry->result;
     } catch (...) {
       // Previously published model/acquisition facts are not rolled back.
@@ -830,7 +810,6 @@ public:
 
   core::Result<void> SetProgramRunMockSimulationPaused(
       const core::ProgramRunMockSimulationPauseRequestDTO &request) override {
-    auto delivery_locks = AcquireProviderDeliveries();
     if (request.run_revision == 0U)
       return core::Result<void>::Err(SimulationError(
           "mock_simulation_invalid", "Run revision is unnumbered"));
@@ -846,7 +825,7 @@ public:
     const auto key = RunKey(request.scope);
     auto accepted =
         request; // allocate exact accepted scope before timer effects
-    std::unique_lock lock(mutex_);
+    std::lock_guard lock(mutex_);
     if (!active_)
       return core::Result<void>::Err(SimulationError(
           "io_signal_service_unavailable", "I/O runtime is retired"));
@@ -890,7 +869,7 @@ public:
     };
     std::vector<ChangePlan> plan;
     for (auto &[node, entry] : node_simulations_) {
-      if (std::get<0>(node) != key.first || std::get<1>(node) != key.second ||
+      if (node.first != key ||
           !entry.result || !entry.result->ok())
         continue;
       const bool node_paused =
@@ -937,15 +916,11 @@ public:
         item.deadline = now + item.remaining;
       }
     }
-    lock.unlock();
-    const auto cancel_prepared = [&] {
-      for (auto &item : plan)
-        if (item.handle)
-          scheduler_->cancel(*item.handle);
-    };
+    // Prepare every replacement handle before changing accepted clock state,
+    // here under the runtime mutex: a timer that is due at once waits for it
+    // and then finds the committed state. Dequeued callbacks still see the
+    // paused due state if setup fails.
     try {
-      // Prepare every replacement handle before changing accepted clock state.
-      // Dequeued callbacks still see the paused due state if setup fails.
       for (auto &item : plan) {
         if (item.pause)
           continue;
@@ -958,16 +933,12 @@ public:
             core::SchedulerPriority::RuntimeSafety);
       }
     } catch (...) {
-      cancel_prepared();
+      for (auto &item : plan)
+        if (item.handle)
+          scheduler_->cancel(*item.handle);
       return core::Result<void>::Err(SimulationError(
           "mock_simulation_resume_not_applied",
           "Resume scheduling failed before clock/timer commit"));
-    }
-    lock.lock();
-    if (!active_) {
-      cancel_prepared();
-      return core::Result<void>::Err(SimulationError(
-          "io_signal_service_unavailable", "I/O runtime is retired"));
     }
     for (auto &item : plan) {
       if (item.pause) {
@@ -985,55 +956,67 @@ public:
   core::Result<void> EndProgramNodeMockSimulation(
       const core::ProgramNodeMockSimulationScopeDTO &scope,
       std::size_t maximum_node_entries) override {
-    auto delivery_locks = AcquireProviderDeliveries();
     if (scope.node_start_index == 0U || maximum_node_entries == 0U)
       return core::Result<void>::Err(
           SimulationError("mock_simulation_invalid", "Invalid node end scope"));
     const auto key = SimulationKey(scope);
     NodeSimulation ended{scope, std::nullopt, {}};
-    std::lock_guard lock(mutex_);
-    if (!active_)
-      return core::Result<void>::Err(SimulationError(
-          "io_signal_service_unavailable", "I/O runtime is retired"));
-    const auto previous = node_simulations_.find(key);
-    if (previous != node_simulations_.end()) {
-      const auto &old_scope = SimulationScope(previous->second);
-      auto expected = old_scope;
-      expected.node = scope.node;
-      expected.node_start_index = scope.node_start_index;
-      if (expected != scope)
+    std::vector<const IoProviderDriverRecord *> cancelled_drivers;
+    cancelled_drivers.reserve(drivers_.size());
+    const auto result = [&]() -> core::Result<void> {
+      std::lock_guard lock(mutex_);
+      if (!active_)
         return core::Result<void>::Err(SimulationError(
-            "mock_simulation_stale", "Node end authority scope changed"));
-      if (scope.node_start_index < old_scope.node_start_index)
-        return core::Result<void>::Ok(); // older END cannot cancel newer work
-      if (scope.node_start_index == old_scope.node_start_index) {
-        if (scope.node.node_attempt_id != old_scope.node.node_attempt_id)
+            "io_signal_service_unavailable", "I/O runtime is retired"));
+      const auto previous = node_simulations_.find(key);
+      if (previous != node_simulations_.end()) {
+        const auto &old_scope = SimulationScope(previous->second);
+        auto expected = old_scope;
+        expected.node = scope.node;
+        expected.node_start_index = scope.node_start_index;
+        if (expected != scope)
           return core::Result<void>::Err(SimulationError(
-              "mock_simulation_stale", "Node end attempt conflicts"));
+              "mock_simulation_stale", "Node end authority scope changed"));
+        if (scope.node_start_index < old_scope.node_start_index)
+          return core::Result<void>::Ok(); // older END cannot cancel newer work
+        if (scope.node_start_index == old_scope.node_start_index) {
+          if (scope.node.node_attempt_id != old_scope.node.node_attempt_id)
+            return core::Result<void>::Err(SimulationError(
+                "mock_simulation_stale", "Node end attempt conflicts"));
+          CollectChangeDriversLocked(previous->second, cancelled_drivers);
+          for (auto &change : previous->second.changes)
+            CancelChangeLocked(change);
+          // The original start result remains historical and inert on replay.
+          return core::Result<void>::Ok();
+        }
+        if (scope.node.node_attempt_id == old_scope.node.node_attempt_id)
+          return core::Result<void>::Err(
+              SimulationError("mock_simulation_stale",
+                              "A higher node end needs a fresh attempt"));
+        CollectChangeDriversLocked(previous->second, cancelled_drivers);
         for (auto &change : previous->second.changes)
           CancelChangeLocked(change);
-        // The original start result remains historical and inert on replay.
-        return core::Result<void>::Ok();
+      } else {
+        const auto in_run =
+            std::count_if(node_simulations_.begin(), node_simulations_.end(),
+                          [&](const auto &row) {
+                            return row.first.first == key.first;
+                          });
+        if (static_cast<std::size_t>(in_run) >= maximum_node_entries)
+          return core::Result<void>::Err(SimulationError(
+              "mock_simulation_invalid", "Captured node capacity exceeded"));
       }
-      if (scope.node.node_attempt_id == old_scope.node.node_attempt_id)
-        return core::Result<void>::Err(
-            SimulationError("mock_simulation_stale",
-                            "A higher node end needs a fresh attempt"));
-      for (auto &change : previous->second.changes)
-        CancelChangeLocked(change);
-    } else {
-      const auto in_run =
-          std::count_if(node_simulations_.begin(), node_simulations_.end(),
-                        [&](const auto &row) {
-                          return std::get<0>(row.first) == std::get<0>(key) &&
-                                 std::get<1>(row.first) == std::get<1>(key);
-                        });
-      if (static_cast<std::size_t>(in_run) >= maximum_node_entries)
-        return core::Result<void>::Err(SimulationError(
-            "mock_simulation_invalid", "Captured node capacity exceeded"));
+      node_simulations_.insert_or_assign(key, std::move(ended));
+      return core::Result<void>::Ok();
+    }();
+    // No change of this node lands after this End returns. A timed change
+    // picks and sets its value under its driver's delivery lock, so taking
+    // that lock once, after the cancel above, waits for a change that was
+    // picked before it. Only the drivers of this node's changes.
+    for (const auto *driver : cancelled_drivers) {
+      auto delivery = driver->AcquireDelivery();
     }
-    node_simulations_.insert_or_assign(key, std::move(ended));
-    return core::Result<void>::Ok();
+    return result;
   }
 
   core::Result<void> EvaluateRules() override {
@@ -1198,7 +1181,6 @@ public:
   SetMockInput(const core::IoSignalId &signal,
                const core::IoSourceIncarnation &expected, bool value) {
     using Reply = core::Result<MockIoInputSetResult>;
-    auto delivery_locks = AcquireProviderDeliveries();
     {
       std::lock_guard lock(mutex_);
       if (!active_)
@@ -1216,7 +1198,9 @@ public:
     if (before.value().installed_incarnation != expected)
       return Reply::Err(
           {"io_signal_catalog_stale", "Mock source incarnation changed", {}});
-    return PublishMockValueLocked(signal, value);
+    return PublishMockValue(
+        signal, value,
+        {"io_signal_service_unavailable", "Mock source is retired", {}});
   }
 
 private:
@@ -1224,8 +1208,32 @@ private:
     if (!condition)
       throw std::runtime_error(message);
   }
+  struct MockInput final {
+    std::size_t record_capacity;
+    std::shared_ptr<IoProviderDriverRecord> driver{};
+  };
+  /// Hands one Mock value over as a device callback hands over a sample: the
+  /// model value is set and queued for the I/O lane under the delivery lock
+  /// of its own driver only (it guards the leaf an Apply may rebind, and it
+  /// orders the change with a node's End and with this runtime's
+  /// retirement). Memory work only; the queue wakes the lane's drain.
+  core::Result<MockBooleanInputSetReceipt>
+  HandOverMockValue(const MockInput &input, const core::IoSignalId &signal,
+                    bool value, const core::ErrorDTO &retired) {
+    auto delivery = input.driver->AcquireDelivery();
+    {
+      std::lock_guard lock(mutex_);
+      if (!active_)
+        return core::Result<MockBooleanInputSetReceipt>::Err(retired);
+    }
+    return input.driver->SetMockValueLocked(signal, value);
+  }
+  /// A Mock value whose answer reports its delivery (a node's start value,
+  /// the Set button): handed over, then recorded at once by an inline drain
+  /// outside every lock, and its admitted record read back.
   core::Result<MockIoInputSetResult>
-  PublishMockValueLocked(const core::IoSignalId &signal, bool value) {
+  PublishMockValue(const core::IoSignalId &signal, bool value,
+                   const core::ErrorDTO &retired) {
     using Reply = core::Result<MockIoInputSetResult>;
     const auto input = mock_inputs_.find(signal);
     Require(input != mock_inputs_.end(),
@@ -1233,7 +1241,7 @@ private:
     const auto before = signals_->ReadSignal(signal);
     if (!before.ok())
       return Reply::Err(before.error());
-    const auto changed = input->second.driver->SetMockValueLocked(signal, value);
+    const auto changed = HandOverMockValue(input->second, signal, value, retired);
     if (!changed.ok())
       return Reply::Err(changed.error());
     auto publication_error = changed.value().publication_error;
@@ -1302,8 +1310,8 @@ public:
           scheduler_->cancel(*sample_expiry_handle_);
         sample_expiry_handle_.reset();
         sample_expiry_deadline_.reset();
-        // Keep replay results stable until in-flight starts have crossed the
-        // same provider barriers. No new callback may publish while inactive.
+        // Keep replay results stable. No new callback may publish while
+        // inactive: every Mock hand-over checks this under its driver lock.
         for (auto &[key, entry] : node_simulations_)
           for (auto &change : entry.changes)
             CancelChangeLocked(change);
@@ -1318,8 +1326,9 @@ public:
     }
     try {
       // No allocation during retirement. With active_ already fenced, waiting
-      // through each actual barrier drains every previously selected script
-      // publication; no runtime timer mutex is held while waiting for a driver.
+      // through each actual barrier waits for every Mock hand-over already
+      // past its check; no runtime timer mutex is held while waiting for a
+      // driver.
       for (const auto &driver : drivers_) {
         auto delivery = driver->AcquireDelivery();
       }
@@ -1394,28 +1403,34 @@ private:
           }, core::SchedulerPriority::Monitoring);
     }
   }
+  /// A due echo hands its value over to the Mock input like a device
+  /// callback; the I/O lane's drain records it.
   void ApplyMockEcho(std::size_t channel, std::size_t index,
                      std::uint64_t serial, bool value) {
-    auto delivery_locks = AcquireProviderDeliveries();
-    // Channels are immutable after Start. This is the same output mutex held
-    // across acceptance and ScheduleMockEcho, so a newer accepted write cannot
-    // overtake this serial check and then be overwritten by this publication.
-    if (channel >= mock_echoes_.size())
+    // Channels, their outputs and their targets' signals are immutable after
+    // Start, and so is the input's driver.
+    if (channel >= mock_echoes_.size() ||
+        index >= mock_echoes_[channel].targets.size())
       return;
+    const auto &signal = mock_echoes_[channel].targets[index].signal;
+    const auto &driver = mock_inputs_.at(signal).driver;
+    // That input's driver lock first, then the output's model lock, the order
+    // the echo has always taken them in. The model lock is held across
+    // acceptance and ScheduleMockEcho, so a newer accepted write cannot
+    // overtake this serial check and then be overwritten by this hand-over.
+    auto delivery = driver->AcquireDelivery();
     auto output_delivery = mock_echoes_[channel].output->AcquireModelDelivery();
-    std::optional<core::IoSignalId> signal;
     {
       std::lock_guard lock(mutex_);
-      if (!active_ || channel >= mock_echoes_.size() ||
-          index >= mock_echoes_[channel].targets.size())
+      if (!active_)
         return;
       auto &target = mock_echoes_[channel].targets[index];
       if (target.serial != serial || !target.handle)
         return;
       target.handle.reset();
-      signal = target.signal;
     }
-    static_cast<void>(PublishMockValueLocked(*signal, value));
+    // No runtime mutex here: the queue's wake takes it.
+    static_cast<void>(driver->SetMockValueLocked(signal, value));
   }
   class IngressWake final : public core::IIoSignalIngress {
   public:
@@ -1457,13 +1472,10 @@ private:
       result.drivers.push_back(driver->AcquireDelivery());
     return result;
   }
-  struct MockInput final {
-    std::size_t record_capacity;
-    std::shared_ptr<IoProviderDriverRecord> driver{};
-  };
   using SimulationReply =
       core::Result<core::ProgramNodeMockSimulationAcknowledgementDTO>;
-  using NodeSimulationKey = std::tuple<std::string, std::string, std::string>;
+  /// (run, node instance): one runner per start, so the run names it.
+  using NodeSimulationKey = std::pair<std::uint64_t, std::string>;
   struct RunningSimulationDeadline final {
     core::TimePoint value;
   };
@@ -1503,17 +1515,14 @@ private:
         },
         entry.origin);
   }
-  using RunSimulationKey = std::pair<std::string, std::string>;
+  using RunSimulationKey = std::uint64_t;
   static RunSimulationKey
   RunKey(const core::ProgramRunMockSimulationScopeDTO &scope) {
-    return {scope.program_runner_owner_epoch.value(),
-            scope.program_run_id.value()};
+    return scope.program_run_id.value();
   }
   static core::ProgramRunMockSimulationScopeDTO
   RunScope(const core::ProgramNodeMockSimulationScopeDTO &scope) {
-    return {scope.request_owner_epoch, scope.program_binding_id,
-            scope.program_runner_owner_epoch, scope.claim_generation,
-            scope.program_run_id};
+    return {scope.program_binding_id, scope.claim_generation, scope.program_run_id};
   }
   static bool
   RunPausesNode(const core::ProgramRunMockSimulationPauseRequestDTO &snapshot,
@@ -1527,8 +1536,7 @@ private:
   }
   static NodeSimulationKey
   SimulationKey(const core::ProgramNodeMockSimulationScopeDTO &scope) {
-    return {scope.program_runner_owner_epoch.value(),
-            scope.program_run_id.value(), scope.node.node_instance_id.value()};
+    return {scope.program_run_id.value(), scope.node.node_instance_id.value()};
   }
   static core::ErrorDTO SimulationError(const std::string &reason,
                                         const std::string &message) {
@@ -1540,46 +1548,73 @@ private:
     change.handle.reset();
     change.due = std::monostate{};
   }
+  /// The drivers of a node's timed changes, each once.
+  void CollectChangeDriversLocked(
+      const NodeSimulation &entry,
+      std::vector<const IoProviderDriverRecord *> &drivers) const {
+    for (const auto &change : entry.changes) {
+      const auto *driver = mock_inputs_.at(change.signal).driver.get();
+      if (std::find(drivers.begin(), drivers.end(), driver) == drivers.end())
+        drivers.push_back(driver);
+    }
+  }
+  /// The node's first due change, among those of `driver` when given.
+  PendingSimulationChange *
+  DueNodeChangeLocked(const NodeSimulationKey &key, std::uint64_t index,
+                      const IoProviderDriverRecord *driver) {
+    const auto entry = node_simulations_.find(key);
+    if (!active_ || entry == node_simulations_.end() ||
+        SimulationScope(entry->second).node_start_index != index ||
+        !entry->second.result || !entry->second.result->ok())
+      return nullptr;
+    const auto context = run_simulation_contexts_.find(
+        RunKey(RunScope(SimulationScope(entry->second))));
+    if (context == run_simulation_contexts_.end() ||
+        RunPausesNode(context->second,
+                      SimulationScope(entry->second).node.node_instance_id) ||
+        context->second.scope != RunScope(SimulationScope(entry->second)))
+      return nullptr;
+    const auto now = clock_->now();
+    const auto due = std::find_if(
+        entry->second.changes.begin(), entry->second.changes.end(),
+        [&](const auto &change) {
+          const auto *running =
+              std::get_if<RunningSimulationDeadline>(&change.due);
+          return running && running->value <= now &&
+                 (!driver ||
+                  mock_inputs_.at(change.signal).driver.get() == driver);
+        });
+    return due == entry->second.changes.end() ? nullptr : &*due;
+  }
+  /// A node's due timed changes, handed over like device callbacks: each is
+  /// picked and set under its own driver's delivery lock (End waits on that
+  /// lock), and the I/O lane's drain records it.
   void ApplyDueNodeSimulation(const NodeSimulationKey &key,
                               std::uint64_t index) {
-    // Actual SimpleScheduler and ManualScheduler queue callbacks. A due worker
-    // may start before schedule() returns, but waits for these SAME barriers.
-    auto delivery_locks = AcquireProviderDeliveries();
     for (;;) {
+      std::shared_ptr<IoProviderDriverRecord> driver;
+      {
+        std::lock_guard lock(mutex_);
+        const auto *due = DueNodeChangeLocked(key, index, nullptr);
+        if (!due)
+          return;
+        driver = mock_inputs_.at(due->signal).driver;
+      }
+      auto delivery = driver->AcquireDelivery();
       std::optional<std::pair<core::IoSignalId, bool>> publication;
       {
         std::lock_guard lock(mutex_);
-        const auto entry = node_simulations_.find(key);
-        if (!active_ || entry == node_simulations_.end() ||
-            SimulationScope(entry->second).node_start_index != index ||
-            !entry->second.result || !entry->second.result->ok())
-          return;
-        const auto context = run_simulation_contexts_.find(
-            RunKey(RunScope(SimulationScope(entry->second))));
-        if (context == run_simulation_contexts_.end() ||
-            RunPausesNode(
-                context->second,
-                SimulationScope(entry->second).node.node_instance_id) ||
-            context->second.scope != RunScope(SimulationScope(entry->second)))
-          return;
-        const auto now = clock_->now();
-        const auto due = std::find_if(
-            entry->second.changes.begin(), entry->second.changes.end(),
-            [&](const auto &change) {
-              const auto *running =
-                  std::get_if<RunningSimulationDeadline>(&change.due);
-              return running && running->value <= now;
-            });
-        if (due == entry->second.changes.end())
-          return;
+        auto *due = DueNodeChangeLocked(key, index, driver.get());
+        if (!due)
+          continue; // ended or cancelled meanwhile; look again
         publication.emplace(due->signal, due->value);
         CancelChangeLocked(*due);
       }
-      // No runtime mutex during ingress delivery: its wake reenters mutex_.
-      // Later source failure remains actual provider/ingress evidence, not a
-      // rewritten start acknowledgement or a blind retry.
+      // No runtime mutex here: the queue's wake takes it. A refused
+      // hand-over remains the source's own loss evidence, not a rewritten
+      // start acknowledgement or a blind retry.
       static_cast<void>(
-          PublishMockValueLocked(publication->first, publication->second));
+          driver->SetMockValueLocked(publication->first, publication->second));
     }
   }
   HostIoSignalRuntime(std::shared_ptr<core::IClock> clock,

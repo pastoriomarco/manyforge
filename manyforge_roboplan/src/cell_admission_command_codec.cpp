@@ -45,6 +45,11 @@ std::string Text(const Value &v, std::string_view name,
           "cell-admission text field is oversized");
   return x.as_string();
 }
+core::RequestKey Key(const Value &v, std::string_view name) {
+  const auto key = core::ParseRequestKey(Text(v, name));
+  Require(key.has_value(), "cell-admission request key is not 32 hex characters");
+  return *key;
+}
 bool Bool(const Value &v, std::string_view name) {
   const auto &x = Member(v, name);
   Require(x.is_bool(), "cell-admission boolean field has the wrong type");
@@ -90,15 +95,15 @@ core::CellAdmissionClaimKindDTO ClaimKind(std::string_view v) {
       return x;
   Fail("unknown cell-admission claim_kind");
 }
-core::CellAdmissionOwnerRoleDTO OwnerRole(std::string_view v) {
-  for (auto x : {core::CellAdmissionOwnerRoleDTO::kProgramRunner,
-                 core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
-                 core::CellAdmissionOwnerRoleDTO::kManager,
-                 core::CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner,
-                 core::CellAdmissionOwnerRoleDTO::kManualOperationOwner,
-                 core::CellAdmissionOwnerRoleDTO::
+core::ApplicationRole OwnerRole(std::string_view v) {
+  for (auto x : {core::ApplicationRole::kProgramRunner,
+                 core::ApplicationRole::kAuthoringOwner,
+                 core::ApplicationRole::kManager,
+                 core::ApplicationRole::kAuthoredSceneOwner,
+                 core::ApplicationRole::kManualOperationOwner,
+                 core::ApplicationRole::
                      kInterventionOrRecoveryOwner})
-    if (core::to_string(x) == v)
+    if (core::ApplicationRoleText(x) == v)
       return x;
   Fail("unknown cell-admission owner_role");
 }
@@ -119,8 +124,7 @@ core::CellAdmissionSettlementKindDTO SettlementKind(std::string_view v) {
   for (auto x : {core::CellAdmissionSettlementKindDTO::kOwnerCommit,
                  core::CellAdmissionSettlementKindDTO::kProvenNoEffect,
                  core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
-                 core::CellAdmissionSettlementKindDTO::kExplicitReset,
-                 core::CellAdmissionSettlementKindDTO::kReconciled})
+                 core::CellAdmissionSettlementKindDTO::kExplicitReset})
     if (core::to_string(x) == v)
       return x;
   Fail("unknown cell-admission settlement_kind");
@@ -151,16 +155,33 @@ core::CellAdmissionScopeDTO Scope(const Value &v) {
           "cell-admission scope is oversized");
   return result;
 }
+// An owner transaction number (or null) typed by the owner role.
+std::optional<core::CellAdmissionOwnerTransactionId>
+TransactionId(const Value &v, std::string_view name, core::ApplicationRole role) {
+  return Optional<core::CellAdmissionOwnerTransactionId>(v, name, [&](const Value &n) {
+    Require(n.is_number() && n.as_number() >= 1.0 &&
+                std::floor(n.as_number()) == n.as_number() &&
+                n.as_number() <= kMaximumSafeInteger,
+            "cell-admission transaction id is out of range");
+    const auto id = core::CellAdmissionOwnerTransactionIdFor(
+        role, static_cast<std::uint64_t>(n.as_number()));
+    Require(id.has_value(), "cell-admission owner role carries no transaction id");
+    return *id;
+  });
+}
+Value TransactionIdValue(const std::optional<core::CellAdmissionOwnerTransactionId> &v) {
+  return v ? Value(static_cast<double>(core::CellAdmissionOwnerTransactionNumber(*v)))
+           : Value(nullptr);
+}
 core::CellAdmissionClaimIntentDTO Intent(const Value &v) {
   const bool program_node = v.is_object() && v.find_object_member("program_node_evidence") != nullptr;
-  Exact(v, program_node ? 11U : 10U);
+  Exact(v, program_node ? 9U : 8U);
+  const auto role = OwnerRole(Text(v, "owner_role"));
   core::CellAdmissionClaimIntentDTO result{
       ClaimKind(Text(v, "claim_kind")),
-      OwnerRole(Text(v, "owner_role")),
-      core::RequestOwnerEpoch(Text(v, "owner_epoch")),
-      Text(v, "owner_transaction_id"),
-      core::RequestId(Text(v, "request_id")),
-      core::ContentDigest(Text(v, "request_payload_digest")),
+      role,
+      TransactionId(v, "owner_transaction_id", role),
+      Key(v, "request_key"),
       core::AdmissionGeneration(Counter(v, "expected_admission_generation")),
       Scope(Member(v, "scope")),
       std::nullopt,
@@ -176,11 +197,11 @@ core::CellAdmissionClaimIntentDTO Intent(const Value &v) {
   result.intervention_evidence =
       Optional<core::CellAdmissionInterventionEvidenceDTO>(
           v, "intervention_evidence", [](const Value &x) {
-            Exact(x, 5U);
+            Exact(x, 4U);
+            const auto offering_role = OwnerRole(Text(x, "offering_owner_role"));
             return core::CellAdmissionInterventionEvidenceDTO{
-                OwnerRole(Text(x, "offering_owner_role")),
-                core::RequestOwnerEpoch(Text(x, "offering_owner_epoch")),
-                Text(x, "offer_transaction_id"),
+                offering_role,
+                TransactionId(x, "offer_transaction_id", offering_role),
                 core::ContentDigest(Text(x, "offer_digest")),
                 Optional<core::CellAdmissionClaimGeneration>(
                     x, "parent_program_cycle_claim_generation",
@@ -196,12 +217,12 @@ core::CellAdmissionClaimIntentDTO Intent(const Value &v) {
           });
   if (program_node) {
     const auto& x = Member(v, "program_node_evidence");
-    Exact(x, 6U);
+    Exact(x, 5U);
     result.program_node_evidence = core::ProgramNodeAdmissionEvidenceDTO{
-        core::RequestOwnerEpoch(Text(x, "program_runner_owner_epoch")),
-        core::ProgramRunId(Text(x, "program_run_id")),
+        core::ProgramRunNumber(Counter(x, "program_run_id", 1U)),
         core::CellAdmissionClaimGeneration(Counter(x, "parent_program_cycle_claim_generation", 1U)),
-        Text(x, "node_instance_id"), Text(x, "node_attempt_id", 512U), Text(x, "owner_api")};
+        Text(x, "node_instance_id"),
+        core::NodeAttemptNumber(Counter(x, "node_attempt_id", 1U)), Text(x, "owner_api")};
   }
   Require(core::ValidateCellAdmissionClaimIntent(result).ok(),
           "cell-admission claim intent is invalid");
@@ -218,15 +239,14 @@ core::CellAdmissionClaimDTO Claim(const Value &v) {
   return result;
 }
 core::CellAdmissionClaimReleaseDTO Release(const Value &v) {
-  Exact(v, 8U);
+  Exact(v, 6U);
   const auto &settlement = Member(v, "settlement");
   Exact(settlement, 2U);
+  const auto role = OwnerRole(Text(v, "owner_role"));
   core::CellAdmissionClaimReleaseDTO result{
-      OwnerRole(Text(v, "owner_role")),
-      core::RequestOwnerEpoch(Text(v, "owner_epoch")),
-      Text(v, "owner_transaction_id"),
-      core::RequestId(Text(v, "request_id")),
-      core::ContentDigest(Text(v, "request_payload_digest")),
+      role,
+      TransactionId(v, "owner_transaction_id", role),
+      Key(v, "request_key"),
       core::AdmissionGeneration(
           Counter(v, "acquired_admission_generation", 1U)),
       core::CellAdmissionClaimGeneration(
@@ -238,15 +258,18 @@ core::CellAdmissionClaimReleaseDTO Release(const Value &v) {
   return result;
 }
 core::ProgramCycleStatusDTO CycleStatus(const Value &x) {
-  Exact(x, 7U);
+  Exact(x, 6U);
   return core::ProgramCycleStatusDTO{
-      core::RequestOwnerEpoch(Text(x, "program_runner_owner_epoch")),
       Counter(x, "cycle_generation"),
       CycleState(Text(x, "state")),
-      Optional<core::ProgramRunId>(
+      // `starting` may name no run yet (contract 1.15.5).
+      Optional<core::ProgramRunNumber>(
           x, "program_run_id", [](const Value &n) {
-            Require(n.is_string(), "program_run_id has the wrong type");
-            return core::ProgramRunId(n.as_string());
+            Require(n.is_number() && n.as_number() >= 1.0 &&
+                        std::floor(n.as_number()) == n.as_number() &&
+                        n.as_number() <= kMaximumSafeInteger,
+                    "program_run_id is out of range");
+            return core::ProgramRunNumber(static_cast<std::uint64_t>(n.as_number()));
           }),
       Optional<core::CellAdmissionClaimGeneration>(
           x, "cycle_claim_generation", [](const Value &n) {
@@ -264,10 +287,9 @@ core::ProgramCycleStatusDTO CycleStatus(const Value &x) {
             return core::ContentDigest(n.as_string());
           }),
       Optional<core::AcceptedProgramResetDTO>(x, "accepted_reset", [](const Value& reset) {
-        Exact(reset, 6U);
+        Exact(reset, 5U);
         return core::AcceptedProgramResetDTO{
-            core::RequestOwnerEpoch(Text(reset, "request_owner_epoch", core::kMaximumProgramResetCallerIdentityBytes)),
-            core::RequestId(Text(reset, "request_id", core::kMaximumProgramResetCallerIdentityBytes)),
+            Key(reset, "request_key"),
             core::ContentDigest(Text(reset, "request_payload_digest")),
             Bool(reset, "reload_initial_scene"), Bool(reset, "reset_robot_position"),
             Optional<core::CellAdmissionClaimGeneration>(reset, "reset_claim_generation", [](const Value& value) {
@@ -291,17 +313,19 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(const Value &v) {
   if (has_runner_loss) {
     result.program_runner_loss = Optional<core::ProgramRunnerContactLossDTO>(
         v, "program_runner_loss", [](const Value &x) {
-          Exact(x, 5U);
+          Exact(x, 4U);
           const auto predicate = Text(x, "failure_predicate", 128U);
           Require(predicate == "program_runner_liveness_probe" ||
                       predicate == "program_runner_liveness_renewal" ||
-                      predicate == "program_runner_reconciliation_renewal",
+                      predicate == "program_runner_reconciliation_renewal" ||
+                      predicate == "program_runner_fault",
                   "Program Runner loss predicate is unsupported");
           return core::ProgramRunnerContactLossDTO{
-              core::RequestOwnerEpoch(Text(x, "manager_owner_epoch")),
-              core::RuntimeEpoch(Text(x, "manager_runtime_epoch")),
               CycleStatus(Member(x, "established_cycle")), predicate,
-              Text(x, "message", 1024U)};
+              Text(x, "message", 1024U),
+              Member(x, "fault_code").is_null()
+                  ? std::nullopt
+                  : std::optional<std::string>(Text(x, "fault_code", 128U))};
         });
   }
   result.required_component_status_current =
@@ -333,21 +357,6 @@ core::CellAdmissionReadinessSnapshotDTO Readiness(const Value &v) {
           "cell-admission readiness snapshot is invalid");
   return result;
 }
-core::CellAdmissionReconcileDTO Reconcile(const Value &v) {
-  Exact(v, 4U);
-  core::CellAdmissionReconcileDTO result{
-      core::RequestOwnerEpoch(Text(v, "kernel_owner_epoch")), {}, {},
-      core::ContentDigest(Text(v, "reconciliation_evidence_digest"))};
-  for (const auto &x : Array(v, "retained_claims"))
-    result.retained_claims.push_back(Claim(x));
-  for (const auto &x : Array(v, "current_owner_epochs")) {
-    Exact(x, 2U);
-    result.current_owner_epochs.push_back(
-        {OwnerRole(Text(x, "owner_role")),
-         core::RequestOwnerEpoch(Text(x, "owner_epoch"))});
-  }
-  return result;
-}
 core::CellAdmissionRecoveryReceiptQueryDTO RecoveryQuery(const Value &v) {
   Exact(v, 3U);
   auto result = core::CellAdmissionRecoveryReceiptQueryDTO{
@@ -363,7 +372,7 @@ core::CellAdmissionRecoveryReceiptQueryDTO RecoveryQuery(const Value &v) {
 
 core::OperatorAlarmAttentionSnapshotDTO
 OperatorAlarmAttention(const Value &v) {
-  Exact(v, 9U);
+  Exact(v, 8U);
   Require(Text(v, "schema_version") == core::kOperatorAlarmAttentionSchemaVersion,
           "operator-alarm attention schema is unsupported");
   core::OperatorAlarmAttentionSnapshotDTO snapshot;
@@ -381,13 +390,13 @@ OperatorAlarmAttention(const Value &v) {
           });
   snapshot.cell_id = core::CellId(
       Text(v, "cell_id", core::kMaximumOperatorAlarmAttentionTextBytes));
-  snapshot.owner_epoch =
-      Text(v, "owner_epoch", core::kMaximumOperatorAlarmAttentionTextBytes);
   snapshot.owner_host_boot_id = Text(
       v, "owner_host_boot_id", core::kMaximumOperatorAlarmAttentionTextBytes);
-  snapshot.owner_incarnation_us = Counter(v, "owner_incarnation_us", 1U);
   snapshot.generation = Counter(v, "generation");
   snapshot.reconciled = Bool(v, "reconciled");
+  // OD-215: the disk check's alarm is active (manual moves and a Reset's move
+  // back are then refused too).
+  snapshot.disk_cannot_keep_records = Bool(v, "disk_cannot_keep_records");
   const auto &members = Member(v, "members");
   Require(members.is_array() &&
               members.as_array().size() <=
@@ -448,19 +457,17 @@ Value IntentValue(const core::CellAdmissionClaimIntentDTO &v) {
        OptionalValue(v.intervention_evidence, [](const auto &x) {
          return Value(Value::Object{
              {"offer_digest", Value(x.offer_digest.value())},
-             {"offer_transaction_id", Value(x.offer_transaction_id)},
-             {"offering_owner_epoch", Value(x.offering_owner_epoch.value())},
+             {"offer_transaction_id", TransactionIdValue(x.offer_transaction_id)},
              {"offering_owner_role",
-              Value(std::string(core::to_string(x.offering_owner_role)))},
+              Value(std::string(core::ApplicationRoleText(x.offering_owner_role)))},
              {"parent_program_cycle_claim_generation",
               OptionalValue(x.parent_program_cycle_claim_generation,
                             [](const auto &n) {
                               return Value(static_cast<double>(n.value()));
                             })}});
        })},
-      {"owner_epoch", Value(v.owner_epoch.value())},
-      {"owner_role", Value(std::string(core::to_string(v.owner_role)))},
-      {"owner_transaction_id", Value(v.owner_transaction_id)},
+      {"owner_role", Value(std::string(core::ApplicationRoleText(v.owner_role)))},
+      {"owner_transaction_id", TransactionIdValue(v.owner_transaction_id)},
       {"program_cycle_evidence",
        OptionalValue(v.program_cycle_evidence, [](const auto &x) {
          return Value(Value::Object{
@@ -468,18 +475,16 @@ Value IntentValue(const core::CellAdmissionClaimIntentDTO &v) {
               Value(x.applied_program_revision.value())},
              {"draft_program_revision", Value(x.draft_program_revision.value())}});
        })},
-      {"request_id", Value(v.request_id.value())},
-      {"request_payload_digest", Value(v.request_payload_digest.value())},
+      {"request_key", Value(core::RequestKeyText(v.request_key))},
       {"scope", ScopeValue(v.scope)}};
   if (v.program_node_evidence.has_value()) {
     const auto& x = *v.program_node_evidence;
     fields.emplace_back("program_node_evidence", Value(Value::Object{
-        {"program_runner_owner_epoch", Value(x.program_runner_owner_epoch.value())},
-        {"program_run_id", Value(x.program_run_id.value())},
+        {"program_run_id", Value(static_cast<double>(x.program_run_id.value()))},
         {"parent_program_cycle_claim_generation",
          Value(static_cast<double>(x.parent_program_cycle_claim_generation.value()))},
         {"node_instance_id", Value(x.node_instance_id)},
-        {"node_attempt_id", Value(x.node_attempt_id)},
+        {"node_attempt_id", Value(static_cast<double>(x.node_attempt_id.value()))},
         {"owner_api", Value(x.owner_api)},
     }));
   }
@@ -500,33 +505,14 @@ Value ReleaseValue(const core::CellAdmissionClaimReleaseDTO &v) {
        Value(static_cast<double>(v.acquired_admission_generation.value()))},
       {"claim_generation",
        Value(static_cast<double>(v.claim_generation.value()))},
-      {"owner_epoch", Value(v.owner_epoch.value())},
-      {"owner_role", Value(std::string(core::to_string(v.owner_role)))},
-      {"owner_transaction_id", Value(v.owner_transaction_id)},
-      {"request_id", Value(v.request_id.value())},
-      {"request_payload_digest", Value(v.request_payload_digest.value())},
+      {"owner_role", Value(std::string(core::ApplicationRoleText(v.owner_role)))},
+      {"owner_transaction_id", TransactionIdValue(v.owner_transaction_id)},
+      {"request_key", Value(core::RequestKeyText(v.request_key))},
       {"settlement",
        Value(Value::Object{
            {"evidence_digest", Value(v.settlement.evidence_digest.value())},
            {"settlement_kind",
             Value(std::string(core::to_string(v.settlement.settlement_kind)))}})}});
-}
-Value OwnerEpochValue(const core::CellAdmissionCurrentOwnerEpochDTO &v) {
-  return Value(Value::Object{
-      {"owner_epoch", Value(v.owner_epoch.value())},
-      {"owner_role", Value(std::string(core::to_string(v.owner_role)))}});
-}
-Value ReconcileSettlementValue(
-    const core::CellAdmissionReconcileSettlementDTO &v) {
-  return Value(Value::Object{
-      {"predecessor_claim", ClaimValue(v.predecessor_claim)},
-      {"reconciliation_evidence_digest",
-       Value(v.reconciliation_evidence_digest.value())},
-      {"settlement_predicate",
-       Value(std::string(core::to_string(v.settlement_predicate)))},
-      {"successor_owner_epoch", Value(v.successor_owner_epoch.value())},
-      {"successor_owner_role",
-       Value(std::string(core::to_string(v.successor_owner_role)))}});
 }
 Value RecoveryReceiptValue(
     const core::CellAdmissionRecoveryReceiptDTO &v) {
@@ -535,22 +521,13 @@ Value RecoveryReceiptValue(
   Value::Array held;
   for (const auto &claim : v.held_claims)
     held.push_back(ClaimValue(claim));
-  Value::Array owners;
-  for (const auto &owner : v.current_owner_epochs)
-    owners.push_back(OwnerEpochValue(owner));
   return Value(Value::Object{
       {"admission_generation",
        Value(static_cast<double>(v.admission_generation.value()))},
-      {"current_owner_epochs", Value(std::move(owners))},
       {"held_claims", Value(std::move(held))},
-      {"kernel_owner_epoch", Value(v.kernel_owner_epoch.value())},
       {"matched_claim",
        OptionalValue(v.matched_claim,
                      [](const auto &x) { return ClaimValue(x); })},
-      {"matched_reconcile_settlement",
-       OptionalValue(v.matched_reconcile_settlement, [](const auto &x) {
-         return ReconcileSettlementValue(x);
-       })},
       {"matched_release",
        OptionalValue(v.matched_release,
                      [](const auto &x) { return ReleaseValue(x); })},
@@ -575,32 +552,31 @@ bool IsCommand(std::string_view v) {
   return v == "cell_admission_get" ||
          v == "cell_admission_update_readiness" ||
          v == "cell_admission_acquire" || v == "cell_admission_release" ||
-         v == "cell_admission_reconcile" ||
          v == "cell_admission_recovery_receipt" ||
          v == cm::kPublishOperatorAlarmAttentionCommand;
 }
 } // namespace
 
 Value ProgramRunnerLossValue(const core::ProgramRunnerContactLossDTO &loss,
-                            const core::RequestOwnerEpoch &kernel_owner_epoch) {
+                            const core::ApplicationStartId application_start_id) {
   Require(core::ValidateProgramRunnerContactLoss(loss).ok(),
           "Program Runner loss snapshot is invalid");
   const auto &cycle = loss.established_cycle;
-  const auto optional_id = [](const auto &id) { return Value(id.value()); };
   const auto optional_counter = [](const auto &number) {
     return Value(static_cast<double>(number.value()));
   };
   return Value(Value::Object{
-      {"request_owner_epoch", Value(kernel_owner_epoch.value())},
-      {"manager_owner_epoch", Value(loss.manager_owner_epoch.value())},
-      {"manager_runtime_epoch", Value(loss.manager_runtime_epoch.value())},
+      // The start, once at the top level (contract 1.16.4 rule 2).
+      {"application_start_id",
+       Value(std::string(core::FormatApplicationStartId(application_start_id).data(), 16U))},
       {"failure_predicate", Value(loss.failure_predicate)},
       {"message", Value(loss.message)},
+      {"fault_code", OptionalValue(loss.fault_code,
+                                   [](const std::string &code) { return Value(code); })},
       {"established_cycle", Value(Value::Object{
-          {"program_runner_owner_epoch", Value(cycle.program_runner_owner_epoch.value())},
           {"cycle_generation", Value(static_cast<double>(cycle.cycle_generation))},
           {"state", Value(std::string(core::to_string(cycle.state)))},
-          {"program_run_id", OptionalValue(cycle.program_run_id, optional_id)},
+          {"program_run_id", OptionalValue(cycle.program_run_id, optional_counter)},
           {"cycle_claim_generation", OptionalValue(cycle.cycle_claim_generation, optional_counter)},
           {"terminal_or_settlement_reference", Value(nullptr)},
           {"accepted_reset", Value(nullptr)}})},
@@ -612,20 +588,6 @@ core::CellAdmissionClaimDTO DecodeCellAdmissionClaim(
   Require(bytes.size() <= kMaximumPacketBytes,
           "cell-admission claim JSON is oversized");
   return Claim(ci::parse_canonical_json(bytes));
-}
-
-core::CellAdmissionClaimIntentDTO DecodeCellAdmissionClaimIntent(
-    const std::string_view bytes) {
-  Require(bytes.size() <= kMaximumPacketBytes,
-          "cell-admission intent JSON is oversized");
-  return Intent(ci::parse_canonical_json(bytes));
-}
-
-core::CellAdmissionClaimReleaseDTO DecodeCellAdmissionClaimRelease(
-    const std::string_view bytes) {
-  Require(bytes.size() <= kMaximumPacketBytes,
-          "cell-admission release JSON is oversized");
-  return Release(ci::parse_canonical_json(bytes));
 }
 
 std::optional<cm::KernelCellAdmissionRpcPacket>
@@ -651,20 +613,29 @@ TryDecodeCellAdmissionCommand(std::string_view bytes) {
     Exact(root, 2U);
     return cm::KernelCellAdmissionRpcPacket{command, std::monostate{}};
   }
-  Exact(root, 3U);
   const auto &request = Member(root, "request");
+  if (command == "cell_admission_acquire") {
+    auto intent = Intent(request);
+    // A Program Reset claim carries the runner's current cycle status beside
+    // its intent (OD-139); no other claim kind carries it.
+    if (intent.claim_kind == core::CellAdmissionClaimKindDTO::kProgramReset) {
+      Exact(root, 4U);
+      return cm::KernelCellAdmissionRpcPacket{
+          command, cm::ProgramResetClaimAcquireRequest{
+                       std::move(intent), CycleStatus(Member(root, "program_cycle_status"))}};
+    }
+    Exact(root, 3U);
+    return cm::KernelCellAdmissionRpcPacket{command, std::move(intent)};
+  }
+  Exact(root, 3U);
   if (command == "cell_admission_update_readiness")
     return cm::KernelCellAdmissionRpcPacket{command, Readiness(request)};
-  if (command == "cell_admission_acquire")
-    return cm::KernelCellAdmissionRpcPacket{command, Intent(request)};
   if (command == "cell_admission_release")
     return cm::KernelCellAdmissionRpcPacket{command, Release(request)};
   if (command == "cell_admission_recovery_receipt")
     return cm::KernelCellAdmissionRpcPacket{command, RecoveryQuery(request)};
-  if (command == cm::kPublishOperatorAlarmAttentionCommand)
-    return cm::KernelCellAdmissionRpcPacket{command,
-                                            OperatorAlarmAttention(request)};
-  return cm::KernelCellAdmissionRpcPacket{command, Reconcile(request)};
+  return cm::KernelCellAdmissionRpcPacket{command,
+                                          OperatorAlarmAttention(request)};
 }
 
 Value CellAdmissionResponseValue(
@@ -694,8 +665,7 @@ Value CellAdmissionResponseValue(
         "operator_alarm_attention",
         Value(Value::Object{
             {"generation",
-             Value(static_cast<double>(attention->generation))},
-            {"owner_epoch", Value(attention->owner_epoch)}}));
+             Value(static_cast<double>(attention->generation))}}));
   else
     result.emplace_back(
         "authoring_admission",

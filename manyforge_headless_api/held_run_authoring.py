@@ -11,7 +11,7 @@ Kernel, either never released (Executed but not Run) or stopped with its Stop
 certified, and the Kernel admits a Program operation only for a released node.
 Control-flow nodes never move, so they do not count. A failure pause also
 needs its published recovery offer with confirmed containment; a settled Halt
-(Full Stopped) needs no active operation. Every manual operation must be
+(run state ``halted``) needs no active operation. Every manual operation must be
 affirmatively settled. An unavailable, unknown or settling fact means "not
 editable". A Draft edit has no external effect, so this grants nothing beyond
 the edit itself: Apply, Execute and every other command keep their own
@@ -87,7 +87,7 @@ def held_run_draft_edit_allowed(cycle: Any, control_response: Any) -> bool:
     if not all(manual_operation_settled(row) for row in manual):
         return False
     state = run.get("state")
-    if state == "full_stopped":
+    if state == "halted":
         return run.get("active_operation_count") == 0
     if state not in {"running", "intervention_required"}:
         return False

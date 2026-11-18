@@ -38,12 +38,14 @@ RuntimeCollisionMonitor::RuntimeCollisionMonitor(
     IScheduler& scheduler,
     Config config,
     TickCallback tick_callback,
-    ShouldContinueCallback should_continue_callback)
+    ShouldContinueCallback should_continue_callback,
+    LateEpisodeCallback late_episode_callback)
     : clock_(clock),
       scheduler_(scheduler),
       config_(config),
       tick_callback_(std::move(tick_callback)),
-      should_continue_callback_(std::move(should_continue_callback)) {}
+      should_continue_callback_(std::move(should_continue_callback)),
+      late_episode_callback_(std::move(late_episode_callback)) {}
 
 bool RuntimeCollisionMonitor::in_callback() const noexcept {
   return t_current_runtime_collision_monitor == this;
@@ -68,10 +70,20 @@ void RuntimeCollisionMonitor::start() {
     handle_ = 0;
   }
   const auto period_ns = std::max<Duration>(1, config_.period_ns);
-  schedule_next_locked(generation_, saturating_add(clock_.now(), period_ns));
+  const auto now = clock_.now();
+  // OD-217: a monitoring run opens its deadman window now (no sample is
+  // verified yet) and starts outside any late episode.
+  verified_sample_ns_.store(now, std::memory_order_relaxed);
+  timing_consecutive_late_periods_.store(0, std::memory_order_relaxed);
+  schedule_next_locked(generation_, saturating_add(now, period_ns));
 }
 
 void RuntimeCollisionMonitor::stop(bool drain_callbacks) {
+  stop(drain_callbacks ? StopWait::kLaneAndOwnCallbacks
+                       : StopWait::kOwnCallbacksBounded);
+}
+
+void RuntimeCollisionMonitor::stop(StopWait wait) {
   {
     std::lock_guard<std::mutex> lock(mutex_);
     if (detach_completed_) return;
@@ -88,7 +100,9 @@ void RuntimeCollisionMonitor::stop(bool drain_callbacks) {
     }
     // Monitor callbacks can own borrowed kernel state: a missed drain bound
     // must not continue into teardown or a new session. It keeps waiting.
-    if (drain_callbacks) {
+    // The lane drain is for detach/destruction only: after the in-flight
+    // count drops, a returning callback still touches this object.
+    if (wait == StopWait::kLaneAndOwnCallbacks) {
       WaitForDrain(
           "runtime_collision_monitor.scheduler_runtime_safety_lane",
           kDrainCallbacksTimeout,
@@ -103,7 +117,7 @@ void RuntimeCollisionMonitor::stop(bool drain_callbacks) {
     auto no_callbacks_in_flight = [this]() {
       return callbacks_in_flight_ == 0;
     };
-    if (drain_callbacks) {
+    if (wait != StopWait::kOwnCallbacksBounded) {
       WaitForDrain(
           "runtime_collision_monitor.monitor_callbacks", kDrainCallbacksTimeout,
           [&](std::chrono::nanoseconds bound) {
@@ -173,7 +187,18 @@ RuntimeCollisionMonitorTimingMetrics RuntimeCollisionMonitor::timing_metrics()
       timing_late_periods_.load(std::memory_order_relaxed),
       timing_missed_periods_.load(std::memory_order_relaxed),
       timing_max_consecutive_late_periods_.load(std::memory_order_relaxed),
+      timing_late_episodes_.load(std::memory_order_relaxed),
   };
+}
+
+void RuntimeCollisionMonitor::note_verified_sample(
+    const TimePoint received_ns) noexcept {
+  auto current = verified_sample_ns_.load(std::memory_order_relaxed);
+  while (current < received_ns &&
+         !verified_sample_ns_.compare_exchange_weak(
+             current, received_ns, std::memory_order_relaxed,
+             std::memory_order_relaxed)) {
+  }
 }
 
 void RuntimeCollisionMonitor::schedule_next_locked(std::uint64_t generation,
@@ -248,6 +273,15 @@ void RuntimeCollisionMonitor::schedule_next_locked(std::uint64_t generation,
                   1, std::memory_order_relaxed) +
               1;
           update_atomic_max(timing_max_consecutive_late_periods_, consecutive);
+          if (consecutive == 1) {
+            // OD-217: the first late check of an episode reports it once.
+            timing_late_episodes_.fetch_add(1, std::memory_order_relaxed);
+            if (late_episode_callback_) {
+              late_episode_callback_(RuntimeCollisionMonitorLateEpisode{
+                  elapsed_after_deadline_ns, missed, callback_duration_ns,
+                  timing_metrics()});
+            }
+          }
         } else {
           timing_consecutive_late_periods_.store(0,
                                                  std::memory_order_relaxed);
@@ -260,7 +294,9 @@ void RuntimeCollisionMonitor::schedule_next_locked(std::uint64_t generation,
         }
         // Keep a fixed-rate cadence without queuing a catch-up burst. Every
         // elapsed deadline is counted above; the next callback is scheduled at
-        // the first cadence boundary strictly after this callback completed.
+        // the first cadence boundary strictly after this callback completed:
+        // deadline + (missed + 1) * period, on the grid set by start(), so a
+        // late check never shifts the grid and a missed period is skipped.
         TimePoint next_deadline = saturating_add(deadline, period_ns);
         if (callback_finished_ns > deadline) {
           const auto remainder =

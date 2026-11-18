@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import uuid
 from copy import deepcopy
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
@@ -29,6 +31,7 @@ from manyforge_composer.backend.routes_deployment_draft import create_deployment
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.program import Program
 from manyforge_headless_api.client import HeadlessClientError
+from manyforge_headless_api.models import ManagerApplyAcknowledgementContext
 from manyforge_composer.backend.scenario_artifacts import (
     UNTITLED_SCENARIO_PATH,
     ScenarioArtifactError,
@@ -116,7 +119,7 @@ def test_persisted_document_identity_includes_authorable_metadata() -> None:
 def test_scenario_save_adopts_both_baselines_and_member_saves_preserve_other_draft(
     tmp_path: Path,
 ) -> None:
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
     authoring = deepcopy(_PROGRAM_FIXTURE)
     program, diagnostics = derive_candidate(authoring, state.node_catalog)
@@ -238,7 +241,7 @@ def test_scenario_save_records_ready_only_for_the_applied_content(
     deployment_matches: bool,
     expected: str,
 ) -> None:
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
     authoring = deepcopy(_PROGRAM_FIXTURE)
     program, diagnostics = derive_candidate(authoring, state.node_catalog)
@@ -287,6 +290,12 @@ def _fixture_model_source(tmp_path: Path) -> None:
 class _PassThroughAdmission:
     def __init__(self) -> None:
         self.events: list[str] = []
+
+    def settle_before_preparation(self) -> None:
+        """No local claim is pending in these route-unit tests."""
+
+    def manager_submission_sent(self, _claim) -> None:
+        """The parent claim's hand-over is the real coordinator's concern."""
 
     def execute(
         self,
@@ -375,10 +384,48 @@ class _PassThroughAdmission:
         return result
 
 
-def _scenario_client(state: ComposerState) -> TestClient:
+def _preparation_reply(request: dict) -> dict:
+    """Headless's answer to an activation preparation that already ended
+    ``succeeded`` (OD-214); its result is read by digest."""
+
+    return {
+        "schema_version": "manyforge.activation_preparation_reply.v1",
+        "command": {
+            "kind": "activation_preparation", "request_key": request["request_key"],
+            "captured_input_digest": request["captured_input_digest"],
+            "step": "preparing", "accepted_at_ns": "1",
+            "end": {"outcome": "succeeded", "code": None, "details": None,
+                    "finished_at_ns": "2"},
+        },
+    }
+
+
+class _CommandClient(TestClient):
+    """A TestClient that sends Load and New as Apply-level commands (OD-214)."""
+
+    def __init__(self, app: FastAPI, state: ComposerState) -> None:
+        super().__init__(app)
+        self.state = state
+
+    def command(self, path: str, body: dict) -> tuple[Any, dict | None]:
+        """Post with a fresh request key; the row once it ended (an accepted
+        command), else ``None`` (refused at once)."""
+
+        key = uuid.uuid4().hex
+        response = self.post(path, json={**body, "request_key": key})
+        if response.status_code != 200:
+            return response, None
+        assert response.json()["schema_version"] == "manyforge.apply_command_reply.v1"
+        assert response.json()["command"]["request_key"] == key
+        row = self.state.apply_commands.ended_row(key)
+        assert row is not None and row["end"] is not None
+        return response, row
+
+
+def _scenario_client(state: ComposerState) -> _CommandClient:
     app = FastAPI()
     app.include_router(create_scenario_document_router(state))
-    return TestClient(app)
+    return _CommandClient(app, state)
 
 
 class _ManagerStub:
@@ -392,16 +439,21 @@ class _ManagerStub:
     def program_cycle_status(self) -> dict:
         return {"state": "idle_after_reset"}
 
+    def execution_control_state(self) -> dict:
+        return {"control_state": {"manual_operations": []}}
+
     def components(self) -> list:
         return []
 
     def authoring_admission(self) -> dict:
         return {"authoring_allowed": True, "admission_generation": 1}
 
-    def manager_apply_status(self, _apply_id, _generation) -> dict:
+    def manager_apply_status(self, _apply_id, _generation, *, application_start_id) -> dict:
         return {"ok": True, "state": "succeeded"}
 
-    def manager_apply_release_for_new(self, _context) -> dict:
+    def manager_apply_release_for_new(self, context) -> dict:
+        # The real client validates the context strictly before sending.
+        ManagerApplyAcknowledgementContext.model_validate(context)
         return {"ok": True, "released": None}
 
     def program_applied(self) -> dict:
@@ -420,8 +472,8 @@ def _fence(state: ComposerState) -> dict:
         "deploymentDraftId": deployment["draft_id"],
         "expectedDeploymentDraftRevision": deployment["draft_revision"],
         "expectedAdmissionGeneration": 1,
-        "requestOwnerEpoch": "browser-test-epoch",
-        "requestId": "scenario-test-request",
+        "applicationStartId": "3f9a0000000000a1",
+        "requestKey": "5ce0" * 8,
         "expectedWorkspaceEpoch": identity.workspace_epoch,
         "expectedWorkspaceRevision": identity.workspace_revision,
     }
@@ -459,7 +511,7 @@ def test_scenario_discard_commits_every_pending_draft_in_one_scenario_commit(
     deployment_pending: bool,
     expected: list[str],
 ) -> None:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     admission = _DraftEditAdmission()
     state.authoring_admission = admission  # type: ignore[assignment]
     installed: list[str] = []
@@ -506,7 +558,7 @@ def test_scenario_discard_commits_every_pending_draft_in_one_scenario_commit(
 def test_scenario_discard_refuses_a_stale_workspace_before_any_discard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     state.authoring_admission = _DraftEditAdmission()  # type: ignore[assignment]
     monkeypatch.setattr(routes_scenario_documents, "prepare_program_discard",
                         lambda *_args: pytest.fail("a stale request must not prepare a discard"))
@@ -523,7 +575,7 @@ def test_scenario_discard_refuses_a_stale_workspace_before_any_discard(
 def test_scenario_discard_refuses_a_stale_draft_fence_without_containing(
     monkeypatch: pytest.MonkeyPatch, stale_field: str
 ) -> None:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     admission = _DraftEditAdmission()
     state.authoring_admission = admission  # type: ignore[assignment]
     monkeypatch.setattr(routes_scenario_documents, "program_workspace",
@@ -780,7 +832,7 @@ def test_interrupted_overwrite_is_detected_without_rollback(
 def test_routes_reject_loading_incomplete_scenario_without_workspace_mutation(
     tmp_path: Path,
 ) -> None:
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
     client = _scenario_client(state)
     target = tmp_path / "draft_cell.scenario"
@@ -803,20 +855,78 @@ def test_routes_reject_loading_incomplete_scenario_without_workspace_mutation(
     assert (target / "scenario.yaml").is_file()
 
     before_load = state.authoring_workspace.snapshot().identity
-    rejected = client.post(
-        "/api/scenario/load",
-        json={"path": str(target)},
-    )
+    rejected, _rejected_row = client.command("/api/scenario/load", {"path": str(target)})
     assert rejected.status_code == 409
     assert rejected.json()["detail"]["code"] == "scenario_activation_incomplete"
+    assert rejected.json()["detail"]["effect"] == "none"
+    # The refusal names the missing member under ``details`` (OD-260); both
+    # members are empty here and the Program's is named first.
+    assert rejected.json()["detail"]["details"] == {
+        "member": "program.yaml", "diagnostic_count": 0,
+    }
+    assert "context" not in rejected.json()["detail"]
     assert state.authoring_workspace.snapshot().identity == before_load
+
+
+def test_load_of_a_program_that_cannot_be_built_names_its_first_diagnostic(
+    tmp_path: Path,
+) -> None:
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
+    state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
+    client = _scenario_client(state)
+    # The root's children become the top-level nodes: the Program has more
+    # than one root and cannot be built.
+    authoring = deepcopy(_PROGRAM_FIXTURE)
+    root = authoring["forest"][0]
+    assert len(root["children"]) > 1
+    authoring["forest"] = root["children"]
+    authoring["positions"] = {
+        key: value for key, value in authoring["positions"].items()
+        if key != root["instance_id"]
+    }
+    document = _document("cell")
+    document["program_draft"] = authoring
+    target = Path(save_scenario_artifact(
+        document, str(tmp_path / "cell.scenario"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    ))
+    expected = derive_candidate(authoring, state.node_catalog)[1]
+    assert expected[0]["code"] == "authoring_forest_root_count"
+
+    before_load = state.authoring_workspace.snapshot().identity
+    rejected, _rejected_row = client.command("/api/scenario/load", {"path": str(target)})
+    assert rejected.status_code == 409
+    detail = rejected.json()["detail"]
+    assert detail["code"] == "scenario_activation_incomplete"
+    assert detail["effect"] == "none"
+    assert detail["details"] == {
+        "member": "program.yaml",
+        "cause_code": "authoring_forest_root_count",
+        "path": "forest",
+        "diagnostic_count": len(expected),
+    }
+    assert "context" not in detail
+    assert state.authoring_workspace.snapshot().identity == before_load
+
+    # A complete Program with an empty Deployment names deployment.yaml.
+    no_deployment = _document("other")
+    no_deployment["deployment_draft"] = None
+    other = save_scenario_artifact(
+        no_deployment, str(tmp_path / "other.scenario"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    )
+    rejected, _rejected_row = client.command("/api/scenario/load", {"path": other})
+    assert rejected.status_code == 409
+    assert rejected.json()["detail"]["details"] == {
+        "member": "deployment.yaml", "diagnostic_count": 0,
+    }
 
 
 def test_save_keeps_written_file_but_refuses_a_stale_saved_baseline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
     client = _scenario_client(state)
     target = tmp_path / "raced-save.scenario"
@@ -876,7 +986,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
             overwrite=False,
         )
     )
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     admission = _PassThroughAdmission()
     state.authoring_admission = admission  # type: ignore[assignment]
     state.headless_client = _ManagerStub()  # type: ignore[assignment]
@@ -960,7 +1070,7 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
         return {"status": "applied", "apply_id": None}
 
     monkeypatch.setattr(state, "_manager_current", lambda _status, **_kw: (
-        "current-bundle", "current-graph", "manager-epoch"
+        "current-bundle", "current-graph"
     ))
     monkeypatch.setattr(
         state, "execute_authored_deployment_candidate", prepare_or_apply
@@ -972,18 +1082,17 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
     )
     refused_startup = {"path": "/p/other.scenario", "code": "scenario_load_failed", "message": "m"}
     state.startup_scenario_notice = refused_startup
-    response = client.post(
-        "/api/scenario/load",
-        json={"path": str(target)},
-    )
+    response, response_row = client.command("/api/scenario/load", {"path": str(target)})
 
     if preparation_fails:
-        assert response.status_code == 409, response.text
-        assert response.json()["detail"] == {
+        # The preparation runs after the Load was accepted (OD-214): its
+        # definite refusal ends the row ``refused``, with no effect.
+        assert response.status_code == 200, response.text
+        assert response_row["end"] == {
+            "outcome": "refused",
             "code": "activation_preparation_failed",
-            "message": "Activation preparation failed",
             "details": {"preparer_detail": "invalid candidate geometry"},
-            "effect": "none",
+            "finished_at_ns": response_row["end"]["finished_at_ns"],
         }
         assert admission.events == []
         assert state.authoring_workspace.snapshot() == before
@@ -991,8 +1100,11 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
         return
 
     assert response.status_code == 200, response.text
-    assert response.json()["outcome"] == "succeeded"
-    assert response.json()["components"] == []
+    assert response_row["end"]["outcome"] == "succeeded"
+    # A succeeded Apply-level row keeps the ApplyResult's component rows
+    # (OD-214 contract §3.1); this Scenario has no components.
+    assert response_row["end"]["details"] == {"components": []}
+    assert response_row["kind"] == "scenario_load"
     # Load = Close, then Apply of the file: two orchestrated Applies.
     assert admission.events == ["validate", "commit", "submit", "wake"] * 2
     # Each: Preview, then the Apply's own preparation and its submission.
@@ -1000,10 +1112,9 @@ def test_scenario_load_uses_one_claim_for_workspace_commit_and_activation(
     assert state.scenario_document_id == "loaded-project"
     assert state.startup_scenario_notice is None  # An opened Scenario clears it.
     loaded = state.authoring_workspace.snapshot().as_dict()
-    # The reply carries the full committed snapshot the browser parser
-    # requires (the same shape as every other authoring route), not only its
-    # identity.
-    assert response.json()["authoringWorkspace"] == loaded
+    # The reply is the row (OD-214); the committed snapshot is read from the
+    # workspace, as after every other authoring change.
+    assert set(response.json()) == {"schema_version", "command"}
     assert loaded["schemaVersion"] == (
         "manyforge.composer_authoring_workspace_snapshot.v3"
     )
@@ -1035,9 +1146,9 @@ def test_scenario_load_settles_only_proven_preacceptance_rejection(
             overwrite=False,
         )
     )
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     claim_owner = _SettlingHeadless()
-    coordinator = AuthoringAdmissionCoordinator(claim_owner)  # type: ignore[arg-type]
+    coordinator = AuthoringAdmissionCoordinator(claim_owner, 0x3F9A0000000000A1)  # type: ignore[arg-type]
     state.authoring_admission = coordinator  # type: ignore[assignment]
     state.headless_client = _ManagerStub()  # type: ignore[assignment]
     client = _scenario_client(state)
@@ -1082,13 +1193,15 @@ def test_scenario_load_settles_only_proven_preacceptance_rejection(
             return {
                 "prepared_activation": candidate,
                 "candidate_preview": {"diff": {}},
-                "manager_apply": {"request_id": "isaac-load.1"},
+                "manager_apply": {"request_key": "1" * 32},
                 "confirmation_required": False,
                 "confirmation_token": None,
                 "preparation": None,
                 "phases_ms": {},
             }
         assert prepared is not None
+        # Each code is the Manager request's own outcome: it was sent.
+        coordinator.manager_submission_sent(_claim)
         raise AuthoringOperationError(
             failure_code,
             (
@@ -1101,24 +1214,22 @@ def test_scenario_load_settles_only_proven_preacceptance_rejection(
     monkeypatch.setattr(
         state,
         "_manager_current",
-        lambda _status, **_kw: ("current-bundle", "current-graph", "manager-epoch"),
+        lambda _status, **_kw: ("current-bundle", "current-graph"),
     )
     monkeypatch.setattr(
         state, "execute_authored_deployment_candidate", prepare_or_reject
     )
-    response = client.post(
-        "/api/scenario/load",
-        json={"path": str(target)},
-    )
+    response, response_row = client.command("/api/scenario/load", {"path": str(target)})
 
     assert state.authoring_workspace.snapshot().identity != before.identity
     # A failed Manager step ends the Load with its typed error (no retry);
     # here it is the Close's, so the file's Apply never starts.
     assert response.status_code == 200, response.text
-    assert response.json()["outcome"] == "failed"
-    assert response.json()["error"]["code"] == failure_code
+    assert response_row["end"]["outcome"] == "failed"
+    assert response_row["end"]["code"] == failure_code
     if settled:
-        assert "named Isaac world is unavailable" in response.json()["error"]["message"]
+        # The row carries the code only; its text comes from the catalogue.
+        assert "message" not in response_row["end"]
         assert claim_owner.settlements == ["owner_commit"]
         assert coordinator.local_claim_pending is False
         assert coordinator.mutation_ready is True
@@ -1126,9 +1237,143 @@ def test_scenario_load_settles_only_proven_preacceptance_rejection(
         [outcome] = coordinator._outcomes.values()
         assert outcome["kind"] == "settled"
     else:
+        # Sent with an uncertain outcome: the Manager owns the parent claim.
+        # Composer neither releases it nor blocks authoring (OD-196).
         assert claim_owner.settlements == []
-        assert coordinator.local_claim_pending is True
-        assert coordinator.mutation_ready is False
+        assert coordinator.local_claim_pending is False
+        assert coordinator.mutation_ready is True
+
+
+def test_new_after_a_failed_apply_with_a_lost_answer_works_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OD-196, study section C: an Apply was sent, its answer lost, and it
+    failed. New's Manager release frees its parent claim (the Manager is the
+    only releaser of it); Composer holds no record of that claim, so New, then
+    a Draft edit and a Load, work."""
+
+    from manyforge_composer.tests.test_authoring_local_mutation import _Cell
+
+    class Cell(_Cell, _ManagerStub):
+        """Kernel and Manager double plus the stub's other Headless reads."""
+
+    target = Path(
+        save_scenario_artifact(
+            _document("loaded-project"),
+            str(tmp_path / "loaded-project.scenario"),
+            allowed_roots=[str(tmp_path)],
+            overwrite=False,
+        )
+    )
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
+    cell = Cell()
+    coordinator = AuthoringAdmissionCoordinator(cell, 0x3F9A0000000000A1)  # type: ignore[arg-type]
+    state.authoring_admission = coordinator  # type: ignore[assignment]
+    state.headless_client = cell  # type: ignore[assignment]
+    monkeypatch.setattr(state, "_manager_current", lambda _status, **_kw: ("bundle", "graph"))
+    monkeypatch.setattr(routes_scenario_documents, "program_workspace",
+                        lambda _state: {"authoringWorkspace": {"workspaceEpoch": "test"}})
+
+    def submit_through_manager(intent_key: str, claim: dict) -> dict:
+        accepted = state.apply_manager_deployment_candidate(
+            {"manager_apply": {"request_key": intent_key}}, claim
+        )
+        return {
+            "status": "accepted",
+            "apply_id": accepted["apply_id"],
+            "apply_generation": accepted["apply_generation"],
+        }
+
+    # The earlier Apply: sent, accepted, answer lost, then failed.
+    cell.manager_fault = "lost_after_accept"
+    with pytest.raises(AuthoringOperationError):
+        coordinator.execute_external_submission(
+            AuthoringMutationEnvelope(
+                expected_admission_generation=cell.generation,
+                application_start_id=0x3F9A0000000000A1,
+                request_key=bytes.fromhex("0a" * 16),
+            ),
+            operation_kind="apply_program",
+            draft_id=state.draft_session.draft_id,
+            draft_revision=state.draft_session.revision,
+            payload={},
+            validate_under_claim=lambda _claim: None,
+            submit=lambda claim: submit_through_manager("1" * 32, claim),
+        )
+    cell.end_apply(1, "failed")
+    assert list(cell.held) == ["0a" * 16]
+    assert coordinator.local_claim_pending is False
+    cell.calls.clear()
+
+    def prepare_or_apply(
+        intent, claim, *, apply, prepared=None, prepare_only=False, confirmed=False
+    ):
+        if prepare_only:
+            # The real preparation first settles a lost answer's claim
+            # (state._prepare_authored_deployment_candidate), then Headless
+            # waits for open admission.
+            state.authoring_admission.settle_before_preparation()
+            cell.calls.append(("prepare", not cell.held))
+            return {"confirmation_required": False, "prepared_activation": {},
+                    "candidate_preview": {"impact": {"components": []}}}
+        return submit_through_manager(intent["request_key"], claim)
+
+    monkeypatch.setattr(state, "execute_authored_deployment_candidate", prepare_or_apply)
+    client = _scenario_client(state)
+
+    response, response_row = client.command("/api/scenario/new", {"discard_unsaved": True})
+
+    assert response.status_code == 200, response.text
+    assert response_row["end"]["outcome"] == "succeeded"
+    claim_and_manager = [
+        call for call in cell.calls
+        if call[0] not in {"authoring_admission", "manager_apply_status"}
+    ]
+    # The Manager releases the failed Apply's parent (claim 1); Composer
+    # never touches it. New's own claim 2 is the Manager's once sent, and the
+    # Manager releases it when New's Apply succeeds.
+    assert claim_and_manager[:5] == [
+        ("release_for_new",),
+        ("manager_release", 1),
+        ("prepare", True),
+        ("prepare", True),
+        ("acquire", claim_and_manager[4][1]),
+    ]
+    assert claim_and_manager[5:] == [("manager_apply", 2), ("manager_release", 2)]
+    assert not any(call[0] == "settle" for call in cell.calls)
+    assert cell.held == {}
+    assert coordinator.local_claim_pending is False
+    assert coordinator.mutation_ready is True
+
+    # A Draft edit works.
+    coordinator.execute_draft_edit(
+        AuthoringMutationEnvelope(
+            expected_admission_generation=cell.generation,
+            application_start_id=0x3F9A0000000000A1,
+            request_key=bytes.fromhex("0b" * 16),
+        ),
+        operation_kind="discard_scenario",
+        workspace=state.authoring_workspace,
+        draft_id=state.draft_session.draft_id,
+        expected_identity=state.authoring_workspace.identity(),
+        install=lambda: False,
+        session="scenario",
+    )
+
+    # A Load works: its New has nothing left to release, then the file applies.
+    cell.calls.clear()
+    loaded, loaded_row = client.command("/api/scenario/load", {"path": str(target)})
+    assert loaded.status_code == 200, loaded.text
+    assert loaded_row["end"]["outcome"] == "succeeded"
+    assert [call[0] for call in cell.calls if call[0] in {
+        "release_for_new", "acquire", "settle", "manager_apply", "manager_release",
+    }] == [
+        "release_for_new",
+        "acquire", "manager_apply", "manager_release",  # the New inside Load
+        "acquire", "manager_apply", "manager_release",  # the file's Apply
+    ]
+    assert cell.held == {}
+    assert coordinator.local_claim_pending is False
 
 
 def test_scenario_load_partial_contained_install_keeps_the_claim(
@@ -1142,9 +1387,9 @@ def test_scenario_load_partial_contained_install_keeps_the_claim(
             overwrite=False,
         )
     )
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     headless = _SettlingHeadless()
-    coordinator = AuthoringAdmissionCoordinator(headless)  # type: ignore[arg-type]
+    coordinator = AuthoringAdmissionCoordinator(headless, 0x3F9A0000000000A1)  # type: ignore[arg-type]
     state.authoring_admission = coordinator  # type: ignore[assignment]
     state.headless_client = _ManagerStub()  # type: ignore[assignment]
     client = _scenario_client(state)
@@ -1167,26 +1412,20 @@ def test_scenario_load_partial_contained_install_keeps_the_claim(
         raise RuntimeError("Deployment install failed")
 
     monkeypatch.setattr(state, "_manager_current", lambda _status, **_kw: (
-        "current-bundle", "current-graph", "manager-epoch"
+        "current-bundle", "current-graph"
     ))
     monkeypatch.setattr(state, "execute_authored_deployment_candidate", prepare_or_apply)
     # The Program installs first; the Deployment install then fails.
     monkeypatch.setattr(
         state.deployment_draft_session, "install_prepared_replacement", broken_install
     )
-    response = client.post(
-        "/api/scenario/load",
-        json={"path": str(target)},
-    )
+    response, response_row = client.command("/api/scenario/load", {"path": str(target)})
 
-    # The contained workspace refuses every later read, the Load's own
-    # result included; the refusal names the install failure.
-    # The body is the failed ApplyResult; the status stays 503.
-    assert response.status_code == 503, response.text
-    result = response.json()
-    assert result["outcome"] == "failed"
-    assert result["error"]["code"] == "composer_workspace_failed_closed"
-    assert "Deployment install failed" in result["error"]["message"]
+    # The contained workspace refuses every later read; the Load's row
+    # ends ``failed`` with the containment's code.
+    assert response.status_code == 200, response.text
+    assert response_row["end"]["outcome"] == "failed"
+    assert response_row["end"]["code"] == "composer_workspace_failed_closed"
     assert state.authoring_workspace.failed_closed is not None
     assert submitted == []
     # Never settled as proven no effect: the claim is retained, admission blocked.
@@ -1214,7 +1453,7 @@ def test_untitled_scenario_resource_is_the_canonical_empty_project(tmp_path: Pat
     document = build_scenario_document(
         scenario_id="Untitled", name="Untitled", description="",
         program_draft=authoring, deployment_draft=deepcopy(_UNTITLED_DEPLOYMENT),
-        manyforge_version="0.2.0", last_known_status="incomplete",
+        manyforge_version="0.3.0", last_known_status="incomplete",
     )
     members, manifest = scenario_artifacts._project_payload(document, source_snapshot={
         "schema_version": scenario_artifacts.SCENARIO_SOURCE_SNAPSHOT_VERSION, "entries": [],
@@ -1241,10 +1480,10 @@ def test_new_loads_the_read_only_untitled_scenario_and_save_as_places_it(
 ) -> None:
     untitled_files = {path.name: path.read_bytes() for path in UNTITLED_SCENARIO_PATH.iterdir()}
     # A repository-wide root may also contain the package: it is still never written.
-    state = ComposerState(allowed_fs_roots=[str(tmp_path), str(UNTITLED_SCENARIO_PATH.parent)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path), str(UNTITLED_SCENARIO_PATH.parent)])
     state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
     state.headless_client = _ManagerStub()  # type: ignore[assignment]
-    monkeypatch.setattr(state, "_manager_current", lambda _status, **_kw: ("bundle", "graph", "epoch"))
+    monkeypatch.setattr(state, "_manager_current", lambda _status, **_kw: ("bundle", "graph"))
     monkeypatch.setattr(routes_scenario_documents, "program_workspace",
                         lambda _state: {"authoringWorkspace": {"workspaceEpoch": "test"}})
     intents: list[dict] = []
@@ -1257,17 +1496,18 @@ def test_new_loads_the_read_only_untitled_scenario_and_save_as_places_it(
             assert confirmed is True
             return {"confirmation_required": False, "prepared_activation": {},
                     "candidate_preview": {"impact": {"components": []}}}
-        return {"status": "accepted", "apply_id": "new-apply", "apply_generation": 1}
+        return {"status": "accepted", "apply_id": 1, "apply_generation": 1}
 
     monkeypatch.setattr(state, "execute_authored_deployment_candidate", prepare_or_apply)
     state.startup_scenario_notice = {"path": "/p/x.scenario", "code": "scenario_load_failed", "message": "m"}
     before = state.authoring_workspace.snapshot()
     client = _scenario_client(state)
-    response = client.post("/api/scenario/new", json={"discard_unsaved": True})
+    response, response_row = client.command("/api/scenario/new", {"discard_unsaved": True})
     assert response.status_code == 200, response.text
-    assert response.json()["outcome"] == "succeeded"
+    assert response_row["end"]["outcome"] == "succeeded"
     assert intents[-1]["scene_initialization"] == "initialize"
-    assert (response.json()["path"], response.json()["scenario_id"]) == (str(UNTITLED_SCENARIO_PATH), "Untitled")
+    assert response_row["kind"] == "scenario_new"
+    assert state.scenario_document_id == "Untitled"
     intent = intents[-1]
     assert intent["scenario_id"] == "Untitled"
     assert intent["project_path"] == str(UNTITLED_SCENARIO_PATH)
@@ -1321,12 +1561,12 @@ class _RunnerKernelCell:
     current = {"retained_bundle_id": _sha("c"), "graph_revision": _sha("d")}
 
     def __init__(self, state: str, *, motion_held: bool = False, lag: int = 2) -> None:
-        self.cycle: dict = {"state": state, "cycle_generation": 4, "program_run_id": "run.1"}
+        self.cycle: dict = {"state": state, "cycle_generation": 4, "program_run_id": 1}
         if state == "running":
             self.cycle["run"] = {
-                "state": "full_stopped" if motion_held else "running",
+                "state": "halted" if motion_held else "running",
                 "active_operation_count": 0,
-                "capture": {"program_run_id": "run.1"},
+                "capture": {"program_run_id": 1},
             }
         self.kernel_cycle = state
         self.lag = lag
@@ -1338,18 +1578,25 @@ class _RunnerKernelCell:
         self.apply_failure: dict | None = None
         self.held_by_failed_apply = False
         self.release_requests: list[dict] = []
+        self.manual_operations: list[dict] = []
+        self.prepared_activations: dict[str, dict] = {}
 
     # Runner (through Headless)
     def program_cycle_status(self) -> dict:
         return deepcopy(self.cycle)
 
     def execution_control_state(self) -> dict:
-        return {"control_state": {"manual_operations": []}}
+        return {"control_state": {"manual_operations": deepcopy(self.manual_operations)}}
 
     def program_cycle_reset(self, body: dict) -> dict:
         self.resets.append(body)
         self.cycle = {"state": "idle_after_reset", "cycle_generation": 5}
-        return {"ok": True}
+        # The runner's row (OD-214), here already ended in its reply.
+        return {"schema_version": "manyforge.program_command_reply.v1", "command": {
+            "kind": "reset", "request_key": body["request_key"], "step": "releasing",
+            "accepted_at_ns": "1",
+            "end": {"outcome": "succeeded", "code": None, "details": None,
+                    "finished_at_ns": "2"}}}
 
     # Kernel authoring admission
     def authoring_admission(self) -> dict:
@@ -1389,7 +1636,7 @@ class _RunnerKernelCell:
         self._require_admission()
         self.prepared.append(request["scenario_id"])
         program = request["program"] is not None
-        return {"prepared_activation": {
+        self.prepared_activations[request["captured_input_digest"]] = {"prepared_activation": {
             "schema_version": "manyforge.prepared_activation_input.v7",
             "prepared_activation_id": _sha("1"),
             "origin": {"kind": "scenario", "scenario_id": request["scenario_id"],
@@ -1407,11 +1654,14 @@ class _RunnerKernelCell:
             "node_environment_digest": _sha("7"),
             "assistant_mode": "forbidden",
         }}
+        return _preparation_reply(request)
+
+    def prepared_activation(self, captured_input_digest: str) -> dict:
+        return deepcopy(self.prepared_activations[captured_input_digest])
 
     def manager_status(self) -> dict:
         return {
-            "source": {"available": True, "freshness": "fresh", "known_gaps": [],
-                       "source_owner_epoch": "manager.epoch"},
+            "source": {"available": True, "freshness": "fresh", "known_gaps": []},
             "status": {"manager_ready": True, "active": dict(self.current)},
         }
 
@@ -1425,11 +1675,11 @@ class _RunnerKernelCell:
 
     def manager_apply(self, body: dict) -> dict:
         assert self.claimed and body["parent_authoring_claim"]
-        self.applies.append(body["correlation_id"])
-        return {"ok": True, "state": "pending", "apply_id": f"apply-{len(self.applies)}",
+        self.applies.append(body["request_key"])
+        return {"ok": True, "state": "pending", "apply_id": len(self.applies),
                 "apply_generation": 1}
 
-    def manager_apply_status(self, _apply_id, _generation) -> dict:
+    def manager_apply_status(self, _apply_id, _generation, *, application_start_id) -> dict:
         if self.apply_failure is not None:
             failure, self.apply_failure = self.apply_failure, None
             if failure.get("effect_boundary") == "before_effect":
@@ -1448,7 +1698,7 @@ class _RunnerKernelCell:
         if not self.held_by_failed_apply:
             return {"ok": True, "released": None}
         self.held_by_failed_apply = self.claimed = False
-        return {"ok": True, "released": {"apply_id": f"apply-{len(self.applies)}",
+        return {"ok": True, "released": {"apply_id": len(self.applies),
                                          "apply_generation": 1}}
 
     def components(self) -> list:
@@ -1461,8 +1711,8 @@ def _runner_kernel_client(
     """The real Load/New route, admission coordinator and candidate
     preparation; only Headless is a double (plus the read-only views)."""
 
-    state = ComposerState(allowed_fs_roots=[str(tmp_path), str(UNTITLED_SCENARIO_PATH.parent)])
-    state.authoring_admission = AuthoringAdmissionCoordinator(cell)  # type: ignore[arg-type]
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path), str(UNTITLED_SCENARIO_PATH.parent)])
+    state.authoring_admission = AuthoringAdmissionCoordinator(cell, 0x3F9A0000000000A1)  # type: ignore[arg-type]
     state.headless_client = cell  # type: ignore[assignment]
     monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": None})
     monkeypatch.setattr(routes_scenario_documents, "program_workspace",
@@ -1488,12 +1738,12 @@ def test_load_after_a_finished_or_held_run_resets_it_first(
         "running" if motion_held else "terminal_awaiting_reset", motion_held=motion_held
     )
     client = _runner_kernel_client(tmp_path, monkeypatch, cell)
-    response = client.post("/api/scenario/load", json={"path": target, "discard_unsaved": True})
+    response, response_row = client.command("/api/scenario/load", {"path": target, "discard_unsaved": True})
     assert response.status_code == 200, response.text
-    assert response.json()["outcome"] == "succeeded", response.json()
-    assert response.json()["scenario_id"] == "loaded-project"
+    assert response_row["end"]["outcome"] == "succeeded", response.json()
+    assert client.state.scenario_document_id == "loaded-project"
     [reset] = cell.resets
-    assert (reset["program_run_id"], reset["expected_cycle_generation"]) == ("run.1", 4)
+    assert (reset["program_run_id"], reset["expected_cycle_generation"]) == (1, 4)
     # The New (its Preview, then the Apply's own preparation), then the file.
     assert cell.prepared == ["Untitled", "Untitled", "loaded-project", "loaded-project"]
     assert len(cell.applies) == 2 and cell.claimed is False
@@ -1504,9 +1754,9 @@ def test_new_after_a_finished_run_resets_it_first(
 ) -> None:
     cell = _RunnerKernelCell("terminal_awaiting_reset")
     client = _runner_kernel_client(tmp_path, monkeypatch, cell)
-    response = client.post("/api/scenario/new", json={"discard_unsaved": True})
+    response, response_row = client.command("/api/scenario/new", {"discard_unsaved": True})
     assert response.status_code == 200, response.text
-    assert response.json()["outcome"] == "succeeded", response.json()
+    assert response_row["end"]["outcome"] == "succeeded", response.json()
     assert len(cell.resets) == 1
     assert cell.prepared == ["Untitled", "Untitled"] and len(cell.applies) == 1
 
@@ -1527,28 +1777,33 @@ def test_new_releases_an_unknown_effect_apply_and_load_works_again(
         "code": "configuration_preservation_failed", "effect_boundary": "unknown",
         "message": "Execution host: retained native owner differs from the planned predecessor",
     }
-    failed = client.post("/api/scenario/load", json={"path": target, "discard_unsaved": True})
+    failed, failed_row = client.command("/api/scenario/load", {"path": target, "discard_unsaved": True})
     assert failed.status_code == 200, failed.text
-    assert failed.json()["outcome"] == "failed"
+    # The Manager's terminal is ``unknown_effect``: the row ends ``unknown``
+    # (OD-214 contract §3.1).
+    assert failed_row["end"]["outcome"] == "unknown"
     assert cell.held_by_failed_apply and cell.claimed
     assert cell.authoring_admission()["authoring_allowed"] is False
     # That Load's own New had nothing to release yet.
     assert len(cell.release_requests) == 1
 
-    response = client.post("/api/scenario/new", json={"discard_unsaved": True})
+    response, response_row = client.command("/api/scenario/new", {"discard_unsaved": True})
     assert response.status_code == 200, response.text
-    assert response.json()["outcome"] == "succeeded", response.json()
+    assert response_row["end"]["outcome"] == "succeeded", response.json()
     release = cell.release_requests[-1]
     assert release["source_label"] == "manyforge_composer"
-    assert release["request_id"].startswith("composer-new.")
+    # New's own fresh key. The context is exactly what the Headless client
+    # accepts: its model forbids any other member.
+    assert len(release["request_key"]) == 32
+    ManagerApplyAcknowledgementContext.model_validate(release)
     assert not cell.held_by_failed_apply and not cell.claimed
     assert cell.authoring_admission()["authoring_allowed"] is True
 
     applies = len(cell.applies)
-    loaded = client.post("/api/scenario/load", json={"path": target, "discard_unsaved": True})
+    loaded, loaded_row = client.command("/api/scenario/load", {"path": target, "discard_unsaved": True})
     assert loaded.status_code == 200, loaded.text
-    assert loaded.json()["outcome"] == "succeeded", loaded.json()
-    assert loaded.json()["scenario_id"] == "loaded-project"
+    assert loaded_row["end"]["outcome"] == "succeeded", loaded.json()
+    assert client.state.scenario_document_id == "loaded-project"
     # Its New found nothing left to release.
     assert len(cell.release_requests) == 3 and len(cell.applies) == applies + 2
 
@@ -1566,8 +1821,8 @@ def test_load_failed_before_any_effect_restores_the_previous_drafts(
         allowed_roots=[str(tmp_path)], overwrite=False,
     )
     cell = _RunnerKernelCell("idle_after_reset")
-    state = ComposerState(allowed_fs_roots=[str(tmp_path), str(UNTITLED_SCENARIO_PATH.parent)])
-    state.authoring_admission = AuthoringAdmissionCoordinator(cell)  # type: ignore[arg-type]
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path), str(UNTITLED_SCENARIO_PATH.parent)])
+    state.authoring_admission = AuthoringAdmissionCoordinator(cell, 0x3F9A0000000000A1)  # type: ignore[arg-type]
     state.headless_client = cell  # type: ignore[assignment]
     monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": None})
     monkeypatch.setattr(routes_scenario_documents, "program_workspace",
@@ -1576,8 +1831,8 @@ def test_load_failed_before_any_effect_restores_the_previous_drafts(
 
     monkeypatch.setattr(HeadlessApplyPorts, "_POLL_SECONDS", 0.0)
     client = _scenario_client(state)
-    loaded = client.post("/api/scenario/load", json={"path": target, "discard_unsaved": True})
-    assert loaded.json()["outcome"] == "succeeded", loaded.json()
+    loaded, loaded_row = client.command("/api/scenario/load", {"path": target, "discard_unsaved": True})
+    assert loaded_row["end"]["outcome"] == "succeeded", loaded.json()
 
     def drafts() -> tuple[dict, dict, dict]:
         program = state.draft_session.retained_state()
@@ -1594,14 +1849,18 @@ def test_load_failed_before_any_effect_restores_the_previous_drafts(
         "cause_details": {"cause_code": "kernel_apply_fence_request_failed",
                           "cause": "the execution owner has no reconciled active configuration"},
     }
-    failed = client.post("/api/scenario/load", json={"path": target, "discard_unsaved": True})
+    failed, failed_row = client.command("/api/scenario/load", {"path": target, "discard_unsaved": True})
     assert failed.status_code == 200, failed.text
-    result = failed.json()
-    assert result["outcome"] == "failed"
-    assert result["error"]["code"] == "kernel_apply_fence_request_failed"
+    # A Manager terminal ``unknown_effect`` ends the row ``unknown`` (OD-214
+    # contract §3.1); a failure before any effect ends it ``failed``.
+    assert failed_row["end"]["outcome"] == (
+        "failed" if boundary == "before_effect" else "unknown"
+    )
+    assert failed_row["end"]["code"] == "kernel_apply_fence_request_failed"
     if boundary == "before_effect":
         assert drafts() == before
-        assert result["authoringWorkspace"]["project"]["document_id"] == "loaded-project"
+        assert state.authoring_workspace.snapshot().as_dict()["project"][
+            "document_id"] == "loaded-project"
         assert cell.authoring_admission()["authoring_allowed"] is True
     else:
         assert drafts() != before
@@ -1610,19 +1869,29 @@ def test_load_failed_before_any_effect_restores_the_previous_drafts(
 
 class _FailedStopKernel:
     """The Kernel reads one real Runner port makes at Reset: its Program-run
-    Stop ends ``failed`` (nothing contained)."""
+    Stop left the run's node faulted (nothing contained)."""
 
     def identity(self) -> dict:
-        return {"ok": True, "identity": {"owner_epoch": "kernel.epoch.1"}}
+        return {"ok": True, "identity": {"application_start_id": "3f9a00000000002a"}}
 
     def stop_program_run(self, body: dict) -> dict:
-        return {"ok": True, "owner_epoch": "kernel.epoch.1", "accepted": {
-            "request_id": body["request_context"]["request_id"], "stop_id": "stop-1",
-            "stop_generation": 1, "replay_status": "accepted_new"}}
+        assert set(body) == {"request_context", "program_run_id"}
+        return {"ok": True, "command": "stop_program_run", "accepted": {
+            "request_key": body["request_context"]["request_key"], "event_id": 1,
+            "hold_revision": 1, "replay_status": "accepted_new",
+            "program_run_id": body["program_run_id"], "requested": "program_end",
+            "applied": "program_end", "widen_reason": "none", "covered": [],
+            "stale_diagnostics": [], "stale_total": 0, "accepted_at_ns": 1}}
 
-    def stop_status(self, stop_id: str) -> dict:
-        return {"ok": True, "stop_status": {
-            "stop_id": stop_id, "state": "failed", "stop_generation": 1}}
+    def read_program_execution_scope(self, program_run_id: int) -> dict:
+        return {"ok": True, "scope": {
+            "schema_version": "manyforge.program_execution_scope.v3",
+            "claim_generation": 1, "program_run_id": program_run_id,
+            "hold_revision": 1, "ready_node_indices": [], "held_node_indices": [],
+            "stopping_node_indices": [], "faulted_node_indices": [0],
+            "selection_release_block_reason": None, "stopped_by": None,
+            "rule_id": None, "frozen": "program_end", "frozen_by": 1,
+            "all_groups_held": False}}
 
     def __getattr__(self, name: str):
         if name in {"submit", "read", "reset", "acknowledge_completed", "stop"}:
@@ -1640,7 +1909,7 @@ class _FailedStopRunnerCell(_RunnerKernelCell):
 
         super().__init__("terminal_awaiting_reset")
         self.port = NativeKernelProgramPort(KernelClient(_FailedStopKernel()))
-        self.port.scope.request_stop("run.1", "stop.operator", "operator Stop")
+        self.port.scope.request_stop(1, bytes(range(16)), "operator Stop")
 
     def program_cycle_reset(self, body: dict) -> dict:
         self.port.scope.reset(body["program_run_id"])
@@ -1656,19 +1925,19 @@ def test_new_and_load_succeed_after_a_failed_program_stop(
     cell = _FailedStopRunnerCell()
     client = _runner_kernel_client(tmp_path, monkeypatch, cell)
     if route == "new":
-        response = client.post("/api/scenario/new", json={"discard_unsaved": True})
+        response, response_row = client.command("/api/scenario/new", {"discard_unsaved": True})
     else:
         target = save_scenario_artifact(
             _document("loaded-project"), str(tmp_path / "loaded-project.scenario"),
             allowed_roots=[str(tmp_path)], overwrite=False,
         )
-        response = client.post(
-            "/api/scenario/load", json={"path": target, "discard_unsaved": True}
+        response, response_row = client.command(
+            "/api/scenario/load", {"path": target, "discard_unsaved": True}
         )
     assert response.status_code == 200, response.text
-    assert response.json()["outcome"] == "succeeded", response.json()
+    assert response_row["end"]["outcome"] == "succeeded", response.json()
     assert len(cell.resets) == 1
-    assert cell.port.scope.capture_stop("run.1") is None
+    assert cell.port.scope.observe(1).state.value == "settled"
 
 
 def test_load_while_run_motion_executes_is_refused_before_any_effect(
@@ -1680,10 +1949,155 @@ def test_load_while_run_motion_executes_is_refused_before_any_effect(
     )
     cell = _RunnerKernelCell("running")
     client = _runner_kernel_client(tmp_path, monkeypatch, cell)
-    response = client.post("/api/scenario/load", json={"path": target, "discard_unsaved": True})
+    response, response_row = client.command("/api/scenario/load", {"path": target, "discard_unsaved": True})
     assert response.status_code == 409, response.text
     assert response.json()["detail"]["code"] == "apply_refused_run_in_progress"
     assert cell.resets == [] and cell.prepared == [] and cell.applies == []
+
+
+# New waits while motion executes or a Stop is in progress (maintainer,
+# 2026-11-13): refused before it releases or changes anything.
+def test_new_while_run_motion_executes_is_refused_before_it_releases_anything(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cell = _RunnerKernelCell("running")
+    cell.held_by_failed_apply = True
+    client = _runner_kernel_client(tmp_path, monkeypatch, cell)
+    response, response_row = client.command("/api/scenario/new", {"discard_unsaved": True})
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert (detail["code"], detail["effect"]) == ("apply_refused_run_in_progress", "none")
+    assert cell.release_requests == [] and cell.held_by_failed_apply
+    assert cell.resets == [] and cell.prepared == [] and cell.applies == []
+
+
+@pytest.mark.parametrize("operation", ["executing", "stopping"])
+def test_new_during_a_manual_move_is_refused_before_any_effect_and_works_after_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, operation: str
+) -> None:
+    cell = _RunnerKernelCell("idle_after_reset")
+    cell.manual_operations = [{"resident": True, "operation": {"state": operation}}]
+    client = _runner_kernel_client(tmp_path, monkeypatch, cell)
+    response, response_row = client.command("/api/scenario/new", {"discard_unsaved": True})
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert (detail["code"], detail["effect"]) == ("authoring_not_ready", "none")
+    assert cell.release_requests == [] and cell.prepared == [] and cell.applies == []
+
+    cell.manual_operations = [{"resident": False, "operation": {"state": "stopped"}}]
+    response, response_row = client.command("/api/scenario/new", {"discard_unsaved": True})
+    assert response.status_code == 200, response.text
+    assert response_row["end"]["outcome"] == "succeeded", response.json()
+    assert len(cell.release_requests) == 1 and len(cell.applies) == 1
+
+
+def test_new_with_all_run_motion_held_resets_the_run_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Unchanged by New's motion check: a held run is Reset, then New runs.
+    cell = _RunnerKernelCell("running", motion_held=True)
+    client = _runner_kernel_client(tmp_path, monkeypatch, cell)
+    response, response_row = client.command("/api/scenario/new", {"discard_unsaved": True})
+    assert response.status_code == 200, response.text
+    assert response_row["end"]["outcome"] == "succeeded", response.json()
+    assert len(cell.resets) == 1 and len(cell.applies) == 1
+
+
+class _BusyComponentCell(_RunnerKernelCell):
+    """Two enabled arms the New removes; ``arm_b`` runs a Reset position
+    (OD-194). Records every component action and authoring claim acquire."""
+
+    def __init__(self) -> None:
+        super().__init__("idle_after_reset")
+        self.states: list[dict] = [
+            {"component_id": component_id, "lifecycle": "enabled", "activity": "idle",
+             "streams": [], "capabilities": [], "observed_at_ns": 1}
+            for component_id in ("arm_a", "arm_b")
+        ]
+        self.states[1].update(
+            activity="busy", action={"action": "reset_position", "started_at_ns": 1}
+        )
+        self.component_actions: list[tuple[str, str]] = []
+        self.acquires = 0
+
+    def action_ends(self) -> None:
+        self.states[1].pop("action")
+        self.states[1]["activity"] = "idle"
+
+    def components(self) -> list:
+        return deepcopy(self.states)
+
+    def component_action(self, component_id: str, action: str) -> dict:
+        from manyforge_headless_api.models import ComponentActionRequest
+
+        ComponentActionRequest.model_validate({"action": action})
+        self.component_actions.append((component_id, action))
+        row = next(row for row in self.states if row["component_id"] == component_id)
+        row["lifecycle"] = "prepared"
+        row["last_action"] = {"action": action, "outcome": "succeeded",
+                              "started_at_ns": 2, "finished_at_ns": 3}
+        return {"ok": True}
+
+    def acquire_authoring_transaction(self, body: dict) -> dict:
+        self.acquires += 1
+        return super().acquire_authoring_transaction(body)
+
+    def manager_deployment_candidate_preview(self, request: dict) -> dict:
+        preview = super().manager_deployment_candidate_preview(request)
+        preview["impact"]["components"] = [
+            {"controllable_component_id": component_id, "disposition": "remove"}
+            for component_id in ("arm_a", "arm_b")
+        ]
+        return preview
+
+
+def _assert_refused_for_the_busy_component(response, cell: _BusyComponentCell) -> None:
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert (detail["code"], detail["effect"]) == ("component_action_in_progress", "none")
+    assert detail["details"] == {"component_id": "arm_b", "action": "reset_position"}
+    # Nothing disabled, released, claimed, prepared or applied.
+    assert cell.component_actions == [] and cell.acquires == 0
+    assert cell.release_requests == [] and cell.prepared == [] and cell.applies == []
+
+
+def test_new_during_a_component_action_is_refused_before_any_disable_or_claim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # OD-194: New is refused up front while any component action runs.
+    cell = _BusyComponentCell()
+    client = _runner_kernel_client(tmp_path, monkeypatch, cell)
+    response, response_row = client.command("/api/scenario/new", {"discard_unsaved": True})
+    _assert_refused_for_the_busy_component(response, cell)
+
+    cell.action_ends()
+    response, response_row = client.command("/api/scenario/new", {"discard_unsaved": True})
+    assert response.status_code == 200, response.text
+    assert response_row["end"]["outcome"] == "succeeded", response.json()
+    assert sorted(cell.component_actions) == [("arm_a", "disable"), ("arm_b", "disable")]
+    assert cell.acquires >= 1 and len(cell.applies) == 1
+
+
+def test_load_during_a_component_action_is_refused_before_its_new_disables_or_claims(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # OD-194: Load's New step shares New's refusal.
+    target = save_scenario_artifact(
+        _document("loaded-project"), str(tmp_path / "loaded-project.scenario"),
+        allowed_roots=[str(tmp_path)], overwrite=False,
+    )
+    cell = _BusyComponentCell()
+    client = _runner_kernel_client(tmp_path, monkeypatch, cell)
+    response, response_row = client.command("/api/scenario/load", {"path": target, "discard_unsaved": True})
+    _assert_refused_for_the_busy_component(response, cell)
+
+    cell.action_ends()
+    response, response_row = client.command("/api/scenario/load", {"path": target, "discard_unsaved": True})
+    assert response.status_code == 200, response.text
+    assert response_row["end"]["outcome"] == "succeeded", response.json()
+    # The New disables both arms; the file's Apply finds them already gone.
+    assert sorted(cell.component_actions) == [("arm_a", "disable"), ("arm_b", "disable")]
+    assert cell.acquires >= 1 and len(cell.applies) == 2
 
 _INVALID_SCENARIO_NAMES = [
     "New cell", "new\tcell", " new_cell", "new_cell ", "-leading", "_leading",
@@ -1694,7 +2108,7 @@ _INVALID_SCENARIO_NAMES = [
 
 @pytest.mark.parametrize("name", _INVALID_SCENARIO_NAMES)
 def test_save_as_refuses_an_invalid_scenario_name(tmp_path: Path, name: str) -> None:
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
     before = state.authoring_workspace.snapshot()
     response = _scenario_client(state).post("/api/scenario-documents/save", json={
@@ -1813,7 +2227,7 @@ def test_routes_refuse_leftover_overrides_before_any_effect(tmp_path: Path) -> N
     workspace, so their operation boundary marks the refusal as no-effect.
     """
 
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
     client = _scenario_client(state)
     target = Path(save_scenario_artifact(
@@ -1827,9 +2241,9 @@ def test_routes_refuse_leftover_overrides_before_any_effect(tmp_path: Path) -> N
     before_workspace = state.authoring_workspace.snapshot().as_dict()
 
     responses = [
-        client.post("/api/scenario/load", json={
+        client.command("/api/scenario/load", {
             "path": str(target), "discard_unsaved": True,
-        }),
+        })[0],
         client.post("/api/scenario-documents/save", json={
             **_fence(state), **_save_target(target),
             "description": "", "confirmOverwrite": True,
@@ -1934,7 +2348,7 @@ def test_save_failure_codes_never_mean_both_refused_and_partially_written(
 def test_save_route_reports_a_partial_write_as_its_distinct_outcome(
     tmp_path: Path,
 ) -> None:
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
     client = _scenario_client(state)
     project = Path(save_scenario_artifact(
@@ -2143,7 +2557,7 @@ def test_dynamic_index_lists_only_project_documents(tmp_path: Path) -> None:
                 ],
             }
 
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.headless_client = Headless()  # type: ignore[assignment]
     response = _scenario_client(state).get(
         "/api/scenario-documents",
@@ -2186,14 +2600,16 @@ def test_load_confirmation_accepts_a_disruptive_impact_in_one_preparation(
     class Headless:
         prepare_calls = 0
 
-        def prepare_activation(self, _request):
+        def prepare_activation(self, request):
             Headless.prepare_calls += 1
+            return _preparation_reply(request)
+
+        def prepared_activation(self, _captured_input_digest):
             return {"prepared_activation": deepcopy(prepared_activation)}
 
         def manager_status(self):
             return {
-                "source": {"available": True, "freshness": "fresh", "known_gaps": [],
-                           "source_owner_epoch": "manager.epoch"},
+                "source": {"available": True, "freshness": "fresh", "known_gaps": []},
                 "status": {"manager_ready": True, "active": dict(current)},
             }
 
@@ -2210,7 +2626,7 @@ def test_load_confirmation_accepts_a_disruptive_impact_in_one_preparation(
                 },
             }
 
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.headless_client = Headless()  # type: ignore[assignment]
     intent = {
         "scenario_id": "cell",
@@ -2223,8 +2639,8 @@ def test_load_confirmation_accepts_a_disruptive_impact_in_one_preparation(
         "program_role_assignment": {},
         "expected_manager_current": dict(current),
         "expected_admission_generation": 1,
-        "manager_request_id": "request",
-        "correlation_id": "correlation",
+        "application_start_id": "3f9a0000000000a1",
+        "request_key": "d1" * 16,
         "confirmation_token": None,
         "draft_id": "draft",
         "draft_revision": 1,
@@ -2269,7 +2685,7 @@ def test_preparation_admission_refusal_is_marked_only_before_the_claim(
             Headless.manager_calls += 1
             raise AssertionError("no Manager read after a refused preparation")
 
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.headless_client = Headless()  # type: ignore[assignment]
     intent = {
         "scenario_id": "cell",
@@ -2282,6 +2698,7 @@ def test_preparation_admission_refusal_is_marked_only_before_the_claim(
         "program_role_assignment": {},
         "expected_manager_current": {},
         "expected_admission_generation": 1,
+        "application_start_id": "3f9a0000000000a1",
     }
     claim = {"claim": "test"} if claimed else None
 
@@ -2308,7 +2725,7 @@ def test_other_unclaimed_preparation_failures_stay_unmarked(tmp_path: Path) -> N
         def prepare_activation(self, _request):
             raise HeadlessClientError("headless_unavailable", "timed out")
 
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.headless_client = Headless()  # type: ignore[assignment]
     with pytest.raises(HeadlessClientError):
         state.execute_authored_deployment_candidate(
@@ -2322,6 +2739,7 @@ def test_other_unclaimed_preparation_failures_stay_unmarked(tmp_path: Path) -> N
                 "program": None,
                 "program_role_assignment": {},
                 "expected_admission_generation": 1,
+                "application_start_id": "3f9a0000000000a1",
             },
             None,
             apply=True,
@@ -2351,9 +2769,9 @@ def _claimed_scenario_state(
 ) -> tuple[ComposerState, TestClient, _SettlingHeadless]:
     """A complete authored workspace whose Saves take a real local claim."""
 
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     headless = _SettlingHeadless()
-    state.authoring_admission = AuthoringAdmissionCoordinator(headless)  # type: ignore[arg-type]
+    state.authoring_admission = AuthoringAdmissionCoordinator(headless, 0x3F9A0000000000A1)  # type: ignore[arg-type]
     authoring = deepcopy(_PROGRAM_FIXTURE)
     program, diagnostics = derive_candidate(authoring, state.node_catalog)
     post = routes_scenario_documents._workspace_post_state(
@@ -2465,8 +2883,8 @@ def test_scenario_save_after_its_write_is_saved_not_adopted_and_never_no_effect(
     # The exact request reads back as settled, so the browser is not locked.
     outcome = coordinator.submission_outcome(AuthoringMutationEnvelope(
         expected_admission_generation=1,
-        request_owner_epoch="browser-test-epoch",
-        request_id="scenario-test-request",
+        application_start_id=0x3F9A0000000000A1,
+        request_key=bytes.fromhex("5ce0" * 8),
     ))
     assert outcome["outcome"]["kind"] == "settled"
 
@@ -2682,7 +3100,7 @@ def test_f6b_manager_projection_unavailable_carries_bounded_diagnostics(
         "source": {
             "available": True, "freshness": "fresh", "known_gaps": [],
             "receiver_age_ns": 400_000_000, "source_generation": 41,
-            "source_owner_epoch": "manager.epoch.1", "source_owner_id": "manager",
+            "source_owner_id": "manager",
             "projection_generation": 90,
         },
         "status": {"manager_ready": True, "active": {
@@ -2690,12 +3108,12 @@ def test_f6b_manager_projection_unavailable_carries_bounded_diagnostics(
     }
     stale = deepcopy(current)
     stale["source"].update({
-        "freshness": "stale", "known_gaps": ["manager_source_stale"],
+        "freshness": "stale", "known_gaps": ["manager_status_unavailable"],
         "receiver_age_ns": 2_600_000_000, "source_generation": 42,
     })
     before = state_module._MANAGER_PROJECTION_GAPS["count"]
     # Unchanged on success; it marks the last current projection.
-    assert ComposerState._manager_current(current) == ("bundle", "graph", "manager.epoch.1")
+    assert ComposerState._manager_current(current) == ("bundle", "graph")
     with caplog.at_level("WARNING", logger=state_module.__name__):
         with pytest.raises(DraftSessionError) as error:
             ComposerState._manager_current(stale, phase="scenario_load.claim")
@@ -2706,7 +3124,7 @@ def test_f6b_manager_projection_unavailable_carries_bounded_diagnostics(
     assert detail["phase"] == "scenario_load.claim"
     assert detail["failed_checks"] == ["source_fresh", "no_known_gaps"]
     assert detail["freshness"] == "stale"
-    assert detail["known_gaps"] == ["manager_source_stale"]
+    assert detail["known_gaps"] == ["manager_status_unavailable"]
     assert detail["receiver_age_ms"] == 2_600
     assert isinstance(detail["source_last_update_unix_ms"], int)
     assert detail["source_owner_id"] == "manager"
@@ -2725,12 +3143,23 @@ def test_f6b_manager_projection_unavailable_carries_bounded_diagnostics(
     assert http.detail["effect"] == "none"
     assert http.detail["context"] == detail
 
+    # OD-281: a section too large for the status frame is refused with its
+    # own typed cause.
+    oversized = deepcopy(current)
+    oversized["source"].update({
+        "freshness": "unavailable", "known_gaps": ["manager_status_section_oversized"],
+    })
+    with pytest.raises(DraftSessionError) as error:
+        ComposerState._manager_current(oversized, phase="scenario_load.claim")
+    assert error.value.code == "manager_status_section_oversized"
+    assert error.value.status_code == 503
+
     # No source at all: every check is named, nothing raises while reporting it.
     with pytest.raises(DraftSessionError) as missing:
         ComposerState._manager_current({}, phase="activation.after_preparation")
     assert missing.value.detail["failed_checks"] == [
         "source_available", "source_fresh", "no_known_gaps",
-        "source_owner_epoch", "manager_ready", "active_identity",
+        "manager_ready", "active_identity",
     ]
     assert missing.value.detail["receiver_age_ms"] is None
 
@@ -2738,7 +3167,7 @@ def test_f6b_manager_projection_unavailable_carries_bounded_diagnostics(
 def _authored_save_client(tmp_path: Path) -> tuple[ComposerState, TestClient]:
     """A complete authored workspace whose Scenario Save passes admission."""
 
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
     authoring = deepcopy(_PROGRAM_FIXTURE)
     program, diagnostics = derive_candidate(authoring, state.node_catalog)
@@ -2797,7 +3226,7 @@ def test_save_as_writes_one_name_and_requires_overwrite_confirmation(
 def test_save_as_requires_a_parent_directory_inside_the_roots(tmp_path: Path) -> None:
     root = tmp_path / "root"
     root.mkdir()
-    state = ComposerState(allowed_fs_roots=[str(root)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(root)])
     state.authoring_admission = _PassThroughAdmission()  # type: ignore[assignment]
     client = _scenario_client(state)
     for directory in (str(tmp_path), str(root / ".."), str(root / "missing")):

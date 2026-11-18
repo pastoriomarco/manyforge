@@ -43,15 +43,17 @@ ______________________________________________________________________
 ## Processes
 
 `./scripts/compose-dev.sh start` runs the workbench in one ROS (Lyrical)
-container; `scripts/dev-workbench.py` starts these processes in it:
+container. `scripts/dev-workbench.py` starts the Manager and Vite; the Manager
+starts the other processes, supervises them, and ends the whole application
+when any of them exits:
 
 | Process | Started as | Port | Role |
 | --- | --- | --- | --- |
-| Program runner | `python -m manyforge_program_runner` | 9011 | Program cycle: tree ticking, Run/Stop/Reset, cycle journal |
-| Headless API | `python -m manyforge_headless_api serve` | 9010 | REST/WebSocket over the owners: components, cell latch, readiness, I/O, cycle, history, alarms |
-| Manager | `manyforge_manager_daemon` | (local sockets) | Apply journal and convergence; starts and stops the execution host |
+| Program runner | `python -m manyforge_program_runner` (started by the Manager) | 9011 | Program cycle: tree ticking, Run/Reset, cycle journal |
+| Headless API | `python -m manyforge_headless_api serve` (started by the Manager) | 9010 | REST/WebSocket over the owners: components, cell latch, readiness, I/O, cycle, history, alarms |
+| Manager | `manyforge_manager_daemon` | (local sockets) | The application's one supervisor: mints the application start identity, starts and stops the other processes and the execution host; Apply journal and convergence |
 | Execution host | `manyforge_ros2_control_execution_host` (started by the Manager) | — | Kernel, planner, collision, component adapters and their processes (`ros2_control.launch.py`, drivers, bridges, the AI assistant's host and bridge) |
-| Composer backend | `python -m manyforge_composer` | 9020 | GUI/REST/MCP shell: Drafts, Scenario files, Apply/Load/New orchestration, proxies to the Headless API |
+| Composer backend | `python -m manyforge_composer` (started by the Manager) | 9020 | GUI/REST/MCP shell: Drafts, Scenario files, Apply/Load/New orchestration, proxies to the Headless API |
 | Composer frontend | Vite (`npm run dev`) | 3000 | Browser GUI |
 
 The execution host also runs the candidate planner as a separate worker
@@ -70,7 +72,7 @@ container, on the same machine or the LAN, and is reached over ROS 2.
 | `manyforge_scene`                         | C++20            | Logical-scene owner: canonical-empty bootstrap, Apply handoff, scene transactions.                                                                                                                                         |
 | `manyforge_persistence`                   | C++20            | Shared SQLite preflight primitives for the durable owners.                                                                                                                                                                 |
 | `manyforge_headless_api`                  | Python/FastAPI   | Bounded REST/WebSocket projection and one execution-control ingress over the owners; component states, cell latch, Run readiness and I/O. It owns transport freshness and delivery, not runtime, Program, scene, alarm, or robot semantics. |
-| `manyforge_program_runner`                | Python/FastAPI   | Independently restartable durable Program-cycle owner: exact Applied capture, tree construction/ticking, backend-owned Resetting/allowed commands, current-state idempotence, and explicit Program Stop/Reset orchestration.   |
+| `manyforge_program_runner`                | Python/FastAPI   | Program-cycle owner for one application start: exact Applied capture, tree construction/ticking, backend-owned Resetting/allowed commands, current-state idempotence, and Reset orchestration.                            |
 | `manyforge_core/python`                   | pybind11         | Bindings exposing the kernel to Python (poll-based; no C++→Python callbacks).                                                                                                                                               |
 | `manyforge_collision`                     | C++20            | Planner-neutral collision-world/query implementation behind ManyForge collision ports.                                                                                                                                      |
 | `manyforge_roboplan`                      | C++ + pybind11   | The execution host: RoboPlan planning adapter and candidate worker, kernel composition, the ros2_control component adapter, the adapter registry, launch artifacts (`controller_launch_artifacts`) and the Mock, simulation and point-cloud adapter families. |
@@ -138,8 +140,8 @@ are separate measured facts and change the authoritative scene only through a
 configured pose-source policy.
 
 Each Apply carries a Scene choice: `initialize` (reset the logical scene and
-seed it from the authored Program/Deployment) or `preserve` (keep it). Load,
-New and a Deployment Apply initialize it. A failed initialization, or a pose-apply failure after
+seed it from the authored Program/Deployment) or `preserve` (keep it). Load
+and New initialize it; Program and Deployment Apply and Revert preserve it. A failed initialization, or a pose-apply failure after
 readiness, is a typed condition, not a silent fallback.
 
 ### Scene Viewer data plane
@@ -215,16 +217,22 @@ functions; external plant safety remains independent.
   lands mid-decision cannot be laundered into a normal completion — the fault
   outranks the normal terminal. Nothing in the behavior layer, Composer, or an
   LLM can fabricate a terminal state.
-- **The addressed kernel owns product Stop semantics.** Scoped Stop and Full
-  Stop are first-class cell operations. The owner resolves and captures scope,
-  reserves a fixed emergency transaction, atomically fences affected resource
-  slots, and hands bounded participant stages to `StopControl`; it then reduces
-  immutable results into one certificate. What a Stop leaves behind is read
-  from component states (the cell latch, below), not stored. Journal,
-  historian, and client latency cannot delay recognition or containment. A
-  controlled stop that a backend refuses does **not** report a stopped-looking
-  state—it advances only through the prepared cascade and otherwise remains
-  failed/intervention-required. Runtime collision enters this same addressed
+- **The addressed kernel owns product Stop semantics.** Stop (Program
+  groups), Stop all and Halt are first-class cell operations, and every Stop
+  goes from the client through Headless to the kernel, never through the
+  Program runner. Under one lock the kernel
+  records the Stop as an event in a fixed ring (a repeated request key is
+  recognised there), raises the Program run's hold, fences the affected
+  resource slots and starts each covered participant's bounded Stop stages;
+  it never refuses a Stop (an invalid one is widened to Stop all, an invalid
+  Halt stays a Halt). Each participant ends stopped or failed, and the event
+  completes when all have. What a Stop leaves behind is read from component
+  states (the cell latch, below), not stored. Journal, historian, and client
+  latency cannot delay recognition or containment. A controlled stop that a
+  backend refuses does **not** report a stopped-looking state—it advances
+  only through the prepared cascade, and a participant whose Stop ends failed
+  raises a Halt and leaves its component `stop_unconfirmed` until the
+  controller reports idle. Runtime collision enters this same addressed
   owner; the subordinate engine cannot issue a competing product Stop. Stop
   ownership never lives in a planner, backend, behavior tree, or UI.
 - **ManyForge owns collision validation.** Collision decisions come from
@@ -503,16 +511,18 @@ or blocks Execute.
 
 ### Faults and the cell latch
 
-A `Fault` has a typed `code` (`fault_estop`, `fault_protective_stop`,
+A `Fault` has a typed `code` (`fault_protective_stop`,
 `fault_drive`, `fault_communication`, `fault_stream_stale`,
 `fault_process_exited`, `fault_vendor`, …), the vendor's code and text where
 there is one, and the `operator_action` that clears it (`enable`, `recover`
 or `none`). The adapter maps vendor codes; unmapped ones pass through as
-`fault_vendor`.
+`fault_vendor`. An e-stop reported by the robot controller is not a fault:
+the component reports it as a `stop` (code `estop`).
 
 The **cell latch** is derived, never stored: after a Stop, non-exempt
 components in the cell cause it while in `fault` or `offline` or reporting
-`activity: unknown`; a fault raised while anything executes can also latch
+`activity: unknown` (also `stop_unconfirmed` after a Stop that ended
+uncontained); a fault raised while anything executes can also latch
 the cell. A component declaring `sim_reset` is the simulator and is exempt in
 every state, including `offline` or `fault`. The existing operator-power and
 unavailable-owner-member exemptions also apply. The latch clears by itself
@@ -621,6 +631,20 @@ Apply is refused while a Program run is in progress
 (`apply_refused_run_in_progress`) and allowed during a cell latch. Global
 rules return to their `active_at_start` value at Load.
 
+Apply, Revert, Load and New each carry a `request_key` and answer once their
+checks that refuse before any effect have passed, with
+`manyforge.apply_command_reply.v1`: the command's row (`kind`, `request_key`,
+`step`, `accepted_at_ns`, `end`). A refusal before any effect is the reply
+itself. The row then shows the step the command is in (`resetting_cycle`,
+`previewing`, `disabling`, `applying`, `clearing_scene`,
+`preparing_components`, and `emptying` for Load's New) with `step_source`
+naming the status that carries the step's detail, and ends `succeeded`,
+`refused`, `failed`, `interrupted` or `unknown` with a typed code and the
+component rows. The command in progress and the last 8 ended rows are
+published as `apply_commands` in the Composer's control state and in
+`GET /api/deployment/workspace`. The same `request_key` sent again returns the
+same row and runs nothing.
+
 ### Run readiness
 
 One computation in the Headless API (`GET /api/program/readiness`, event
@@ -685,7 +709,7 @@ ______________________________________________________________________
 
 Every motion moves through an explicit, guarded state machine — no implicit
 transitions from outside the kernel (simplified below). There is no
-operation Pause: Stop halts a move, a new move continues toward a target, and
+operation Pause: Stop ends a move, a new move continues toward a target, and
 runtime speed scale 0 freezes in place without cancelling:
 
 ```
@@ -737,7 +761,7 @@ one active condition update bounded evidence without flooding the popup; a true
 return followed by recurrence creates a new activation and requires a new
 acknowledgement. Run/resume and motion-producing recovery remain gated while a
 motion-attention alarm is unacknowledged or alarm state is unreconciled. Stop,
-Full Stop, and policy-admitted Reset remain available. The bulk acknowledgement
+Stop all, Halt, and policy-admitted Reset remain available. The bulk acknowledgement
 control is shown only when more than one alarm requires acknowledgement.
 
 Component faults and the cell latch are separate from alarms: they clear when
@@ -772,6 +796,32 @@ Current alarms are a bounded condition projection with explicit set, clear,
 activation, return, and acknowledgement facts; log severity alone cannot
 create or clear one.
 
+The execution host records its operations, controls, Stops, I/O rule changes
+and cell-admission claims in its operation journal
+(`execution-state/operation-journal.sqlite3`). Every action takes effect in
+memory first; one ordinary writer thread writes the records afterwards, in
+the order of the actions, with SQLite `synchronous=NORMAL`. No action waits
+for the journal, and a record that cannot be written never refuses or undoes
+one. Such a record (the queue of 4,096 is full, beyond 194 places only Stop
+rows use, or its write fails) is counted and dropped. The first of a run of
+such losses logs one `manyforge_journal_write_fault` line and raises the alarm "Operation records
+are being lost" (runtime fault `operation_journal_write_fault`); it never
+blocks motion and clears by itself once a batch writes everything and leaves
+the queue empty. The journal's `journal_metadata.records_lost` becomes 1 once
+records of that start were lost, and shutdown logs one
+`operation_journal_records_lost` line with the count of records not written.
+A row's `occurred_at_wall` is the wall time of its
+action, not of the write. A cell-admission claim is two rows,
+`cell_claim_acquired` and `cell_claim_released`. The writer removes old
+finished operations and keeps unfinished ones; only after records were lost
+(a full queue or a failed write) does it bound the unfinished ones as well,
+at 4,096. Of the released claims it keeps both rows of the newest 64 and
+removes the older ones; a claim not yet released keeps its row. The event
+stream and History see a row once it is written, except
+the two claim rows, which stay in the journal only. Nothing
+reads the journal back while the application runs; the next start's report
+on the previous run reads it.
+
 Exposed through:
 
 - `GET /api/cycle/status` — cycle state and the one current versioned recovery
@@ -798,7 +848,7 @@ A refusal carries one carrier everywhere: `{code, message, details}` plus the
 - **HTTP** (headless API and Composer): refusals are
   `{"detail": {code, message, details, producer, request_id}}`. A request
   that fails validation is `invalid_request` (HTTP 422) with `details` mapping
-  each refused field path (for example `body.request_id`) to its field code;
+  each refused field path (for example `body.request_key`) to its field code;
   an uncaught headless failure is `headless_api_internal_failure` (HTTP 500).
 - **Apply**: a failed Apply's terminal record keeps the failed step as `code`,
   the inner cause's own `cause_code` and `cause_details`, its `producer`, and
@@ -869,13 +919,22 @@ The current generated contracts are:
 
 The current versioned WebSocket contract is:
 
-- [`CONTROL_WEBSOCKET_V2.md`](CONTROL_WEBSOCKET_V2.md) — the common
+- [`CONTROL_WEBSOCKET.md`](CONTROL_WEBSOCKET.md) — the common
   backend-authoritative execution-control session, fixed heartbeat/freshness
   profile, sequencing, backpressure, reconnect, and integration rules.
 
 The optional MCP adapter is described by the generated
 [`MCP_RUNTIME_CONTRACT.md`](MCP_RUNTIME_CONTRACT.md). Tool discovery is not
 evidence that an external assistant provider has been qualified.
+
+The MCP library would turn NaN, Infinity or a number too large to hold
+(such as `1e999`) into an empty value, so a tool call holding a repeated
+member or such a number is refused as an invalid request (HTTP 400, JSON-RPC
+`-32600`) and nothing is carried out. A Stop holding such a number is not
+refused: a `manyforge_kernel` `stop` or `stop_all` whose body holds one is
+sent on with an empty body and becomes Stop all; a Stop command sent with
+`manyforge_cycle_control` whose payload holds one is sent on with an empty
+payload and becomes Stop all (a Halt stays a Halt).
 
 For the repository/component index and assistant-provider setup, see
 [`../../AGENTS.md`](../../AGENTS.md).

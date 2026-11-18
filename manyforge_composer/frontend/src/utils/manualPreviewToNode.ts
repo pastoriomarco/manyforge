@@ -77,7 +77,7 @@ export function manualPreviewToNode(
   const motion = selectedStatus?.directControl;
   if (!motion || binding === null) return { ok: false, reason: 'The applied target binding is unavailable.' };
   const receipt = state.preview;
-  if (receipt === null || receipt.schemaVersion !== 'manyforge.direct_control_motion_preview.v4') {
+  if (receipt === null || receipt.schemaVersion !== 'manyforge.direct_control_motion_preview.v5') {
     return { ok: false, reason: 'Preview again: this preview does not record its TCP.' };
   }
   if (receipt.graphRevision !== selectedStatus?.graphRevision

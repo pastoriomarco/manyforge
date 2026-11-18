@@ -655,7 +655,6 @@ core::Result<void> PrepareCompositionIoProviderResources(
                 key_capacity.value() == 0U
             ? std::shared_ptr<HostIoSignalRuntime>{}
             : HostIoSignalRuntime::Create(
-                  cell.addressed_kernel().request_owner_epoch(),
                   candidate.publication_generation.value(), std::move(sources),
                   cell.clock(), cell.scheduler(), key_capacity.value(),
                   std::move(system_rows), std::move(adapter_rows));

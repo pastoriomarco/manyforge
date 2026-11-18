@@ -36,10 +36,10 @@ from pydantic import (
 # Frozen schema identifiers
 # ---------------------------------------------------------------------------
 
-LAUNCH_CONTRACT_SCHEMA = "manyforge.operator_launch_contract.v1"
+LAUNCH_CONTRACT_SCHEMA = "manyforge.operator_launch_contract.v2"
 CONFIGURATION_SCHEMA = "manyforge.operator_launch_configuration.v1"
-STATUS_SCHEMA = "manyforge.launch_instance_status.v1"
-RESULT_SCHEMA = "manyforge.operator_command_result.v1"
+STATUS_SCHEMA = "manyforge.launch_instance_status.v2"
+RESULT_SCHEMA = "manyforge.operator_command_result.v2"
 SOURCE_IDENTITY_SCHEMA = "manyforge.source_identity.v1"
 JSON_SCHEMA_DRAFT_2020_12 = "https://json-schema.org/draft/2020-12/schema"
 
@@ -763,7 +763,7 @@ class ReadinessObservation(StrictOperatorContract):
     state: ReadinessState
     source_schema: str
     owner_id: str | None = None
-    owner_epoch: str | None = None
+    application_start_id: str | None = None
     payload_sha256: str
     observed_at_unix_ns: Annotated[int, Field(ge=1, le=MAX_SAFE_INTEGER)]
     reason_code: str | None = None
@@ -787,12 +787,14 @@ class ReadinessObservation(StrictOperatorContract):
             return None
         return _bounded_nfc(value, label="owner_id", maximum_bytes=MAX_ID_BYTES)
 
-    @field_validator("owner_epoch")
+    @field_validator("application_start_id")
     @classmethod
-    def _validate_owner_epoch(cls, value: str | None) -> str | None:
+    def _validate_application_start_id(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        return _bounded_nfc(value, label="owner_epoch", maximum_bytes=MAX_ID_BYTES)
+        return _bounded_nfc(
+            value, label="application_start_id", maximum_bytes=MAX_ID_BYTES
+        )
 
     @field_validator("payload_sha256")
     @classmethod

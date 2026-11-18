@@ -3,22 +3,27 @@ import {
 } from 'react';
 
 import {
+  displayRunId,
   programMotionStopSettled,
   type ProgramPendingCommand,
   type ProgramResetOptions,
   type ProgramRuntimeController,
 } from '../hooks/useProgramRuntime';
 import { busyLabel, busyReason, type BusyOperation } from '../state/busyOperation';
+import { PERSISTENT_KEYS_RESET_NOTE, RELOAD_INITIAL_SCENE_NOTE } from '../state/initialSceneApplied';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type {
   AutomaticRetryAuditEvent,
   CycleRecoveryOffer,
   JsonValue,
+  ProgramExecutionSelectionControls,
   ProgramInterventionStopScope,
+  ProgramRunStateName,
   RuntimeControlAuditEvent,
   TakeoverFallbackAuditEvent,
 } from '../types/api';
 import type { ExecutionObservationTransportStatus } from '../types/viewerObservation';
+import type { OperationStateName } from '../types/robotControl';
 import { manualOperationRequiresRecovery, robotControlHasActiveOperation } from '../state/robotControl';
 import {
   appliedExecutionSelectionRows, executionGroupDisplay, executionGroupScopes,
@@ -35,6 +40,7 @@ import { NamespaceGroupOptions, useNamespaceGroups } from './common/NamespaceGro
 import { groupByNamespace } from '../utils/blackboardNamespaces';
 import {
   blockedReasonText,
+  haltCauseText,
   latchCauseText,
   latchSummary,
   runEndPresentation,
@@ -141,8 +147,8 @@ function stateLabel(state: string, motionStopSettled = false): string {
     motionStopSettled
     && (state === 'running' || state === 'intervention_required')
   ) return 'Stopped';
-  if (state === 'stopped' || state === 'full_stopped') return 'Stopped';
-  if (state === 'full_stopping') return 'Stopping';
+  if (state === 'stopped' || state === 'halted') return 'Stopped';
+  if (state === 'halting') return 'Stopping';
   return state.replaceAll('_', ' ');
 }
 
@@ -157,10 +163,9 @@ const RETRY_ACTION_IDS: readonly string[] = [
 /** The Program commands' busy labels while their request is in flight. */
 const RUNTIME_OPERATIONS: Partial<Record<NonNullable<ProgramPendingCommand>, BusyOperation>> = {
   run: { command: 'run', label: 'Executing…', name: 'Execute' },
-  'resume-full-stop': { command: 'resume-full-stop', label: 'Executing…', name: 'Execute' },
+  'resume-halt': { command: 'resume-halt', label: 'Executing…', name: 'Execute' },
   reset: { command: 'reset', label: 'Resetting…', name: 'Reset' },
-  stop: { command: 'stop', label: 'Stopping…', name: 'Stop' },
-  'full-stop': { command: 'full-stop', label: 'Halting…', name: 'Halt' },
+  halt: { command: 'halt', label: 'Halting…', name: 'Halt' },
 };
 const ACTIVATE_OPERATION: BusyOperation = { command: 'activate', label: 'Activating…', name: 'Activate and execute' };
 
@@ -218,7 +223,7 @@ export function automaticRetryText(event: RuntimeControlAuditEvent): string | nu
 
 /** The brief warning for one automatic retry: "Collision Stop on move · attempt 2 of 4". */
 function automaticRetryBriefNotice(
-  programRunId: string | null,
+  programRunId: number | null,
   event: AutomaticRetryAuditEvent,
 ): WorkbenchNotice {
   const {
@@ -260,7 +265,7 @@ export function takeoverFallbackText(event: RuntimeControlAuditEvent): string | 
 
 /** The brief warning for one takeover fallback (like an automatic retry's). */
 function takeoverFallbackBriefNotice(
-  programRunId: string | null,
+  programRunId: number | null,
   event: TakeoverFallbackAuditEvent,
 ): WorkbenchNotice {
   return {
@@ -386,7 +391,7 @@ function newestIoSourceUnavailable(
 }
 
 function ioSourceBriefNotice(
-  programRunId: string | null,
+  programRunId: number | null,
   event: RuntimeControlAuditEvent,
 ): WorkbenchNotice {
   const transition = ioSourceTransition(event) as IoSourceTransition;
@@ -408,12 +413,12 @@ function ioSourceBriefNotice(
  * restarts its timer.
  */
 function useBriefNewestAuditEvent<E extends RuntimeControlAuditEvent>(
-  programRunId: string | null,
+  programRunId: number | null,
   audit: readonly RuntimeControlAuditEvent[] | null,
   newestOf: (audit: readonly RuntimeControlAuditEvent[]) => E | null,
-  noticeOf: (programRunId: string | null, event: E) => WorkbenchNotice,
+  noticeOf: (programRunId: number | null, event: E) => WorkbenchNotice,
 ): WorkbenchNotice | null {
-  const [baseline, setBaseline] = useState<{ runId: string | null; revision: number } | null>(null);
+  const [baseline, setBaseline] = useState<{ runId: number | null; revision: number } | null>(null);
   if (audit !== null && baseline === null) {
     setBaseline({ runId: programRunId, revision: newestOf(audit)?.eventRevision ?? 0 });
   }
@@ -427,7 +432,7 @@ function useBriefNewestAuditEvent<E extends RuntimeControlAuditEvent>(
 
 /** The brief warning for a newly unavailable io wait source (see the retry notice). */
 export function useBriefIoSourceUnavailable(
-  programRunId: string | null,
+  programRunId: number | null,
   audit: readonly RuntimeControlAuditEvent[] | null,
 ): WorkbenchNotice | null {
   return useBriefNewestAuditEvent(
@@ -446,7 +451,7 @@ export function useBriefIoSourceUnavailable(
  * its run and revision, so an unchanged retry never restarts its timer.
  */
 export function useBriefAutomaticRetry(
-  programRunId: string | null,
+  programRunId: number | null,
   audit: readonly RuntimeControlAuditEvent[] | null,
 ): WorkbenchNotice | null {
   return useBriefNewestAuditEvent(
@@ -459,7 +464,7 @@ export function useBriefAutomaticRetry(
 
 /** The brief warning for the newest takeover fallback (see the retry notice). */
 export function useBriefTakeoverFallback(
-  programRunId: string | null,
+  programRunId: number | null,
   audit: readonly RuntimeControlAuditEvent[] | null,
 ): WorkbenchNotice | null {
   return useBriefNewestAuditEvent(
@@ -475,20 +480,25 @@ function actionLabel(value: string): string {
   return label.charAt(0).toUpperCase() + label.slice(1);
 }
 
-const RUNTIME_MONITOR_OBSERVATION_LOST = 'runtime_monitor_observation_lost';
+const RUNTIME_MONITOR_NON_CONTACT_REASONS = [
+  'runtime_monitor_observation_lost',
+  'runtime_monitor_checks_stopped',
+] as const;
 
 /**
  * The Recovery line's class label. A runtime-monitor Stop for lost position
- * feedback keeps the `runtime_collision` recovery class but is not a
- * collision: it is named by its reason's catalog text. Display only.
+ * feedback, or for collision checks that did not run in time (OD-217), keeps
+ * the `runtime_collision` recovery class but is not a collision: it is named
+ * by its reason's catalog text. Display only.
  */
 export function recoveryClassLabel(
   offer: Pick<CycleRecoveryOffer, 'recoveryClass' | 'reason'>,
 ): string {
-  if (offer.recoveryClass === 'runtime_collision'
-    && (offer.reason.code === RUNTIME_MONITOR_OBSERVATION_LOST
-      || offer.reason.details?.reason === RUNTIME_MONITOR_OBSERVATION_LOST)) {
-    return ERROR_CATALOG[RUNTIME_MONITOR_OBSERVATION_LOST][0];
+  if (offer.recoveryClass === 'runtime_collision') {
+    const reason = RUNTIME_MONITOR_NON_CONTACT_REASONS.find(
+      (code) => offer.reason.code === code || offer.reason.details?.reason === code,
+    );
+    if (reason !== undefined) return ERROR_CATALOG[reason][0];
   }
   return actionLabel(offer.recoveryClass);
 }
@@ -517,6 +527,7 @@ export function ProgramRuntimePanel({
     persistentValues,
     runnerAllows,
     runnerRefusal,
+    runnerBusyReason,
     stageManualResult,
   } = controller;
   const [blackboardKey, setBlackboardKey] = useState('');
@@ -538,6 +549,8 @@ export function ProgramRuntimePanel({
     : simulationHeldNodes(controls.audit, state.run.nodeStatuses);
   const runReason = state.run?.reason ? formatStructuredError(state.run.reason) : null;
   const runEnd = state.run?.runEnd == null ? null : runEndPresentation(state.run.runEnd);
+  // Present only while the run is halting or halted (its `halt` is null otherwise).
+  const haltCause = haltCauseText(state.run?.halt ?? null);
   // A run in progress is shown by the run itself, not as a blocked reason.
   const blockedReasons = (controller.readiness?.blocked_reasons ?? [])
     .filter((reason) => reason.code !== 'run_in_progress' && reason.code !== 'program_motion_running');
@@ -569,7 +582,7 @@ export function ProgramRuntimePanel({
   // Never turn a missing projection into "not moving".
   const motionSummary = state.run === null
     ? (state.runnerAvailable ? 'None' : 'Unknown')
-    : ['full_stopped', 'full_stopping'].includes(state.run.state)
+    : ['halted', 'halting'].includes(state.run.state)
       ? 'Halted'
       : allMotion === null
         ? 'Unknown'
@@ -702,7 +715,7 @@ export function ProgramRuntimePanel({
             </strong>
             <small>
               {state.run
-                ? `${runEnd === null ? '' : `${runEnd.text} · `}${shortIdentity(state.run.capture.programRunId)} · revision ${state.run.runRevision}`
+                ? `${runEnd === null ? '' : `${runEnd.text} · `}${displayRunId(controller.applicationStartId, state.run.capture.programRunId)} · revision ${state.run.runRevision}`
                 : state.runnerAvailable
                   ? 'No run is active.'
                   : 'No current owner projection; execution state is unknown.'}
@@ -761,6 +774,11 @@ export function ProgramRuntimePanel({
               <small key={row.label}>{` · ${row.label}: ${row.value}`}</small>
             ))}
           </span>
+        </div>
+      )}
+      {haltCause !== null && (
+        <div className="program-feedback" role="status" aria-label="Halt cause">
+          <span>{haltCause}</span>
         </div>
       )}
       {simulationHeld.map((node) => (
@@ -967,8 +985,10 @@ export function ProgramRuntimePanel({
               selectedBlackboardKey === null
               || blackboardIssue !== null
               || blackboardWriteRefusal !== null
+              || runnerBusyReason !== null
               || state.controlPending !== null
             }
+            title={runnerBusyReason ?? undefined}
             onClick={() => {
               if (selectedBlackboardKey === null) return;
               const { key, type } = selectedBlackboardKey;
@@ -991,12 +1011,14 @@ export function ProgramRuntimePanel({
           projectPath={state.applied.projectPath}
           appliedRevision={state.applied.programRevision}
           runId={state.run?.capture.programRunId ?? null}
+          applicationStartId={controller.applicationStartId}
           sceneResourceIds={sceneResourceIds}
           frameProgram={{
             program: state.applied.program,
             frames: state.applied.programBinding.frame_bindings.map((row) => row.reference),
           }}
           client={persistentValues}
+          runnerBusyReason={runnerBusyReason}
         />
       )}
 
@@ -1091,7 +1113,7 @@ function manualRecoveryTarget(
   const gripper = gripperTarget !== undefined
     || (motionTarget === undefined
       && nativeStatus?.directControlGripper != null
-      && operation.programRunId === nativeStatus.directControlGripper.programRunId);
+      && operation.payloadKind === 'capability_command');
   const target = gripper
     ? (gripperTarget ?? nativeStatus?.directControlGripper ?? undefined)
     : (motionTarget ?? nativeStatus?.directControl ?? undefined);
@@ -1246,6 +1268,14 @@ export function deriveTransportGuidance({
       severity: 'error',
       domain: 'recovery',
       title: latchSummary(facts.cellLatch) ?? 'Cell latched',
+      // Each faulted component's "Component fault" alarm is shown inside
+      // this item while the cell is latched: one item per failure.
+      alarmSubjects: facts.cellLatch.causes
+        .filter((cause) => cause.kind === 'fault')
+        .map((cause) => ({
+          definitionId: 'manyforge.runtime.component_fault',
+          subjectId: cause.component_id,
+        })),
       message: [
         ...facts.cellLatch.causes.map((cause) => `${latchCauseText(cause)}.`),
         'Program run and resume, nodes, manual motion and manual I/O are blocked.',
@@ -1261,12 +1291,15 @@ export function deriveTransportGuidance({
       title: 'Program recovery required',
       alarmDefinitionIds: ['manyforge.program.operation_failure'],
       message: facts.programRecoveryMessage,
-      actions: [{
-        id: 'review-program-recovery',
-        label: 'Review Program recovery',
-        title: 'Open the Program recovery details and owner-offered actions.',
-        run: onReviewProgramRecovery,
-      }],
+      // A recovery-required cycle has no owner offers; its way out is Reset.
+      actions: program.cycleState === 'recovery_required'
+        ? (onReset === undefined ? undefined : [programResetAction(onReset)])
+        : [{
+          id: 'review-program-recovery',
+          label: 'Review Program recovery',
+          title: 'Open the Program recovery details and owner-offered actions.',
+          run: onReviewProgramRecovery,
+        }],
     });
   } else if (facts.resetRequired) {
     // The run's own end reason names why it ended.
@@ -1310,6 +1343,23 @@ export function executionGroupFallbackMessage(fallback: ExecutionGroupFallback):
   }
 }
 
+const NO_PROGRAM_RUNNING = 'No Program is running.';
+/** With no Program the All column stays: its Stop is Stop all (OP-3). */
+const NO_PROGRAM_SELECTIONS: ProgramExecutionSelectionControls['groups'] = [{
+  groupId: 'all',
+  nodeCount: 0,
+  heldNodeCount: 0,
+  state: 'unavailable',
+  stopAllowed: false,
+  startAllowed: false,
+  startUnavailableReason: 'program_run_not_active',
+  resumeAllowed: false,
+  resumeUnavailableReason: 'program_run_not_active',
+  runtimeScaleSelector: null,
+  runtimeScaleUnavailableReason: 'program_run_not_active',
+  resourceIds: [],
+}];
+
 /**
  * Execution groups of the Applied Program and which of them the Motion panel
  * shows: the Applied Program's viewer choice, so hiding a group takes effect
@@ -1331,7 +1381,7 @@ function useTransportGroups(program: ProgramRuntimeController) {
   const projectedSelections = state.controls?.executionSelections.groups;
   const selections = projectedSelections !== undefined && projectedSelections.length > 0
     ? projectedSelections
-    : appliedSelections;
+    : appliedSelections.length > 0 ? appliedSelections : NO_PROGRAM_SELECTIONS;
   const allGroup = selections.find((group) => group.groupId === 'all');
   const namedGroups = selections.filter((group) => group.groupId !== 'all');
   const display = executionGroupDisplay(
@@ -1485,6 +1535,12 @@ export function resetKeptMessage(options: Required<ProgramResetOptions>): string
   return 'The Scene, carried objects, gripper state and robot positions stay as they are.';
 }
 
+// A manual operation in these states may move or is about to (OD-300).
+const ACTIVE_OPERATION_STATES: ReadonlySet<OperationStateName> = new Set([
+  'queued', 'resolving', 'planning', 'validating', 'prepared', 'dispatching', 'executing', 'stopping',
+]);
+const TERMINAL_RUN_STATES: ReadonlySet<ProgramRunStateName> = new Set(['stopped', 'succeeded', 'failed']);
+
 export function ProgramTransportControls({
   enabled,
   program,
@@ -1516,7 +1572,7 @@ export function ProgramTransportControls({
   const tcpHoldHistory = useRef(new ActiveTcpHoldHistory());
   const locallyStartedRun = useRef(false);
   const [resumeIntent, setResumeIntent] = useState<{
-    runId: string; groupId: string | null; changes: ResumeTcpChange[]; error?: string;
+    runId: number; groupId: string | null; changes: ResumeTcpChange[]; error?: string;
   } | null>(null);
   useEffect(() => {
     const source = robot.controlSource;
@@ -1534,7 +1590,10 @@ export function ProgramTransportControls({
       unsubscribe();
     };
   }, [robot.controlSource]);
-  const [haltIntent, setHaltIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
+  const [haltIntent, setHaltIntent] = useState<'confirm' | null>(null);
+  // The confirmed Halt's Stop all was refused or failed (the dialog says so).
+  const [haltStopAllFailed, setHaltStopAllFailed] = useState(false);
+  const haltRequest = useRef(0);
   // Reset during execution ends the run and restarts the tree, so it is
   // confirmed like Halt: motion stops first, the question comes after.
   const [resetIntent, setResetIntent] = useState<'stopping' | 'confirm' | 'automatic' | null>(null);
@@ -1554,17 +1613,22 @@ export function ProgramTransportControls({
   const [admittedSpeeds, setAdmittedSpeeds] = useState<AdmittedSpeedsView>({ kind: 'no_run' });
   const detailsRunId = state.run?.capture.programRunId ?? null;
   const detailsRunRevision = state.run?.runRevision ?? null;
+  const detailsStartId = program.applicationStartId;
   useEffect(() => {
     if (!detailsOpen) return undefined;
     if (detailsRunId === null) {
       setAdmittedSpeeds({ kind: 'no_run' });
       return undefined;
     }
+    if (detailsStartId === null) {
+      setAdmittedSpeeds({ kind: 'unavailable', reason: 'Execution owner identity is unavailable.' });
+      return undefined;
+    }
     const controller = new AbortController();
     setAdmittedSpeeds((current) => (current.kind === 'ready' && current.speeds.programRunId === detailsRunId
       ? current
       : { kind: 'loading' }));
-    api.execution.admittedSpeeds(detailsRunId, controller.signal).then(
+    api.execution.admittedSpeeds(detailsRunId, detailsStartId, controller.signal).then(
       (speeds) => setAdmittedSpeeds({ kind: 'ready', speeds }),
       (error: unknown) => {
         if (controller.signal.aborted) return;
@@ -1572,7 +1636,7 @@ export function ProgramTransportControls({
       },
     );
     return () => controller.abort();
-  }, [detailsOpen, detailsRunId, detailsRunRevision]);
+  }, [detailsOpen, detailsRunId, detailsRunRevision, detailsStartId]);
   const {
     selections, allGroup, visibleGroups, hiddenGroupCount, fallback: groupFallback, groupTitle,
     groupMotionComponentIds,
@@ -1598,10 +1662,8 @@ export function ProgramTransportControls({
   const observedControls = robot.tcpResumeCycle?.runtimeControls ?? null;
   const resumeCycleMatches = robot.tcpResumeFresh === true && state.run !== null
     && observedRun !== null && observedControls !== null
-    && observedRun.ownerEpoch === state.run.ownerEpoch
     && observedRun.capture.programRunId === runCapture?.programRunId
     && observedRun.runRevision === state.run.runRevision
-    && observedControls.ownerEpoch === observedRun.ownerEpoch
     && observedControls.programRunId === observedRun.capture.programRunId
     && observedControls.runRevision === observedRun.runRevision;
   const tcpSelections = resumeCycleMatches ? observedControls?.executionSelections.groups ?? [] : [];
@@ -1609,8 +1671,8 @@ export function ProgramTransportControls({
     .map((group) => `group:${group.groupId}`);
   const unknownTcpKeys = tcpSelections.filter((group) => group.ordinaryHeldNodeCount == null)
     .map((group) => `group:${group.groupId}`);
-  if (resumeCycleMatches && observedRun?.state === 'full_stopped') heldTcpKeys.push('full');
-  else if (resumeCycleMatches && observedRun?.state === 'full_stopping') unknownTcpKeys.push('full');
+  if (resumeCycleMatches && observedRun?.state === 'halted') heldTcpKeys.push('full');
+  else if (resumeCycleMatches && observedRun?.state === 'halting') unknownTcpKeys.push('full');
   // eslint-disable-next-line react-hooks/exhaustive-deps -- TCP hold history intentionally observes every commit.
   useEffect(() => {
     if (robot.tcpResumeConnectionLost === true) {
@@ -1637,29 +1699,29 @@ export function ProgramTransportControls({
   };
   const motionActive = robotControlHasActiveOperation(robot.state);
   const programMotionRunning = ['running', 'intervention_required'].includes(state.run?.state ?? '');
-  // The command receipt can precede the next owner projection. Treat that
-  // short accepted-Run interval as starting so Stop remains available and
-  // the owner-scoped velocity controls do not flicker off.
-  const programStopping = cycleState === 'stopping';
-  const programFullStopping = state.run?.state === 'full_stopping';
-  const programFullStopped = state.run?.state === 'full_stopped';
+  const programHalting = state.run?.state === 'halting';
+  const programHalted = state.run?.state === 'halted';
   // Execute and Resume follow the backend's RunReadiness. The
   // GUI adds only the in-flight guard, the Applied Program the request names,
   // the Composer-side refusal (unapplied Draft, running assistant turn; not part of RunReadiness) and,
   // the Runner's own Run gate (scene preparation, Apply, runner).
   const readiness = program.readiness;
+  // Another Program command in progress (any panel or client): the runner
+  // refuses its commands meanwhile (OD-144). Stop, Stop all and Halt never
+  // pass through the runner and are never held back by it.
+  const runnerBusy = program.runnerBusyReason;
   const canRun = enabled
     && state.applied !== null
     && state.pending === null
     && program.composerRefusalReason === null
+    && runnerBusy === null
     && program.runnerAllows('program_run')
     && readiness?.can_execute === true;
-  const stopCommandPending = ['stop', 'full-stop', 'reset']
-    .includes(state.pending ?? '');
-  const canResumeFullStop = enabled
-    && programFullStopped
+  const canResumeHalt = enabled
+    && programHalted
     && state.pending === null
     && program.composerRefusalReason === null
+    && runnerBusy === null
     && readiness?.can_resume === true;
   const readinessReasons = (readiness?.blocked_reasons ?? []).map(blockedReasonText);
   const runRefusalCode = program.runnerAllows('program_run') ? null : program.runnerRefusal('program_run');
@@ -1670,18 +1732,33 @@ export function ProgramTransportControls({
     && state.applied !== null
     && state.pending === null
     && program.composerRefusalReason === null
+    && runnerBusy === null
     && program.runnerAllows('program_run')
     && program.activation.available;
   const authoringAdmissionBlocked = authoringAdmissionAllowed === false;
-  const executeAdmissionBlocked = authoringAdmissionBlocked && !canResumeFullStop;
-  const canRunOrResume = canResumeFullStop
+  const executeAdmissionBlocked = authoringAdmissionBlocked && !canResumeHalt;
+  const canRunOrResume = canResumeHalt
     || (!authoringAdmissionBlocked && (canRun || canActivateExecute));
   const canReset = enabled
     && state.pending === null
     && state.selectionPending.length === 0
     && state.controlPending === null
+    && runnerBusy === null
     && program.runnerAllows('program_reset');
   const allMotionQuiesced = state.runnerAvailable && executionSelectionIsQuiescent(allGroup);
+  // OD-300: Stop all and Halt are enabled only when there is something to
+  // stop. A status feed that is not current keeps both enabled: disabled
+  // only ever means the cell said nothing is moving.
+  const statusFeedCurrent = robot.statusFeedCurrent === true;
+  const manualMotionActive = motionActive || (robot.currentStatus?.manualOperations ?? [])
+    .some((operation) => ACTIVE_OPERATION_STATES.has(operation.state));
+  // A claimed run is one Halt acts on: it freezes the Program and blocks new
+  // manual moves. An already halted run has nothing more for Halt to do.
+  const runClaimed = state.run !== null && !TERMINAL_RUN_STATES.has(state.run.state);
+  const programMotionActive = cycleState === 'starting'
+    || (runClaimed && !executionSelectionIsQuiescent(allGroup));
+  const canStopAll = !statusFeedCurrent || manualMotionActive || programMotionActive;
+  const canHalt = canStopAll || (runClaimed && !programHalted);
   // Paused on failed nodes: each active hold has its own offer and owns its
   // motion groups (a hold in no named group: every group no other hold
   // names). A group's Retry (in place of Run/Resume) and Continue (in place
@@ -1700,6 +1777,7 @@ export function ProgramTransportControls({
     && state.pending === null
     && state.controlPending === null
     && program.composerRefusalReason === null
+    && runnerBusy === null
     && readiness?.motion_clear === true;
   const offerControls = (
     offer: CycleRecoveryOffer,
@@ -1752,7 +1830,7 @@ export function ProgramTransportControls({
         ? 'Retry waits until stopping the Program\'s other motion is confirmed.'
         : `Retry is unavailable: ${(retryAction.disabledReasonCode ?? 'not allowed').replaceAll('_', ' ')}.`;
     }
-    return program.composerRefusalReason
+    return runnerBusy ?? program.composerRefusalReason
       ?? (controls.interventionStopScope === 'own_groups'
         ? `Retry ${offer.nodeInstanceId} and let its groups continue.`
         : recoveryHolds.length > 1
@@ -1776,29 +1854,20 @@ export function ProgramTransportControls({
       setDetailsOpen(false);
     }
   };
-  const canProgramHalt = enabled
-    && state.runnerAvailable
-    && cycleState === 'running'
-    && ['running', 'intervention_required'].includes(state.run?.state ?? '')
-    && state.controls !== null
-    && allGroup !== undefined
-    && allGroup.state !== 'unavailable'
-    && state.pending === null
-    && state.selectionPending.length === 0
-    && state.controlPending === null
-    && !programFullStopping
-    && program.runnerAllows('program_full_stop');
-
-  useEffect(() => {
-    if (haltIntent !== 'automatic' || !allMotionQuiesced) return;
-    setHaltIntent(null);
-    void program.fullStop();
-  }, [allMotionQuiesced, haltIntent, program]);
+  // A group Stop is available whenever there is a run to stop: nothing in
+  // progress (starting, another command, an earlier Stop or Halt, a
+  // connection that is not current) holds it back. While a Halt or a Forced
+  // Program End ends the run, the owner answers a motion Stop with no effect.
+  // Stop all (the All column) and Halt name no run: they are always available.
+  const runToStop = programMotionRunning || programHalting
+    || state.run?.state === 'stopping';
 
   // Ask only once every motion group has stopped (no groups: nothing moves).
   // A completed Halt has already contained all motion; while it settles,
   // wait for it rather than sending a motion Stop the owner would refuse.
-  const motionSettled = allGroup === undefined || allMotionQuiesced || programFullStopped;
+  // A run with nothing left to stop (ended, or none) is settled too.
+  const motionSettled = allGroup === undefined || allMotionQuiesced || programHalted
+    || !runToStop;
   useEffect(() => {
     if (resetIntent === 'stopping' && motionSettled) setResetIntent('confirm');
     if (resetIntent === 'automatic' && motionSettled) {
@@ -1823,7 +1892,9 @@ export function ProgramTransportControls({
   const positionAvailable = positionAvailability?.available === true;
   const positionUnavailableReason = positionAvailability === null
     ? 'The backend does not report whether robot positions can be reset.'
-    : positionAvailability.reason;
+    : positionAvailability.reason !== null && Object.hasOwn(ERROR_CATALOG, positionAvailability.reason)
+      ? ERROR_CATALOG[positionAvailability.reason][1]
+      : positionAvailability.reason;
   // Reload needs an applied Program: with none there is no initial scene.
   const reloadAvailable = state.applied !== null;
   const handledReloadRequest = useRef(0);
@@ -1859,7 +1930,7 @@ export function ProgramTransportControls({
     }
     if (!motionSettled) {
       setResetIntent(confirmReset ? 'stopping' : 'automatic');
-      if (programFullStopping) return;
+      if (programHalting) return;
       const accepted = await program.stopMotion(['all']);
       if (!accepted) setResetIntent(null);
       return;
@@ -1868,17 +1939,20 @@ export function ProgramTransportControls({
     else void program.reset();
   };
 
-  const requestProgramHalt = async () => {
-    if (!canProgramHalt) return;
-    if (!allMotionQuiesced) {
-      setHaltIntent('stopping');
-      const accepted = await program.stopMotion(['all']);
-      if (!accepted) {
-        setHaltIntent(null);
-        return;
-      }
-    }
-    setHaltIntent(preferences.confirmHalt ? 'confirm' : 'automatic');
+  const requestProgramHalt = () => {
+    // Stop all goes out at once, unconfirmed; the question that follows is
+    // only about halting the Program. A refused Stop all does not end the
+    // Halt: the question still follows and says so. Cancel leaves the
+    // Program's groups stopped, ready for Resume. With the confirmation off,
+    // Halt follows at once (both are idempotent; nothing waits).
+    // With no run claimed, Halt equals Stop all (R2): nothing to confirm.
+    const request = ++haltRequest.current;
+    setHaltStopAllFailed(false);
+    void program.stopAll().then((accepted) => {
+      if (!accepted && haltRequest.current === request) setHaltStopAllFailed(true);
+    });
+    if (preferences.confirmHalt && runClaimed) setHaltIntent('confirm');
+    else void program.halt();
   };
   const nativeStatus = robot.currentStatus;
   const {
@@ -1889,7 +1963,7 @@ export function ProgramTransportControls({
   } = transportRecoveryFacts(program, robot);
   const recoveryRequired = manualRecovery.length > 0 || cellLatch !== null || programRecovery;
   const groupScaleStopAffects = (groupId: string): boolean => {
-    if (['stopping', 'full_stopping'].includes(state.run?.state ?? '')) return true;
+    if (['stopping', 'halting'].includes(state.run?.state ?? '') || state.pending === 'stop-all') return true;
     if (selections.some((group) => group.groupId === groupId && group.state === 'stopping')) {
       return true;
     }
@@ -1907,7 +1981,9 @@ export function ProgramTransportControls({
       : cellLatch !== null
         ? latchSummary(cellLatch)
         : programRecovery
-          ? 'The Program requires recovery. Review the current owner-offered actions.'
+          ? (program.cycleState === 'recovery_required'
+            ? 'The Program requires recovery. Reset the Program.'
+            : 'The Program requires recovery. Review the current owner-offered actions.')
           : resetRequired ? 'Reset the Program before starting another run.'
             : nativeStatus == null
               ? observationTransport?.phase === 'no_robot_loaded'
@@ -1964,7 +2040,7 @@ export function ProgramTransportControls({
       label: focusedHoldControls.continuePending ? 'Continuing' : 'Continue',
       enabled: focusedHoldControls.canContinue,
       reason: focusedHoldControls.canContinue ? null
-        : program.composerRefusalReason
+        : runnerBusy ?? program.composerRefusalReason
           ?? (focusedHoldControls.continueAction.enabled ? null
             : `Continue is unavailable: ${(focusedHoldControls.continueAction.disabledReasonCode ?? 'not allowed').replaceAll('_', ' ')}.`),
       run: () => requestContinue(focusedHoldControls),
@@ -1972,7 +2048,7 @@ export function ProgramTransportControls({
     reset: {
       label: resetLabel,
       enabled: canReset && resetIntent === null,
-      reason: canReset ? null : 'Reset is unavailable in the current backend control state.',
+      reason: canReset ? null : runnerBusy ?? 'Reset is unavailable in the current backend control state.',
       run: () => { void requestProgramReset(); },
     },
   };
@@ -2028,12 +2104,9 @@ export function ProgramTransportControls({
             )}
             <div className="transport-group-grid" aria-label="Motion group controls">
           {visibleGroups.length === 0 && (
+            // Never without a Program: its All column stays (Stop all, OP-3).
             <p className="transport-groups-empty">
-              {observationTransport?.phase === 'no_robot_loaded'
-                ? 'No robot loaded'
-                : selections.length === 0
-                ? 'Group controls require an Applied Program.'
-                : 'No command groups are displayed. Open Settings to choose one.'}
+              No command groups are displayed. Open Settings to choose one.
             </p>
           )}
           {visibleGroups.map((group) => {
@@ -2043,18 +2116,16 @@ export function ProgramTransportControls({
             const releasePending = selectionGroupPending(group.groupId, 'start-motion')
               || selectionGroupPending(group.groupId, 'resume-motion');
             const selectionTransitionPending = state.selectionPending.length > 0;
-            const canGroupStop = enabled
-              && state.runnerAvailable
-              && !stopCommandPending
-              && !programStopping
-              && programMotionRunning
-              && group.stopAllowed
-              && !selectionTransitionPending
-              && !stopPending
+            // Stop is available whenever there is a run to stop; a group
+            // already held, or not yet started, has none. A repeated press
+            // sends another Stop.
+            // The All column's Stop is Stop all: it names no run and is
+            // always available (with no Program it stops manual moves).
+            const allColumn = group.groupId === 'all';
+            const noProgramColumn = group === NO_PROGRAM_SELECTIONS[0];
+            const canGroupStop = allColumn ? canStopAll : (runToStop
               && group.state !== 'held'
-              && group.state !== 'ready'
-              && group.state !== 'stopping'
-              && program.runnerAllows('program_motion_stop');
+              && group.state !== 'ready');
             // A rule hold whose scope meets this group gates its Run/Resume,
             // Retry and Continue (the kernel refuses them with `rule_holds`).
             const ruleHold = ruleHoldMeeting(readiness?.blocked_reasons ?? [],
@@ -2069,6 +2140,7 @@ export function ProgramTransportControls({
               && !releasePending
               && state.controlPending === null
               && program.composerRefusalReason === null
+              && runnerBusy === null
               && readiness?.motion_clear === true
               && ruleHold === null;
             const releaseLabel = group.state === 'ready' ? 'Run' : 'Resume';
@@ -2127,7 +2199,9 @@ export function ProgramTransportControls({
                   type="button"
                   className="transport-group-resume"
                   disabled={retry !== null ? !canRetryGroup : waitsForHold || stopSettling || !canGroupRelease}
-                  title={ruleHold !== null
+                  title={noProgramColumn
+                    ? NO_PROGRAM_RUNNING
+                    : ruleHold !== null
                     ? ruleHold.message
                     : retry !== null && retryTarget !== null
                     ? retryTitle(retryTarget)
@@ -2139,7 +2213,7 @@ export function ProgramTransportControls({
                         ? `${releaseLabel} ${group.groupId}: its stopped and not-yet-started motion continues.`
                         : group.state === 'running'
                           ? `${group.groupId} motion is running.`
-                          : program.composerRefusalReason
+                          : runnerBusy ?? program.composerRefusalReason
                             ?? group.resumeUnavailableReason?.replaceAll('_', ' ')
                             ?? `${releaseLabel} is unavailable for this group.`}
                   onClick={() => {
@@ -2158,7 +2232,7 @@ export function ProgramTransportControls({
                     type="button"
                     className="danger-button transport-group-stop"
                     disabled={!owner.canContinue || ruleHold !== null}
-                    title={ruleHold?.message ?? 'Continuing fails the node'}
+                    title={ruleHold?.message ?? runnerBusy ?? 'Continuing fails the node'}
                     aria-label={`Continue ${group.groupId}: fail held node ${owner.offer.nodeInstanceId}`}
                     onClick={() => requestContinue(owner)}
                   >{owner.continuePending ? 'Continuing' : 'Continue'}</button>
@@ -2167,13 +2241,22 @@ export function ProgramTransportControls({
                     type="button"
                     className="danger-button transport-group-stop"
                     disabled={!canGroupStop}
-                    title={canGroupStop
+                    title={allColumn
+                      ? canStopAll
+                        ? 'Stop all motion in the cell, manual moves included, without resetting the Program. Every group stays stopped until Resume.'
+                        : 'Nothing is moving.'
+                      : canGroupStop
                       ? `Stop motion in ${group.groupId} without resetting the Program.`
                       : group.state === 'held'
                         ? 'This group is already stopped.'
                         : 'Stop is unavailable for this group.'}
-                    onClick={() => { void program.stopMotion([group.groupId]); }}
-                  >{stopPending || group.state === 'stopping' ? 'Stopping'
+                    onClick={() => {
+                      if (allColumn) void program.stopAll();
+                      else void program.stopMotion([group.groupId]);
+                    }}
+                  >{allColumn
+                    ? (state.pending === 'stop-all' || group.state === 'stopping' ? 'Stopping' : 'Stop')
+                    : stopPending || group.state === 'stopping' ? 'Stopping'
                       : group.state === 'held' || group.state === 'ready' ? 'Stopped' : 'Stop'}</button>
                 )}
                 <label className="transport-group-scale" title={scaleAvailable
@@ -2183,7 +2266,7 @@ export function ProgramTransportControls({
                       : effectiveMixed
                         ? ' Effective member scales are mixed or not yet settled.'
                         : '')
-                  : scaleReason}
+                  : noProgramColumn ? NO_PROGRAM_RUNNING : scaleReason}
                 >
                   <span>Velocity</span>
                   <input
@@ -2219,13 +2302,13 @@ export function ProgramTransportControls({
             disabled={!canRunOrResume || program.activation.flow !== null}
             title={executeAdmissionBlocked
               ? authoringAdmissionTooltip
-              : busyReason(runtimeOperation) ?? busyReason(activationOperation) ?? (canResumeFullStop
+              : busyReason(runtimeOperation) ?? busyReason(activationOperation) ?? (canResumeHalt
                 ? 'Resume the halted Program tree. Motion stays stopped until Run or Resume in the Motion panel.'
                 : canRun
                   ? 'Execute the exact Applied Program without starting robot motion.'
                   : canActivateExecute
                     ? `Activate the components that are not enabled, then execute the Program once.\n${readinessReasons.join('\n')}`
-                    : program.composerRefusalReason
+                    : runnerBusy ?? program.composerRefusalReason
                       ?? (readinessReasons.length > 0 ? readinessReasons.join('\n') : null)
                       ?? runRefusal
                       ?? blockedReason
@@ -2233,13 +2316,13 @@ export function ProgramTransportControls({
                         ? "Execute readiness unavailable: the execution host's state can't be read."
                         : 'Execute requires an Applied Program.'))}
             onClick={() => {
-              if (canResumeFullStop) requestTcpResume('full', null, () => { void program.resumeFullStop(); });
+              if (canResumeHalt) requestTcpResume('full', null, () => { void program.resumeHalt(); });
               else if (canRun) void program.run();
               else program.activation.open();
             }}
-          >{state.pending === 'run' || state.pending === 'resume-full-stop'
-            ? busyLabel(runtimeOperation, ['run', 'resume-full-stop'], 'Execute')
-            : canResumeFullStop
+          >{state.pending === 'run' || state.pending === 'resume-halt'
+            ? busyLabel(runtimeOperation, ['run', 'resume-halt'], 'Execute')
+            : canResumeHalt
               ? 'Execute'
               : cycleState === 'starting'
                 ? 'Executing'
@@ -2248,12 +2331,12 @@ export function ProgramTransportControls({
             ref={haltButton}
             type="button"
             className="danger-button transport-full-stop transport-unique-control"
-            disabled={!canProgramHalt || haltIntent !== null}
-            title={canProgramHalt
-              ? 'Stop all Program motion, then halt Program execution.'
-              : 'Halt is available only while a Program is executing.'}
-            onClick={() => { void requestProgramHalt(); }}
-          >{haltIntent !== null || programFullStopping ? 'Halting' : 'Halt'}</button>
+            disabled={!canHalt}
+            title={canHalt
+              ? 'Stop all motion in the cell, then halt Program execution.'
+              : 'Nothing is running.'}
+            onClick={requestProgramHalt}
+          >{haltIntent !== null || programHalting ? 'Halting' : 'Halt'}</button>
           <button
             ref={resetButton}
             type="button"
@@ -2265,7 +2348,7 @@ export function ProgramTransportControls({
                   ? 'Stop all Program motion, then confirm ending this run and resetting the Program.'
                   : idleReset ? 'Reload the initial Scene or reset robot positions.'
                     : 'Reset the current Program cycle using its exact owner evidence.'
-              : 'Reset is unavailable in the current backend control state.')}
+              : runnerBusy ?? 'Reset is unavailable in the current backend control state.')}
             onClick={() => { void requestProgramReset(); }}
           >{resetLabel}</button>
           <div className="transport-unique-icons">
@@ -2348,7 +2431,7 @@ export function ProgramTransportControls({
             </div>
             <div>
               <dt>Stop</dt>
-              <dd>Stops one group&apos;s motion. The tree keeps its place; Resume continues.</dd>
+              <dd>Stops one group&apos;s motion. The tree keeps its place; Resume continues. In All groups, Stop stops all motion in the cell, manual moves included, and every group waits for Resume.</dd>
             </div>
             <div>
               <dt>Retry</dt>
@@ -2356,7 +2439,7 @@ export function ProgramTransportControls({
             </div>
             <div>
               <dt>Halt</dt>
-              <dd>Stops all Program motion and pauses the tree. Execute resumes the tree; motion stays stopped until Run or Resume.</dd>
+              <dd>Stops all motion in the cell and pauses the tree. Execute resumes the tree; motion stays stopped until Run or Resume. Manual moves stay blocked until Execute or Reset.</dd>
             </div>
             <div>
               <dt>Reset</dt>
@@ -2470,6 +2553,7 @@ export function ProgramTransportControls({
           <summary>Current setup</summary>
           <ProgramRunSetup
             applied={state.applied}
+            applicationStartId={program.applicationStartId}
             targets={robot.currentStatus?.directControlTargets ?? []}
             admitted={admittedSpeeds}
             groups={selections.map((group) => {
@@ -2534,9 +2618,9 @@ export function ProgramTransportControls({
               const waitsForHold = owner === null && recoveryHolds.length > 0
                 && (group?.state === 'held' || group?.state === 'ready');
               if (resumeIntent.groupId === null) {
-                if (canResumeFullStop) {
+                if (canResumeHalt) {
                   setResumeIntent(null);
-                  void program.resumeFullStop();
+                  void program.resumeHalt();
                 } else setResumeIntent({ ...resumeIntent, error: 'Resume is no longer available.' });
               } else if (enabled && state.runnerAvailable && cycleState === 'running'
                   && programMotionRunning && state.pending === null
@@ -2545,6 +2629,7 @@ export function ProgramTransportControls({
                   && group?.resumeAllowed && group.state !== 'stopping'
                   && group.resumeUnavailableReason !== 'selected_motion_stop_settling'
                   && program.composerRefusalReason === null
+                  && runnerBusy === null
                   && readiness?.motion_clear === true) {
                 setResumeIntent(null);
                 void program.resumeMotion([resumeIntent.groupId]);
@@ -2588,9 +2673,8 @@ export function ProgramTransportControls({
               <span>Reload initial scene</span>
             </label>
             <small className="transport-reset-option-note">
-              {reloadUnavailableReason
-                ?? 'Scene objects, including carried ones, are replaced by the Program\'s initial Scene.'}
-              {appliedPersistentKeys && ' Persistent keys return to their initial values.'}
+              {reloadUnavailableReason ?? RELOAD_INITIAL_SCENE_NOTE}
+              {appliedPersistentKeys && PERSISTENT_KEYS_RESET_NOTE}
             </small>
             <label className="toggle-control" title={positionUnavailableReason ?? undefined}>
               <input
@@ -2615,7 +2699,7 @@ export function ProgramTransportControls({
           )}
           {resetKept !== null && <p>{resetKept}</p>}
           {!idleReset && !endedReset && <p>
-            {programFullStopped
+            {programHalted
               ? 'Cancel keeps the run halted; Execute resumes it.'
               : `Cancel keeps the run stopped; ${continueLabel} in the Motion panel continues it.`}
           </p>}
@@ -2647,12 +2731,18 @@ export function ProgramTransportControls({
         returnFocusRef={haltButton}
       >
         <div className="dialog-copy transport-confirmation">
+          {haltStopAllFailed && (
+            <p className="inline-message severity-error" role="alert">
+              Stop all not confirmed{state.error === null ? '.' : `: ${state.error}`}
+            </p>
+          )}
           <p>
-            Motion is stopped. Halt also pauses the Program tree; Execute
-            resumes it later, with motion still stopped until Run or Resume.
+            {allMotionQuiesced ? 'Motion is stopped. ' : ''}Halt also pauses the
+            Program tree; Execute resumes it later, with motion still stopped
+            until Run or Resume. Manual moves stay blocked until Execute or Reset.
             Choose Cancel if you only meant to stop motion.
           </p>
-          {!allMotionQuiesced && (
+          {programMotionRunning && !allMotionQuiesced && (
             <p role="status">Waiting for all motion groups to stop…</p>
           )}
           <div className="dialog-actions">
@@ -2660,10 +2750,9 @@ export function ProgramTransportControls({
             <button
               type="button"
               className="danger-button"
-              disabled={!allMotionQuiesced}
               onClick={() => {
                 setHaltIntent(null);
-                void program.fullStop();
+                void program.halt();
               }}
             >Halt Program</button>
           </div>

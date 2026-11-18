@@ -26,17 +26,22 @@ prerequisites, commands and troubleshooting.
    output needed to diagnose a failure. Do not claim Isaac or hardware
    qualification from this mock setup check.
 
-The workbench normally keeps up to five previous sessions under
-`.manyforge-dev/runtime/<container-name>/previous-sessions/`. If
+The workbench keeps previous runs under
+`.manyforge-dev/runtime/<container-name>/previous-runs/`: at most five runs,
+counting the current one, and at most 2 GiB of archived runs and older History
+files together, oldest deleted first, and fewer when ManyForge's files exceed
+their [disk limits](DEVELOPMENT_WORKBENCH.md#disk-limits). If
 `MANYFORGE_DEV_CACHE_BASE` is set, it replaces `.manyforge-dev` in that path.
 `MANYFORGE_DEV_RUNTIME_STATE_ROOT`, when set, takes precedence over the cache
-base and directly names the runtime root containing `previous-sessions/`.
+base and directly names the runtime root containing `previous-runs/`.
 Unimported
 records, including safety records, are not guaranteed to survive retention:
-copy any sessions you want to keep elsewhere.
+copy any runs you want to keep elsewhere. A runtime root that still holds
+`previous-sessions/` from an earlier build is refused at start; move that
+folder out of the runtime root first.
 
-If session-count cleanup encounters more than 1,000 entries in
-`previous-sessions/`, `session-reports/` or `session-reports/pending/`, it
+If previous-run cleanup encounters more than 1,000 entries in
+`previous-runs/`, `session-reports/` or `session-reports/pending/`, it
 warns and pauses. With the workbench stopped, inspect the backlog and copy
 records you need. Preserve
 the current session, pending reports and incomplete selections.

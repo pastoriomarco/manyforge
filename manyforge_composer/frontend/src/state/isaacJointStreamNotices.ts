@@ -118,7 +118,6 @@ export function isaacJointStreamNotices(
     && section.freshness === 'fresh'
     && section.knownGaps.length === 0
     && section.sourceGeneration !== null
-    && section.sourceOwnerEpoch !== null
     && section.sourceOwnerId !== null;
   if (!sectionCurrent) {
     return [unavailableNotice(configured[0]!, 'The scene-runtime source is stale or unavailable.')];

@@ -3,6 +3,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 import re
+import zlib
 
 import pytest
 from pydantic import ValidationError
@@ -33,8 +34,18 @@ from manyforge_headless_api.models import (
     PlaceSequencePlanningRequest,
     RuntimeScaleControlRequest,
     SceneTransactionRequest,
+    FullStopIntentRequest,
     StopIntentRequest,
 )
+
+
+_A = "3f9a0000000000a1"
+# A formed key (class 3, part 0).
+_KEY = "c0" + "01" * 15
+
+
+def _key(sequence: int) -> str:
+    return "c0" + "01" * 7 + f"{sequence:016x}"
 
 
 def test_candidate_preview_requires_exact_prepared_activation_identity() -> None:
@@ -49,9 +60,11 @@ def test_candidate_preview_requires_exact_prepared_activation_identity() -> None
             "retained_bundle_id": "bundle.1",
         },
         "expected_admission_generation": 7,
-        "request_owner_epoch": "manager.1",
+        "application_start_id": _A,
     }
     parsed = ManagerDeploymentCandidatePreviewRequest.model_validate(body)
+    # ``A`` is checked at the edge and never serialized downstream.
+    assert "application_start_id" not in parsed.model_dump(mode="json")
     assert parsed.prepared_activation_id == "sha256:" + "e" * 64
     missing = dict(body)
     del missing["prepared_activation_id"]
@@ -62,11 +75,9 @@ def test_candidate_preview_requires_exact_prepared_activation_identity() -> None
 @pytest.mark.parametrize("groups", [["arm", "grippers"], [], ["bad group"], "arm"])
 def test_program_stop_group_list_is_bounded_and_explicit(groups):
     body = {
-        "request_id": "stop.groups",
-        "request_owner_epoch": "caller.1",
+        "request_key": _KEY,
         "source_label": "operator_ui",
-        "program_run_id": "run.1",
-        "expected_owner_epoch": "runner.1",
+        "program_run_id": 1,
         "group_ids": groups,
     }
     if groups == ["arm", "grippers"]:
@@ -81,9 +92,9 @@ def test_program_diagnostic_values_reject_nonportable_json(value):
     with pytest.raises(ValidationError):
         ProgramDiagnosticRequest.model_validate(
             {
-                "schema_version": "manyforge.program_diagnostic.v4",
-                "program_run_id": "run.1",
-                "owner_epoch": "runner.1",
+                "schema_version": "manyforge.program_diagnostic.v5",
+                "program_run_id": 1,
+                "application_start_id": "3f9a0000000000a1",
                 "program_revision": "sha256:" + "a" * 64,
                 "program_binding_id": "sha256:" + "b" * 64,
                 "retained_bundle_id": "sha256:" + "c" * 64,
@@ -144,10 +155,8 @@ def test_native_failure_detail_keys_match_the_runtime_constant() -> None:
 
 def _caller() -> dict[str, object]:
     return {
-        "request_id": "request.1",
-        "request_owner_epoch": "client.epoch.1",
+        "request_key": _KEY,
         "source_label": "operator_ui",
-        "correlation_id": None,
     }
 
 
@@ -250,14 +259,15 @@ def _planning_motion(
 
 
 def _planning_operation(
-    request_id: str, payload: dict[str, object], *, tool: bool = False
+    label: str, payload: dict[str, object], *, tool: bool = False
 ) -> dict[str, object]:
+    # Each phase is its own request: its own key, derived from its label.
     return {
-        "request_context": {**_caller(), "request_id": request_id},
+        "request_context": {**_caller(), "request_key": _key(zlib.crc32(label.encode()))},
         "program_id": "program:test",
         "program_revision": "program-revision:test",
         "program_binding_id": "program-binding:test",
-        "program_run_id": "run:test",
+        "program_run_id": 1,
         "expected_graph_revision": "graph:test",
         "expected_retained_bundle_id": "bundle:test",
         "expected_scene_revision": {
@@ -285,27 +295,39 @@ def test_manual_context_is_optional_and_does_not_change_ordinary_wire():
     ordinary = OperationIntentRequest.model_validate(body)
     assert ordinary.model_dump(mode="json") == body
     body["manual_handover"] = {
-        "program_runner_owner_epoch": "runner.1",
-        "program_run_id": "parent.1",
+        "program_run_id": 3,
         "claim_generation": 1,
-        "selection_revision": 0,
+        "hold_revision": 0,
     }
-    assert OperationIntentRequest.model_validate(body).model_dump(mode="json") == body
-    body["manual_handover"]["program_run_id"] = body["program_run_id"]
-    with pytest.raises(ValidationError, match="own Run"):
+    # A manual handover has no run of its own; its parent run is the context.
+    with pytest.raises(ValidationError, match="without a Run"):
         OperationIntentRequest.model_validate(body)
+    body["program_run_id"] = None
+    assert OperationIntentRequest.model_validate(body).model_dump(mode="json") == body
+
+
+def test_manual_intent_has_no_run_and_sends_null():
+    body = _planning_operation("manual.2", _tool_payload(), tool=True)
+    del body["program_run_id"]
+    manual = OperationIntentRequest.model_validate(body)
+    assert manual.program_run_id is None
+    assert manual.model_dump(mode="json") == {**body, "program_run_id": None}
 
 
 @pytest.mark.parametrize(
     "change",
     [
         {"claim_generation": 0},
-        {"selection_revision": -1},
-        {"selection_revision": 2**53},
-        {"selection_revision": True},
+        {"hold_revision": -1},
+        {"hold_revision": 2**53},
+        {"hold_revision": True},
+        # The hold revision replaced the selection revision (no alias).
+        {"selection_revision": 0},
         {"program_run_id": ""},
-        {"program_run_id": "x" * 129},
-        {"program_runner_owner_epoch": "a\0b"},
+        {"program_run_id": "3"},
+        {"program_run_id": 0},
+        # The runner owner epoch left the Kernel-held coordinates.
+        {"program_runner_owner_epoch": "runner.1"},
         {"unknown": 1},
     ],
 )
@@ -313,10 +335,9 @@ def test_manual_context_rejects_invalid_coordinates(change):
     with pytest.raises(ValidationError):
         ManualProgramHandoverContext.model_validate(
             {
-                "program_runner_owner_epoch": "runner.1",
-                "program_run_id": "parent.1",
+                "program_run_id": 3,
                 "claim_generation": 1,
-                "selection_revision": 0,
+                "hold_revision": 0,
                 **change,
             }
         )
@@ -328,10 +349,9 @@ def test_manual_producer_indices_are_closed_and_canonical(indices):
         ManualProgramHandover.model_validate(
             {
                 "context": {
-                    "program_runner_owner_epoch": "runner.1",
-                    "program_run_id": "parent.1",
+                    "program_run_id": 3,
                     "claim_generation": 1,
-                    "selection_revision": 0,
+                    "hold_revision": 0,
                 },
                 "producer_node_indices": indices,
             }
@@ -386,11 +406,11 @@ def test_coordinated_operation_checks_every_participant_action_span() -> None:
     operation["participants"][1]["action_span"] = {
         "action_source": "system",
         "action_span_id": "span.second",
-        "program_run_id": "run:other",
+        "program_run_id": 2,
     }
     with pytest.raises(ValidationError, match="must match the operation"):
         OperationIntentRequest.model_validate(operation)
-    operation["participants"][1]["action_span"]["program_run_id"] = "run:test"
+    operation["participants"][1]["action_span"]["program_run_id"] = 1
     assert OperationIntentRequest.model_validate(operation).participants[1].action_span
 
 
@@ -921,7 +941,7 @@ def test_apply_rejects_unknown_identity_and_noncanonical_busy_policy() -> None:
         "prepared_activation": _prepared_activation(),
         "expected_admission_generation": 7,
         "candidate_receipt": {
-            "schema_version": "manyforge.manager_deployment_candidate_receipt.v2",
+            "schema_version": "manyforge.manager_deployment_candidate_receipt.v3",
             "deployment_artifact_id": "deployment.1",
             "deployment_revision": "sha256:" + "a" * 64,
             "prepared_activation_id": "sha256:" + "e" * 64,
@@ -932,7 +952,6 @@ def test_apply_rejects_unknown_identity_and_noncanonical_busy_policy() -> None:
                 "retained_bundle_id": "bundle.1",
             },
             "expected_admission_generation": 7,
-            "manager_owner_epoch": "owner.1",
             "impact_digest": "sha256:" + "c" * 64,
             "destructive_impact": False,
             "receipt_digest": "sha256:" + "c" * 64,
@@ -975,7 +994,7 @@ def test_apply_requires_one_exact_prepared_activation() -> None:
         "prepared_activation": _prepared_activation(),
         "expected_admission_generation": 7,
         "candidate_receipt": {
-            "schema_version": "manyforge.manager_deployment_candidate_receipt.v2",
+            "schema_version": "manyforge.manager_deployment_candidate_receipt.v3",
             "deployment_artifact_id": "deployment.1",
             "deployment_revision": "sha256:" + "a" * 64,
             "prepared_activation_id": "sha256:" + "e" * 64,
@@ -986,7 +1005,6 @@ def test_apply_requires_one_exact_prepared_activation() -> None:
                 "retained_bundle_id": "bundle.1",
             },
             "expected_admission_generation": 7,
-            "manager_owner_epoch": "owner.1",
             "impact_digest": "sha256:" + "c" * 64,
             "destructive_impact": False,
             "receipt_digest": "sha256:" + "c" * 64,
@@ -1082,11 +1100,10 @@ def test_apply_requires_one_exact_prepared_activation() -> None:
 def _status_body() -> dict[str, object]:
     prepared = _prepared_activation()
     return {
-        "apply_id": "apply.3",
+        "apply_id": 3,
         "scene_initialization": "preserve",
         "apply_generation": 3,
-        "request_id": "request.3",
-        "request_owner_epoch": "client.epoch.3",
+        "request_key": _key(3),
         "prepared_activation": {
             **{
                 key: prepared[key]
@@ -1412,34 +1429,36 @@ def test_apply_status_requires_strict_failure_acknowledgement_state() -> None:
         })
 
 
-def test_apply_acknowledgement_context_is_bounded_and_allows_missing_epoch() -> None:
+def test_apply_acknowledgement_context_is_bounded_and_names_only_key_and_label() -> None:
     request = ManagerApplyAcknowledgementRequest.model_validate({
+        "application_start_id": _A,
         "request_context": {
-            "request_id": "composer-ack.request.1",
+            "request_key": _KEY,
             "source_label": "manyforge_composer",
-        }
+        },
     })
-    assert request.request_context.model_dump(mode="json", exclude_none=True) == {
-        "request_id": "composer-ack.request.1",
-        "source_label": "manyforge_composer",
+    assert request.model_dump(mode="json", exclude_none=True) == {
+        "request_context": {
+            "request_key": _KEY,
+            "source_label": "manyforge_composer",
+        },
     }
-    with_epoch = ManagerApplyAcknowledgementContext.model_validate({
-        "request_id": "composer-ack.request.2",
-        "source_label": "manyforge_composer",
-        "request_owner_epoch": "operator-command.epoch.2",
-        "correlation_id": "correlation.2",
-    })
-    assert with_epoch.request_owner_epoch == "operator-command.epoch.2"
     for context in (
-        {"request_id": "", "source_label": "manyforge_composer"},
-        {"request_id": "request.1", "source_label": ""},
+        {"request_key": _KEY, "source_label": ""},
+        {"request_key": _KEY, "source_label": "manyforge\ncomposer"},
+        # The owner epoch and the correlation id are deleted (BS 2.8).
         {
-            "request_id": "request.1",
+            "request_key": _KEY,
             "source_label": "manyforge_composer",
-            "request_owner_epoch": "e\u0301",
+            "request_owner_epoch": "operator-command.epoch.2",
         },
         {
-            "request_id": "request.1",
+            "request_key": _KEY,
+            "source_label": "manyforge_composer",
+            "correlation_id": "correlation.2",
+        },
+        {
+            "request_key": _KEY,
             "source_label": "manyforge_composer",
             "unexpected": True,
         },
@@ -1452,7 +1471,7 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
     context = _caller()
     control = {
         "request_context": context,
-        "operation_id": "operation-1",
+        "operation_id": 1,
         "expected_operation_revision": 1,
         "reason": "r" * 4096,
     }
@@ -1465,9 +1484,8 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
         )
 
     stop_target = {
-        "operation_id": "operation-1",
+        "operation_id": 1,
         "expected_operation_revision": 1,
-        "expected_stop_generation": 0,
     }
     assert (
         StopIntentRequest.model_validate(
@@ -1478,15 +1496,23 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
             }
         )
         .operations[0]
-        .expected_stop_generation
-        == 0
+        .expected_operation_revision
+        == 1
     )
+    # A Stop carries no Stop generation (stop state model §7.3): no alias.
+    with pytest.raises(ValidationError):
+        StopIntentRequest.model_validate(
+            {
+                "request_context": context,
+                "operations": [{**stop_target, "expected_stop_generation": 0}],
+            }
+        )
     multi_stop = StopIntentRequest.model_validate(
         {
             "request_context": context,
             "operations": [
                 stop_target,
-                {**stop_target, "operation_id": "operation-2"},
+                {**stop_target, "operation_id": 2},
             ],
             "reason": "r" * 1025,
         }
@@ -1503,7 +1529,6 @@ def test_operation_mutations_are_strict_bounded_and_generation_fenced() -> None:
                         "resource_id": "resource-1",
                         "expected_graph_revision": "graph.1",
                         "expected_operation_resource_generation": 1,
-                        "expected_stop_generation": 0,
                     }
                 ],
             }
@@ -1657,10 +1682,8 @@ def test_gripper_command_requires_unit_tags_and_matching_nonnegative_effort() ->
 def _scene_transaction() -> dict[str, object]:
     scene_id = "sha256:" + "d" * 64
     return {
-        "request_context": {
-            **_caller(),
-            "request_owner_epoch": "scene-owner.epoch.7",
-        },
+        "application_start_id": _A,
+        "request_context": _caller(),
         "expected_projection_revision": {
             "retained_bundle_id": "sha256:" + "b" * 64,
             "graph_revision": "sha256:" + "c" * 64,
@@ -1689,10 +1712,18 @@ def _scene_transaction() -> dict[str, object]:
 def test_scene_transaction_is_strict_and_cannot_assert_attribution() -> None:
     parsed = SceneTransactionRequest.model_validate(_scene_transaction())
     assert parsed.operation.scene_resource_id == "part.1"
-    assert (
-        parsed.request_context.request_owner_epoch
-        != parsed.expected_projection_revision.scene_revision.scene_id
-    )
+    # The context names the request only; ``A`` is checked at the edge and
+    # never serialized downstream.
+    dumped = parsed.model_dump(mode="json")
+    assert dumped["request_context"] == {"request_key": _KEY, "source_label": "operator_ui"}
+    assert "application_start_id" not in dumped
+    with pytest.raises(ValidationError):
+        SceneTransactionRequest.model_validate(
+            {
+                **_scene_transaction(),
+                "request_context": {**_caller(), "request_owner_epoch": "scene-owner.epoch.7"},
+            }
+        )
 
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         SceneTransactionRequest.model_validate(
@@ -1725,14 +1756,23 @@ def test_scene_transaction_is_strict_and_cannot_assert_attribution() -> None:
 
     reset = _scene_transaction()
     reset["program_reset_scene_authorization"] = {
-        "program_runner_owner_epoch": "program-runner.epoch.2",
-        "program_run_id": "program-cycle.2",
+        "program_run_id": 2,
         "cycle_claim_generation": 9,
         "terminal_or_settlement_reference": "sha256:" + "e" * 64,
+        "program_cycle_status": {
+            "cycle_generation": 4, "state": "resetting", "program_run_id": 2,
+            "cycle_claim_generation": 9, "terminal_or_settlement_reference": "sha256:" + "e" * 64,
+            "accepted_reset": {"request_key": _KEY, "request_payload_digest": "sha256:" + "a" * 64,
+                               "reload_initial_scene": True, "reset_robot_position": False,
+                               "reset_claim_generation": None}},
     }
     parsed_reset = SceneTransactionRequest.model_validate(reset)
     assert parsed_reset.program_reset_scene_authorization is not None
     assert parsed_reset.program_reset_scene_authorization.cycle_claim_generation == 9
+    # OD-139: the runner's current cycle status is required.
+    del reset["program_reset_scene_authorization"]["program_cycle_status"]
+    with pytest.raises(ValidationError):
+        SceneTransactionRequest.model_validate(reset)
 
 
 def test_scene_support_declarations_are_portable_and_mode_normalized() -> None:
@@ -1979,9 +2019,8 @@ def test_the_empty_cell_preparation_has_a_scenario_origin() -> None:
 @pytest.mark.parametrize("value", [None, 0, 1, "true", "false", [], {}])
 def test_program_reset_options_are_strict_default_off(option, value):
     from manyforge_headless_api.models import ProgramCycleResetRequest
-    body = {"request_id": "reset.1", "request_owner_epoch": "caller.1", "source_label": "operator_ui",
-            "correlation_id": None, "program_run_id": None, "expected_owner_epoch": "runner.1",
-            "expected_cycle_generation": 1}
+    body = {"request_key": _KEY, "source_label": "operator_ui",
+            "program_run_id": None, "expected_cycle_generation": 1}
     parsed = ProgramCycleResetRequest.model_validate(body)
     assert parsed.reload_initial_scene is False and parsed.reset_robot_position is False
     with pytest.raises(ValidationError):
@@ -1990,11 +2029,15 @@ def test_program_reset_options_are_strict_default_off(option, value):
 
 def test_no_run_selected_reset_requires_retained_options_and_truthful_phase():
     from manyforge_headless_api.program_cycle import ProgramCycleStatusDTO
-    cycle = {"program_runner_owner_epoch": "runner.1", "cycle_generation": 1,
+    cycle = {"cycle_generation": 1,
              "state": "resetting", "program_run_id": None, "cycle_claim_generation": None,
              "terminal_or_settlement_reference": None, "execution_control_revision": 2,
-             "causal_correlation_id": "reset.1", "causal_session_id": None, "causal_client_sequence": None,
-             "current_command_kind": "program_reset", "failure": None, "reset_phase": "restoring_scene",
+             "causal_request_key": _KEY,
+             "current_command_kind": "program_reset",
+             "runner_commands": {"in_progress": {
+                 "kind": "reset", "request_key": _KEY, "step": "restoring_scene",
+                 "accepted_at_ns": "1", "end": None}, "ended": []},
+             "failure": None, "reset_phase": "restoring_scene",
              "reset_options": {"reload_initial_scene": True, "reset_robot_position": False},
              "reset_robot_position": {"available": False, "reason": "unsupported"}, "allowed_commands": []}
     ProgramCycleStatusDTO.model_validate(cycle)
@@ -2013,13 +2056,23 @@ def test_no_run_selected_reset_requires_retained_options_and_truthful_phase():
 
 
 def test_idle_reset_scene_authorization_is_a_closed_union_with_the_existing_run_shape():
-    authorization = {"program_runner_owner_epoch": "runner.1", "cycle_generation": 3,
-                     "reset_claim": {"request_owner_epoch": "caller.1", "request_id": "reset.1",
-                                    "request_payload_digest": "sha256:" + "a" * 64, "reset_claim_generation": 7}}
+    authorization = {"cycle_generation": 3,
+                     "reset_claim": {"request_key": _KEY,
+                                    "request_payload_digest": "sha256:" + "a" * 64, "reset_claim_generation": 7},
+                     "program_cycle_status": {
+                         "cycle_generation": 3, "state": "resetting", "program_run_id": None,
+                         "cycle_claim_generation": None, "terminal_or_settlement_reference": None,
+                         "accepted_reset": {"request_key": _KEY, "request_payload_digest": "sha256:" + "a" * 64,
+                                            "reload_initial_scene": True, "reset_robot_position": False,
+                                            "reset_claim_generation": 7}}}
     body = {**_scene_transaction(), "program_reset_scene_authorization": authorization}
     parsed = SceneTransactionRequest.model_validate(body)
     assert parsed.program_reset_scene_authorization.model_dump(mode="json") == authorization
-    for malformed in ({**authorization, "program_run_id": "invented"},
+    for malformed in ({**authorization, "program_run_id": 1},
+                      {key: value for key, value in authorization.items() if key != "program_cycle_status"},
+                      {**authorization, "program_cycle_status": {
+                          **authorization["program_cycle_status"], "reset_phase": "restoring_scene"}},
+                      {**authorization, "reset_claim": {**authorization["reset_claim"], "request_key": "reset.1"}},
                       {**authorization, "reset_claim": {**authorization["reset_claim"], "reset_claim_generation": None}},
                       {**authorization, "reset_claim": {**authorization["reset_claim"], "reload_initial_scene": True}}):
         with pytest.raises(ValidationError):
@@ -2028,7 +2081,7 @@ def test_idle_reset_scene_authorization_is_a_closed_union_with_the_existing_run_
 
 def _recovery_action(**changes: object) -> dict[str, object]:
     body = {
-        "request_id": "recovery.1",
+        "request_key": _KEY,
         "action": "retry_motion_from_current_state",
         "expected_assessment_revision": 2,
         "expected_control_command_epoch": 0,
@@ -2062,17 +2115,15 @@ def test_runtime_control_audit_rows_pass_through_the_cycle_frame_unchanged():
         }
     ]
     frame = {
-        "program_runner_owner_epoch": "runner.1",
         "cycle_generation": 1,
         "state": "running",
-        "program_run_id": "run.1",
+        "program_run_id": 1,
         "cycle_claim_generation": 1,
         "terminal_or_settlement_reference": None,
         "execution_control_revision": 1,
-        "causal_correlation_id": None,
-        "causal_session_id": None,
-        "causal_client_sequence": None,
+        "causal_request_key": None,
         "current_command_kind": None,
+        "runner_commands": {"in_progress": None, "ended": []},
         "failure": None,
         "reset_phase": None,
         "reset_options": None,
@@ -2083,19 +2134,17 @@ def test_runtime_control_audit_rows_pass_through_the_cycle_frame_unchanged():
         "runtime_control_revision": 3,
         "recovery_offer": None,
         "run": {
-            "owner_epoch": "runner.1",
-            "capture": {"program_run_id": "run.1"},
+            "capture": {"program_run_id": 1},
             "run_revision": 1,
             "node_status_revision": 1,
             "state": "running",
         },
         "runtime_controls": {
-            "program_run_id": "run.1",
-            "owner_epoch": "runner.1",
+            "program_run_id": 1,
             "run_revision": 1,
             "runtime_controls": {
-                "schema_version": "manyforge.program_runtime_controls.v3",
-                "program_run_id": "run.1",
+                "schema_version": "manyforge.program_runtime_controls.v4",
+                "program_run_id": 1,
                 "runtime_control_revision": 3,
                 "recovery_fences": {},
                 "retry_counts": {"move.1": 1},
@@ -2129,3 +2178,355 @@ def test_run_failure_details_accept_qualified_signal_without_truncation() -> Non
     details["reference"]["signal_name"] += "x"
     with pytest.raises(ValueError):
         validate_failure_details_and_origin(details, origin)
+
+
+def test_a_stop_body_is_never_invalid_because_of_its_key() -> None:
+    """The Stop models carry the client's key unchecked: Headless forms it,
+    and a Stop without a valid key acts with a Headless key (1.8, Q8)."""
+    context = _caller()
+    target = {
+        "operation_id": 1,
+        "expected_operation_revision": 1,
+    }
+    for request_key in (_KEY, _KEY.upper(), "", "not-a-key", None):
+        stop_context = {**context, "request_key": request_key}
+        StopIntentRequest.model_validate(
+            {"request_context": stop_context, "operations": [target]}
+        )
+        FullStopIntentRequest.model_validate({"request_context": stop_context})
+    for removed in ("request_id", "request_owner_epoch", "correlation_id"):
+        stop_context = {**context, removed: "x"}
+        with pytest.raises(ValidationError):
+            StopIntentRequest.model_validate(
+                {"request_context": stop_context, "operations": [target]}
+            )
+
+
+def _cycle_status(**changes: object) -> dict[str, object]:
+    return {
+        "cycle_generation": 1,
+        "state": "starting",
+        "program_run_id": None,
+        "cycle_claim_generation": None,
+        "terminal_or_settlement_reference": None,
+        "execution_control_revision": 1,
+        "causal_request_key": _KEY,
+        "current_command_kind": "program_run",
+        "runner_commands": {"in_progress": _row("start"), "ended": []},
+        "failure": None,
+        "reset_phase": None,
+        "reset_options": None,
+        "reset_robot_position": {"available": False, "reason": "unsupported"},
+        "allowed_commands": [],
+        **changes,
+    }
+
+
+def _row(kind: str, **changes: object) -> dict[str, object]:
+    return {"kind": kind, "request_key": _KEY, "step": None,
+            "accepted_at_ns": None, "end": None, **changes}
+
+
+def _end(outcome: str, code: str | None = None, **changes: object) -> dict[str, object]:
+    return {"outcome": outcome, "code": code, "details": None,
+            "finished_at_ns": "2", **changes}
+
+
+def test_the_runner_commands_are_closed_rows() -> None:
+    """OD-144/OD-214: the command holding the runner and the last 8 ended."""
+    from manyforge_headless_api.program_cycle import ProgramCycleStatusDTO
+
+    def status(in_progress=None, ended=()):
+        return _cycle_status(runner_commands={"in_progress": in_progress,
+                                              "ended": list(ended)})
+
+    for kind in ("start", "reset", "scene_preparation", "resume_motion",
+                 "persistent_values_clear", "recovery_action"):
+        ProgramCycleStatusDTO.model_validate(status(_row(kind)))
+    ProgramCycleStatusDTO.model_validate(status(
+        _row("start", step="claiming", accepted_at_ns="1"),
+        [_row("reset", step="releasing", accepted_at_ns="1", end=_end("succeeded")),
+         _row("start", end=_end("refused", "program_cycle_reset_required",
+                                details={"x": 1})),
+         _row("resume_motion", step="applying", accepted_at_ns="1",
+              end=_end("unknown", "program_cycle_reconciliation_required"))]))
+    ProgramCycleStatusDTO.model_validate(status(None, [
+        _row("start", step="admitting", accepted_at_ns="1", end=_end("refused", "x"))] * 8))
+    invalid = [
+        status(_row("program_run")),
+        status(_row("stop_all")),
+        status(_row("start", request_key="KEY")),
+        status(_row("start", step="flying", accepted_at_ns="1")),
+        # Times are decimal text (wall-clock ns exceed a JSON-safe integer).
+        status(_row("start", step="admitting", accepted_at_ns=1)),
+        status(_row("start", step="admitting", accepted_at_ns="01")),
+        # A step before acceptance; an end in progress; no end when ended.
+        status(_row("start", step="claiming")),
+        status(_row("start", end=_end("refused", "x"))),
+        status(None, [_row("start")]),
+        # Before acceptance only refused or unknown; a code exactly unless succeeded.
+        status(None, [_row("start", end=_end("succeeded"))]),
+        status(None, [_row("start", accepted_at_ns="1", end=_end("succeeded", "x"))]),
+        status(None, [_row("start", accepted_at_ns="1", end=_end("failed"))]),
+        status(None, [_row("start", accepted_at_ns="1", end=_end("cancelled", "x"))]),
+        status(None, [_row("start", accepted_at_ns="1", end=_end("refused", "x"))] * 9),
+    ]
+    for value in invalid:
+        with pytest.raises(ValidationError):
+            ProgramCycleStatusDTO.model_validate(value)
+    without = _cycle_status()
+    del without["runner_commands"]
+    with pytest.raises(ValidationError):
+        ProgramCycleStatusDTO.model_validate(without)
+    for removed in ({"command_in_progress": None}, {"command_in_progress": "start"}):
+        with pytest.raises(ValidationError):
+            ProgramCycleStatusDTO.model_validate({**_cycle_status(), **removed})
+
+
+def test_the_command_reply_is_one_versioned_row() -> None:
+    from manyforge_headless_api.program_cycle import (
+        PROGRAM_COMMAND_REPLY_SCHEMA,
+        ProgramCommandReplyDTO,
+    )
+
+    assert PROGRAM_COMMAND_REPLY_SCHEMA == "manyforge.program_command_reply.v1"
+    ProgramCommandReplyDTO.model_validate({
+        "schema_version": PROGRAM_COMMAND_REPLY_SCHEMA,
+        "command": _row("start", step="admitting", accepted_at_ns="1")})
+    with pytest.raises(ValidationError):
+        ProgramCommandReplyDTO.model_validate({
+            "schema_version": "manyforge.program_runtime_control_result.v2",
+            "command": _row("start", step="admitting", accepted_at_ns="1")})
+
+
+def test_a_start_window_cycle_has_no_run_and_no_claim_yet() -> None:
+    """K-6: a run number is announced only after its Kernel claim (1.15.5)."""
+    from manyforge_headless_api.program_cycle import ProgramCycleStatusDTO
+
+    ProgramCycleStatusDTO.model_validate(_cycle_status())
+    ProgramCycleStatusDTO.model_validate(
+        _cycle_status(program_run_id=3, cycle_claim_generation=2)
+    )
+    for change in (
+        {"cycle_claim_generation": 2},
+        {"state": "running"},
+        {"causal_request_key": "reset.1"},
+        {"causal_request_key": _KEY.upper()},
+        {"causal_correlation_id": None},
+    ):
+        with pytest.raises(ValidationError):
+            ProgramCycleStatusDTO.model_validate(_cycle_status(**change))
+
+
+def test_runner_requests_forward_the_formed_key_and_never_a():
+    """1.15.1: the runner receives the formed key; ``A`` stays at Headless."""
+    from manyforge_headless_api.models import (
+        CycleRecoveryActionRequest,
+        ProgramCycleResetRequest,
+        ProgramHaltResumeRequest,
+        ProgramRunStartRequest,
+        ProgramSelectionResumeRequest,
+    )
+
+    digest = "sha256:" + "0" * 64
+    bodies = (
+        (ProgramRunStartRequest, {"scenario_id": "lite6", "source_document_digest": digest,
+                                  "expected_applied_record_digest": digest,
+                                  "draft_program_revision": digest}),
+        (ProgramCycleResetRequest, {"program_run_id": 3, "expected_cycle_generation": 1}),
+        (ProgramHaltResumeRequest, {"program_run_id": 3, "expected_run_revision": 1}),
+        (ProgramSelectionResumeRequest, {"program_run_id": 3, "expected_hold_revision": 0}),
+        (CycleRecoveryActionRequest, {"offer_id": digest, "offer_revision": 1,
+                                      "action_id": "reset_cycle"}),
+    )
+    for model, fields in bodies:
+        parsed = model.model_validate({**_caller(), "application_start_id": _A, **fields})
+        dumped = parsed.model_dump(mode="json")
+        assert dumped["request_key"] == _KEY
+        assert "application_start_id" not in dumped
+        for removed in ("expected_owner_epoch", "control_session_number", "client_sequence"):
+            assert removed not in dumped
+            with pytest.raises(ValidationError):
+                model.model_validate({**_caller(), **fields, removed: 1})
+        with pytest.raises(ValidationError):
+            model.model_validate({**_caller(), **fields, "program_run_id": "run.1"})
+
+
+def test_history_filters_accept_the_display_and_copy_forms():
+    from manyforge_headless_api.history_query import HistorianQueryRequest
+
+    for form in ("7", "3f9a/op7", _A + "/op7"):
+        query = HistorianQueryRequest(operation_id=form)
+        assert query.native_arguments(now_utc_ns=1)["correlations"] == {"operation_id": "7"}
+    copy = HistorianQueryRequest(operation_id=_A + "/op7", stop_event_id=_A[:4] + "/stop2")
+    assert copy.start_identities() == ({_A}, {_A[:4]})
+    # The named start is the store's filter; none means the current start.
+    assert copy.native_arguments(now_utc_ns=1)["application_start_id"] == _A
+    assert HistorianQueryRequest(operation_id="7").native_arguments(now_utc_ns=1)["application_start_id"] is None
+    whole = HistorianQueryRequest(application_start_id=_A).native_arguments(now_utc_ns=1)
+    assert (whole["application_start_id"], whole["correlations"]) == (_A, {})
+    for invalid in ("op.7", "3f9a/stop7", "07"):
+        with pytest.raises(ValidationError):
+            HistorianQueryRequest(operation_id=invalid)
+    for incoherent in (
+        {"application_start_id": "3F9A"},
+        {"application_start_id": "0" * 16},
+        {"application_start_id": _A, "operation_id": "1" * 16 + "/op7"},
+        {"application_start_id": _A, "operation_id": "ffff/op7"},
+        {"source_owner_epoch": _A},
+    ):
+        with pytest.raises(ValidationError):
+            HistorianQueryRequest(**incoherent)
+
+
+# Bulk change 1, third pass: documents the runner and behaviour layer produce
+# and the owner-epoch fields deleted with their compares (contract 1.16.4).
+
+
+def _diagnostic(**changes: object) -> dict[str, object]:
+    return {
+        "schema_version": "manyforge.program_diagnostic.v5",
+        "program_run_id": 1,
+        "application_start_id": _A,
+        "program_revision": "sha256:" + "a" * 64,
+        "program_binding_id": "sha256:" + "b" * 64,
+        "retained_bundle_id": "sha256:" + "c" * 64,
+        "graph_revision": "sha256:" + "d" * 64,
+        "state": "succeeded",
+        "reason_code": None,
+        "message": "Completed",
+        "occurred_at_ns": "1",
+        "occurred_at_wall": "2026-09-08T10:00:00Z",
+        "blackboard": {},
+        "omitted_blackboard_count": 0,
+        "delivery_loss_count": 0,
+        "details": None,
+        "origin": None,
+        **changes,
+    }
+
+
+def test_program_diagnostic_v5_keeps_its_start_identity_in_the_record() -> None:
+    parsed = ProgramDiagnosticRequest.model_validate(_diagnostic())
+    assert parsed.model_dump(mode="json")["application_start_id"] == _A
+    for invalid in (
+        _diagnostic(schema_version="manyforge.program_diagnostic.v4"),
+        _diagnostic(owner_epoch="runner.1"),
+    ):
+        with pytest.raises(ValidationError):
+            ProgramDiagnosticRequest.model_validate(invalid)
+
+
+def test_cycle_status_and_its_frame_name_no_runner_owner_epoch() -> None:
+    from manyforge_headless_api.program_cycle import ProgramCycleStatusDTO
+
+    ProgramCycleStatusDTO.model_validate(_cycle_status())
+    with pytest.raises(ValidationError):
+        ProgramCycleStatusDTO.model_validate(
+            _cycle_status(program_runner_owner_epoch=_A)
+        )
+
+
+def test_node_admission_evidence_and_reset_scene_authorization_carry_no_epoch() -> None:
+    from manyforge_headless_api.models import (
+        ProgramNodeAdmissionEvidenceRequest,
+        ProgramResetSceneAuthorizationRequest,
+    )
+
+    evidence = {
+        "program_run_id": 1,
+        "parent_program_cycle_claim_generation": 2,
+        "node_instance_id": "place",
+        "node_attempt_id": 3,
+        "owner_api": "scene.transaction",
+    }
+    ProgramNodeAdmissionEvidenceRequest.model_validate(evidence)
+    authorization = {
+        "program_run_id": 1,
+        "cycle_claim_generation": 2,
+        "terminal_or_settlement_reference": "sha256:" + "e" * 64,
+        "program_cycle_status": {
+            "cycle_generation": 4, "state": "resetting", "program_run_id": 1,
+            "cycle_claim_generation": 2, "terminal_or_settlement_reference": "sha256:" + "e" * 64,
+            "accepted_reset": {"request_key": _KEY, "request_payload_digest": "sha256:" + "a" * 64,
+                               "reload_initial_scene": True, "reset_robot_position": False,
+                               "reset_claim_generation": None}},
+    }
+    ProgramResetSceneAuthorizationRequest.model_validate(authorization)
+    for model, body in (
+        (ProgramNodeAdmissionEvidenceRequest, evidence),
+        (ProgramResetSceneAuthorizationRequest, authorization),
+    ):
+        with pytest.raises(ValidationError):
+            model.model_validate({**body, "program_runner_owner_epoch": _A})
+
+
+def test_io_signal_read_is_the_v3_query_without_an_owner_epoch() -> None:
+    from manyforge_headless_api.models import IoSignalReadRequest
+
+    read = {
+        "schema_version": "manyforge.target_observation_query.v3",
+        "program_binding_id": "sha256:" + "a" * 64,
+        "kind": "io_signal",
+        "signal": {"component_id": "station", "signal_name": "part_present"},
+    }
+    assert IoSignalReadRequest.model_validate(read).target_query().model_dump(
+        mode="json", exclude_none=True
+    ) == read
+    with pytest.raises(ValidationError):
+        IoSignalReadRequest.model_validate({**read, "owner_epoch": "owner.1"})
+
+
+def test_stop_all_and_halt_body_is_the_request_context_alone() -> None:
+    """Stop all and Halt name no run and carry no Stop generation."""
+    context = _caller()
+    parsed = FullStopIntentRequest.model_validate({"request_context": context})
+    assert set(parsed.model_dump(mode="json")) == {"request_context"}
+    for extra in ({"expected_stop_generation": 0}, {"program_run_id": 1}):
+        with pytest.raises(ValidationError):
+            FullStopIntentRequest.model_validate({"request_context": context, **extra})
+
+
+def test_recovery_action_carries_no_certificate_fence() -> None:
+    """The operation revision alone fences a recovery action (L5, N3)."""
+    for removed in ("expected_stop_certificate_id", "expected_stop_owner_generation"):
+        with pytest.raises(ValidationError):
+            OperationRecoveryActionRequest.model_validate(
+                _recovery_action(**{removed: "x" if removed.endswith("_id") else 1})
+            )
+
+
+def test_program_run_end_carries_the_run_and_its_context_only() -> None:
+    from manyforge_headless_api.models import ProgramRunStopIntentRequest
+
+    body = {"request_context": {**_caller(), "request_key": _KEY}, "program_run_id": 3}
+    assert ProgramRunStopIntentRequest.model_validate(body).program_run_id == 3
+    with pytest.raises(ValidationError):
+        ProgramRunStopIntentRequest.model_validate({**body, "reason": "x"})
+
+
+def test_selection_release_is_fenced_by_the_hold_revision_alone() -> None:
+    from manyforge_headless_api.models import ProgramSelectionResumeRequest
+
+    body = {**_caller(), "program_run_id": 3, "expected_hold_revision": 2}
+    assert ProgramSelectionResumeRequest.model_validate(body).expected_hold_revision == 2
+    with pytest.raises(ValidationError):
+        ProgramSelectionResumeRequest.model_validate(
+            {**_caller(), "program_run_id": 3, "expected_selection_revision": 2}
+        )
+
+
+@pytest.mark.parametrize(
+    "old_member",
+    [
+        {"request_payload_digest": "sha256:" + "e" * 64},
+        {"owner_transaction_id": "authoring-transaction.1"},
+    ],
+)
+def test_authoring_transaction_request_has_no_digest_or_transaction_id(old_member) -> None:
+    from manyforge_headless_api.models import AuthoringMutationContext
+
+    body = {**_caller(), "expected_admission_generation": 7}
+    assert AuthoringMutationContext.model_validate(body).expected_admission_generation == 7
+    with pytest.raises(ValidationError):
+        AuthoringMutationContext.model_validate({**body, **old_member})

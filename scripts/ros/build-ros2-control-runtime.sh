@@ -113,9 +113,14 @@ if [[ -n "$DATA_OVERLAY" ]]; then
     # shellcheck disable=SC1090
     source "${DATA_OVERLAY}/setup.bash"
 fi
+COLCON=(colcon)
 if [[ -d "${MANYFORGE_VENV}" ]]; then
     # shellcheck disable=SC1091
     source "${MANYFORGE_VENV}/bin/activate"
+    # Run colcon under the venv's Python: --symlink-install takes the
+    # installed Python scripts' shebang from the Python running colcon, and
+    # those scripts need venv-only modules (fastapi).
+    COLCON=("${MANYFORGE_VENV}/bin/python3" -m colcon)
 fi
 set -u
 
@@ -195,7 +200,7 @@ if [[ "${MANYFORGE_ROS2_CONTROL_BUILD_TESTING:-OFF}" == ON ]]; then
     ROS_OVERLAY_PACKAGES=(manyforge_perception_interfaces "${ROS_OVERLAY_PACKAGES[@]}")
 fi
 
-colcon --log-base "${ROS_OVERLAY}/log" build \
+"${COLCON[@]}" --log-base "${ROS_OVERLAY}/log" build \
     --base-paths "${ROS_OVERLAY_BASE_PATHS[@]}" \
     --build-base "${ROS_OVERLAY}/build" \
     --install-base "${ROS_OVERLAY}/install" \

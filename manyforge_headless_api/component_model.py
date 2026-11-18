@@ -13,8 +13,12 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 import time
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Final, Literal, NotRequired, TypedDict
 
+from pydantic import BaseModel, ConfigDict
+
+from .control_protocol import ProgramCycleState
+from .error_codes import COMPONENT_OWNER_STALLED
 from .native import HeadlessApiError
 
 Lifecycle = Literal["offline", "not_prepared", "prepared", "enabled", "fault"]
@@ -34,11 +38,6 @@ STOPPING_ACTIONS: frozenset[str] = frozenset({"disable", "power_off", "reboot"})
 # A component's lifecycle timeout when its Deployment row sets none
 # (`configuration.lifecycle_command_timeout_s`, default 10 s).
 DEFAULT_LIFECYCLE_TIMEOUT_S = 10.0
-# The host's stop grace of a component's controller launch group before its
-# SIGKILL (C++ `manyforge::core::kControllerLaunchStopGrace`, the one source;
-# a test keeps them equal). A host Apply may retire one per component it
-# changes: its bound counts it (the Manager's `HostApplyTimeout`, F8).
-HOST_COMPONENT_STOP_GRACE_S = 10.0
 
 
 class ErrorText(TypedDict):
@@ -123,7 +122,8 @@ class ComponentState(TypedDict):
     fault: NotRequired[Fault]
     stop: NotRequired[ComponentStop]
     # Why it's offline / not_prepared; a member shown offline through its
-    # owner carries `owner_unavailable`.
+    # owner carries `owner_unavailable`; activity `unknown` after a Stop that
+    # ended uncontained carries `stop_unconfirmed`.
     reason: NotRequired[ErrorText]
     activity: Activity
     streams: list[ComponentStream]
@@ -143,6 +143,9 @@ class CellLatchCause(TypedDict):
     kind: Literal["fault", "offline", "activity_unknown", "stop"]
     fault: NotRequired[Fault]
     stop: NotRequired[ComponentStop]
+    # Why the activity is unknown: `stop_unconfirmed` while the component's
+    # last Stop ended uncontained (until its controller reports idle).
+    reason: NotRequired[ErrorText | None]
 
 
 class CellLatch(TypedDict):
@@ -329,8 +332,6 @@ RUN_REFUSAL_CODES: frozenset[str] = frozenset(
         "manual_operation_in_progress",
         "program_not_executable",
         "execution_host_internal_fault",
-        "execution_host_restart_awaiting_components",
-        "execution_host_restart_settling",
         "manager_unavailable",
         "program_scene_preparation_failed",
         "program_cycle_reset_required",
@@ -352,7 +353,48 @@ SIMULATION_NOT_PLAYING_REASONS: frozenset[str] = frozenset(
 _IDLE_CYCLE_STATE = "idle_after_reset"
 # The runner's Resume command: allowed only while the run is held (stopped by
 # Stop/Halt or a rule), never while its motion runs.
-_RESUME_COMMAND = "program_resume_full_stop"
+_RESUME_COMMAND = "program_resume_halt"
+
+RUN_READINESS_REQUEST_SCHEMA: Final = "manyforge.run_readiness_request.v1"
+
+
+class RunCycleFacts(TypedDict):
+    """What readiness needs from the Program runner's cycle."""
+
+    state: ProgramCycleState
+    resume_halt_allowed: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CycleUnknown:
+    """No current cycle facts, and the typed reason why."""
+
+    code: Literal[
+        "program_control_state_synchronizing",
+        "program_control_source_unavailable",
+    ]
+
+
+_CYCLE_UNKNOWN_MESSAGES: Final = {
+    "program_control_state_synchronizing": "The Program state is still synchronizing",
+    "program_control_source_unavailable": "The Program state is unavailable",
+}
+
+
+class RunCycleFactsDTO(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    state: ProgramCycleState
+    resume_halt_allowed: bool
+
+
+class RunReadinessRequest(BaseModel):
+    """The runner's readiness question, with its own current cycle facts."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal["manyforge.run_readiness_request.v1"]
+    program_cycle: RunCycleFactsDTO
 
 
 def rule_hold_meets_program(hold: Mapping[str, Any], program_motion: Iterable[str]) -> bool:
@@ -387,13 +429,18 @@ def manual_operation_resident(execution_control: Mapping[str, Any] | None) -> bo
     )
 
 
-def _runner_allows(cycle: Mapping[str, Any], command_kind: str) -> bool:
-    return any(
-        isinstance(command, Mapping)
-        and command.get("command_kind") == command_kind
-        and command.get("allowed") is True
-        for command in cycle.get("allowed_commands") or ()
-    )
+def run_cycle_facts(cycle: Mapping[str, Any]) -> RunCycleFacts:
+    """Readiness's facts from one Program cycle status."""
+
+    return {
+        "state": cycle["state"],
+        "resume_halt_allowed": any(
+            isinstance(command, Mapping)
+            and command.get("command_kind") == _RESUME_COMMAND
+            and command.get("allowed") is True
+            for command in cycle.get("allowed_commands") or ()
+        ),
+    }
 
 
 def program_not_executable(status: Mapping[str, Any] | None) -> BlockedReason | None:
@@ -413,15 +460,17 @@ def program_not_executable(status: Mapping[str, Any] | None) -> BlockedReason | 
 
 def run_readiness(
     model: ComponentModel,
-    cycle: Mapping[str, Any] | None,
+    cycle: RunCycleFacts | CycleUnknown,
     *,
     manual_operation_in_progress: bool,
     program_status: Mapping[str, Any] | None = None,
 ) -> RunReadiness:
     """The one computation of Execute/Resume readiness.
 
-    ``cycle`` is the Program runner's cycle status (None: the runner can't be
-    read); ``program_status`` the applied-Program status (None: unknown).
+    ``cycle`` is the Program runner's cycle facts: supplied by the runner when
+    it asks, otherwise taken from the held Program control state (or why
+    they are unknown); ``program_status`` the applied-Program status (None:
+    unknown).
     Every component in the cell must be enabled (deactivated ones never
     reach it); an owner has no Enable: `prepared` is its usable state.
     A component declaring `sim_reset` is the simulator itself: its state does
@@ -429,10 +478,8 @@ def run_readiness(
     robots and tools keep their own lifecycle and health rules."""
 
     reasons: list[BlockedReason] = []
-    if cycle is None:
-        reasons.append(
-            _reason("program_runner_unavailable", "The Program runner is not available")
-        )
+    if isinstance(cycle, CycleUnknown):
+        reasons.append(_reason(cycle.code, _CYCLE_UNKNOWN_MESSAGES[cycle.code]))
     if manual_operation_in_progress:
         reasons.append(
             _reason(
@@ -538,16 +585,17 @@ def run_readiness(
                     signal_id=signal_id,
                 )
             )
-    cycle_state = cycle.get("state") if cycle is not None else None
+    known = not isinstance(cycle, CycleUnknown)
+    resume_allowed = known and cycle["resume_halt_allowed"]
     run_reasons = list(reasons)
-    if cycle is not None and cycle_state != _IDLE_CYCLE_STATE:
+    if known and cycle["state"] != _IDLE_CYCLE_STATE:
         run_reasons.append(
             _reason(
                 "run_in_progress",
                 "A Program run is in progress; Reset it first",
             )
         )
-        if cycle_state == "running" and not _runner_allows(cycle, _RESUME_COMMAND):
+        if cycle["state"] == "running" and not resume_allowed:
             run_reasons.append(
                 _reason(
                     "program_motion_running",
@@ -556,9 +604,7 @@ def run_readiness(
             )
     return {
         "can_execute": not run_reasons,
-        "can_resume": cycle is not None
-        and _runner_allows(cycle, _RESUME_COMMAND)
-        and not reasons,
+        "can_resume": resume_allowed and not reasons,
         # A rule hold gates only its own scope; the kernel refuses motion
         # in that scope (`rule_holds`), so it doesn't hold every group here.
         "motion_clear": all(reason["code"] == "rule_holds" for reason in reasons),
@@ -629,44 +675,15 @@ def group_action_order(states: Iterable[ComponentState], action: str) -> list[st
     return result
 
 
-def lifecycle_timeouts_s(cell_graph: Mapping[str, Any]) -> dict[str, float]:
-    """Each component's authored lifecycle timeout in the active cell graph,
-    in seconds, as the host reads it (`component_lifecycle_budgets_ns`): the
-    runtime units' ``lifecycle_command_timeouts`` and ``io_provider_devices``
-    rows. A component without one uses ``DEFAULT_LIFECYCLE_TIMEOUT_S``."""
+def owner_stall(state: ComponentState) -> Fault | None:
+    """The component's owner-stall fault (``component_owner_stalled``), if it
+    reports one. It lasts while the component's owner has not finished an
+    internal task, which may be the waited action itself, and no action has it
+    as a precondition, so a caller waiting for an action of this component
+    ends on it."""
 
-    timeouts: dict[str, float] = {}
-    for unit in cell_graph.get("runtime_units") or ():
-        configuration = unit.get("configuration") if isinstance(unit, Mapping) else None
-        if not isinstance(configuration, Mapping):
-            continue
-        for field_name in ("lifecycle_command_timeouts", "io_provider_devices"):
-            for row in configuration.get(field_name) or ():
-                value = row.get("lifecycle_command_timeout_s") if isinstance(row, Mapping) else None
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    timeouts[str(row.get("controllable_component_id"))] = float(value)
-    return timeouts
-
-
-def launch_settle_bound_s(timeouts: Iterable[float]) -> float:
-    """The host's launch bound (the bring-up bound, `LaunchSettleBound`): the
-    sum of the lifecycle timeouts of the components a composition launches or
-    removes, one default when that is none."""
-
-    total = sum(timeouts)
-    return total if total > 0 else DEFAULT_LIFECYCLE_TIMEOUT_S
-
-
-def action_wait_s(
-    action: str, lifecycle_timeout_s: float, launch_bound_s: float, *, launch_settled: bool
-) -> float:
-    """How long a caller waits for an action's result, as the host bounds it:
-    the component's lifecycle timeout; a ``prepare`` of a component whose
-    launch may not have settled first waits up to the launch bound."""
-
-    if action == "prepare" and not launch_settled:
-        return launch_bound_s + lifecycle_timeout_s
-    return lifecycle_timeout_s
+    fault = state.get("fault")
+    return fault if fault is not None and fault.get("code") == COMPONENT_OWNER_STALLED else None
 
 
 def wait_for_action(
@@ -675,18 +692,18 @@ def wait_for_action(
     action: Action,
     previous: ActionResult | None,
     *,
-    timeout_s: float,
     poll_seconds: float = 0.1,
 ) -> ActionResult:
     """Wait until the component's action started after ``previous`` finished.
 
-    The coordinator publishes the finished action as ``last_action``. The wait
-    is bounded by the component's lifecycle timeout (``timeout_s``): a result
-    that hasn't come back by then is ``unknown`` and nothing resends it.
+    The coordinator publishes the finished action as ``last_action``; the
+    component's adapter bounds the action itself (its lifecycle command
+    time), so the wait has no limit of its own. It also ends, ``unknown`` with
+    the fault's code, when the component reports the owner-stall fault, whose
+    action never finishes. A read that fails (the host is lost) raises.
     """
 
     started_ns = time.time_ns()
-    deadline = time.monotonic() + timeout_s
     while True:
         state = next(
             (row for row in read_states() if row["component_id"] == component_id), None
@@ -698,17 +715,12 @@ def wait_for_action(
         last = state.get("last_action")
         if "action" not in state and last is not None and last != previous:
             return last
-        if time.monotonic() >= deadline:
+        stalled = owner_stall(state)
+        if stalled is not None:
             return {
                 "action": action,
                 "outcome": "unknown",
-                "error": {
-                    "code": "component_action_outcome_unknown",
-                    "message": (
-                        f"{action} of {component_id} didn't finish within "
-                        f"{timeout_s:g} s"
-                    ),
-                },
+                "error": {"code": stalled["code"], "message": stalled["message"]},
                 "started_at_ns": started_ns,
                 "finished_at_ns": time.time_ns(),
             }

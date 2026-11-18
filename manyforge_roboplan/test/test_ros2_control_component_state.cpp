@@ -42,6 +42,38 @@ TEST(Ros2ControlComponentState, AnExitedLaunchIsAFaultWithRecover) {
   EXPECT_EQ(state.fault->since_ns, 3);
 }
 
+// A failed ROS transport inside ManyForge is its own fault, not an exited
+// process: Recover rebuilds the transport.
+TEST(Ros2ControlComponentState, AFailedRosTransportIsItsOwnFaultWithRecover) {
+  auto observation = Prepared();
+  observation.transport_fault = "ROS transport executor thread failed: test (owner /x)";
+  observation.process_fault = "controller launch exited with status 1";
+  const auto state = ros2_control_component_state(observation, 3);
+  EXPECT_EQ(state.lifecycle, Lifecycle::kFault);
+  ASSERT_TRUE(state.fault.has_value());
+  EXPECT_EQ(state.fault->code, core::FaultCode::kRosTransportFailed);
+  EXPECT_EQ(state.fault->operator_action, core::FaultOperatorAction::kRecover);
+  EXPECT_TRUE(state.fault->clearable);
+}
+
+// OD-245: an owner stall offers no action while it lasts and is gone once the
+// observation no longer carries it.
+TEST(Ros2ControlComponentState, AnOwnerStallOffersNoActionAndEndsWithTheStall) {
+  auto observation = Prepared();
+  observation.owner_stalled = "ROS transport owner /x stalled in task";
+  const auto stalled = ros2_control_component_state(observation, 3);
+  EXPECT_EQ(stalled.lifecycle, Lifecycle::kFault);
+  EXPECT_EQ(stalled.activity, Activity::kUnknown);
+  ASSERT_TRUE(stalled.fault.has_value());
+  EXPECT_EQ(stalled.fault->code, core::FaultCode::kOwnerStalled);
+  EXPECT_EQ(stalled.fault->operator_action, core::FaultOperatorAction::kNone);
+  EXPECT_FALSE(stalled.fault->clearable);
+  observation.owner_stalled.reset();
+  const auto ended = ros2_control_component_state(observation, 4);
+  EXPECT_FALSE(ended.fault.has_value());
+  EXPECT_EQ(ended.lifecycle, Lifecycle::kPrepared);
+}
+
 TEST(Ros2ControlComponentState, AStaleOwnStreamIsAFaultExceptInASimulator) {
   auto observation = Prepared();
   observation.controller_active = true;

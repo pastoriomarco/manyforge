@@ -14,10 +14,15 @@ their generated-contract and supported external consumers are inventoried.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query
 
+from .application_identity import (
+    ApplicationStartIdText,
+    RequestKeyText,
+    parse_application_start_id,
+)
 from .authoring_workspace import AuthoringWorkspaceError
 from .authoring_admission import AuthoringMutationEnvelope
 from .reset_apply_log import ResetApplyContextRequest, record_reset_apply_context
@@ -29,8 +34,10 @@ def create_authoring_workspace_router(state: ComposerState) -> APIRouter:
 
     @router.get("/api/authoring/submission-outcome")
     def read_submission_outcome(
-        request_owner_epoch: str = Query(min_length=1, max_length=256),
-        request_id: str = Query(min_length=1, max_length=256),
+        # `Query()` inside `Annotated`: as a default it would replace the
+        # annotation and drop the text validators.
+        application_start_id: Annotated[ApplicationStartIdText, Query()],
+        request_key: Annotated[RequestKeyText, Query()],
         expected_admission_generation: int = Query(ge=1, le=9_007_199_254_740_991),
     ) -> dict[str, Any]:
         """Read exact confirmed evidence; never retry, settle or release a claim."""
@@ -39,7 +46,9 @@ def create_authoring_workspace_router(state: ComposerState) -> APIRouter:
                 "code": "authoring_owner_unavailable", "message": "Authoring owner is unavailable",
             })
         return state.authoring_admission.submission_outcome(AuthoringMutationEnvelope(
-            expected_admission_generation, request_owner_epoch, request_id,
+            expected_admission_generation,
+            parse_application_start_id(application_start_id),
+            bytes.fromhex(request_key),
         ))
 
     @router.post("/api/authoring/reset-apply-contexts")

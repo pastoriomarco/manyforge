@@ -2,6 +2,7 @@
 #include "execution_host_commands.hpp"
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
+#include <manyforge_core/types/application_identity.hpp>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/file.h>
@@ -242,25 +243,6 @@ void RequireDisjointDirectories(const std::filesystem::path &left,
           std::string(labels) + " must be disjoint directory trees");
 }
 
-void RequirePathOutsideDirectory(const std::filesystem::path &path,
-                                 const std::filesystem::path &directory,
-                                 const std::string_view labels) {
-  if (path.empty()) {
-    return;
-  }
-  std::error_code error;
-  const auto canonical_parent =
-      std::filesystem::canonical(path.parent_path(), error);
-  Require(!error, std::string(labels) + " parent is unavailable");
-  const auto canonical_path = canonical_parent / path.filename();
-  const auto canonical_directory = std::filesystem::canonical(directory, error);
-  Require(!error, std::string(labels) + " directory is unavailable");
-  const auto mismatch =
-      std::mismatch(canonical_directory.begin(), canonical_directory.end(),
-                    canonical_path.begin(), canonical_path.end());
-  Require(mismatch.first != canonical_directory.end(),
-          std::string(labels) + " must be outside disposable run storage");
-}
 
 [[nodiscard]] std::filesystem::path
 ExistingRegularFile(std::filesystem::path path, std::string_view label,
@@ -279,7 +261,7 @@ ExistingRegularFile(std::filesystem::path path, std::string_view label,
 }
 
 [[nodiscard]] std::string RandomToken(std::string_view prefix) {
-  std::array<unsigned char, kOwnerEpochRandomBytes> bytes{};
+  std::array<unsigned char, kRandomTokenBytes> bytes{};
   std::size_t offset = 0U;
   while (offset < bytes.size()) {
     const auto count =
@@ -396,14 +378,8 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       config.scene_asset_root_fd = ParseFileDescriptor(value);
     } else if (option == "--manyforge-managed-site-settings") {
       config.site_settings = LoadManagedSiteSettings(value);
-    } else if (option == "--manyforge-managed-manager-state-root") {
-      config.manager_state_root = value;
     } else if (option == "--manyforge-managed-manager-run-root") {
       config.manager_run_root = value;
-    } else if (option == "--manyforge-managed-logical-scene-database") {
-      config.logical_scene_database = value;
-    } else if (option == "--manyforge-managed-program-cycle-journal") {
-      config.program_cycle_journal = value;
     } else if (option == "--manyforge-managed-execution-state-root") {
       config.execution_state_root = value;
     } else if (option == "--manyforge-managed-execution-run-root") {
@@ -418,8 +394,11 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       config.graph_revision = core::GraphRevision(value);
     } else if (option == "--runtime-unit-id") {
       config.runtime_unit_id = value;
-    } else if (option == "--runtime-epoch") {
-      config.runtime_epoch = value;
+    } else if (option == "--application-start-id") {
+      const auto start_id = core::ParseApplicationStartId(value);
+      Require(start_id.has_value(),
+              "managed runtime application-start identity is invalid");
+      config.application_start_id = *start_id;
     } else if (option == "--product-identity") {
       config.product_identity = value;
     } else if (option == "--configuration-identity") {
@@ -428,7 +407,7 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       Fail("unknown managed runtime option " + option);
     }
   }
-  Require(seen.size() >= 15U && seen.size() <= 20U &&
+  Require(seen.size() >= 14U && seen.size() <= 17U &&
               config.manager_channel_fd >= 0 &&
               config.manager_liveness_channel_fd >= 0 &&
               config.manager_liveness_channel_fd != config.manager_channel_fd &&
@@ -438,7 +417,7 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
           "managed runtime invocation is incomplete");
   Require(IsPortableRuntimeIdentity(config.cell_id) &&
               IsPortableRuntimeIdentity(config.runtime_unit_id) &&
-              IsPortableRuntimeIdentity(config.runtime_epoch),
+              config.application_start_id.value != 0U,
           "managed runtime identity is invalid");
   Require(!config.retained_bundle_id.empty() && !config.graph_revision.empty(),
           "managed runtime retained descriptor is invalid");
@@ -480,41 +459,15 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
       program_artifact_status.st_ino == package_status.st_ino) {
     config.program_artifact_root.clear();
   }
-  config.manager_state_root = ExistingPrivateDirectory(
-      std::move(config.manager_state_root), "managed Manager state root");
   config.manager_run_root = ExistingPrivateDirectory(
       std::move(config.manager_run_root), "managed Manager run root");
-  if (!config.logical_scene_database.empty()) {
-    config.logical_scene_database =
-        ExistingRegularFile(std::move(config.logical_scene_database),
-                            "managed logical-scene database", false);
-  }
-  const auto validate_future_database = [](std::filesystem::path path,
-                                           const std::string_view label) {
-    Require(!path.empty() && path.has_filename() && path.filename() != "." &&
-                path.filename() != "..",
-            std::string(label) + " path is invalid");
-    static_cast<void>(ExistingPrivateDirectory(path.parent_path(),
-                                               std::string(label) + " parent"));
-    std::error_code error;
-    const auto status = std::filesystem::symlink_status(path, error);
-    Require((!error || error == std::errc::no_such_file_or_directory) &&
-                !std::filesystem::is_symlink(status),
-            std::string(label) + " path is not a safe physical leaf");
-    return path;
-  };
-  if (!config.program_cycle_journal.empty()) {
-    config.program_cycle_journal =
-        validate_future_database(std::move(config.program_cycle_journal),
-                                 "managed Program-cycle journal");
-  }
   config.execution_state_root = ExistingPrivateDirectory(
       std::move(config.execution_state_root), "managed execution state root");
   config.execution_run_root = ExistingPrivateDirectory(
       std::move(config.execution_run_root), "managed execution run root");
-  const std::array<const std::filesystem::path *, 4U> typed_roots{
-      &config.manager_state_root, &config.manager_run_root,
-      &config.execution_state_root, &config.execution_run_root};
+  const std::array<const std::filesystem::path *, 3U> typed_roots{
+      &config.manager_run_root, &config.execution_state_root,
+      &config.execution_run_root};
   for (std::size_t left = 0U; left < typed_roots.size(); ++left) {
     for (std::size_t right = left + 1U; right < typed_roots.size(); ++right) {
       RequireDisjointDirectories(*typed_roots[left], *typed_roots[right],
@@ -527,16 +480,6 @@ ParseManagedRuntimeArguments(const int argc, char **argv) {
     if (!config.program_artifact_root.empty()) {
       RequireDisjointDirectories(config.program_artifact_root, *typed_root,
                                  "managed Program/runtime capabilities");
-    }
-  }
-  const std::array<const std::filesystem::path *, 2U> durable_paths{
-      &config.logical_scene_database, &config.program_cycle_journal};
-  const std::array<const std::filesystem::path *, 2U> run_roots{
-      &config.manager_run_root, &config.execution_run_root};
-  for (const auto *durable_path : durable_paths) {
-    for (const auto *run_root : run_roots) {
-      RequirePathOutsideDirectory(*durable_path, *run_root,
-                                  "managed durable path/run capability");
     }
   }
   config.candidate_worker = ExistingRegularFile(
@@ -573,10 +516,12 @@ void SendManagedRuntimePacket(const int fd, const std::string_view bytes) {
           bytes.size() <=
               component_manager::detail::kMaximumManagedRuntimeRpcPacketBytes,
       "managed runtime response is empty or oversized");
+  // No time limit (OD-290 (a)): the wait ends when the Manager's channel
+  // takes the response, hangs up, or this host is asked to stop.
   pollfd descriptor{fd, POLLOUT | POLLHUP, 0};
   int ready = -1;
   do {
-    ready = ::poll(&descriptor, 1U, 750);
+    ready = ::poll(&descriptor, 1U, -1);
   } while (ready < 0 && errno == EINTR && g_stop_requested == 0);
   Require(ready > 0 && (descriptor.revents & POLLOUT) != 0,
           "managed runtime parent did not accept a response");
@@ -665,7 +610,7 @@ ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
     Require(!stop_token.stop_requested(), "Manager scene request cancelled");
     int ready = -1;
     do {
-      ready = ::poll(&connected, 1, kManagerSceneDeadlineMilliseconds);
+      ready = ::poll(&connected, 1, kManagerConnectDeadlineMilliseconds);
     } while (ready < 0 && errno == EINTR);
     Require(ready > 0 && (connected.revents & POLLOUT) != 0,
             "Manager command socket connection timed out");
@@ -677,14 +622,18 @@ ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
             "Manager command socket connection was rejected");
   }
 
+  // OD-298 (a): no time limit once connected. Each wait ends on its event,
+  // on the Manager closing the connection (POLLHUP) or on the stop token,
+  // whose callback shuts the socket down (also POLLHUP).
   pollfd outbound{descriptor.get(), POLLOUT, 0};
   Require(!stop_token.stop_requested(), "Manager scene request cancelled");
   int ready = -1;
   do {
-    ready = ::poll(&outbound, 1, kManagerSceneDeadlineMilliseconds);
+    ready = ::poll(&outbound, 1, -1);
   } while (ready < 0 && errno == EINTR);
+  Require(!stop_token.stop_requested(), "Manager scene request cancelled");
   Require(ready > 0 && (outbound.revents & POLLOUT) != 0,
-          "Manager did not accept a scene request in time");
+          "Manager closed the connection before the scene request was sent");
   ssize_t sent = -1;
   do {
     sent = ::send(descriptor.get(), bytes.data(), bytes.size(), MSG_NOSIGNAL);
@@ -695,10 +644,11 @@ ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
   pollfd inbound{descriptor.get(), POLLIN, 0};
   Require(!stop_token.stop_requested(), "Manager scene request cancelled");
   do {
-    ready = ::poll(&inbound, 1, kManagerSceneDeadlineMilliseconds);
+    ready = ::poll(&inbound, 1, -1);
   } while (ready < 0 && errno == EINTR);
+  Require(!stop_token.stop_requested(), "Manager scene request cancelled");
   Require(ready > 0 && (inbound.revents & POLLIN) != 0,
-          "Manager scene response timed out");
+          "Manager closed the connection before answering the scene request");
   std::vector<char> buffer(kMaximumManagerResponseBytes);
   iovec vector{buffer.data(), buffer.size()};
   msghdr message{};

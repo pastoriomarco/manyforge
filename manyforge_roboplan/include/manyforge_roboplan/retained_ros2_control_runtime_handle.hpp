@@ -165,9 +165,10 @@ using CommittedSceneSourceFn = std::function<std::shared_ptr<const core::Logical
 using CommittedToolContextSourceFn = std::function<core::Result<core::ToolContextDTO>(
     const std::optional<std::string> &, const core::LogicalSceneSnapshotDTO &)>;
 
-/// Active TCP: appends one confirmed change to the host's
-/// ordered events stream (and History). Called under the handle's lock, so
-/// the stream order is the commit order; it never calls back into the handle.
+/// Active TCP: posts one confirmed change to the host's
+/// ordered events stream (and History). Called after the handle's lock is
+/// released, inside the robot's arm step (`SerializedStep` kArm), so one
+/// robot's changes are posted in commit order; it never waits.
 using ActiveTcpEventSink = std::function<void(const core::ActiveTcpChangeDTO &change)>;
 
 /// Active TCP: the robot's Active TCP with its order: the owner's
@@ -176,7 +177,7 @@ using ActiveTcpEventSink = std::function<void(const core::ActiveTcpChangeDTO &ch
 /// the same process, so it is monotonic within its owner epoch), and a
 /// `sequence` from 0 at install, +1 on every confirmed change, resets
 /// included. The host adds the Kernel owner epoch; a reader keeps the
-/// greatest `{owner_epoch, registration_generation, sequence}`.
+/// greatest `{registration_generation, sequence}`.
 struct ActiveTcpReading final {
   /// The robot; none when this handle owns no Active TCP (a gripper-only
   /// component).
@@ -202,7 +203,6 @@ struct RetainedMeasuredJointStateLane final {
   /// Defaults of the component's `measured_joints` stream row (budget =
   /// `freshness_budget_ns`, message-stamp liveness).
   core::StreamSeverityDTO stream_severity;
-  core::StreamRecoveryDTO stream_recovery;
   /// Mock grippers (stock ParallelGripperCommand) only: the gripper's
   /// `gripper_feedback` stream rides this lane. Its sample is the gripper
   /// joint in this JointState; defaults are the component's row. Isaac
@@ -557,7 +557,8 @@ private:
   [[nodiscard]] core::Result<void> RebindAfterRearm(std::chrono::nanoseconds bound);
   /// Active TCP: with `send`, the vendor adapter's TCP step at `tcp_frame`
   /// (none: no TCP) and its settle; then the commit of `entry` (none: the
-  /// reset) and its event. `send_failure_completes`: a failed step still
+  /// reset) and its event, posted after the handle's lock is released.
+  /// `send_failure_completes`: a failed step still
   /// commits (a reset). Caller holds a `kArm` `SerializedStep`.
   [[nodiscard]] core::Result<void>
   ChangeActiveTcp(const std::optional<core::TcpEntryReferenceDTO> &entry,
@@ -644,6 +645,10 @@ public:
   /// Whether the installed launch is still starting: not settled, its process
   /// not exited, and within its bound. False without an installed launch.
   [[nodiscard]] bool ControllerLaunchSettling() const;
+  /// Whether the installed launch's process has exited by itself (its health
+  /// source reports an exit; not during a stop this host ordered). False
+  /// without an installed launch. A pure read of the cached exit.
+  [[nodiscard]] bool ControllerLaunchExited() const;
   /// Cache the already captured diagnostic of this exact process occurrence.
   /// The host checks its installed handle/process under the existing fence;
   /// construction/encoding occurs outside all observation/control locks.
@@ -745,8 +750,13 @@ public:
   /// on, the joint state broadcaster too when the controller manager reports
   /// it loaded but off. Known success without a request when the controller
   /// manager already reports it so. Each request once, never retried.
+  /// `step_deadline` (Enable's lifecycle command time) bounds the hardware
+  /// request and the broadcaster switch: one unanswered by then ends
+  /// `ros2_control_hardware_state_timeout` / `ros2_control_switch_timeout`
+  /// (effect unknown). None (Disable, Prepare): the hardware request's own cap.
   [[nodiscard]] RetainedRos2ControlSwitchResult
-  SwitchArmHardware(bool active, std::stop_token cancellation);
+  SwitchArmHardware(bool active, std::optional<MockResetPositionStepDeadline> step_deadline,
+                    std::stop_token cancellation);
 
   /// A gripper's `prepare`: its controller loaded inactive on active
   /// hardware (or its configured local owner, or, for an Isaac gripper
@@ -763,6 +773,8 @@ public:
   [[nodiscard]] std::optional<MockResetPositionTarget>
   mock_reset_position_target() const;
   [[nodiscard]] bool mock_reset_writer_inactive() const;
+  /// A position reset was interrupted (or runs now); the next one runs again.
+  [[nodiscard]] bool mock_reset_position_pending() const;
   [[nodiscard]] bool mock_reset_writer_active() const;
   [[nodiscard]] bool mock_reset_successor_ready() const;
   [[nodiscard]] std::shared_ptr<RetainedObservationWake>

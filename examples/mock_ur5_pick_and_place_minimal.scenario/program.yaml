@@ -110,11 +110,7 @@
     {
       "pose": {
         "frame_ref": {
-          "kind": "target_frame",
-          "frame": {
-            "component_id": "ur5_robot",
-            "frame_id": "base"
-          }
+          "kind": "cell_frame"
         },
         "orientation": {
           "xyzw": [
@@ -125,9 +121,9 @@
           ]
         },
         "position_m": [
-          1.2,
+          0.5,
           0.0,
-          0.4
+          -0.011
         ]
       },
       "scene_resource_id": "table",
@@ -141,5 +137,5 @@
       }
     }
   ],
-  "schema_version": "manyforge.composer_authoring_forest.v1"
+  "schema_version": "manyforge.composer_authoring_forest.v2"
 }

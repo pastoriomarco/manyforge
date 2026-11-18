@@ -1,3 +1,4 @@
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include <gtest/gtest.h>
 
 #include <manyforge_core/runtime_participant_registry.hpp>
@@ -102,12 +103,11 @@ using namespace manyforge::core;
 [[nodiscard]] OperationIntentDTO operation_for(std::string target_role, std::string capability,
                                                OperationParticipantPayloadDTO payload) {
   return OperationIntentDTO{
-      PublicRequestContextDTO{RequestId("request.1"), RequestOwnerEpoch("owner.epoch.1"), "test",
-                              std::nullopt},
+      PublicRequestContextDTO{TestRequestKey("request.1"), "test"},
       ProgramId("program.pick"),
       ProgramRevision("program-revision"),
       ProgramBindingId("program-binding"),
-      ProgramRunId("run.1"),
+      ProgramRunNumber(1U),
       GraphRevision("graph"),
       RetainedBundleId("bundle"),
       std::nullopt,

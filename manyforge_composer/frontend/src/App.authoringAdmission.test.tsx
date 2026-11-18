@@ -16,7 +16,11 @@ import {
 import { readyState, statusFixture } from './testFixtures/robotControl';
 import { robotControlReducer } from './state/robotControl';
 import { authoringAdmissionNotices } from './App';
-import { authoringAdmissionTooltip, replacementAdmissionAllowed } from './components/authoringAdmission';
+import {
+  applyAdmissionBlock,
+  authoringAdmissionTooltip,
+  replacementAdmissionAllowed,
+} from './components/authoringAdmission';
 
 function ViewerHoldProbe({ notices }: { notices: WorkbenchNotice[] }) {
   const held = useViewerConditionHold(notices);
@@ -50,27 +54,27 @@ describe('authoring admission status', () => {
 
   it('names the owner target and accepted mode for a manual operation', () => {
     const activity = authoringAdmissionNotices(false, {
-      ownerEpoch: 'owner.1',
-      operationId: 'op.1',
+      applicationStartId: 'owner.1',
+      operationId: 1,
       targetName: 'lite6_robot · arm',
       modeLabel: 'Move To',
       title: 'lite6_robot · arm is moving (Move To).',
-      message: 'Program editing resumes when it ends.',
-      tooltip: 'lite6_robot · arm is moving (Move To). Program editing resumes when it ends.',
+      message: 'Editing resumes when it ends.',
+      tooltip: 'lite6_robot · arm is moving (Move To). Editing resumes when it ends.',
     });
     expect(activity).toEqual([{
-      id: 'authoring-admission.manual.owner.1.op.1',
+      id: 'authoring-admission.manual.owner.1.1',
       severity: 'info',
       domain: 'program_authoring',
       title: 'lite6_robot · arm is moving (Move To).',
-      message: 'Program editing resumes when it ends.',
+      message: 'Editing resumes when it ends.',
       busy: true,
     }]);
     const markup = renderToStaticMarkup(
       <WorkbenchNotificationStack errorRow={null} warnings={[]} activity={activity} />,
     );
     expect(markup).toContain('lite6_robot · arm is moving (Move To).');
-    expect(markup).toContain('Program editing resumes when it ends.');
+    expect(markup).toContain('Editing resumes when it ends.');
     expect(activity[0].actions).toBeUndefined();
   });
 
@@ -80,25 +84,26 @@ describe('authoring admission status', () => {
     const status = base.status ?? statusFixture();
     if (intent === null) throw new Error('ready fixture needs a preview intent');
     const accepted = robotControlReducer(base, {
-      type: 'operation_mode_accepted', generation: base.generation, ownerEpoch: status.ownerEpoch,
-      requestId: intent.request_context.request_id, operationId: 'op.1', mode: 'move_to',
+      type: 'operation_mode_accepted', generation: base.generation, applicationStartId: status.applicationStartId,
+      requestKey: intent.request_context.request_key, operationId: 1, mode: 'move_to',
     });
     const participant = intent.participants[0];
     const operation = {
-      operationId: 'op.1', operationRevision: 1, resident: true, state: 'executing' as const,
-      progress: 0, activeStopId: null, activeStopGeneration: null, terminalError: null,
+      operationId: 1, operationRevision: 1, resident: true, state: 'executing' as const,
+      progress: 0, stopEventId: null, terminalError: null,
+      payloadKind: 'motion' as const,
       controllableComponentId: participant.target.component_id, commandTargetId: participant.target.command_target_id,
     };
     const running = { ...accepted, status, phase: 'executing' as const, operation };
     expect(manualOperationAdmissionCopy(running)).toMatchObject({
-      operationId: 'op.1', targetName: 'robot-a · arm', modeLabel: 'Move To',
+      operationId: 1, targetName: 'robot-a · arm', modeLabel: 'Move To',
       title: 'robot-a · arm is moving (Move To).',
-      tooltip: 'robot-a · arm is moving (Move To). Program editing resumes when it ends.',
+      tooltip: 'robot-a · arm is moving (Move To). Editing resumes when it ends.',
     });
     expect(manualOperationAdmissionCopy({ ...running, acceptedOperationMode: null })).toMatchObject({
       targetName: 'robot-a · arm', modeLabel: null,
       title: 'Manual motion on robot-a · arm is running.',
-      tooltip: 'Manual motion on robot-a · arm is running. Program editing resumes when it ends.',
+      tooltip: 'Manual motion on robot-a · arm is running. Editing resumes when it ends.',
     });
     expect(manualOperationAdmissionCopy({
       ...running, acceptedOperationMode: null,
@@ -107,7 +112,7 @@ describe('authoring admission status', () => {
   });
 
   it('provides the operation-specific admission tooltip to blocked controls', () => {
-    const tooltip = 'lite6_robot · arm is moving (Move To). Program editing resumes when it ends.';
+    const tooltip = 'lite6_robot · arm is moving (Move To). Editing resumes when it ends.';
     expect(renderToStaticMarkup(
       <AuthoringAdmissionTooltipProvider tooltip={tooltip}><TooltipProbe /></AuthoringAdmissionTooltipProvider>,
     )).toBe(`<button title="${tooltip}">Run</button>`);
@@ -123,11 +128,29 @@ describe('authoring admission status', () => {
     expect(replacementAdmissionAllowed(null, null)).toBeNull();
   });
 
+  it('lets New and Load through the claim a failed Apply still holds', () => {
+    // New releases that Apply first (maintainer, 2026-11-13).
+    expect(replacementAdmissionAllowed(false, 'not_admitted', true)).toBe(true);
+    expect(replacementAdmissionAllowed(false, 'not_admitted', false)).toBe(false);
+    expect(replacementAdmissionAllowed(true, null, true)).toBe(true);
+    expect(replacementAdmissionAllowed(null, null, true)).toBeNull();
+  });
+
+  it('lets Apply through a run\'s lock, which its Reset-and-Apply ends (AUD-4)', () => {
+    const block = 'A Program run is active; editing resumes after Reset or when the run ends.';
+    expect(applyAdmissionBlock(block, true, 'execution_active')).toBeNull();
+    // No run to Reset, or another cause: the lock still blocks Apply.
+    expect(applyAdmissionBlock(block, false, 'execution_active')).toBe(block);
+    expect(applyAdmissionBlock('Authoring is currently unavailable.', true, null))
+      .toBe('Authoring is currently unavailable.');
+    expect(applyAdmissionBlock(null, true, 'execution_active')).toBeNull();
+  });
+
   it('uses generic background copy only for a known background step', () => {
     expect(authoringAdmissionTooltip(null, true, null))
       .toBe('The cell is finishing a background step; this is available again in a moment.');
     expect(authoringAdmissionTooltip(null, false, 'execution_active'))
-      .toBe('Program execution is active; Program editing resumes when it ends.');
+      .toBe('A Program run is active; editing resumes after Reset or when the run ends.');
     expect(authoringAdmissionTooltip(null, false, null))
       .toBe('Authoring is currently unavailable.');
   });

@@ -35,7 +35,7 @@ export function useAppliedSettlementRefresh({
     void latest.current.runtime.refresh();
     latest.current.program.refreshApplied();
   }, [settlement]);
-  const applied = appliedKey(runtime.state.applied);
+  const applied = appliedKey(runtime.state.applied, runtime.state.appliedApplicationStartId);
   const observed = useRef<string | null>(null);
   useEffect(() => {
     const previous = observed.current;

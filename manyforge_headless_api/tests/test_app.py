@@ -40,7 +40,7 @@ from manyforge_headless_api.models import (
     ManagerApplyRequest,
     ManagerApplyAcknowledgementContext,
     ProgramCycleResetRequest,
-    ProgramFullStopResetRequest,
+    ProgramHaltDiscardRequest,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
 )
@@ -92,6 +92,9 @@ _BINDING_FIXTURE = (
     _ROOT / "manyforge_deployment/resources/program_binding_lite6_native.fixture.json"
 )
 _ADMISSION_GENERATION = 7
+# This start's ``A`` (contract 1.1) and one of another start.
+_APPLICATION_START_ID = "3f9a0000000000a1"
+_OTHER_START_ID = "0bad0000000000b2"
 _AUTHORING_DIGEST = "sha256:" + "e" * 64
 
 
@@ -109,14 +112,12 @@ class FakeCellAdmission:
             "claim_kind",
             "expected_admission_generation",
             "intervention_evidence",
-            "owner_epoch",
             "owner_role",
             "owner_transaction_id",
             "program_cycle_evidence",
-            "request_id",
-            "request_payload_digest",
+            "request_key",
             "scope",
-        }:
+        } or intent["owner_transaction_id"] is not None:
             raise CellAdmissionError(
                 "authoring_claim_invalid",
                 "fixture admission intent is not exact",
@@ -137,20 +138,21 @@ class FakeCellAdmission:
             "accepted_at_ns": 1,
         }
 
+    def release(self, release: dict[str, Any]) -> dict[str, Any]:
+        self.releases = [*getattr(self, "releases", []), copy.deepcopy(release)]
+        return self.get()
+
 
 def _authoring_claim(
     *,
-    request_id: str = "authoring.1",
-    owner_transaction_id: str = "authoring-transaction.1",
+    request_key: str = "a1" * 16,
 ) -> dict[str, Any]:
     return FakeCellAdmission().acquire(
         {
             "claim_kind": "authoring_mutation",
             "owner_role": "authoring_owner",
-            "owner_epoch": "authoring-owner.epoch.1",
-            "owner_transaction_id": owner_transaction_id,
-            "request_id": request_id,
-            "request_payload_digest": _AUTHORING_DIGEST,
+            "owner_transaction_id": None,
+            "request_key": request_key,
             "expected_admission_generation": _ADMISSION_GENERATION,
             "scope": {"resources": [], "configurations": []},
             "program_cycle_evidence": None,
@@ -215,9 +217,8 @@ def _applied_projection(
         "graph_revision": binding["graph_revision"],
         "node_environment_digest": binding["node_environment"]["environment_digest"],
         "owner_identities": [{
-            "owner_role": "headless_projection",
-            "owner_id": "headless.program-apply",
-            "owner_epoch": "headless.epoch.1",
+            "role": "headless_projection",
+            "application_start_id": _APPLICATION_START_ID,
         }],
         "preparation_digest": "sha256:" + "4" * 64,
         "program": copy.deepcopy(program),
@@ -229,7 +230,7 @@ def _applied_projection(
         "source_document_digest": source_document_digest,
         "scenario_id": scenario_id,
         "project_path": f"/projects/{scenario_id}.scenario",
-        "schema_version": "manyforge.applied_program_selection.v4",
+        "schema_version": "manyforge.applied_program_selection.v5",
         "simulation_scene": None,
         "program_frame_facts": {
             "applied_record_digest": record_digest,
@@ -244,7 +245,6 @@ def _applied_projection(
             "record_digest": record_digest,
             "semantic_content_digest": "sha256:" + "7" * 64,
             "source_generation": 1,
-            "source_owner_epoch": "program-owner.epoch.1",
             "source_owner_id": "program-owner.cell-a",
         },
     }
@@ -280,16 +280,12 @@ def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("deployment_candidate_cell_mismatch") == 409
     assert _error_status("activation_preparer_busy") == 409
     # D6: typed refusals before any effect are client errors, not 500.
-    assert _error_status("cell_close_operation_nonterminal") == 409
-    assert _error_status("cell_close_containment_uncertain") == 409
     assert _error_status("manual_operation_scope_stale") == 409
     # RunReadiness reasons are typed refusals, not 500.
     for code in ("run_in_progress", "component_not_enabled", "component_unhealthy",
                  "input_not_fresh", "program_motion_running",
                  "manual_operation_in_progress", "program_not_executable"):
         assert _error_status(code) == 409
-    assert _error_status("program_required_component_not_active") == 409
-    assert _error_status("route_selection_component_not_ready") == 409
 
 
 def test_run_refusals_are_409_and_unknown_runner_stays_503() -> None:
@@ -321,10 +317,10 @@ def test_execution_projection_refusal_preserves_http_class_and_owner_details(
 ) -> None:
     execution = FakeExecution()
     message = "the managed execution owner has no active physical product"
-    details = {"owner_epoch": "native-owner.empty"}
+    details = {"application_start_id": "3f9a0000000000a1"}
 
     envelope = {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "ok": False,
         "error": {"code": code, "message": message, "details": details},
     }
@@ -534,7 +530,7 @@ def test_applied_program_projection_rejects_invalid_source_generation(
 def _manager_payload() -> dict[str, Any]:
     offer_digest = "sha256:" + "c" * 64
     return {
-        "api_version": "manyforge.manager_source.v1",
+        "api_version": "manyforge.manager_source.v2",
         "active": {
             "canonical_empty": False,
             "cell_graph": {"cell_id": "cell-a", "components": []},
@@ -578,7 +574,6 @@ def _section(owner: str, payload: dict[str, Any]) -> dict[str, Any]:
         "source_content_digest": "sha256:" + "a" * 64,
         "source_generation": 2,
         "source_observed_at_ns": 1,
-        "source_owner_epoch": "epoch.1",
         "source_owner_id": owner,
         "source_owner_kind": "test",
     }
@@ -587,7 +582,6 @@ def _section(owner: str, payload: dict[str, Any]) -> dict[str, Any]:
 class FakeCore:
     def __init__(self) -> None:
         self.acknowledgements: list[dict[str, Any]] = []
-        self.historian_reconciliations: list[dict[str, Any]] = []
         self.manager_payload = _manager_payload()
         self.program_preparations: list[dict[str, Any]] = []
         self.program_commits: list[tuple[dict[str, Any], str | None]] = []
@@ -606,16 +600,31 @@ class FakeCore:
 
     def runtime_snapshot(self) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.headless_runtime_snapshot.v1",
+            "schema_version": "manyforge.headless_runtime_snapshot.v3",
             "complete": True,
             "projection_generation": 4,
-            "projection_owner_epoch": "projection.epoch.1",
+            "application_start_id": "3f9a00000000ffff",
             "reasons": [],
             "sections": {
                 "manager": _section("component-manager.cell-a", self.manager_payload),
                 "logical_scene": _section(
                     "logical-scene.cell-a",
-                    {"api_version": "manyforge.logical_scene_source.v1"},
+                    {
+                        "api_version": "manyforge.logical_scene_source.v1",
+                        # FakeManager's committed revision: a scene commit
+                        # answers once the mirror shows it (OD-293).
+                        "access": {
+                            "active_projection": {
+                                "retained_bundle_id": "sha256:" + "b" * 64,
+                                "graph_revision": "sha256:" + "c" * 64,
+                                "scene_revision": {
+                                    "scene_id": "sha256:" + "d" * 64,
+                                    "revision_id": 2,
+                                    "content_hash": "sha256:" + "c" * 64,
+                                },
+                            },
+                        },
+                    },
                 ),
                 "scene_runtime": _section(
                     "scene-runtime.cell-a",
@@ -630,7 +639,7 @@ class FakeCore:
         return {
             "availability": {"implementations": [], "manager_runtime_converged": True},
             "capability_offers": list(self.capability_offers),
-            "schema_version": "manyforge.node_environment_projection.v2",
+            "schema_version": "manyforge.node_environment_projection.v3",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
             "environment_digest": self.node_environment_digest,
@@ -639,18 +648,16 @@ class FakeCore:
                 "freshness": "fresh",
                 "known_gaps": [],
                 "projection_generation": 1,
-                "projection_owner_epoch": "projection.epoch.1",
                 "receiver_age_ns": 10,
                 "source_content_digest": "sha256:" + "b" * 64,
                 "source_generation": 1,
-                "source_owner_epoch": "projection.epoch.1",
                 "source_owner_id": "headless-api.node-environment",
             },
         }
 
     def source_model_projection(self) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.source_model_projection.v3",
+            "schema_version": "manyforge.source_model_projection.v4",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
             "components": [],
@@ -761,7 +768,7 @@ class FakeCore:
 
     def assistant_mode_projection(self, mode_id: str) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.assistant_mode_projection.v2",
+            "schema_version": "manyforge.assistant_mode_projection.v3",
             "mode": mode_id,
             "assistant_component_id": "assistant",
             "runs_in": ["no_program_active"],
@@ -791,7 +798,7 @@ class FakeCore:
 
     def assistant_mode_index(self) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.assistant_mode_index.v2",
+            "schema_version": "manyforge.assistant_mode_index.v3",
             "retained_bundle_id": "bundle.1",
             "graph_revision": "graph.1",
             "ai_model_component_id": "assistant_model",
@@ -819,8 +826,7 @@ class FakeCore:
         ordering: str = "default",
     ) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.operator_alarm_snapshot.v2",
-            "owner_epoch": "alarm.epoch.1",
+            "schema_version": "manyforge.operator_alarm_snapshot.v3",
             "generation": 3,
             "reconciled": True,
             "health": {"state": "available", "details": {}},
@@ -831,7 +837,7 @@ class FakeCore:
         }
 
     def alarm_metrics(self) -> dict[str, Any]:
-        return {"schema_version": "manyforge.operator_alarm_metrics.v1"}
+        return {"schema_version": "manyforge.operator_alarm_metrics.v2"}
 
     def acknowledge_alarm(self, **kwargs: Any) -> dict[str, Any]:
         self.acknowledgements.append(kwargs)
@@ -844,7 +850,7 @@ class FakeCore:
     def history(self, **kwargs: Any) -> dict[str, Any]:
         del kwargs
         return {
-            "schema_version": "manyforge.historian_summary_page.v2",
+            "schema_version": "manyforge.historian_summary_page.v3",
             "events": [],
             "next_before_sequence": None,
             "truncated": False,
@@ -852,10 +858,10 @@ class FakeCore:
 
     def history_detail(self, sequence: int) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.historian_detail.v2",
+            "schema_version": "manyforge.historian_detail.v3",
             "sequence": sequence,
             "event": {
-                "schema_version": "manyforge.historian_event.v2",
+                "schema_version": "manyforge.historian_event.v3",
                 "event_id": "event-1",
                 "component": "manyforge.execution",
                 "event_type": "operation_updated",
@@ -876,15 +882,6 @@ class FakeCore:
             "available": True,
         }
 
-    def reconcile_historian_health(self, **kwargs: Any) -> dict[str, Any]:
-        self.historian_reconciliations.append(kwargs)
-        return {
-            "schema_version": "manyforge.historian_reconciliation.v1",
-            "reconciled": kwargs["expected_generation"] == 1,
-            "audit_event_ids": ["event-1"],
-            "health": self.historian_health(),
-        }
-
     def shutdown(self) -> None:
         raise AssertionError("injected service must not be shut down by the app")
 
@@ -901,20 +898,19 @@ class FakeManager:
     def apply(self, request: ManagerApplyRequest) -> dict[str, Any]:
         self.requests.append(request)
         return {
-            "api_version": "manyforge.manager_command_response.v2",
+            "api_version": "manyforge.manager_command_response.v3",
             "ok": False,
             "error": {
                 "code": "kernel_owner_unavailable",
                 "message": "operational Apply is unavailable",
             },
-            "request_id": request.request_id,
-            "request_owner_epoch": request.request_owner_epoch,
+            "request_key": request.request_key,
         }
 
-    def observe_apply(self, apply_id: str, apply_generation: int) -> dict[str, Any]:
+    def observe_apply(self, apply_id: int, apply_generation: int) -> dict[str, Any]:
         self.apply_observations.append((apply_id, apply_generation))
         return {
-            "api_version": "manyforge.manager_command_response.v2",
+            "api_version": "manyforge.manager_command_response.v3",
             "apply_generation": apply_generation,
             "apply_id": apply_id,
             "candidate_projection_revision": None,
@@ -942,15 +938,14 @@ class FakeManager:
                 "assistant_mode": "optional",
                 "prepared_activation_id": "sha256:" + "e" * 64,
             },
-            "request_id": "request.1",
-            "request_owner_epoch": "client.epoch.1",
+            "request_key": "b1" * 16,
             "state": "pending",
             "failure_acknowledgement": "unavailable",
         }
 
     def acknowledge_apply(
         self,
-        apply_id: str,
+        apply_id: int,
         apply_generation: int,
         request_context: ManagerApplyAcknowledgementContext,
     ) -> dict[str, Any]:
@@ -984,7 +979,7 @@ class FakeManager:
         self.scene_requests.append((request, trusted_principal_id))
         context = request.request_context
         return {
-            "api_version": "manyforge.manager_command_response.v2",
+            "api_version": "manyforge.manager_command_response.v3",
             "committed_projection_revision": {
                 "retained_bundle_id": "sha256:" + "b" * 64,
                 "graph_revision": "sha256:" + "c" * 64,
@@ -998,8 +993,7 @@ class FakeManager:
             "ok": True,
             "projection_status": "committed",
             "replay_status": "accepted_new",
-            "request_id": context.request_id,
-            "request_owner_epoch": context.request_owner_epoch,
+            "request_key": context.request_key,
             "transaction_sequence": 1,
             "update_status": "geometry_changed",
         }
@@ -1044,10 +1038,10 @@ class FakeExecution:
 
     def observation(self) -> dict[str, Any]:
         return {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "ok": True,
             "command": "observation",
-            "observation": {"schema_version": "manyforge.execution_observation.v4"},
+            "observation": {"schema_version": "manyforge.execution_observation.v5"},
         }
 
     def submit(
@@ -1102,7 +1096,7 @@ class FakeExecution:
             "preview_receipt": {},
         }
 
-    def read(self, operation_id: str) -> dict[str, Any]:
+    def read(self, operation_id: int) -> dict[str, Any]:
         return {
             "ok": True,
             "command": "read",
@@ -1118,7 +1112,7 @@ class FakeExecution:
     ) -> dict[str, Any]:
         self.requests.append(("plan_pick", request))
         self.principals.append(("plan_pick", trusted_principal_id))
-        return {"ok": True, "command": "plan_pick", "planning_result": {}}
+        return {"ok": True, "command": "plan_pick", "planning_job": {"state": "accepted"}}
 
     def plan_place(
         self,
@@ -1128,7 +1122,36 @@ class FakeExecution:
     ) -> dict[str, Any]:
         self.requests.append(("plan_place", request))
         self.principals.append(("plan_place", trusted_principal_id))
-        return {"ok": True, "command": "plan_place", "planning_result": {}}
+        return {"ok": True, "command": "plan_place", "planning_job": {"state": "accepted"}}
+
+    def _planning_job(self, command: str, job_id: str) -> dict[str, Any]:
+        self.requests.append((command, job_id))
+        if job_id == "unknown":
+            return {
+                "ok": False,
+                "error": {"code": "planning_job_unknown", "message": "no such job"},
+            }
+        if job_id == "unfinished":
+            return {
+                "ok": False,
+                "error": {"code": "planning_job_unfinished", "message": "planning"},
+            }
+        if command == "release_planning_job":
+            return {"ok": True, "command": command}
+        return {
+            "ok": True,
+            "command": command,
+            "planning_job": {"job_id": job_id, "state": "planning"},
+        }
+
+    def read_planning_job(self, job_id: str) -> dict[str, Any]:
+        return self._planning_job("read_planning_job", job_id)
+
+    def cancel_planning_job(self, job_id: str) -> dict[str, Any]:
+        return self._planning_job("cancel_planning_job", job_id)
+
+    def release_planning_job(self, job_id: str) -> dict[str, Any]:
+        return self._planning_job("release_planning_job", job_id)
 
     def _control(
         self,
@@ -1157,38 +1180,56 @@ class FakeExecution:
         self.principals.append(("stop", trusted_principal_id))
         return {"ok": True, "command": "stop", "accepted": {}}
 
-    def full_stop(
+    def stop_all(
         self, request: object, *, trusted_principal_id: str | None
     ) -> dict[str, Any]:
-        self.requests.append(("full_stop", request))
-        self.principals.append(("full_stop", trusted_principal_id))
-        return {"ok": True, "command": "full_stop", "accepted": {}}
+        self.requests.append(("stop_all", request))
+        self.principals.append(("stop_all", trusted_principal_id))
+        return {"ok": True, "command": "stop_all", "accepted": {"event_id": 1}}
 
-    def recognized_malformed_stop(
+    def halt(
+        self, request: object, *, trusted_principal_id: str | None
+    ) -> dict[str, Any]:
+        self.requests.append(("halt", request))
+        self.principals.append(("halt", trusted_principal_id))
+        return {"ok": True, "command": "halt", "accepted": {"event_id": 2}}
+
+    def recognized_stop(
         self,
         *,
-        request_id: str,
+        request_key: str,
         recognized_route: str,
         reason: str,
+        source_label: str | None,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]:
         self.requests.append(
             (
-                "recognized_malformed_stop",
+                "recognized_stop",
                 {
-                    "request_id": request_id,
+                    "request_key": request_key,
                     "recognized_route": recognized_route,
                     "reason": reason,
+                    "source_label": source_label,
                 },
             )
         )
-        self.principals.append(("recognized_malformed_stop", trusted_principal_id))
+        self.principals.append(("recognized_stop", trusted_principal_id))
+        applied = "halt" if recognized_route == "/api/execution/halt" else "stop_all"
+        requested = {"/api/execution/stops": "operation"}.get(recognized_route, applied)
         return {
             "ok": True,
-            "command": "stop",
+            "command": "recognized_stop",
             "accepted": {
-                "request_id": request_id,
-                "resolution_disposition": "promoted_to_full",
+                "request_key": request_key,
+                "requested": requested,
+                "applied": applied,
+                # The Kernel's reason by the ingress reason (OD-244).
+                "widen_reason": (
+                    "stale_start"
+                    if reason == "recognized_stop_start_not_current"
+                    else "malformed"
+                ),
             },
         }
 
@@ -1227,14 +1268,13 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
         graph_revision=digest_a,
     )
     return {
-        "schema_version": "manyforge.program_run_status.v4",
+        "schema_version": "manyforge.program_run_status.v5",
         "owner_id": "program-runner.cell-a",
-        "owner_epoch": "program-runner.epoch.1",
         "run_revision": 1,
         "state": state,
         "capture": {
-            "schema_version": "manyforge.program_run_capture.v2",
-            "program_run_id": "program-run.1",
+            "schema_version": "manyforge.program_run_capture.v3",
+            "program_run_id": 1,
             "applied_record_digest": "sha256:" + "5" * 64,
             "scenario_id": "cell-pick",
             "source_document_digest": "sha256:" + "6" * 64,
@@ -1250,13 +1290,13 @@ def _program_run_snapshot(*, state: str = "running") -> dict[str, Any]:
             "node_policies": [],
             "owner_identities": [
                 {
-                    "owner_role": "program_runner",
-                    "owner_id": "program-runner.cell-a",
-                    "owner_epoch": "program-runner.epoch.1",
+                    "role": "program_runner",
+                    "application_start_id": _APPLICATION_START_ID,
                 }
             ],
         },
         "tree_status": "running",
+        "halt": None,
         "node_status_revision": 1,
         "node_statuses": {"root": "running"},
         "active_operation_count": 1,
@@ -1278,6 +1318,36 @@ def _applied_for_program_run() -> dict[str, Any]:
     )
 
 
+def _command_reply(
+    kind: str,
+    request_key: str,
+    *,
+    step: str | None = "admitting",
+    end: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The runner's reply at acceptance, `program_command_reply.v1` (OD-214)."""
+
+    return {
+        "schema_version": "manyforge.program_command_reply.v1",
+        "command": {
+            "kind": kind,
+            "request_key": request_key,
+            "step": step,
+            "accepted_at_ns": "1763112345678901234",
+            "end": end,
+        },
+    }
+
+
+def _command_end(outcome: str, code: str | None = None) -> dict[str, Any]:
+    return {
+        "outcome": outcome,
+        "code": code,
+        "details": None,
+        "finished_at_ns": "1763112345678909999",
+    }
+
+
 class FakeProgramRunner:
     def __init__(
         self,
@@ -1289,15 +1359,13 @@ class FakeProgramRunner:
         self.node_environment_digest = node_environment_digest
         self.calls: list[tuple[str, Any]] = []
 
-    def cycle_status(self) -> dict[str, Any]:
+    def cycle_status(self, *, before_command: bool = False) -> dict[str, Any]:
         command_kinds = (
             "program_run",
             "program_motion_stop",
-            "program_full_stop",
-            "program_stop",
             "program_reset",
-            "program_resume_full_stop",
-            "program_discard_full_stop",
+            "program_resume_halt",
+            "program_discard_halt",
             "program_runtime_blackboard_write",
             "program_manual_result_stage",
             "program_manual_handover",
@@ -1305,12 +1373,12 @@ class FakeProgramRunner:
             "operation_stop",
             "operation_reset",
             "operation_acknowledge_completed",
-            "cell_full_stop",
+            "stop_all",
+            "halt",
             "execution_recovery",
             "runtime_scale",
         )
         return {
-            "program_runner_owner_epoch": "program-runner.epoch.1",
             "execution_control_revision": 1,
             "cycle_generation": 1,
             "state": "idle_after_reset",
@@ -1343,9 +1411,9 @@ class FakeProgramRunner:
     def runs(self, *, active_only: bool, limit: int) -> dict[str, Any]:
         self.calls.append(("runs", (active_only, limit)))
         return {
-            "schema_version": "manyforge.program_run_index.v2",
+            "schema_version": "manyforge.program_run_index.v3",
             "owner_id": "program-runner.cell-a",
-            "owner_epoch": "program-runner.epoch.1",
+            "application_start_id": _APPLICATION_START_ID,
             "active_only": active_only,
             "truncated": False,
             "runs": [self._snapshot()] if self.active else [],
@@ -1353,7 +1421,7 @@ class FakeProgramRunner:
 
     def start_run(self, body: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(("start", copy.deepcopy(body)))
-        return self._snapshot()
+        return _command_reply("start", body["request_key"])
 
     def prepare_applied_scene(self, body: dict[str, Any]) -> dict[str, Any]:
         self.calls.append(("prepare_scene", copy.deepcopy(body)))
@@ -1366,55 +1434,23 @@ class FakeProgramRunner:
             "prepared_scene": {"schema_version": "manyforge.prepared_program_scene.v1"},
         }
 
-    def read_run(self, program_run_id: str) -> dict[str, Any]:
+    def read_run(self, program_run_id: int) -> dict[str, Any]:
         self.calls.append(("read", program_run_id))
         return self._snapshot()
 
-    def stop_run(
-        self,
-        program_run_id: str,
-        body: dict[str, Any],
-    ) -> dict[str, Any]:
-        self.calls.append(("stop", (program_run_id, copy.deepcopy(body))))
-        return self._snapshot(state="stopping")
-
-    def stop_motion(
-        self,
-        program_run_id: str,
-        body: dict[str, Any],
-    ) -> dict[str, Any]:
-        self.calls.append(("motion_stop", (program_run_id, copy.deepcopy(body))))
-        return self._snapshot(state="running")
-
-    def full_stop(
-        self,
-        program_run_id: str,
-        body: dict[str, Any],
-    ) -> dict[str, Any]:
-        self.calls.append(("full_stop", (program_run_id, copy.deepcopy(body))))
-        return self._snapshot(state="full_stopping")
-
     def prepare_manual_handover(
-        self, program_run_id: str, body: dict[str, Any]
+        self, program_run_id: int, body: dict[str, Any]
     ) -> dict[str, Any]:
         self.calls.append(("manual_handover", (program_run_id, copy.deepcopy(body))))
-        return self._snapshot()
+        return _command_reply("prepare_manual_handover", body["request_key"])
 
-    def resume_full_stop(
+    def resume_halt(
         self,
-        program_run_id: str,
+        program_run_id: int,
         body: dict[str, Any],
     ) -> dict[str, Any]:
-        self.calls.append(("resume_full_stop", (program_run_id, copy.deepcopy(body))))
-        return self._snapshot(state="running")
-
-    def discard_full_stop(
-        self,
-        program_run_id: str,
-        body: dict[str, Any],
-    ) -> dict[str, Any]:
-        self.calls.append(("discard_full_stop", (program_run_id, copy.deepcopy(body))))
-        return self._snapshot(state="stopped")
+        self.calls.append(("resume_halt", (program_run_id, copy.deepcopy(body))))
+        return _command_reply("resume_halt", body["request_key"])
 
     def close(self) -> None:
         self.calls.append(("close", None))
@@ -1478,7 +1514,7 @@ def _node_availability_fixture(
             for entry in environment.catalog.entries
             for requirement in entry.required_capabilities
         }),
-        "schema_version": "manyforge.node_environment_projection.v2",
+        "schema_version": "manyforge.node_environment_projection.v3",
         "retained_bundle_id": applied["retained_bundle_id"],
         "graph_revision": applied["graph_revision"],
         "environment_digest": environment.manifest.environment_digest,
@@ -1503,7 +1539,6 @@ def _node_availability_fixture(
         "cycle_generation": 11,
         "graph_revision": applied["graph_revision"],
         "node_environment_digest": environment.manifest.environment_digest,
-        "owner_epoch": "program-runner.epoch.1",
         "owner_id": "program-runner",
         "program_binding_id": applied["program_binding_id"],
         "program_id": applied["program_id"],
@@ -1512,7 +1547,7 @@ def _node_availability_fixture(
         "scenario_id": applied["scenario_id"],
     }
     runner_projection = {
-        "schema_version": "manyforge.program_node_availability.v1",
+        "schema_version": "manyforge.program_node_availability.v2",
         "availability": availability,
         "source": {
             **source,
@@ -1529,15 +1564,14 @@ class _ResetProgramRunner(FakeProgramRunner):
     def __init__(self) -> None:
         super().__init__()
         self.cycle = {
-            "program_runner_owner_epoch": "program-runner.epoch.1",
             "cycle_generation": 4,
             "state": "terminal_awaiting_reset",
-            "program_run_id": "program-run.1",
+            "program_run_id": 1,
             "cycle_claim_generation": 22,
             "terminal_or_settlement_reference": "sha256:" + "a" * 64,
         }
 
-    def cycle_status(self) -> dict[str, Any]:
+    def cycle_status(self, *, before_command: bool = False) -> dict[str, Any]:
         self.calls.append(("cycle_status", None))
         return copy.deepcopy(self.cycle)
 
@@ -1552,26 +1586,15 @@ class _ResetProgramRunner(FakeProgramRunner):
                 "Reset does not identify the current Program cycle",
                 409,
             )
-        return {
-            "schema_version": "manyforge.program_cycle_reset_result.v1",
-            "program_run_id": body["program_run_id"],
-            "reset_cycle_generation": body["expected_cycle_generation"],
-            "idle_cycle_generation": body["expected_cycle_generation"] + 1,
-            "settlement_reference": body["settlement_evidence_digest"],
-            "admission": {},
-            "runtime_controls": None,
-        }
+        return _command_reply("reset", body["request_key"])
 
 
 def _cycle_reset_request() -> ProgramCycleResetRequest:
     return ProgramCycleResetRequest.model_validate(
         {
-            "request_id": "reset.1",
-            "request_owner_epoch": "composer.epoch.1",
+            "request_key": "c1" * 16,
             "source_label": "composer",
-            "correlation_id": None,
-            "program_run_id": "program-run.1",
-            "expected_owner_epoch": "program-runner.epoch.1",
+            "program_run_id": 1,
             "expected_cycle_generation": 4,
             "expected_claim_generation": 22,
             "terminal_reference": "sha256:" + "a" * 64,
@@ -1589,7 +1612,9 @@ def test_program_cycle_reset_is_one_thin_owner_command() -> None:
 
     result = service.program_cycle_reset(_cycle_reset_request())
 
-    assert result["idle_cycle_generation"] == 5
+    # The runner's row at acceptance is the reply; its end is published in
+    # the cycle status (OD-214).
+    assert result == _command_reply("reset", "c1" * 16)
     assert execution.requests == []
     assert [kind for kind, _request in runner.calls] == ["reset_cycle"]
 
@@ -1634,7 +1659,7 @@ def test_successor_idle_reset_is_rejected_without_replaying_effects() -> None:
     assert [kind for kind, _request in runner.calls] == ["reset_cycle"]
 
 
-def test_full_stopped_reset_is_one_public_command_with_exact_inner_settlement() -> None:
+def test_halted_discard_is_one_public_command_with_exact_inner_settlement() -> None:
     execution = FakeExecution()
     runner = _ResetProgramRunner()
     runner.cycle.update(
@@ -1646,29 +1671,28 @@ def test_full_stopped_reset_is_one_public_command_with_exact_inner_settlement() 
     service = _service(
         FakeCore(), FakeManager(), execution=execution, program_runner=runner
     )
-    request = ProgramFullStopResetRequest.model_validate(
+    request = ProgramHaltDiscardRequest.model_validate(
         {
-            "request_id": "reset-full-stop.1",
-            "request_owner_epoch": "composer.epoch.1",
+            "request_key": "c2" * 16,
             "source_label": "composer",
-            "correlation_id": None,
-            "program_run_id": "program-run.1",
-            "expected_owner_epoch": "program-runner.epoch.1",
+            "program_run_id": 1,
             "expected_run_revision": 1,
             "expected_cycle_generation": 4,
             "expected_claim_generation": 22,
-            "reason": "operator Reset discarded Full Stop",
+            "reason": "operator Reset discarded the halted run",
         }
     )
 
-    result = service.program_run_reset_full_stop("program-run.1", request)
+    result = service.program_run_discard_halt(1, request)
 
-    assert result["idle_cycle_generation"] == 5
+    assert result == _command_reply("reset", request.request_key)
     assert [kind for kind, _value in runner.calls] == ["reset_cycle"]
     reset_body = runner.calls[-1][1]
     assert reset_body["terminal_reference"] is None
     assert reset_body["settlement_evidence_digest"] is None
-    assert reset_body["request_id"] == request.request_id
+    assert reset_body["request_key"] == request.request_key
+    # The runner gets the key only; session and sequence are inside it.
+    assert "control_session_number" not in reset_body
     assert execution.requests == []
 
 
@@ -1686,6 +1710,7 @@ def _service(
         program_runner=program_runner,  # type: ignore[arg-type]
         cell_admission=FakeCellAdmission(),
         activation_preparer=activation_preparer,  # type: ignore[arg-type]
+        application_start_id=_APPLICATION_START_ID,
     )
 
 
@@ -1724,14 +1749,22 @@ class FakeActivationPreparer:
         }
 
 
-def test_activation_preparation_accepts_any_generation_while_idle() -> None:
-    core = FakeCore()
-    manager = FakeManager()
-    preparer = FakeActivationPreparer()
-    client = TestClient(
-        create_app(service=_service(core, manager, activation_preparer=preparer))
-    )
-    body = {
+def _preparation_ended(service: HeadlessService, request_key: str) -> dict[str, Any]:
+    """The preparation's row once it ended (the preparing thread ends it)."""
+
+    deadline = time.monotonic() + 5.0
+    while True:
+        row = service.activation_preparations.find(request_key)
+        if row is not None and row["end"] is not None:
+            return row
+        assert time.monotonic() < deadline, row
+        time.sleep(0.01)
+
+
+def _preparation_request_body(key: str = "a5" * 16) -> dict[str, Any]:
+    return {
+        "application_start_id": _APPLICATION_START_ID,
+        "request_key": key,
         "scenario_id": "scenario_a",
         "project_path": "/projects/scenario_a.scenario",
         "source_document_digest": "sha256:" + "6" * 64,
@@ -1745,10 +1778,40 @@ def test_activation_preparation_accepts_any_generation_while_idle() -> None:
         "expected_admission_generation": _ADMISSION_GENERATION,
     }
 
+
+def test_activation_preparation_accepts_any_generation_while_idle() -> None:
+    core = FakeCore()
+    manager = FakeManager()
+    preparer = FakeActivationPreparer()
+    service = _service(core, manager, program_runner=FakeProgramRunner(),
+                       activation_preparer=preparer)
+    client = TestClient(create_app(service=service))
+    body = _preparation_request_body()
+
     response = client.post("/api/activation-preparations", json=body)
 
+    # OD-214: answered at acceptance with the row; the key Headless formed
+    # (class 3) names it.
     assert response.status_code == 200, response.text
-    assert response.json()["prepared_activation"]["prepared_activation_id"]
+    reply = response.json()
+    assert reply["schema_version"] == "manyforge.activation_preparation_reply.v1"
+    row = reply["command"]
+    key = "c0" + "a5" * 15
+    assert row["kind"] == "activation_preparation"
+    assert row["request_key"] == key
+    assert row["captured_input_digest"] == "sha256:" + "8" * 64
+    assert row["accepted_at_ns"].isdigit()
+    assert row["step"] in {"awaiting_admission", "preparing"} or row["end"] is not None
+    ended = _preparation_ended(service, key)
+    assert ended["step"] == "preparing"
+    assert ended["end"]["outcome"] == "succeeded"
+    assert ended["end"]["code"] is None
+    # Published beside `scene_clear` in the cycle status.
+    status = client.get("/api/cycle/status").json()
+    assert status["activation_preparation"] == {"in_progress": None, "ended": [ended]}
+    prepared = client.get("/api/activation-preparations/" + "sha256:" + "8" * 64)
+    assert prepared.status_code == 200, prepared.text
+    assert prepared.json()["prepared_activation"]["prepared_activation_id"]
     assert preparer.calls == [
         {
             "scenario_id": "scenario_a",
@@ -1765,10 +1828,108 @@ def test_activation_preparation_accepts_any_generation_while_idle() -> None:
     ]
 
     # The request's generation is evidence only: a different one is prepared.
+    body = _preparation_request_body("a6" * 16)
     body["expected_admission_generation"] = _ADMISSION_GENERATION - 1
-    prepared = client.post("/api/activation-preparations", json=body)
-    assert prepared.status_code == 200, prepared.text
+    again = client.post("/api/activation-preparations", json=body)
+    assert again.status_code == 200, again.text
+    assert _preparation_ended(service, "c0" + "a6" * 15)["end"]["outcome"] == "succeeded"
     assert len(preparer.calls) == 2
+
+
+def test_activation_preparation_replays_a_kept_key_without_preparing_again() -> None:
+    preparer = FakeActivationPreparer()
+    service = _service(FakeCore(), FakeManager(), activation_preparer=preparer)
+    client = TestClient(create_app(service=service))
+
+    first = client.post("/api/activation-preparations", json=_preparation_request_body())
+    key = first.json()["command"]["request_key"]
+    ended = _preparation_ended(service, key)
+    replay = client.post("/api/activation-preparations", json=_preparation_request_body())
+
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == {
+        "schema_version": "manyforge.activation_preparation_reply.v1",
+        "command": ended,
+    }
+    assert len(preparer.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("code", "outcome"),
+    [
+        # A definite refusal of the input (HTTP 409 before): no effect.
+        ("activation_preparation_failed", "refused"),
+        ("authoring_not_ready", "refused"),
+        # Every other typed failure, the subprocess bound included.
+        ("activation_preparation_timeout", "failed"),
+        ("activation_preparation_request_oversized", "failed"),
+    ],
+)
+def test_activation_preparation_ends_its_row_with_the_typed_code(
+    code: str, outcome: str
+) -> None:
+    class FailingPreparer(FakeActivationPreparer):
+        def prepare(self, **kwargs: Any) -> dict[str, Any]:
+            super().prepare(**kwargs)
+            raise HeadlessApiError(code, "preparer text", details={"preparer_detail": "x"})
+
+    preparer = FailingPreparer()
+    service = _service(FakeCore(), FakeManager(), activation_preparer=preparer)
+    client = TestClient(create_app(service=service))
+
+    response = client.post("/api/activation-preparations", json=_preparation_request_body())
+
+    assert response.status_code == 200, response.text
+    ended = _preparation_ended(service, response.json()["command"]["request_key"])
+    assert ended["step"] == "preparing"
+    assert ended["end"]["outcome"] == outcome
+    assert ended["end"]["code"] == code
+    # The error's own details; no message text.
+    assert ended["end"]["details"] == {"preparer_detail": "x"}
+    # Nothing prepared to read.
+    missing = client.get("/api/activation-preparations/" + "sha256:" + "8" * 64)
+    assert missing.status_code == 404
+    assert missing.json()["detail"]["code"] == "activation_preparation_result_not_found"
+
+
+def test_activation_preparation_refusals_at_once_are_replies_not_rows() -> None:
+    service = _service(FakeCore(), FakeManager())
+    client = TestClient(create_app(service=service))
+
+    unconfigured = client.post("/api/activation-preparations", json=_preparation_request_body())
+    body = _preparation_request_body()
+    del body["request_key"]
+    keyless = TestClient(
+        create_app(service=_service(
+            FakeCore(), FakeManager(), activation_preparer=FakeActivationPreparer()
+        ))
+    ).post("/api/activation-preparations", json=body)
+
+    assert unconfigured.status_code == 503
+    assert unconfigured.json()["detail"]["code"] == "activation_preparer_unavailable"
+    assert keyless.status_code == 422
+    assert service.activation_preparations.snapshot() == {"in_progress": None, "ended": []}
+
+
+def test_activation_preparation_status_survives_a_runner_read_failure() -> None:
+    class OfflineRunner(FakeProgramRunner):
+        def cycle_status(self, *, before_command: bool = False) -> dict[str, Any]:
+            raise ProgramRunnerClientError("program_runner_unavailable", "offline")
+
+    service = _service(FakeCore(), FakeManager(), program_runner=OfflineRunner(),
+                       activation_preparer=FakeActivationPreparer())
+    client = TestClient(create_app(service=service))
+    key = client.post(
+        "/api/activation-preparations", json=_preparation_request_body()
+    ).json()["command"]["request_key"]
+    ended = _preparation_ended(service, key)
+
+    status = client.get("/api/cycle/status")
+
+    assert status.status_code == 503
+    assert status.json()["detail"]["details"]["activation_preparation"] == {
+        "in_progress": None, "ended": [ended],
+    }
 
 
 def test_activation_preparation_refuses_removed_parameter_overrides() -> None:
@@ -1824,13 +1985,113 @@ def test_source_model_context_rejects_closed_or_malformed_envelopes(mutation) ->
     assert response.json()["detail"]["code"] == "source_model_context_invalid"
 
 
+_CALLER_KEY = "d1" * 16
+# The key Headless forms from the client's: class 3 (HTTP), part 0.
+_FORMED_CALLER_KEY = "c0" + "d1" * 15
+
+
+def _headless_key(sequence: int) -> str:
+    """The ``sequence``-th class 1 key Headless (minter 5) mints this start."""
+
+    return "40" + "00" * 6 + "05" + f"{sequence:016x}"
+
+
 def _caller() -> dict[str, Any]:
     return {
-        "request_id": "request.1",
-        "request_owner_epoch": "client.epoch.1",
+        "request_key": _CALLER_KEY,
+        "application_start_id": _APPLICATION_START_ID,
         "source_label": "operator_ui",
-        "correlation_id": "correlation.1",
     }
+
+
+def test_authoring_settle_carries_the_causing_request_key() -> None:
+    """The settle body carries the key of the request that causes the release
+    (contract 1.15.2); Headless forms it like every HTTP key and names the
+    claim by the claim's own identity."""
+
+    service = _service(FakeCore(), FakeManager())
+    claim = _authoring_claim(request_key="a1" * 16)
+    body = {
+        "request_key": "b7" * 16,
+        "application_start_id": _APPLICATION_START_ID,
+        "claim": claim,
+        "settlement_kind": "owner_commit",
+        "evidence_digest": _AUTHORING_DIGEST,
+    }
+    with TestClient(create_app(service=service)) as client:
+        response = client.post("/api/program/authoring-transactions/settle", json=body)
+        assert response.status_code == 200, response.text
+        missing = client.post(
+            "/api/program/authoring-transactions/settle",
+            json={key: value for key, value in body.items() if key != "request_key"},
+        )
+    assert response.json()["admission"]["authoring_allowed"] is True
+    (release,) = service.cell_admission.releases
+    # Class 3, part 0, of the client's key; not the claim's key.
+    assert release["request_key"] == "c0" + "b7" * 15
+    assert release["request_key"] != claim["intent"]["request_key"]
+    assert release["owner_transaction_id"] is None
+    assert release["claim_generation"] == claim["claim_generation"]
+    assert release["acquired_admission_generation"] == claim["acquired_admission_generation"]
+    assert "request_payload_digest" not in release
+    assert missing.json()["detail"]["code"] == "request_key_required"
+    assert len(service.cell_admission.releases) == 1
+
+
+def test_authoring_acquire_claims_without_digest_or_transaction_number() -> None:
+    """An authoring claim carries no request digest and a null owner
+    transaction id; a body still naming either is refused at ingress."""
+
+    service = _service(FakeCore(), FakeManager())
+    body = {**_caller(), "expected_admission_generation": _ADMISSION_GENERATION}
+    with TestClient(create_app(service=service)) as client:
+        response = client.post("/api/program/authoring-transactions", json=body)
+        old_digest = client.post(
+            "/api/program/authoring-transactions",
+            json={**body, "request_payload_digest": _AUTHORING_DIGEST},
+        )
+        old_transaction = client.post(
+            "/api/program/authoring-transactions",
+            json={**body, "owner_transaction_id": "authoring-transaction.1"},
+        )
+    assert response.status_code == 200, response.text
+    intent = response.json()["claim"]["intent"]
+    assert intent["owner_transaction_id"] is None
+    assert intent["request_key"] == _FORMED_CALLER_KEY
+    assert "request_payload_digest" not in intent
+    assert old_digest.status_code == 422
+    assert old_transaction.status_code == 422
+
+
+@pytest.mark.parametrize("outcome_unknown", [True, False])
+def test_authoring_acquire_passes_on_a_lost_kernel_answer(outcome_unknown: bool) -> None:
+    """OD-196: when Headless lost the Kernel's answer to a claim request, its
+    refusal says so (``details.outcome_unknown``), so the Composer keeps the
+    exact request for replay; a definite refusal of the same code does not."""
+
+    from manyforge_headless_api.client import HeadlessHttpClient
+
+    class LostAnswerAdmission(FakeCellAdmission):
+        def acquire(self, intent: dict[str, Any]) -> dict[str, Any]:
+            raise CellAdmissionError(
+                "execution_owner_unavailable",
+                "native execution transport failed: timed out",
+                outcome_unknown=outcome_unknown,
+            )
+
+    service = _service(FakeCore(), FakeManager())
+    service.cell_admission = LostAnswerAdmission()
+    body = {**_caller(), "expected_admission_generation": _ADMISSION_GENERATION}
+    with TestClient(create_app(service=service)) as client:
+        response = client.post("/api/program/authoring-transactions", json=body)
+
+    detail = response.json()["detail"]
+    assert detail["code"] == "execution_owner_unavailable"
+    assert detail["details"] == ({"outcome_unknown": True} if outcome_unknown else {})
+    # The Composer's client carries it as a typed detail, not as text.
+    error = HeadlessHttpClient._error_from_response(response.json(), response.status_code)
+    assert error.code == "execution_owner_unavailable"
+    assert error.details.get("outcome_unknown") is (True if outcome_unknown else None)
 
 
 def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None:
@@ -1854,10 +2115,10 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         context = client.get("/api/source-model-context").json()
         assert context["schema_version"] == "manyforge.source_model_context.v1"
         assert context["node_environment"]["schema_version"] == (
-            "manyforge.node_environment_projection.v2"
+            "manyforge.node_environment_projection.v3"
         )
         assert context["source_model"]["schema_version"] == (
-            "manyforge.source_model_projection.v3"
+            "manyforge.source_model_projection.v4"
         )
         urdf = client.get("/api/viewer-model/urdf")
         assert urdf.status_code == 200
@@ -1941,7 +2202,6 @@ def test_alarm_snapshot_names_the_kernel_held_attention_copy() -> None:
             "retained_bundle_id": "bundle.1",
         },
         "generation": 2,
-        "owner_epoch": "alarm.epoch.1",
         "reconciled": True,
     }
     service.kernel_attention_source = lambda: held
@@ -1976,7 +2236,7 @@ def test_component_overview_fact_capture_reads_each_source_once() -> None:
         def authoring_admission(self) -> dict[str, Any]:
             return self.value("authoring_admission")
 
-        def program_cycle_status(self) -> dict[str, Any]:
+        def program_cycle_status(self, **_kwargs: Any) -> dict[str, Any]:
             return self.value("program_cycle")
 
         def program_applied(self) -> dict[str, Any]:
@@ -2091,7 +2351,7 @@ def test_palette_assistant_nodes_need_the_model_query_offer() -> None:
                 {
                     "grant_policy": {},
                     "mode": "composer-assistant",
-                    "schema_version": "manyforge.assistant_mode_projection.v2",
+                    "schema_version": "manyforge.assistant_mode_projection.v3",
                     "skills": [],
                     "tools": [],
                     "source": {"available": True},
@@ -2235,6 +2495,14 @@ def test_manager_status_preserves_owner_canonical_empty(
     assert status["source"]["source_generation"] == 2
 
 
+def test_manager_status_refuses_the_previous_source_version() -> None:
+    core = FakeCore()
+    core.manager_payload["api_version"] = "manyforge.manager_source.v1"
+    with pytest.raises(HeadlessApiError) as error:
+        _service(core, FakeManager()).manager_status()
+    assert error.value.code == "manager_source_invalid"
+
+
 def test_manager_status_rejects_missing_canonical_empty() -> None:
     core = FakeCore()
     del core.manager_payload["active"]["canonical_empty"]
@@ -2293,8 +2561,6 @@ def test_manager_status_and_diff_preserve_offer_digest_fields() -> None:
 
 @pytest.mark.parametrize("code,status", [
     ("program_run_started_then_failed", 422),
-    ("program_run_superseded_by_stop", 422),
-    ("program_run_stopped_before_start", 409),
     ("authoring_not_ready", 409),
     ("program_cycle_reconciliation_required", 503),
     ("program_runner_internal_error", 500),
@@ -2303,7 +2569,7 @@ def test_program_started_then_failed_preserves_owner_status_and_details(
     code: str, status: int,
 ) -> None:
     details = {
-        "program_run_id": "program-cycle.2",
+        "program_run_id": 2,
         "claim_generation": 9,
         "needs_reset": True,
         "cause_code": "component_lifecycle_facts_stale",
@@ -2369,13 +2635,6 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
         "expected_applied_record_digest": "sha256:" + "5" * 64,
         "draft_program_revision": core.applied_program["program_revision"],
     }
-    stop_body = {
-        **_caller(),
-        "request_id": "request.2",
-        "program_run_id": "program-run.1",
-        "expected_owner_epoch": "program-runner.epoch.1",
-        "reason": "operator stop",
-    }
 
     with client:
         index = client.get(
@@ -2387,64 +2646,65 @@ def test_program_runner_surface_is_a_strict_thin_owner_projection() -> None:
             "/api/program/scene-preparations",
             json={
                 **_caller(),
-                "request_id": "request.prepare.1",
+                "request_key": "d3" * 16,
                 "expected_applied_record_digest": "sha256:" + "5" * 64,
                 "expected_admission_generation": _ADMISSION_GENERATION,
             },
         )
-        read = client.get("/api/program/runs/program-run.1")
-        motion_stopped = client.post(
-            "/api/program/runs/program-run.1/motion-stop",
-            json={
-                **stop_body,
-                "request_id": "request.motion-stop.1",
-                "reason": "ordinary operator motion Stop",
-            },
+        read = client.get(
+            "/api/program/runs/1",
+            params={"application_start_id": _APPLICATION_START_ID},
         )
-        full_stopped = client.post(
-            "/api/program/runs/program-run.1/full-stop",
-            json={
-                **stop_body,
-                "request_id": "request.full-stop.1",
-                "reason": "ordinary operator Full Stop",
-            },
+        # The public Program Full Stop is gone; Halt names no run and goes
+        # to the Kernel. Execute after Halt reaches the runner.
+        removed = client.post(
+            "/api/program/runs/1/full-stop",
+            json={**_caller(), "request_key": "d2" * 16, "program_run_id": 1},
         )
         resumed = client.post(
-            "/api/program/runs/program-run.1/resume-full-stop",
+            "/api/program/runs/1/resume-halt",
             json={
                 **_caller(),
-                "request_id": "request.resume-full-stop.1",
-                "program_run_id": "program-run.1",
-                "expected_owner_epoch": "program-runner.epoch.1",
+                "request_key": "d4" * 16,
+                "program_run_id": 1,
                 "expected_run_revision": 1,
-                "reason": "operator Run after Full Stop",
+                "reason": "operator Execute after Halt",
             },
-        )
-        stopped = client.post(
-            "/api/program/runs/program-run.1/stop",
-            json=stop_body,
         )
 
         assert index.status_code == 200
         assert index.json()["active_only"] is True
         assert started.status_code == 200, started.text
-        assert started.json()["capture"]["scenario_id"] == "cell-pick"
+        # The reply is the runner's row; it names the formed key, so it
+        # carries ``A`` and the key's display form (1.5).
+        assert started.json()["schema_version"] == "manyforge.program_command_reply.v1"
+        assert started.json()["command"]["kind"] == "start"
+        assert started.json()["command"]["request_key"] == runner.calls[1][1]["request_key"]
+        assert started.json()["application_start_id"] == _APPLICATION_START_ID
     assert prepared.json()["status"] == "prepared"
-    assert read.json()["capture"]["program_run_id"] == "program-run.1"
-    assert motion_stopped.json()["state"] == "running"
-    assert full_stopped.json()["state"] == "full_stopping"
-    assert resumed.json()["state"] == "running"
-    assert stopped.json()["state"] == "stopping"
+    assert read.json()["capture"]["program_run_id"] == 1
+    # A reply naming a run carries ``A`` and the display form (1.5).
+    assert read.json()["application_start_id"] == _APPLICATION_START_ID
+    assert read.json()["display"] == "3f9a/run1"
+    assert removed.status_code in (404, 405)
+    assert resumed.json()["command"] == {
+        "kind": "resume_halt",
+        "request_key": "c0" + "d4" * 15,
+        "step": "admitting",
+        "accepted_at_ns": "1763112345678901234",
+        "end": None,
+    }
     assert [call[0] for call in runner.calls] == [
         "runs",
         "start",
         "prepare_scene",
         "read",
-        "motion_stop",
-        "full_stop",
-        "resume_full_stop",
-        "stop",
+        "resume_halt",
     ]
+    # The runner receives the formed key and no ``A`` (1.15.1).
+    resume_call = runner.calls[4][1][1]
+    assert resume_call["request_key"] == "c0" + "d4" * 15
+    assert "application_start_id" not in resume_call
 
 
 def test_rest_command_owner_projection_does_not_block_asgi_event_loop() -> None:
@@ -2457,7 +2717,7 @@ def test_rest_command_owner_projection_does_not_block_asgi_event_loop() -> None:
             self._first_projection_lock = threading.Lock()
             self._blocked_first_projection = False
 
-        def cycle_status(self) -> dict[str, Any]:
+        def cycle_status(self, *, before_command: bool = False) -> dict[str, Any]:
             with self._first_projection_lock:
                 block = not self._blocked_first_projection
                 self._blocked_first_projection = True
@@ -2603,11 +2863,42 @@ def test_program_run_captures_current_environment_not_package_provenance() -> No
 
     response = client.post("/api/program/runs", json=request)
 
+    # OD-214: the reply is the runner's row; the capture (and its current
+    # environment) is read from the run in the cycle status.
     assert response.status_code == 200
-    assert response.json()["capture"]["node_environment_digest"] == (
-        current_environment
-    )
+    assert response.json()["command"]["kind"] == "start"
+    assert [call[0] for call in runner.calls] == ["start"]
     assert current_environment != core.applied_program["node_environment_digest"]
+
+
+def test_program_run_status_carries_its_halt_unchanged() -> None:
+    """``halt``: null, or ``{kind, source_label}`` while halting or halted."""
+
+    for halt in (
+        None,
+        {"kind": "halt", "source_label": "operator_ui"},
+        {"kind": "runner_loss", "source_label": None},
+    ):
+        snapshot = {**_program_run_snapshot(state="halted"), "halt": halt}
+        expected = copy.deepcopy(snapshot)
+        assert HeadlessService._validate_program_run_snapshot(snapshot) == expected
+    without = _program_run_snapshot()
+    del without["halt"]
+    invalid_halts = (
+        {"kind": "", "source_label": None},
+        {"kind": "halt"},
+        {"kind": "halt", "source_label": None, "event_id": 1},
+        {"kind": 1, "source_label": None},
+        {"kind": "halt", "source_label": 1},
+        "halt",
+    )
+    for snapshot in (
+        without,
+        *({**_program_run_snapshot(), "halt": halt} for halt in invalid_halts),
+    ):
+        with pytest.raises(HeadlessApiError) as invalid:
+            HeadlessService._validate_program_run_snapshot(snapshot)
+        assert invalid.value.code == "program_runner_response_invalid"
 
 
 def test_program_run_status_carries_failure_details_and_origin_unchanged() -> None:
@@ -2699,7 +2990,7 @@ def test_program_run_status_carries_failure_details_and_origin_unchanged() -> No
         )
 
 
-def test_program_run_start_rejects_stale_applied_or_divergent_runner() -> None:
+def test_program_run_start_rejects_stale_applied_and_forwards_the_runner_row() -> None:
     core = FakeCore()
     core.applied_program = _applied_for_program_run()
     runner = FakeProgramRunner()
@@ -2728,22 +3019,18 @@ def test_program_run_start_rejects_stale_applied_or_divergent_runner() -> None:
                 "expected_applied_record_digest": "sha256:" + "f" * 64,
             },
         )
-        original = runner.start_run
-
-        def divergent(request: dict[str, Any]) -> dict[str, Any]:
-            snapshot = original(request)
-            snapshot["capture"]["program_revision"] = "sha256:" + "f" * 64
-            return snapshot
-
-        runner.start_run = divergent  # type: ignore[method-assign]
-        divergent_response = client.post("/api/program/runs", json=body)
+        # OD-214: the runner answers at acceptance; the run it starts (and
+        # its capture) is read from the cycle status, so the reply carries
+        # no capture to compare. The row is forwarded unchanged.
+        accepted = client.post("/api/program/runs", json=body)
 
     assert stale.status_code == 409
     assert stale.json()["detail"]["code"] == ("program_run_applied_selection_stale")
-    assert divergent_response.status_code == 502
-    assert divergent_response.json()["detail"]["code"] == (
-        "program_runner_response_invalid"
-    )
+    assert [call[0] for call in runner.calls] == ["start"]
+    assert accepted.status_code == 200
+    assert accepted.json()["command"] == _command_reply(
+        "start", runner.calls[0][1]["request_key"]
+    )["command"]
 
 
 def test_program_model_attempt_is_validated_before_native_commit() -> None:
@@ -2752,11 +3039,13 @@ def test_program_model_attempt_is_validated_before_native_commit() -> None:
     client = TestClient(app)
     digest = "sha256:" + "a" * 64
     body = {
-        "schema_version": "manyforge.program_model_attempt.v1",
-        "model_attempt_id": "attempt.1",
-        "program_run_id": "program-run.1",
+        "application_start_id": _APPLICATION_START_ID,
+        "schema_version": "manyforge.program_model_attempt.v2",
+        # A class 2 key (run, attempt, phase) (1.15.12).
+        "model_attempt_id": "80" + "00" * 6 + "01" + "00" * 5 + "01" + "0001",
+        "program_run_id": 1,
         "node_instance_id": "query.1",
-        "node_attempt_id": "node-attempt.1",
+        "node_attempt_id": 1,
         "external_attempt_index": 1,
         "assistant_projection_digest": digest,
         "model_endpoint_alias": "selection",
@@ -2804,6 +3093,7 @@ def test_program_model_attempt_is_validated_before_native_commit() -> None:
     assert accepted.status_code == 200
     assert accepted.json()["status"] == "stored"
     assert invalid.status_code == 422
+    # ``A`` is checked at the edge and kept inside the record (1.15.12).
     assert core.model_attempts == [body]
 
 
@@ -2851,7 +3141,7 @@ def test_configured_auth_adapter_alone_can_stamp_trusted_principal() -> None:
     assert core.acknowledgements[-1]["assurance"] == "authenticated:test"
 
 
-def test_bulk_acknowledgement_uses_one_common_owner_epoch_fence() -> None:
+def test_bulk_acknowledgement_carries_the_formed_key_and_no_epoch() -> None:
     client, core, _manager = _client()
     with client:
         response = client.post(
@@ -2866,8 +3156,10 @@ def test_bulk_acknowledgement_uses_one_common_owner_epoch_fence() -> None:
         )
     assert response.status_code == 200
     mutation = core.acknowledgements[-1]
-    assert mutation["request_owner_epoch"] == "client.epoch.1"
+    # ``A`` was checked once at the edge; nothing inside compares it (BS 0).
+    assert mutation["request_key"] == _FORMED_CALLER_KEY
     assert mutation["expected_generation"] == 3
+    assert "request_owner_epoch" not in mutation
     assert "expected_owner_epoch" not in mutation
 
 
@@ -2911,27 +3203,19 @@ def test_alarm_acknowledgements_wake_the_control_projection(
     assert len(wakes) == wake_count + 2
 
 
-def test_historian_reconciliation_is_an_attributed_public_mutation() -> None:
-    client, core, _manager = _client(trusted=True)
+def test_history_has_no_reconcile_route_and_its_health_stays_readable() -> None:
+    # History drops and counts what it cannot write and clears its own alarm;
+    # there is nothing to reconcile, so the mutation is gone.
+    client, _core, _manager = _client(trusted=True)
     with client:
         response = client.post(
             "/api/execution/history/reconcile",
             json={**_caller(), "expected_health_generation": 1},
         )
-    assert response.status_code == 200
-    assert response.json()["reconciled"] is True
-    mutation = core.historian_reconciliations[-1]
-    assert mutation == {
-        "expected_generation": 1,
-        "request_id": "request.1",
-        "request_owner_epoch": "client.epoch.1",
-        "source_label": "operator_ui",
-        "correlation_id": "correlation.1",
-        "transport_kind": "http",
-        "adapter_id": "manyforge.headless.http.v1",
-        "assurance": "authenticated:test",
-        "trusted_principal_id": "operator.7",
-    }
+        health = client.get("/api/execution/history/health")
+    assert response.status_code in {404, 405}
+    assert health.status_code == 200
+    assert health.json()["available"] is True
 
 
 def test_apply_is_forwarded_and_unavailable_owner_error_stays_typed() -> None:
@@ -2967,7 +3251,7 @@ def test_apply_is_forwarded_and_unavailable_owner_error_stays_typed() -> None:
                 },
                 "expected_admission_generation": 7,
                 "candidate_receipt": {
-                    "schema_version": "manyforge.manager_deployment_candidate_receipt.v2",
+                    "schema_version": "manyforge.manager_deployment_candidate_receipt.v3",
                     "deployment_artifact_id": "deployment.1",
                     "deployment_revision": "sha256:" + "b" * 64,
                     "prepared_activation_id": "sha256:" + "e" * 64,
@@ -2978,7 +3262,6 @@ def test_apply_is_forwarded_and_unavailable_owner_error_stays_typed() -> None:
                         "retained_bundle_id": "bundle.1",
                     },
                     "expected_admission_generation": 7,
-                    "manager_owner_epoch": "client.epoch.1",
                     "impact_digest": "sha256:" + "c" * 64,
                     "destructive_impact": False,
                     "receipt_digest": "sha256:" + "d" * 64,
@@ -2997,7 +3280,11 @@ def test_apply_status_is_a_read_only_durable_identity_observation() -> None:
     with client:
         response = client.get(
             "/api/manager/apply/status",
-            params={"apply_id": "apply/7", "apply_generation": 7},
+            params={
+                "apply_id": 7,
+                "apply_generation": 7,
+                "application_start_id": _APPLICATION_START_ID,
+            },
         )
 
     assert response.status_code == 200
@@ -3006,12 +3293,12 @@ def test_apply_status_is_a_read_only_durable_identity_observation() -> None:
     # One bounded lifecycle: the phase and the last real progress agree, and
     # neither is derived from responsiveness or a heartbeat.
     assert body["phase"] == body["last_progress"]["phase"] == "accepted"
-    assert body["request_id"] == "request.1"
+    assert body["request_key"] == "b1" * 16
     assert body["prepared_activation"]["program_outcome"] == {
         "kind": "bound",
         "program_binding_id": "sha256:" + "9" * 64,
     }
-    assert manager.apply_observations == [("apply/7", 7)]
+    assert manager.apply_observations == [(7, 7)]
 
 
 def test_apply_acknowledgement_is_a_post_for_the_exact_durable_identity() -> None:
@@ -3019,11 +3306,14 @@ def test_apply_acknowledgement_is_a_post_for_the_exact_durable_identity() -> Non
     with client:
         response = client.post(
             "/api/manager/apply/acknowledge",
-            params={"apply_id": "apply/7", "apply_generation": 7},
-            json={"request_context": {
-                "request_id": "composer-ack.request.7",
-                "source_label": "manyforge_composer",
-            }},
+            params={"apply_id": 7, "apply_generation": 7},
+            json={
+                "application_start_id": _APPLICATION_START_ID,
+                "request_context": {
+                    "request_key": "e7" * 16,
+                    "source_label": "manyforge_composer",
+                },
+            },
         )
 
     assert response.status_code == 200
@@ -3031,11 +3321,11 @@ def test_apply_acknowledgement_is_a_post_for_the_exact_durable_identity() -> Non
     assert body["state"] == "failed"
     assert body["failure_acknowledgement"] == "acknowledged"
     assert body["failure"]["message"] == "Apply was refused before effect."
-    assert manager.apply_acknowledgements == [("apply/7", 7)]
+    assert manager.apply_acknowledgements == [(7, 7)]
     assert manager.apply_acknowledgement_contexts[0].model_dump(
         mode="json", exclude_none=True
     ) == {
-        "request_id": "composer-ack.request.7",
+        "request_key": "c0" + "e7" * 15,
         "source_label": "manyforge_composer",
     }
 
@@ -3045,7 +3335,7 @@ class _CommittingManager(FakeManager):
         super().__init__()
         self.state = state
 
-    def observe_apply(self, apply_id: str, apply_generation: int) -> dict[str, Any]:
+    def observe_apply(self, apply_id: int, apply_generation: int) -> dict[str, Any]:
         return {**super().observe_apply(apply_id, apply_generation), "state": self.state}
 
 
@@ -3100,12 +3390,13 @@ def test_only_an_observed_committed_apply_notifies_the_program_runner(
     runner = _NotifiedRunner()
     manager = _CommittingManager(state)
     core = FakeCore()
-    core.committed_activation = _committed_activation("apply.1")  # type: ignore[attr-defined]
+    core.committed_activation = _committed_activation(1)  # type: ignore[attr-defined]
     service = _status_reading_service(core, manager, runner)
     with TestClient(create_app(service=service)) as client:
         response = client.get(
             "/api/manager/apply/status",
-            params={"apply_id": "apply.1", "apply_generation": 1},
+            params={"apply_id": 1, "apply_generation": 1,
+                    "application_start_id": _APPLICATION_START_ID},
         )
         assert response.status_code == 200
         assert response.json()["state"] == state
@@ -3138,14 +3429,15 @@ def test_a_status_read_wakes_the_runner_only_once_manager_source_names_it() -> N
                 "program_applied_selection_not_active",
                 "Applied Program requires one converged active configuration",
             )
-        return _committed_activation("apply.1")
+        return _committed_activation(1)
 
     core.committed_scenario_activation = lagging_activation  # type: ignore[method-assign]
     service = _status_reading_service(core, manager, runner)
     with TestClient(create_app(service=service)) as client:
         response = client.get(
             "/api/manager/apply/status",
-            params={"apply_id": "apply.1", "apply_generation": 1},
+            params={"apply_id": 1, "apply_generation": 1,
+                    "application_start_id": _APPLICATION_START_ID},
         )
         assert response.json()["state"] == "succeeded"
         deadline = time.monotonic() + 5
@@ -3153,11 +3445,11 @@ def test_a_status_read_wakes_the_runner_only_once_manager_source_names_it() -> N
             time.sleep(0.001)
         assert lagging_reads >= 3
         assert runner.reconciliations == 0  # never woken into the refusal
-        core.committed_activation = _committed_activation("apply.1")  # type: ignore[attr-defined]
+        core.committed_activation = _committed_activation(1)  # type: ignore[attr-defined]
         projected.set()
         assert runner.wait_for(1)
     assert runner.reconciliations == 1
-    assert runner.observed_activations == [_committed_activation("apply.1")]
+    assert runner.observed_activations == [_committed_activation(1)]
 
 
 def test_a_failed_cleanup_never_changes_the_committed_apply_outcome() -> None:
@@ -3168,7 +3460,7 @@ def test_a_failed_cleanup_never_changes_the_committed_apply_outcome() -> None:
     )
     manager = _CommittingManager("succeeded")
     core = FakeCore()
-    core.committed_activation = _committed_activation("apply.1")  # type: ignore[attr-defined]
+    core.committed_activation = _committed_activation(1)  # type: ignore[attr-defined]
     service = _status_reading_service(core, manager, runner)
     observed = []
     with TestClient(create_app(service=service)) as client:
@@ -3176,7 +3468,8 @@ def test_a_failed_cleanup_never_changes_the_committed_apply_outcome() -> None:
             observed.append(
                 client.get(
                     "/api/manager/apply/status",
-                    params={"apply_id": "apply.1", "apply_generation": 1},
+                    params={"apply_id": 1, "apply_generation": 1,
+                    "application_start_id": _APPLICATION_START_ID},
                 )
             )
             assert runner.wait_for(count)
@@ -3195,7 +3488,7 @@ def test_a_failed_cleanup_never_changes_the_committed_apply_outcome() -> None:
 
 def _scene_completion_service(runner: _NotifiedRunner):
     core = FakeCore()
-    core.committed_activation = _committed_activation("apply.2")
+    core.committed_activation = _committed_activation(2)
     status = _applied_program_status_projection()
     status["record_digest"] = core.committed_activation["record_digest"]
     core.applied_program_status_projection = status
@@ -3214,7 +3507,9 @@ def test_committed_apply_prepares_scene_even_if_values_already_reconciled():
     assert len(preparations) == 1
     assert preparations[0]["expected_applied_record_digest"] == core.committed_activation["record_digest"]
     assert preparations[0]["expected_admission_generation"] == _ADMISSION_GENERATION
-    assert preparations[0]["request_owner_epoch"] == "program-runner.epoch.1"
+    # Each attempt carries its own Headless key (class 1, minter 5; BS 11.6).
+    assert preparations[0]["request_key"].startswith("40" + "00" * 6 + "05")
+    assert "request_owner_epoch" not in preparations[0]
 
 
 
@@ -3223,7 +3518,8 @@ def test_supported_apply_completion_places_scene_without_browser_callback():
     service, _core = _scene_completion_service(runner)
     with TestClient(create_app(service=service)) as client:
         response = client.get("/api/manager/apply/status", params={
-            "apply_id": "apply.2", "apply_generation": 1,
+            "apply_id": 2, "apply_generation": 1,
+            "application_start_id": _APPLICATION_START_ID,
         })
         assert response.status_code == 200
         assert response.json()["state"] == "succeeded"
@@ -3248,11 +3544,11 @@ def test_apply_completion_releases_its_bookkeeping_lock_before_runner_rpc():
 def test_apply_completion_rechecks_current_selection_before_scene_effect(caplog):
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
-    original = runner.cycle_status
+    original = service.authoring_admission
     def changed_selection():
         _set_applied_record_digest(core.applied_program, "sha256:" + "a" * 64)
         return original()
-    runner.cycle_status = changed_selection
+    service.authoring_admission = changed_selection
     service.notify_committed_apply()
     assert not runner.calls
     assert "program_run_applied_selection_stale" in caplog.text
@@ -3264,11 +3560,8 @@ def test_duplicate_apply_notification_does_not_replace_deliberate_scene_edits():
     service.notify_committed_apply()
     service.notify_committed_apply()
     assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 1
-    core.committed_activation["apply_id"] = "apply.3"
+    core.committed_activation["apply_id"] = 3
     core.committed_activation["apply_generation"] = 2
-    core.committed_activation["committed_applies"][-1].update(
-        apply_id="apply.3", apply_generation=2
-    )
     service.notify_committed_apply()
     assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 2
 
@@ -3318,11 +3611,11 @@ def test_empty_apply_clear_publishes_one_correlated_transient_result(state):
                                    **({"reason": "scene_outcome_unknown", "message": "unconfirmed"} if state == "unknown" else {}),
                                    "refused": [{"resource_id": "part", "code": "missing_reference", "message": "unavailable"}] if state == "partial" else []}}
     runner.prepare_applied_scene = clear
-    service._empty_scene_applies.add(("apply.2", 1))
+    service._empty_scene_applies.add((2, 1))
     service.notify_committed_apply()
     service.notify_committed_apply()
     observed = service.program_cycle_status(include_scene_clear=True)["scene_clear"]
-    assert observed["apply_id"] == "apply.2"
+    assert observed["apply_id"] == 2
     assert observed["apply_generation"] == 1
     assert observed["state"] == state
     assert len(calls) == 1 and calls[0]["clear_empty_scene"] is True
@@ -3349,18 +3642,21 @@ def test_empty_apply_owner_unavailable_reports_failure_without_submission():
         executable=False, program_id=None, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
-    service._empty_scene_applies.add(("apply.2", 1))
+    service._empty_scene_applies.add((2, 1))
     def unavailable():
+        raise CellAdmissionError("execution_owner_unavailable", "owner unavailable")
+    def runner_unavailable(**_kwargs):
         raise ProgramRunnerClientError("program_runner_unavailable", "owner unavailable", 503)
-    runner.cycle_status = unavailable
+    service.cell_admission.get = unavailable
+    runner.cycle_status = runner_unavailable
     service.notify_committed_apply()
     assert service._scene_clear["state"] == "failed"
     assert service._scene_clear["reason"]["code"] == "scene_clear_failed"
-    assert service._scene_clear["reason"]["details"]["reason"] == "program_runner_unavailable"
+    assert service._scene_clear["reason"]["details"]["reason"] == "execution_owner_unavailable"
     assert not [body for kind, body in runner.calls if kind == "prepare_scene"]
     with pytest.raises(HeadlessApiError) as caught:
         service.program_cycle_status(include_scene_clear=True)
-    assert caught.value.details["scene_clear"]["apply_id"] == "apply.2"
+    assert caught.value.details["scene_clear"]["apply_id"] == 2
     assert caught.value.details["scene_clear"]["state"] == "failed"
 
 
@@ -3371,7 +3667,7 @@ def test_empty_apply_lost_runner_response_is_unknown_and_not_retried():
         executable=False, program_id=None, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
-    service._empty_scene_applies.add(("apply.2", 1))
+    service._empty_scene_applies.add((2, 1))
     calls = []
     def lost(body):
         calls.append(body)
@@ -3392,7 +3688,7 @@ def test_empty_apply_malformed_success_is_unknown():
         executable=False, program_id=None, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
-    service._empty_scene_applies.add(("apply.2", 1))
+    service._empty_scene_applies.add((2, 1))
     runner.prepare_applied_scene = lambda body: {
         "schema_version": "manyforge.program_scene_preparation.v1", "status": "prepared",
         "program_revision": None, "applied_record_digest": core.committed_activation["record_digest"],
@@ -3424,17 +3720,15 @@ def test_new_apply_does_not_mark_an_in_flight_clear_settled():
                                    "state": "unknown", "reason": "scene_outcome_unknown",
                                    "message": "transaction not confirmed", "last_observed_remaining": ["part"]}}
     runner.prepare_applied_scene = delayed
-    service._empty_scene_applies.add(("apply.2", 1))
+    service._empty_scene_applies.add((2, 1))
     worker = Thread(target=service.notify_committed_apply)
     worker.start()
     try:
         assert entered.wait(5)
         current = core.committed_activation
-        current["apply_id"] = "apply.3"
+        current["apply_id"] = 3
         current["apply_generation"] = 2
         current["scene_initialization"] = "preserve"
-        current["committed_applies"][-1].update(
-            apply_id="apply.3", apply_generation=2, scene_initialization="preserve")
         service.notify_committed_apply()
         assert service.program_cycle_status(include_scene_clear=True)["scene_clear"]["state"] == "pending"
     finally:
@@ -3442,7 +3736,7 @@ def test_new_apply_does_not_mark_an_in_flight_clear_settled():
         worker.join(5)
     assert not worker.is_alive()
     status = service.program_cycle_status(include_scene_clear=True)["scene_clear"]
-    assert status["apply_id"] == "apply.2" and status["state"] == "unknown"
+    assert status["apply_id"] == 2 and status["state"] == "unknown"
 
 
 def test_superseded_empty_apply_cannot_cancel_new_scenario_preparation():
@@ -3453,21 +3747,21 @@ def test_superseded_empty_apply_cannot_cancel_new_scenario_preparation():
         executable=False, program_id=None, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
-    service._empty_scene_applies.add(("apply.2", 1))
+    service._empty_scene_applies.add((2, 1))
     old_selected, release_old = Event(), Event()
     new_latched, release_new = Event(), Event()
     clear = service._clear_empty_applied
-    cycle_status = service.program_cycle_status
+    admission = service.authoring_admission
 
     def delayed_clear(identity):
         old_selected.set()
         assert release_old.wait(5)
         clear(identity)
 
-    def delayed_cycle_status(*args, **kwargs):
+    def delayed_admission():
         new_latched.set()
         assert release_new.wait(5)
-        return cycle_status(*args, **kwargs)
+        return admission()
 
     service._clear_empty_applied = delayed_clear
     old = threading.Thread(target=service.notify_committed_apply)
@@ -3476,21 +3770,19 @@ def test_superseded_empty_apply_cannot_cancel_new_scenario_preparation():
     try:
         assert old_selected.wait(5)
         current = core.committed_activation
-        current.update(apply_id="apply.3", apply_generation=2,
+        current.update(apply_id=3, apply_generation=2,
                        record_digest="sha256:" + "f" * 64)
-        current["committed_applies"][-1].update(
-            apply_id="apply.3", apply_generation=2, record_digest=current["record_digest"])
         normal_status["record_digest"] = current["record_digest"]
         core.applied_program_status_projection = normal_status
         _set_applied_record_digest(core.applied_program, current["record_digest"])
-        service.program_cycle_status = delayed_cycle_status
+        service.authoring_admission = delayed_admission
         new.start()
         assert new_latched.wait(5)
         release_old.set()
         old.join(5)
         assert not old.is_alive()
-        assert service._apply_scene_attempted == ("apply.3", 2, current["record_digest"])
-        assert service._scene_clear == {"apply_id": "apply.2", "apply_generation": 1,
+        assert service._apply_scene_attempted == (3, 2, current["record_digest"])
+        assert service._scene_clear == {"apply_id": 2, "apply_generation": 1,
                                        "state": "superseded", "remaining": None, "reason": None}
     finally:
         release_old.set()
@@ -3504,11 +3796,12 @@ def test_superseded_empty_apply_cannot_cancel_new_scenario_preparation():
     assert preparations[0]["expected_applied_record_digest"] == current["record_digest"]
 
 
-def test_empty_apply_identity_read_failure_preserves_newer_attempt(caplog):
+def test_empty_apply_identity_read_failure_ends_it_and_preserves_newer_attempt(caplog):
+    # OD-239: the clear could not confirm its Apply; it ends `failed`.
     runner = _NotifiedRunner()
     service, _core = _scene_completion_service(runner)
-    old = ("apply.2", 1, "sha256:" + "a" * 64)
-    new = ("apply.3", 2, "sha256:" + "b" * 64)
+    old = (2, 1, "sha256:" + "a" * 64)
+    new = (3, 2, "sha256:" + "b" * 64)
     service._empty_scene_applies.add(old[:2])
     service._apply_scene_attempted = new
 
@@ -3518,23 +3811,30 @@ def test_empty_apply_identity_read_failure_preserves_newer_attempt(caplog):
     service.committed_scenario_activation = unavailable
     service._clear_empty_applied(old)
     assert service._apply_scene_attempted == new
-    assert service._scene_clear is None
-    assert old[:2] in service._empty_scene_applies
+    assert service._scene_clear == {"apply_id": 2, "apply_generation": 1, "state": "failed",
+                                   "remaining": None,
+                                   "reason": {"code": "scene_clear_failed",
+                                              "message": "activation unavailable",
+                                              "details": {"reason": "scene_owner_unavailable"}}}
+    assert old[:2] not in service._empty_scene_applies
     assert "Cannot confirm committed Apply for Scene clear: activation unavailable" in caplog.text
     assert not runner.calls
 
 
 @pytest.mark.parametrize("condition", ["superseded", "identity_unavailable"])
 @pytest.mark.parametrize("status_owner", ["apply", "direct"])
-def test_unstarted_empty_apply_preserves_another_clear_status(condition, status_owner):
+def test_unstarted_empty_apply_ends_without_hiding_a_later_apply_status(condition, status_owner):
+    # OD-239: the unstarted Apply ends (superseded or failed) and leaves the
+    # pending set; a later Apply's status stays (its waiter ends on it), a
+    # direct clear's status (answered in its reply) is replaced.
     runner = _NotifiedRunner()
     service, _core = _scene_completion_service(runner)
-    old = ("apply.2", 1, "sha256:" + "a" * 64)
-    new = ("apply.3", 2, "sha256:" + "b" * 64)
+    old = (2, 1, "sha256:" + "a" * 64)
+    new = (3, 2, "sha256:" + "b" * 64)
     service._empty_scene_applies.add(old[:2])
     service._apply_scene_attempted = new
     status = ({"apply_id": new[0], "apply_generation": new[1]} if status_owner == "apply"
-              else {"request_id": "clear.new"})
+              else {"request_key": "c3" * 16})
     status.update(state="unknown", remaining=None,
                   reason={"code": "scene_clear_unknown", "message": "response unavailable",
                           "details": {"reason": "scene_outcome_unknown"}})
@@ -3547,20 +3847,32 @@ def test_unstarted_empty_apply_preserves_another_clear_status(condition, status_
 
     service.committed_scenario_activation = current
     service._clear_empty_applied(old)
-    assert service._scene_clear == status
+    if status_owner == "apply":
+        assert service._scene_clear == status
+    elif condition == "superseded":
+        assert service._scene_clear == {"apply_id": 2, "apply_generation": 1, "state": "superseded",
+                                        "remaining": None, "reason": None}
+    else:
+        assert service._scene_clear == {"apply_id": 2, "apply_generation": 1, "state": "failed",
+                                   "remaining": None,
+                                   "reason": {"code": "scene_clear_failed",
+                                              "message": "activation unavailable",
+                                              "details": {"reason": "scene_owner_unavailable"}}}
     assert service._apply_scene_attempted == new
-    assert (old[:2] in service._empty_scene_applies) == (condition == "identity_unavailable")
+    assert old[:2] not in service._empty_scene_applies
     assert not runner.calls
 
 
-def test_empty_apply_identity_read_failure_allows_later_notification_retry():
+def test_empty_apply_identity_read_failure_ends_it_failed_without_retry():
+    # OD-239: a read failure before the clear began publishes `failed`; a
+    # later notification does not clear for that Apply again.
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     core.applied_program_status_projection.update(
         executable=False, program_id=None, program_revision=None,
         program_binding_id=None, program=None, non_executable=None,
     )
-    identity = ("apply.2", 1, core.committed_activation["record_digest"])
+    identity = (2, 1, core.committed_activation["record_digest"])
     service._empty_scene_applies.add(identity[:2])
     read_activation = service.committed_scenario_activation
     reads = 0
@@ -3574,28 +3886,105 @@ def test_empty_apply_identity_read_failure_allows_later_notification_retry():
 
     service.committed_scenario_activation = transient_failure
     service.notify_committed_apply()
-    assert identity[:2] in service._empty_scene_applies
+    assert identity[:2] not in service._empty_scene_applies
     assert service._apply_scene_attempted is None
-    assert service._scene_clear is None
+    assert service._scene_clear == {"apply_id": 2, "apply_generation": 1, "state": "failed",
+                                   "remaining": None,
+                                   "reason": {"code": "scene_clear_failed",
+                                              "message": "activation unavailable",
+                                              "details": {"reason": "scene_owner_unavailable"}}}
+    service.notify_committed_apply()
     assert not [body for kind, body in runner.calls if kind == "prepare_scene"]
 
-    calls = []
-    def clear(body):
-        calls.append(body)
-        return {"schema_version": "manyforge.program_scene_preparation.v1", "status": "prepared",
-                "program_revision": None, "applied_record_digest": identity[2],
-                "prepared_scene": {"schema_version": "manyforge.empty_scene_clear.v1",
-                                   "state": "succeeded", "last_observed_remaining": [],
-                                   "refused": []}}
-    runner.prepare_applied_scene = clear
+
+def _empty_applied(core: FakeCore) -> None:
+    core.applied_program_status_projection.update(
+        executable=False, program_id=None, program_revision=None,
+        program_binding_id=None, program=None, non_executable=None,
+    )
+
+
+def test_empty_apply_ends_failed_when_the_committed_apply_cannot_be_read(caplog):
+    # OD-239 path (b): the notification's own read of the committed Apply fails.
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    _empty_applied(core)
+    service._empty_scene_applies.add((2, 1))
+
+    def unavailable():
+        raise HeadlessApiError("manager_command_unavailable", "Manager did not answer")
+
+    service.committed_scenario_activation = unavailable
     service.notify_committed_apply()
+    assert (2, 1) not in service._empty_scene_applies
+    assert service._scene_clear == {
+        "apply_id": 2, "apply_generation": 1, "state": "failed", "remaining": None,
+        "reason": {"code": "scene_clear_failed", "message": "Manager did not answer",
+                   "details": {"reason": "manager_command_unavailable"}},
+    }
+    assert not [body for kind, body in runner.calls if kind == "prepare_scene"]
+
+
+def test_empty_apply_replaced_before_its_clear_began_ends_superseded():
+    # OD-239 path (b): a later Apply (here with a Program) is the committed one.
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    service._empty_scene_applies.add((1, 1))
+    service.notify_committed_apply()  # committed: Apply 2, a Program
+    assert (1, 1) not in service._empty_scene_applies
+    assert service._scene_clear == {"apply_id": 1, "apply_generation": 1, "state": "superseded",
+                                    "remaining": None, "reason": None}
+
+
+def test_empty_apply_whose_applied_program_does_not_match_ends_failed():
+    # OD-239 path (b): the digest of the Applied Program differs.
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    _empty_applied(core)
+    core.applied_program_status_projection["record_digest"] = "sha256:" + "a" * 64
+    service._empty_scene_applies.add((2, 1))
     service.notify_committed_apply()
-    assert identity[:2] not in service._empty_scene_applies
-    assert service._apply_scene_attempted == identity
-    assert service._scene_clear == {"apply_id": identity[0], "apply_generation": identity[1],
-                                    "state": "succeeded", "remaining": [], "reason": None}
-    assert len(calls) == 1 and calls[0]["clear_empty_scene"] is True
-    assert calls[0]["expected_applied_record_digest"] == identity[2]
+    assert (2, 1) not in service._empty_scene_applies
+    status = service._scene_clear
+    assert status["apply_id"] == 2 and status["state"] == "failed"
+    assert status["reason"]["code"] == "scene_clear_failed"
+    assert status["reason"]["details"] == {"reason": "program_run_applied_selection_stale"}
+    assert not [body for kind, body in runner.calls if kind == "prepare_scene"]
+
+
+def test_empty_apply_without_a_program_runner_ends_failed_at_once():
+    # OD-239 path (c): no runner, so no follower clears the Scene.
+    from types import SimpleNamespace
+
+    class _AcceptingManager(FakeManager):
+        def apply(self, request):
+            return {"api_version": "manyforge.manager_command_response.v3", "ok": True,
+                    "apply_id": 4, "apply_generation": 1, "replay_status": "accepted_new"}
+
+    core = FakeCore()
+    service = _service(core, _AcceptingManager(), program_runner=None)
+    assert service.apply_follower is None
+    request = SimpleNamespace(
+        scene_initialization="initialize",
+        prepared_activation=SimpleNamespace(program_outcome={"kind": "no_program"}),
+    )
+    service.manager_apply(request)
+    assert service._empty_scene_applies == set()
+    status = service._scene_clear
+    assert status["apply_id"] == 4 and status["apply_generation"] == 1
+    assert status["state"] == "failed"
+    assert status["reason"]["details"] == {"reason": "program_runner_unavailable"}
+
+
+def test_an_unstarted_empty_apply_never_hides_a_later_apply_status():
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    later = {"apply_id": 5, "apply_generation": 1, "state": "succeeded",
+             "remaining": [], "reason": None}
+    service._scene_clear = dict(later)
+    with service._empty_scene_execution_lock, service._apply_scene_completion_lock:
+        service._end_empty_apply((3, 1), {"state": "superseded", "remaining": None, "reason": None})
+    assert service._scene_clear == later
 
 
 def test_newer_queued_clear_replaces_old_status_and_preserves_unknown():
@@ -3603,8 +3992,8 @@ def test_newer_queued_clear_replaces_old_status_and_preserves_unknown():
 
     runner = _NotifiedRunner()
     service, _core = _scene_completion_service(runner)
-    first = ("apply.2", 1, "sha256:" + "a" * 64)
-    second = ("apply.3", 2, "sha256:" + "b" * 64)
+    first = (2, 1, "sha256:" + "a" * 64)
+    second = (3, 2, "sha256:" + "b" * 64)
     current = {"apply_id": first[0], "apply_generation": first[1], "record_digest": first[2]}
     service.committed_scenario_activation = lambda: dict(current)
     service._empty_scene_applies.update({first[:2], second[:2]})
@@ -3659,18 +4048,47 @@ def test_direct_clear_handles_bootstrap_and_does_not_repeat_request():
                                    "refused": [{"resource_id": "part", "code": "missing_reference", "message": "unavailable"}]}}
     runner.prepare_applied_scene = clear
     request = ProgramScenePreparationRequest.model_validate({
-        "request_id": "clear.1", "request_owner_epoch": "program-runner.epoch.1",
+        "request_key": "c4" * 16,
         "source_label": "composer_ui", "expected_admission_generation": _ADMISSION_GENERATION,
         "clear_empty_scene": True, "expected_applied_record_digest": None,
         "expected_publication_generation": 1,
     })
     response = service.program_scene_prepare(request)
-    assert response["scene_clear"]["request_id"] == "clear.1"
+    assert response["scene_clear"]["request_key"] == "c4" * 16
     assert response["scene_clear"]["state"] == "partial"
     assert service.program_cycle_status(include_scene_clear=True)["scene_clear"] == response["scene_clear"]
     with pytest.raises(HeadlessApiError):
         service.program_scene_prepare(request)
     assert len(calls) == 1
+
+
+def test_direct_clear_busy_runner_is_failed_before_effect_not_unknown():
+    from manyforge_headless_api.models import ProgramScenePreparationRequest
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    service.manager_status = lambda: {
+        "source": {"available": True, "freshness": "fresh"},
+        "status": {"manager_ready": True, "runtime": {"converged": True},
+                   "active": {"canonical_empty": True, "publication": {"publication_generation": 1}}},
+    }
+
+    def busy(_body):
+        raise ProgramRunnerClientError(
+            "execution_control_ingress_busy", "another Program command is in progress",
+            503, details={"command_in_progress": "start"},
+        )
+
+    runner.prepare_applied_scene = busy
+    request = ProgramScenePreparationRequest.model_validate({
+        "request_key": "c6" * 16,
+        "source_label": "composer_ui", "expected_admission_generation": _ADMISSION_GENERATION,
+        "clear_empty_scene": True, "expected_applied_record_digest": None,
+        "expected_publication_generation": 1,
+    })
+    result = service.program_scene_prepare(request)["scene_clear"]
+    assert result["state"] == "failed"
+    assert result["reason"]["code"] == "scene_clear_failed"
+    assert result["reason"]["details"]["reason"] == "execution_control_ingress_busy"
 
 
 def test_direct_clear_rejects_nonempty_or_changed_publication_before_runner_call():
@@ -3683,7 +4101,7 @@ def test_direct_clear_rejects_nonempty_or_changed_publication_before_runner_call
                    "active": {"canonical_empty": False, "publication": {"publication_generation": 2}}},
     }
     request = ProgramScenePreparationRequest.model_validate({
-        "request_id": "clear.2", "request_owner_epoch": "program-runner.epoch.1",
+        "request_key": "c5" * 16,
         "source_label": "composer_ui", "expected_admission_generation": _ADMISSION_GENERATION,
         "clear_empty_scene": True, "expected_applied_record_digest": None,
         "expected_publication_generation": 1,
@@ -3694,9 +4112,9 @@ def test_direct_clear_rejects_nonempty_or_changed_publication_before_runner_call
     assert not [body for kind, body in runner.calls if kind == "prepare_scene"]
 
 
-def _committed_activation(apply_id: str = "apply.2") -> dict[str, Any]:
+def _committed_activation(apply_id: int = 2) -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.committed_scenario_activation.v4",
+        "schema_version": "manyforge.committed_scenario_activation.v6",
         "scene_initialization": "initialize",
         "apply_id": apply_id,
         "apply_generation": 1,
@@ -3709,28 +4127,10 @@ def _committed_activation(apply_id: str = "apply.2") -> dict[str, Any]:
         "program_binding_id": None,
         "retained_bundle_id": "sha256:" + "1" * 64,
         "graph_revision": "sha256:" + "2" * 64,
-        "committed_applies": [
-            {
-                "scene_initialization": "initialize",
-                "apply_id": "apply.1",
-                "apply_generation": 1,
-                "record_digest": "sha256:" + "c" * 64,
-                "origin": {"kind": "scenario", "scenario_id": "scenario.2", "source_document_digest": "sha256:" + "e" * 64,
-                           "project_path": "/projects/scenario.2.scenario"},
-            },
-            {
-                "scene_initialization": "initialize",
-                "apply_id": apply_id,
-                "apply_generation": 1,
-                "record_digest": "sha256:" + "d" * 64,
-                "origin": {"kind": "scenario", "scenario_id": "scenario.1", "source_document_digest": "sha256:" + "e" * 64,
-                           "project_path": "/projects/scenario.1.scenario"},
-            },
-        ],
     }
 
 
-def test_committed_activation_projects_every_committed_apply_of_the_history() -> None:
+def test_committed_activation_projects_the_current_apply() -> None:
     core = FakeCore()
     core.committed_activation = _committed_activation()  # type: ignore[attr-defined]
     with TestClient(create_app(service=_service(core, FakeManager()))) as client:
@@ -3738,29 +4138,12 @@ def test_committed_activation_projects_every_committed_apply_of_the_history() ->
         assert response.status_code == 200
         assert response.json() == _committed_activation()
 
-        # Manager's journal evicts older committed Applies: a retained window
-        # shorter than the publication history is the current history.
-        evicted = {**_committed_activation(), "publication_generation": 300}
-        core.committed_activation = evicted  # type: ignore[attr-defined]
-        response = client.get("/api/program/committed-activation")
-        assert response.status_code == 200
-        assert response.json() == evicted
-
-        # More committed Applies than Apply publications is refused.
-        core.committed_activation = {  # type: ignore[attr-defined]
-            **_committed_activation(),
-            "publication_generation": 2,
-        }
-        refused = client.get("/api/program/committed-activation")
-        assert refused.json()["detail"]["code"] == "program_activation_invalid"
-
-        # Every committed Apply is named by its Apply identity; the current
-        # one by the same identity it is current under.
+        # The current Apply is named by its Apply identity, and the record
+        # is closed: the former Apply history is refused.
         anonymous = _committed_activation()
-        del anonymous["committed_applies"][0]["apply_id"]
-        renamed = _committed_activation()
-        renamed["committed_applies"][1]["apply_generation"] = 2
-        for invalid in (anonymous, renamed):
+        del anonymous["apply_id"]
+        with_history = {**_committed_activation(), "committed_applies": []}
+        for invalid in (anonymous, with_history):
             core.committed_activation = invalid  # type: ignore[attr-defined]
             refused = client.get("/api/program/committed-activation")
             assert refused.json()["detail"]["code"] == "program_activation_invalid"
@@ -3769,9 +4152,10 @@ def test_committed_activation_projects_every_committed_apply_of_the_history() ->
 def _scene_body() -> dict[str, Any]:
     scene_id = "sha256:" + "d" * 64
     return {
+        "application_start_id": _APPLICATION_START_ID,
         "request_context": {
-            **_caller(),
-            "request_owner_epoch": scene_id,
+            "request_key": _CALLER_KEY,
+            "source_label": "operator_ui",
         },
         "expected_projection_revision": {
             "retained_bundle_id": "sha256:" + "b" * 64,
@@ -3819,7 +4203,7 @@ def test_scene_result_lookup_never_submits_the_transaction(monkeypatch) -> None:
     def lookup(request):
         requests.append(request)
         return {
-            "api_version": "manyforge.manager_command_response.v2",
+            "api_version": "manyforge.manager_command_response.v3",
             "ok": True,
             "result": None,
         }
@@ -3829,10 +4213,8 @@ def test_scene_result_lookup_never_submits_the_transaction(monkeypatch) -> None:
         response = client.post("/api/scene/transactions/status", json=_scene_body())
     assert response.status_code == 200
     assert response.json()["result"] is None
-    assert (
-        requests[0].request_context.request_id
-        == _scene_body()["request_context"]["request_id"]
-    )
+    # The lookup names the request by its formed key (class 3).
+    assert requests[0].request_context.request_key == _FORMED_CALLER_KEY
     assert manager.scene_requests == []
 
 
@@ -3991,39 +4373,114 @@ def test_recognized_malformed_stop_promotes_instead_of_returning_validation_erro
             content=b"x" * (1024 * 1024 + 1),
             headers={"content-type": "application/json", "x-request-id": "http.stop.2"},
         )
-        malformed_full = client.post(
-            "/api/execution/full-stop",
+        malformed_stop_all = client.post(
+            "/api/execution/stop-all",
             json={},
             headers={"x-request-id": "http.stop.3"},
+        )
+        malformed_halt = client.post(
+            "/api/execution/halt",
+            content=b'{"request_context":',
+            headers={"content-type": "application/json", "x-request-id": "http.stop.4"},
         )
 
     assert response.status_code == 200, response.text
     assert oversized.status_code == 200, oversized.text
-    assert malformed_full.status_code == 200, malformed_full.text
+    assert malformed_stop_all.status_code == 200, malformed_stop_all.text
+    assert malformed_halt.status_code == 200, malformed_halt.text
+    # The Kernel widens by route (PD-1): Halt stays Halt.
+    assert malformed_halt.json()["accepted"]["applied"] == "halt"
+    assert malformed_stop_all.json()["accepted"]["applied"] == "stop_all"
     assert oversized.headers["connection"] == "close"
     assert execution.requests == [
         (
-            "recognized_malformed_stop",
+            "recognized_stop",
             {
-                "request_id": "malformed-stop.http.stop.1",
+                "request_key": _headless_key(1),
                 "recognized_route": "/api/execution/stops",
                 "reason": "recognized_stop_payload_invalid",
+                "source_label": None,
             },
         ),
         (
-            "recognized_malformed_stop",
+            "recognized_stop",
             {
-                "request_id": "malformed-stop.http.stop.2",
+                "request_key": _headless_key(2),
                 "recognized_route": "/api/execution/stops",
                 "reason": "recognized_stop_body_oversized",
+                "source_label": None,
             },
         ),
         (
-            "recognized_malformed_stop",
+            "recognized_stop",
             {
-                "request_id": "malformed-stop.http.stop.3",
-                "recognized_route": "/api/execution/full-stop",
+                "request_key": _headless_key(3),
+                "recognized_route": "/api/execution/stop-all",
                 "reason": "recognized_stop_payload_invalid",
+                "source_label": None,
+            },
+        ),
+        (
+            "recognized_stop",
+            {
+                "request_key": _headless_key(4),
+                "recognized_route": "/api/execution/halt",
+                "reason": "recognized_stop_payload_invalid",
+                "source_label": None,
+            },
+        ),
+    ]
+
+
+def test_program_stop_with_invalid_body_promotes_instead_of_validation_error() -> None:
+    """A Program motion Stop with an invalid body is still a Stop, as on the
+    execution Stop routes; other Program routes keep their validation error.
+    (The Program Full Stop route is deleted.)"""
+    execution = FakeExecution()
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution))
+    with TestClient(app) as client:
+        motion_truncated = client.post(
+            "/api/program/runs/1/motion-stop",
+            content=b'{"request_key":',
+            headers={"content-type": "application/json", "x-request-id": "program.stop.1"},
+        )
+        motion = client.post(
+            "/api/program/runs/1/motion-stop",
+            json={"request_key": "f1" * 16},
+            headers={"x-request-id": "program.stop.2"},
+        )
+        removed = client.post(
+            "/api/program/runs/1/full-stop",
+            json={},
+            headers={"x-request-id": "program.stop.3"},
+        )
+        resume = client.post(
+            "/api/program/runs/1/resume-motion",
+            json={},
+            headers={"x-request-id": "program.resume.1"},
+        )
+
+    assert motion_truncated.status_code == 200, motion_truncated.text
+    assert motion.status_code == 200, motion.text
+    assert removed.status_code in (404, 405), removed.text
+    assert resume.status_code == 422, resume.text
+    assert execution.requests == [
+        (
+            "recognized_stop",
+            {
+                "request_key": _headless_key(1),
+                "recognized_route": "/api/execution/stops",
+                "reason": "recognized_stop_payload_invalid",
+                "source_label": None,
+            },
+        ),
+        (
+            "recognized_stop",
+            {
+                "request_key": _headless_key(2),
+                "recognized_route": "/api/execution/stops",
+                "reason": "recognized_stop_payload_invalid",
+                "source_label": None,
             },
         ),
     ]
@@ -4144,9 +4601,9 @@ def test_program_diagnostic_route_is_bounded_attributed_evidence_only():
 
     core.record_program_diagnostic = record
     payload = {
-        "schema_version": "manyforge.program_diagnostic.v4",
-        "program_run_id": "run.1",
-        "owner_epoch": "runner.1",
+        "schema_version": "manyforge.program_diagnostic.v5",
+        "program_run_id": 1,
+        "application_start_id": _APPLICATION_START_ID,
         "program_revision": "sha256:" + "a" * 64,
         "program_binding_id": "sha256:" + "b" * 64,
         "retained_bundle_id": "sha256:" + "c" * 64,
@@ -4167,22 +4624,25 @@ def test_program_diagnostic_route_is_bounded_attributed_evidence_only():
         },
     }
     with client:
-        valid = client.post("/api/program/diagnostics", json=payload)
+        # ``A`` is checked at the edge and kept inside the record.
+        start = {"application_start_id": _APPLICATION_START_ID}
+        valid = client.post("/api/program/diagnostics", json={**payload, **start})
         assert valid.status_code == 200, valid.text
         assert records == [payload]
         qualified = {**payload, "details": {"reference_type": "signal", "reference": {
             "component_id": "robot", "signal_name": "é" * 256,
         }}}
-        accepted = client.post("/api/program/diagnostics", json=qualified)
+        accepted = client.post(
+            "/api/program/diagnostics", json={**qualified, **start}
+        )
         assert accepted.status_code == 200, accepted.text
         assert records[-1] == qualified
         for invalid in (
-            {**payload, "schema_version": "manyforge.program_diagnostic.v1"},
+            {**payload, "schema_version": "manyforge.program_diagnostic.v4"},
             {
-                **payload,
-                "schema_version": "manyforge.program_diagnostic.v2",
-                "runtime_overrides": {},
-                "omitted_override_count": 0,
+                **{k: v for k, v in payload.items() if k != "application_start_id"},
+                "schema_version": "manyforge.program_diagnostic.v4",
+                "owner_epoch": "runner.1",
             },
             {key: value for key, value in payload.items() if key != "origin"},
             {**payload, "origin": None},
@@ -4201,7 +4661,9 @@ def test_program_diagnostic_route_is_bounded_attributed_evidence_only():
             {**payload, "blackboard": {"wide": [0] * 513}},
             {**payload, "blackboard": {"huge": "x" * 65536}},
         ):
-            response = client.post("/api/program/diagnostics", json=invalid)
+            response = client.post(
+                "/api/program/diagnostics", json={**invalid, **start}
+            )
             assert response.status_code in (413, 422), response.text
         assert records == [payload, qualified]
 
@@ -4241,21 +4703,21 @@ def test_history_list_is_summary_only_and_keeps_exact_detail_on_demand() -> None
     client, core, _manager = _client()
     large_payload = {
         "message": "Control connection stale",
-        "program_run_id": "program-run.7",
+        "program_run_id": 7,
         "nested": {
-            "operation_id": "operation.9",
+            "operation_id": 9,
             "diagnostic_blob": "x" * 32_000,
         },
     }
 
     def history(**_kwargs: Any) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.historian_summary_page.v2",
+            "schema_version": "manyforge.historian_summary_page.v3",
             "events": [
                 {
                     "sequence": 7,
                     "event": {
-                        "schema_version": "manyforge.historian_event_summary.v2",
+                        "schema_version": "manyforge.historian_event_summary.v3",
                         "event_id": "event-7",
                         "component": "manyforge.composer",
                         "event_type": "client_incident_activated",
@@ -4267,8 +4729,8 @@ def test_history_list_is_summary_only_and_keeps_exact_detail_on_demand() -> None
                         "wall_clock_regressed": False,
                         "condition_severity": "ERROR",
                         "message": "Control connection stale",
-                        "program_run_id": "program-run.7",
-                        "operation_id": "operation.9",
+                        "program_run_id": "7",
+                        "operation_id": "9",
                         "condition_id": None,
                     },
                 }
@@ -4279,10 +4741,10 @@ def test_history_list_is_summary_only_and_keeps_exact_detail_on_demand() -> None
 
     def history_detail(sequence: int) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.historian_detail.v2",
+            "schema_version": "manyforge.historian_detail.v3",
             "sequence": sequence,
             "event": {
-                "schema_version": "manyforge.historian_event.v2",
+                "schema_version": "manyforge.historian_event.v3",
                 "event_id": "event-7",
                 "component": "manyforge.composer",
                 "event_type": "client_incident_activated",
@@ -4305,11 +4767,11 @@ def test_history_list_is_summary_only_and_keeps_exact_detail_on_demand() -> None
 
     assert response.status_code == 200, response.text
     page = response.json()
-    assert page["schema_version"] == "manyforge.historian_summary_page.v2"
+    assert page["schema_version"] == "manyforge.historian_summary_page.v3"
     assert len(response.content) < 2_048
     assert "payload" not in page["events"][0]["event"]
     assert page["events"][0]["event"] == {
-        "schema_version": "manyforge.historian_event_summary.v2",
+        "schema_version": "manyforge.historian_event_summary.v3",
         "event_id": "event-7",
         "component": "manyforge.composer",
         "event_type": "client_incident_activated",
@@ -4321,8 +4783,8 @@ def test_history_list_is_summary_only_and_keeps_exact_detail_on_demand() -> None
         "wall_clock_regressed": False,
         "condition_severity": "ERROR",
         "message": "Control connection stale",
-        "program_run_id": "program-run.7",
-        "operation_id": "operation.9",
+        "program_run_id": "7",
+        "operation_id": "9",
         "condition_id": None,
     }
     assert detail.status_code == 200
@@ -4361,12 +4823,21 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
         "/api/execution/motion-previews",
         "/api/execution/capability-command-previews",
         "/api/execution/stops",
-        "/api/execution/full-stop",
+        "/api/execution/stop-all",
+        "/api/execution/halt",
         "/api/execution/pick-place/plans/pick",
         "/api/execution/pick-place/plans/place",
+        "/api/execution/pick-place/plans/{job_id}",
+        "/api/execution/pick-place/plans/{job_id}/cancel",
+        "/api/execution/pick-place/plans/{job_id}/release",
     }.issubset(paths)
     assert all("pick-place/sequences" not in path for path in paths)
     assert "/api/kernel/stop" not in paths
+    # Stop state model: the Full Stop routes are gone, no aliases.
+    assert "/api/execution/full-stop" not in paths
+    assert "/api/program/runs/{program_run_id}/full-stop" not in paths
+    assert "/api/program/runs/{program_run_id}/resume-full-stop" not in paths
+    assert "/api/program/runs/{program_run_id}/resume-halt" in paths
     # Component model v2: the stop-fault latch, Recover cell and CCLC routes
     # are gone; components are read and acted on through /api/components.
     assert not any(path.startswith(("/api/execution/stop-fault", "/api/execution/cell-recover",
@@ -4397,6 +4868,58 @@ def test_execution_diagnostics_is_explicit_and_status_alias_is_retired() -> None
     assert retired.status_code == 404
 
 
+# OD-217: the host's v4 status reply, with one collision-check row per robot.
+_STATUS_V4_REPLY: dict[str, Any] = {
+    "api_version": "manyforge.execution_command_response.v6",
+    "command": "status",
+    "ok": True,
+    "status": {
+        "control_state": {},
+        "identity": {},
+        "runtime_collision_checks": [
+            {
+                "check_period_ns": 10_000_000,
+                "checks_late": 3,
+                "checks_run": 4,
+                "controllable_component_id": "lite6_robot",
+                "periods_skipped": 4,
+            },
+            {
+                "check_period_ns": 50_000_000,
+                "checks_late": 0,
+                "checks_run": 0,
+                "controllable_component_id": "ur5e_robot",
+                "periods_skipped": 0,
+            },
+        ],
+        "schema_version": "manyforge.execution_status.v4",
+        "targets": {},
+    },
+}
+
+
+def test_execution_diagnostics_pass_the_v4_check_counts_unchanged() -> None:
+    # The native client reads `status` and passes the reply as it came.
+    native = ExecutionCommandClient.__new__(ExecutionCommandClient)
+    sent: list[dict[str, Any]] = []
+
+    def exchange(command: dict[str, Any]) -> dict[str, Any]:
+        sent.append(command)
+        return copy.deepcopy(_STATUS_V4_REPLY)
+
+    native._exchange = exchange  # type: ignore[method-assign]
+    assert native.diagnostics() == _STATUS_V4_REPLY
+    assert [command["command"] for command in sent] == ["status"]
+
+    execution = FakeExecution()
+    execution.diagnostics = lambda: copy.deepcopy(_STATUS_V4_REPLY)  # type: ignore[method-assign]
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution))
+    with TestClient(app) as client:
+        diagnostics = client.get("/api/execution/diagnostics")
+    assert diagnostics.status_code == 200
+    assert diagnostics.json() == _STATUS_V4_REPLY
+
+
 def test_control_diagnostics_are_bounded_and_do_not_start_source_work() -> None:
     client, _core, _manager = _client()
     with client:
@@ -4414,7 +4937,6 @@ def test_control_diagnostics_are_bounded_and_do_not_start_source_work() -> None:
         "snapshot": 0,
         "delta": 0,
         "command_receipt": 0,
-        "resync_required": 0,
     }
 
 
@@ -4438,10 +4960,10 @@ def test_execution_observation_websocket_proxies_one_persistent_credited_session
         ) -> dict[str, Any]:
             self.cursors.append(copy.deepcopy(cursor))
             return {
-                "api_version": "manyforge.execution_command_response.v4",
+                "api_version": "manyforge.execution_command_response.v6",
                 "command": "observation",
                 "observation": {
-                    "schema_version": "manyforge.execution_observation.v4",
+                    "schema_version": "manyforge.execution_observation.v5",
                     "source_sequence": len(self.cursors),
                 },
                 "ok": True,
@@ -4456,10 +4978,10 @@ def test_execution_observation_websocket_proxies_one_persistent_credited_session
     app = create_app(service=_service(FakeCore(), FakeManager(), execution))
     first_credit = {
         "last_applied": None,
-        "schema_version": "manyforge.execution_observation_credit.v1",
+        "schema_version": "manyforge.execution_observation_credit.v2",
     }
     applied_cursor = {
-        "owner_epoch": "owner-1",
+        "application_start_id": "3f9a0000000000a1",
         "source_epoch": "source-1",
         "source_sequence": 1,
     }
@@ -4471,7 +4993,7 @@ def test_execution_observation_websocket_proxies_one_persistent_credited_session
             socket.send_json(
                 {
                     "last_applied": applied_cursor,
-                    "schema_version": ("manyforge.execution_observation_credit.v1"),
+                    "schema_version": ("manyforge.execution_observation_credit.v2"),
                 }
             )
             assert socket.receive_json()["observation"]["source_sequence"] == 2
@@ -4487,16 +5009,16 @@ def test_execution_observation_websocket_proxies_one_persistent_credited_session
         {},
         {
             "last_applied": None,
-            "schema_version": "manyforge.execution_observation_credit.v1",
+            "schema_version": "manyforge.execution_observation_credit.v2",
             "unexpected": True,
         },
         {
             "last_applied": {
-                "owner_epoch": "owner-1",
+                "application_start_id": "3f9a0000000000a1",
                 "source_epoch": "source-1",
                 "source_sequence": True,
             },
-            "schema_version": "manyforge.execution_observation_credit.v1",
+            "schema_version": "manyforge.execution_observation_credit.v2",
         },
     ],
 )
@@ -4525,10 +5047,9 @@ def test_motion_preview_is_a_thin_non_effectful_execution_route(
 ) -> None:
     execution = FakeExecution()
     context = {
-        "program_runner_owner_epoch": "runner.1",
-        "program_run_id": "held.program",
+        "program_run_id": 4,
         "claim_generation": 1,
-        "selection_revision": 3,
+        "hold_revision": 3,
     }
     if held:
         execution.manual_handover = {
@@ -4537,16 +5058,15 @@ def test_motion_preview_is_a_thin_non_effectful_execution_route(
         }
     app = create_app(service=_service(FakeCore(), FakeManager(), execution))
     body = {
+        "application_start_id": _APPLICATION_START_ID,
         "request_context": {
-            "request_id": "request.preview.1",
-            "request_owner_epoch": "execution.epoch.1",
+            "request_key": "a2" * 16,
             "source_label": "operator_ui",
-            "correlation_id": None,
         },
         "program_id": "manyforge.direct_control.motion",
         "program_revision": "sha256:" + "a" * 64,
         "program_binding_id": "sha256:" + "b" * 64,
-        "program_run_id": "direct-control-run.1",
+        "program_run_id": None,
         "expected_graph_revision": "sha256:" + "c" * 64,
         "expected_retained_bundle_id": "sha256:" + "d" * 64,
         "expected_scene_revision": {
@@ -4616,7 +5136,7 @@ def test_manual_cleanup_uses_shared_control_ingress_and_exact_runner(case) -> No
     if case == "not_allowed":
         original = runner.cycle_status
 
-        def disabled():
+        def disabled(**_kwargs):
             result = original()
             for command in result["allowed_commands"]:
                 if command["command_kind"] == "program_manual_handover":
@@ -4632,32 +5152,26 @@ def test_manual_cleanup_uses_shared_control_ingress_and_exact_runner(case) -> No
     )
     body = {
         **_caller(),
-        "request_id": "cleanup.1",
-        "program_run_id": "program-run.1",
-        "expected_owner_epoch": "program-runner.epoch.1",
+        "request_key": "a3" * 16,
+        "program_run_id": 1,
         "expected_run_revision": 1,
         "operation": {
             "request_context": {
-                "request_id": "manual.1",
-                "request_owner_epoch": "execution.epoch.1",
+                "request_key": "a4" * 16,
                 "source_label": "operator_ui",
-                "correlation_id": None,
             },
             "program_id": "manyforge.direct_control.gripper",
             "program_revision": "sha256:" + "a" * 64,
             "program_binding_id": "sha256:" + "b" * 64,
-            "program_run_id": "manual.1",
+            "program_run_id": None,
             "expected_graph_revision": "sha256:" + "c" * 64,
             "expected_retained_bundle_id": "sha256:" + "d" * 64,
             "expected_scene_revision": None,
             "coordination_policy": "independent",
             "manual_handover": {
-                "program_runner_owner_epoch": "program-runner.epoch.1",
-                "program_run_id": (
-                    "other" if case == "wrong_parent" else "program-run.1"
-                ),
+                "program_run_id": 2 if case == "wrong_parent" else 1,
                 "claim_generation": 1,
-                "selection_revision": 3,
+                "hold_revision": 3,
             },
             "participants": [
                 {
@@ -4680,19 +5194,22 @@ def test_manual_cleanup_uses_shared_control_ingress_and_exact_runner(case) -> No
             ],
         },
     }
-    target = "other" if case == "wrong_path" else "program-run.1"
+    target = 2 if case == "wrong_path" else 1
     with TestClient(app) as client:
         response = client.post(f"/api/program/runs/{target}/manual-handover", json=body)
     assert execution.requests == []
     if case == "held":
         assert response.status_code == 200, response.text
-        assert response.json()["state"] == "running"
+        assert response.json()["command"]["kind"] == "prepare_manual_handover"
+        assert response.json()["command"]["request_key"] == "c0" + "a3" * 15
         assert [kind for kind, _ in runner.calls] == ["manual_handover"]
         run_id, received = runner.calls[0][1]
-        assert run_id == "program-run.1"
+        assert run_id == 1
         assert received["operation"] == body["operation"]
         assert received["expected_run_revision"] == 1
-        assert received["request_id"] == "cleanup.1"
+        # The runner gets the formed key (class 3) and no ``A`` (1.15.1).
+        assert received["request_key"] == "c0" + "a3" * 15
+        assert "application_start_id" not in received
     else:
         assert (
             response.status_code
@@ -4709,16 +5226,15 @@ def test_capability_command_preview_is_a_thin_non_effectful_execution_route() ->
     execution = FakeExecution()
     app = create_app(service=_service(FakeCore(), FakeManager(), execution))
     body = {
+        "application_start_id": _APPLICATION_START_ID,
         "request_context": {
-            "request_id": "request.gripper-preview.1",
-            "request_owner_epoch": "execution.epoch.1",
+            "request_key": "a5" * 16,
             "source_label": "operator_ui",
-            "correlation_id": None,
         },
         "program_id": "manyforge.direct_control.gripper",
         "program_revision": "sha256:" + "a" * 64,
         "program_binding_id": "sha256:" + "b" * 64,
-        "program_run_id": "direct-control-gripper-run.1",
+        "program_run_id": None,
         "expected_graph_revision": "sha256:" + "c" * 64,
         "expected_retained_bundle_id": "sha256:" + "d" * 64,
         "expected_scene_revision": {
@@ -4779,9 +5295,9 @@ def test_execution_missing_reference_is_a_public_not_found() -> None:
         ) -> dict[str, Any]:
             raise AssertionError("not called")
 
-        def read(self, _operation_id: str) -> dict[str, Any]:
+        def read(self, _operation_id: int) -> dict[str, Any]:
             return {
-                "api_version": "manyforge.execution_command_response.v4",
+                "api_version": "manyforge.execution_command_response.v6",
                 "ok": False,
                 "error": {
                     "code": "missing_reference",
@@ -4792,10 +5308,47 @@ def test_execution_missing_reference_is_a_public_not_found() -> None:
 
     app = create_app(service=_service(FakeCore(), FakeManager(), MissingExecution()))
     with TestClient(app) as client:
-        response = client.get("/api/execution/operations/operation-retired")
+        response = client.get(
+            "/api/execution/operations/9",
+            params={"application_start_id": _APPLICATION_START_ID},
+        )
 
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "missing_reference"
+
+
+def test_planning_job_routes_read_cancel_and_release_at_once() -> None:
+    """OD-213 (1): a plan is a job; its routes answer at once, typed refusals
+    keep their HTTP status."""
+
+    execution = FakeExecution()
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution))
+    with TestClient(app) as client:
+        read = client.get("/api/execution/pick-place/plans/job-1")
+        cancel = client.post("/api/execution/pick-place/plans/job-1/cancel")
+        release = client.post("/api/execution/pick-place/plans/job-1/release")
+        unknown = client.get("/api/execution/pick-place/plans/unknown")
+        unfinished = client.post("/api/execution/pick-place/plans/unfinished/release")
+        too_long = client.get("/api/execution/pick-place/plans/" + "a" * 97)
+
+    assert read.status_code == 200, read.text
+    assert read.json()["planning_job"] == {"job_id": "job-1", "state": "planning"}
+    assert cancel.status_code == 200
+    assert cancel.json()["command"] == "cancel_planning_job"
+    assert release.status_code == 200
+    assert release.json()["command"] == "release_planning_job"
+    assert unknown.status_code == 404
+    assert unknown.json()["error"]["code"] == "planning_job_unknown"
+    assert unfinished.status_code == 409
+    assert unfinished.json()["error"]["code"] == "planning_job_unfinished"
+    assert too_long.status_code == 422
+    assert [request for request in execution.requests if request[0].endswith("_job")] == [
+        ("read_planning_job", "job-1"),
+        ("cancel_planning_job", "job-1"),
+        ("release_planning_job", "job-1"),
+        ("read_planning_job", "unknown"),
+        ("release_planning_job", "unfinished"),
+    ]
 
 
 def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
@@ -4809,29 +5362,29 @@ def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
         )
     )
     context = {
-        "request_id": "request.control.1",
-        "request_owner_epoch": "execution.epoch.1",
+        "request_key": "a6" * 16,
         "source_label": "operator_ui",
-        "correlation_id": None,
     }
     control = {
+        "application_start_id": _APPLICATION_START_ID,
         "request_context": context,
-        "operation_id": "operation-1",
+        "operation_id": 1,
         "expected_operation_revision": 3,
         "reason": "operator request",
     }
     stop = {
+        "application_start_id": _APPLICATION_START_ID,
         "request_context": context,
         "operations": [
             {
-                "operation_id": "operation-1",
+                "operation_id": 1,
                 "expected_operation_revision": 3,
-                "expected_stop_generation": 0,
             }
         ],
         "reason": "operator Stop",
     }
     scale_control = {
+        "application_start_id": _APPLICATION_START_ID,
         "request_context": context,
         "selector": {
             "program_binding_id": "binding-1",
@@ -4845,7 +5398,7 @@ def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
     with TestClient(app) as client:
         for endpoint in ("reset", "acknowledge-completed"):
             response = client.post(
-                f"/api/execution/operations/operation-1/{endpoint}",
+                f"/api/execution/operations/1/{endpoint}",
                 json=control,
             )
             assert response.status_code == 200, response.text
@@ -4969,23 +5522,22 @@ def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> No
         trusted_principal_adapter=FakeTrustedAdapter(),
     )
     body = {
+        "application_start_id": _APPLICATION_START_ID,
         "request_context": {
-            "request_id": "request.control.trusted",
-            "request_owner_epoch": "execution.epoch.1",
+            "request_key": "a7" * 16,
             "source_label": "operator_ui",
-            "correlation_id": None,
         },
-        "operation_id": "operation-1",
+        "operation_id": 1,
         "expected_operation_revision": 3,
         "reason": None,
     }
     with TestClient(app) as client:
         forged = client.post(
-            "/api/execution/operations/operation-1/reset",
+            "/api/execution/operations/1/reset",
             json={**body, "principal_id": "forged"},
         )
         forged_context = client.post(
-            "/api/execution/operations/operation-1/reset",
+            "/api/execution/operations/1/reset",
             json={
                 **body,
                 "request_context": {
@@ -4994,7 +5546,7 @@ def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> No
                 },
             },
         )
-        accepted = client.post("/api/execution/operations/operation-1/reset", json=body)
+        accepted = client.post("/api/execution/operations/1/reset", json=body)
 
     assert forged.status_code == 422
     assert forged_context.status_code == 422
@@ -5013,17 +5565,16 @@ def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -
         )
     )
     context = {
-        "request_id": "request.control.1",
-        "request_owner_epoch": "execution.epoch.1",
+        "request_key": "a6" * 16,
         "source_label": "operator_ui",
-        "correlation_id": None,
     }
     with TestClient(app) as client:
         mismatch = client.post(
-            "/api/execution/operations/operation-1/reset",
+            "/api/execution/operations/1/reset",
             json={
+                "application_start_id": _APPLICATION_START_ID,
                 "request_context": context,
-                "operation_id": "operation-2",
+                "operation_id": 2,
                 "expected_operation_revision": 1,
                 "reason": None,
             },
@@ -5031,14 +5582,14 @@ def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -
         broad_stop = client.post(
             "/api/execution/stops",
             json={
+                "application_start_id": _APPLICATION_START_ID,
                 "request_context": context,
                 "operations": [
                     {
                         "operation_id": operation_id,
                         "expected_operation_revision": 1,
-                        "expected_stop_generation": 0,
                     }
-                    for operation_id in ("operation-1", "operation-2")
+                    for operation_id in (1, 2)
                 ],
                 "reason": None,
             },
@@ -5046,12 +5597,12 @@ def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -
         mixed_stop = client.post(
             "/api/execution/stops",
             json={
+                "application_start_id": _APPLICATION_START_ID,
                 "request_context": context,
                 "operations": [
                     {
-                        "operation_id": "operation-1",
+                        "operation_id": 1,
                         "expected_operation_revision": 1,
-                        "expected_stop_generation": 0,
                     }
                 ],
                 "components": [
@@ -5067,6 +5618,7 @@ def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -
         invalid_scale = client.post(
             "/api/execution/runtime-scale-control",
             json={
+                "application_start_id": _APPLICATION_START_ID,
                 "request_context": context,
                 "selector": {
                     "program_binding_id": "binding-1",
@@ -5085,7 +5637,7 @@ def test_operation_control_paths_accept_bounded_stop_and_promote_mixed_scope() -
     assert invalid_scale.status_code == 422
     assert [kind for kind, _request in execution.requests] == [
         "stop",
-        "recognized_malformed_stop",
+        "recognized_stop",
     ]
 
 
@@ -5140,11 +5692,16 @@ class _PersistentValuesRunner:
         if body.get("key") == "halted":
             raise ProgramRunnerClientError(
                 "persistent_key_run_conflict",
-                "Program run program-cycle.1 refused the edit",
+                "Program run 1 refused the edit",
                 409,
                 producer="kernel",
             )
-        return {"action": action}
+        kind = {
+            "set": "persistent_value_set",
+            "reset": "persistent_value_reset",
+            "clear": "persistent_values_clear",
+        }[action]
+        return _command_reply(kind, body["request_key"], step="applying")
 
 
 def test_persistent_values_proxy_the_program_runner_with_its_refusals() -> None:
@@ -5154,8 +5711,7 @@ def test_persistent_values_proxy_the_program_runner_with_its_refusals() -> None:
     )
     base = "/api/program/persistent-values"
     caller = {
-        "request_id": "request.1",
-        "request_owner_epoch": "composer.epoch.1",
+        "request_key": "a8" * 16,
         "source_label": "operator_ui",
         "project_path": "/projects/cell-pick.scenario",
     }
@@ -5168,17 +5724,28 @@ def test_persistent_values_proxy_the_program_runner_with_its_refusals() -> None:
     assert client.get(base).json() == {
         "project_path": "/projects/cell-pick.scenario", "keys": []
     }
-    assert client.post(base, json={**edit, "value": 2}).json() == {"action": "set"}
-    assert client.post(f"{base}/reset", json=edit).json() == {"action": "reset"}
-    assert client.post(f"{base}/clear", json=caller).json() == {"action": "clear"}
+    # The runner's row at acceptance is forwarded unchanged (OD-214); the
+    # formed key (class 3) names it.
+    formed = "c0" + "a8" * 15
+    assert client.post(base, json={**edit, "value": 2}).json() == _command_reply(
+        "persistent_value_set", formed, step="applying"
+    )
+    assert client.post(f"{base}/reset", json=edit).json() == _command_reply(
+        "persistent_value_reset", formed, step="applying"
+    )
+    assert client.post(f"{base}/clear", json=caller).json() == _command_reply(
+        "persistent_values_clear", formed, step="applying"
+    )
     refused = client.post(
         base,
         json={
             **edit,
             "key": "halted",
             "value": 2,
-            "program_run_id": "run.1",
+            "program_run_id": 1,
             "expected_run_revision": 3,
+            # Naming a run names a start-minted value (contract 1.6).
+            "application_start_id": _APPLICATION_START_ID,
         },
     )
     assert refused.status_code == 409
@@ -5208,30 +5775,30 @@ def test_program_run_admitted_speeds_copy_the_latest_owner_diagnostic_per_robot(
     client, core, _manager = _client()
     calls: list[dict[str, Any]] = []
 
-    def prepared(sequence: int, run: str, component: str, admitted: float) -> dict[str, Any]:
+    def prepared(sequence: int, run: int, component: str, admitted: float) -> dict[str, Any]:
         return {
             "sequence": sequence,
             "event": {
                 "event_type": "operation_prepared",
                 "occurred_at_wall": f"2026-10-04T10:00:{sequence:02d}Z",
                 "payload": {
-                    "schema_version": "manyforge.operation_history_event.v1",
+                    "schema_version": "manyforge.operation_history_event.v2",
                     "journal_payload": {
                         "record_kind": "operation_prepared",
                         "intent": {
                             "transition_reason": "subordinate_motion_prepared",
                             "prepared_motion_diagnostics": [{
-                                "participant_id": "p-1",
+                                "participant_id": {"operation_id": sequence, "ordinal": 1},
                                 "requested_tcp_linear_speed_mps": 0.15,
                                 "deployment_maximum_tcp_linear_speed_mps": 0.1,
                                 "admitted_tcp_linear_speed_mps": admitted,
                             }],
                         },
                         "operation_state": {
-                            "operation_id": f"op-{sequence}",
+                            "operation_id": sequence,
                             "program_run_id": run,
                             "participants": [{
-                                "participant_id": "p-1",
+                                "participant_id": {"operation_id": sequence, "ordinal": 1},
                                 "controllable_component_id": component,
                                 "command_target_id": "arm",
                             }],
@@ -5246,9 +5813,9 @@ def test_program_run_admitted_speeds_copy_the_latest_owner_diagnostic_per_robot(
         return {
             "schema_version": "manyforge.historian_export_page.v1",
             "events": [
-                prepared(9, "run-1", "lite6_robot", 0.1),
-                prepared(8, "run-1", "lite6_robot", 0.05),  # older: not shown
-                prepared(7, "run-other", "ur5e_robot", 0.2),  # another run
+                prepared(9, 1, "lite6_robot", 0.1),
+                prepared(8, 1, "lite6_robot", 0.05),  # older: not shown
+                prepared(7, 2, "ur5e_robot", 0.2),  # another run
             ],
             "truncated": False,
             "next_before_sequence": None,
@@ -5256,17 +5823,23 @@ def test_program_run_admitted_speeds_copy_the_latest_owner_diagnostic_per_robot(
 
     core.history_export = history_export  # type: ignore[attr-defined]
     with client:
-        response = client.get("/api/execution/program-runs/run-1/admitted-speeds")
+        response = client.get(
+            "/api/execution/program-runs/1/admitted-speeds",
+            params={"application_start_id": _APPLICATION_START_ID},
+        )
     assert response.status_code == 200, response.text
     assert calls[0]["event_types"] == ["operation_prepared"]
-    assert calls[0]["correlations"] == {"program_run_id": "run-1"}
+    # The store compares a minted id by its decimal text.
+    assert calls[0]["correlations"] == {"program_run_id": "1"}
     assert response.json() == {
-        "schema_version": "manyforge.program_run_admitted_speeds.v1",
-        "program_run_id": "run-1",
+        "schema_version": "manyforge.program_run_admitted_speeds.v2",
+        "program_run_id": 1,
+        "application_start_id": _APPLICATION_START_ID,
+        "display": "3f9a/run1",
         "targets": [{
             "controllable_component_id": "lite6_robot",
             "command_target_id": "arm",
-            "operation_id": "op-9",
+            "operation_id": 9,
             "occurred_at_wall": "2026-10-04T10:00:09Z",
             "requested_tcp_linear_speed_mps": 0.15,
             "deployment_maximum_tcp_linear_speed_mps": 0.1,
@@ -5279,7 +5852,6 @@ def test_program_only_apply_preserves_scene_and_still_reconciles_values():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     core.committed_activation["scene_initialization"] = "preserve"
-    core.committed_activation["committed_applies"][-1]["scene_initialization"] = "preserve"
     service.notify_committed_apply()
     service.notify_committed_apply()
     assert runner.reconciliations == 2
@@ -5309,18 +5881,17 @@ def test_operation_reset_carries_no_output_acknowledgement() -> None:
         )
     )
     body = {
+        "application_start_id": _APPLICATION_START_ID,
         "request_context": {
-            "request_id": "request.control.reset",
-            "request_owner_epoch": "execution.epoch.1",
+            "request_key": "a9" * 16,
             "source_label": "operator_ui",
-            "correlation_id": None,
         },
-        "operation_id": "operation-1",
+        "operation_id": 1,
         "expected_operation_revision": 3,
         "reason": None,
     }
     with TestClient(app) as client:
-        plain = client.post("/api/execution/operations/operation-1/reset", json=body)
+        plain = client.post("/api/execution/operations/1/reset", json=body)
 
     assert plain.status_code == 200
     assert len([request for kind, request in execution.requests if kind == "reset"]) == 1
@@ -5380,7 +5951,7 @@ class _SceneRetryWait:
         return self.stopped
 
 
-def test_apply_scene_retries_only_readiness_with_backoff_and_same_identity():
+def test_apply_scene_retries_only_readiness_with_backoff_and_a_key_per_attempt():
     runner = _NotifiedRunner()
     service, _core = _scene_completion_service(runner)
     waiter = _SceneRetryWait(lambda: None)
@@ -5397,14 +5968,71 @@ def test_apply_scene_retries_only_readiness_with_backoff_and_same_identity():
     runner.prepare_applied_scene = prepare
     service.notify_committed_apply()
     assert len(attempts) == 3
-    assert [body["request_id"] for body in attempts] == [attempts[0]["request_id"]] * 3
-    assert [body["request_owner_epoch"] for body in attempts] == [
-        attempts[0]["request_owner_epoch"]
+    # Each attempt is its own request with its own Headless key (BS 11.6);
+    # the Applied identity stays the same.
+    keys = [body["request_key"] for body in attempts]
+    assert len(set(keys)) == 3
+    assert [body["expected_applied_record_digest"] for body in attempts] == [
+        attempts[0]["expected_applied_record_digest"]
     ] * 3
     assert waiter.waits == [0.25, 0.25]
     assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 1
     service.notify_committed_apply()
     assert len(attempts) == 3
+
+
+def test_apply_scene_retries_a_busy_runner_and_succeeds_when_it_frees():
+    """OD-144: busy with another command is refused before any effect, so
+    the Apply's scene step tries again."""
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    waiter = _SceneRetryWait(lambda: None)
+    service._apply_scene_stop = waiter
+    original = runner.prepare_applied_scene
+    attempts = []
+
+    def prepare(body):
+        attempts.append(copy.deepcopy(body))
+        if len(attempts) < 3:
+            raise ProgramRunnerClientError(
+                "execution_control_ingress_busy", "another Program command is in progress",
+                503, details={"command_in_progress": "start"},
+            )
+        return original(body)
+
+    runner.prepare_applied_scene = prepare
+    service.notify_committed_apply()
+    assert len(attempts) == 3
+    assert len({body["request_key"] for body in attempts}) == 3
+    assert waiter.waits == [0.25, 0.25]
+    assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 1
+    assert service._initial_scene_failure is None
+
+
+def test_empty_apply_busy_runner_is_failed_before_effect_not_unknown():
+    runner = _NotifiedRunner()
+    service, core = _scene_completion_service(runner)
+    core.applied_program_status_projection.update(
+        executable=False, program_id=None, program_revision=None,
+        program_binding_id=None, program=None, non_executable=None,
+    )
+    service._empty_scene_applies.add((2, 1))
+    calls = []
+
+    def busy(body):
+        calls.append(body)
+        raise ProgramRunnerClientError(
+            "execution_control_ingress_busy", "another Program command is in progress",
+            503, details={"command_in_progress": "reset"},
+        )
+
+    runner.prepare_applied_scene = busy
+    service.notify_committed_apply()
+    status = service.program_cycle_status(include_scene_clear=True)["scene_clear"]
+    assert status["state"] == "failed"
+    assert status["reason"]["code"] == "scene_clear_failed"
+    assert status["reason"]["details"]["reason"] == "execution_control_ingress_busy"
+    assert len(calls) == 1
 
 
 def test_apply_scene_retry_stops_when_new_apply_is_committed():
@@ -5420,13 +6048,9 @@ def test_apply_scene_retry_stops_when_new_apply_is_committed():
         return original(body)
 
     def supersede():
-        core.committed_activation["apply_id"] = "apply.3"
+        core.committed_activation["apply_id"] = 3
         core.committed_activation["apply_generation"] = 2
         core.committed_activation["record_digest"] = "sha256:" + "f" * 64
-        core.committed_activation["committed_applies"][-1].update(
-            apply_id="apply.3", apply_generation=2,
-            record_digest=core.committed_activation["record_digest"],
-        )
         core.applied_program_status_projection["record_digest"] = core.committed_activation["record_digest"]
         _set_applied_record_digest(core.applied_program, core.committed_activation["record_digest"])
 
@@ -5457,70 +6081,73 @@ def test_apply_scene_retry_stops_on_service_close():
     assert waiter.waits == [0.25]
 
 
-def test_apply_scene_retry_reports_refusal_after_bound(monkeypatch, caplog):
-    import manyforge_headless_api.service as service_module
-
+def test_apply_scene_retry_has_no_time_limit():
+    # OD-214: no 30 s bound; a typed refusal before effects is tried again
+    # until the preparation is sent (or superseded, or the service closes).
     runner = _NotifiedRunner()
     service, _core = _scene_completion_service(runner)
+    original = runner.prepare_applied_scene
     attempts = []
-    now = [0.0]
-
-    class Clock:
-        @staticmethod
-        def monotonic():
-            return now[0]
 
     def prepare(body):
         attempts.append(body)
-        raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
+        if len(attempts) <= 200:
+            raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
+        return original(body)
 
-    def advance():
-        now[0] += 0.25
-
-    monkeypatch.setattr(service_module, "time", Clock)
     runner.prepare_applied_scene = prepare
-    waiter = _SceneRetryWait(advance)
+    waiter = _SceneRetryWait(lambda: None)
     service._apply_scene_stop = waiter
     service.notify_committed_apply()
-    assert len(attempts) == 120
-    assert len(waiter.waits) == 120
-    assert "authoring_not_ready" in caplog.text
-    assert now[0] == 30.0
+    assert len(attempts) == 201
+    assert waiter.waits == [0.25] * 200
+    assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 1
+    assert service._initial_scene_failure is None
 
 
-def test_apply_scene_retry_does_not_start_after_slow_pre_dispatch_reads(monkeypatch, caplog):
-    import manyforge_headless_api.service as service_module
-
+def test_apply_scene_waits_for_the_admission_to_open_before_sending():
     runner = _NotifiedRunner()
     service, _core = _scene_completion_service(runner)
-    attempts = []
-    now = [0.0]
+    original_admission = service.authoring_admission
+    reads = []
 
-    class Clock:
-        @staticmethod
-        def monotonic():
-            return now[0]
+    def admission():
+        reads.append(1)
+        value = dict(original_admission())
+        if len(reads) <= 3:
+            value["authoring_allowed"] = False
+        return value
 
-    def prepare(body):
-        attempts.append(body)
-        raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
-
-    original_cycle_status = service.program_cycle_status
-
-    def slow_cycle_status():
-        result = original_cycle_status()
-        if attempts:
-            now[0] = 30.0
-        return result
-
-    monkeypatch.setattr(service_module, "time", Clock)
-    service.program_cycle_status = slow_cycle_status
-    runner.prepare_applied_scene = prepare
-    service._apply_scene_stop = _SceneRetryWait(lambda: now.__setitem__(0, 29.9))
+    service.authoring_admission = admission
+    waiter = _SceneRetryWait(lambda: None)
+    service._apply_scene_stop = waiter
     service.notify_committed_apply()
-    assert len(attempts) == 1
-    assert now[0] == 30.0
-    assert "authoring_not_ready" in caplog.text
+    # Nothing is sent while the admission is closed.
+    assert waiter.waits == [0.25] * 3
+    assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 1
+    assert service._initial_scene_failure is None
+
+
+def test_apply_scene_wait_for_the_admission_ends_when_the_host_is_lost(caplog):
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    original_admission = service.authoring_admission
+    reads = []
+
+    def admission():
+        reads.append(1)
+        if len(reads) > 2:
+            raise HeadlessApiError("execution_owner_unavailable", "execution host closed the socket")
+        return {**original_admission(), "authoring_allowed": False}
+
+    service.authoring_admission = admission
+    service._apply_scene_stop = _SceneRetryWait(lambda: None)
+    service.notify_committed_apply()
+    assert [row for row in runner.calls if row[0] == "prepare_scene"] == []
+    assert "execution_owner_unavailable" in caplog.text
+    failure = service._initial_scene_failure
+    assert failure is not None and failure["state"] == "failed"
+    assert failure["reason"]["code"] == "execution_owner_unavailable"
 
 
 def test_apply_scene_does_not_retry_untyped_authoring_not_ready():
@@ -5556,61 +6183,6 @@ def test_apply_scene_does_not_retry_unknown_runner_outcome():
 
 
 
-def test_apply_scene_retry_stops_when_runner_owner_changes():
-    runner = _NotifiedRunner()
-    service, _core = _scene_completion_service(runner)
-    attempts = []
-    old_cycle_status = runner.cycle_status
-    changed = [False]
-
-    def cycle_status():
-        result = old_cycle_status()
-        if changed[0]:
-            result["program_runner_owner_epoch"] = "program-runner.epoch.2"
-        return result
-
-    def prepare(body):
-        attempts.append(body)
-        raise ProgramRunnerClientError("authoring_not_ready", "not ready", 409)
-
-    runner.cycle_status = cycle_status
-    runner.prepare_applied_scene = prepare
-    service._apply_scene_stop = _SceneRetryWait(
-        lambda: changed.__setitem__(0, True)
-    )
-    service.notify_committed_apply()
-    assert len(attempts) == 1
-
-
-def test_apply_scene_initial_attempt_reports_deadline_after_slow_status_reads(
-    monkeypatch, caplog
-):
-    import manyforge_headless_api.service as service_module
-
-    runner = _NotifiedRunner()
-    service, _core = _scene_completion_service(runner)
-    attempts = []
-    now = [0.0]
-
-    class Clock:
-        @staticmethod
-        def monotonic():
-            return now[0]
-
-    def cycle_status():
-        now[0] = 30.0
-        return runner.cycle_status()
-
-    runner.prepare_applied_scene = lambda body: attempts.append(body)
-    service.program_cycle_status = cycle_status
-    monkeypatch.setattr(service_module, "time", Clock)
-    service._apply_scene_stop = _SceneRetryWait(lambda: None)
-    service.notify_committed_apply()
-    assert attempts == []
-    assert "program_scene_preparation_failed" in caplog.text
-    assert "deadline expired before dispatch" in caplog.text
-
-
 def test_initial_scene_failure_status_is_apply_scoped_and_runner_independent():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
@@ -5618,15 +6190,14 @@ def test_initial_scene_failure_status_is_apply_scoped_and_runner_independent():
         raise ProgramRunnerClientError("program_scene_preparation_failed", "scene unavailable", 409)
     runner.prepare_applied_scene = failed
     service.notify_committed_apply()
-    runner.cycle_status = lambda: (_ for _ in ()).throw(
+    runner.cycle_status = lambda **_kwargs: (_ for _ in ()).throw(
         ProgramRunnerClientError("program_runner_unavailable", "offline"))
     failure = service.runtime()["initial_scene_failure"]
     assert failure["state"] == "unknown"
     assert failure["reason"] == {"code": "program_scene_preparation_failed", "message": "scene unavailable"}
-    assert failure["apply_id"] == "apply.2"
-    core.committed_activation["apply_id"] = "apply.3"
+    assert failure["apply_id"] == 2
+    core.committed_activation["apply_id"] = 3
     core.committed_activation["apply_generation"] = 2
-    core.committed_activation["committed_applies"][-1].update(apply_id="apply.3", apply_generation=2)
     assert service.initial_scene_status()["initial_scene_failure"] is None
 
 
@@ -5657,9 +6228,54 @@ def test_initial_scene_condition_clears_only_after_successful_reload_reset():
     with pytest.raises(HeadlessApiError):
         service.program_cycle_reset(request)
     assert service.initial_scene_status()["initial_scene_failure"] is not None
-    runner.reset_cycle = lambda _body: {"schema_version": "manyforge.program_cycle_reset_result.v1", "program_run_id": request.program_run_id, "reset_cycle_generation": request.expected_cycle_generation, "idle_cycle_generation": request.expected_cycle_generation + 1}
+    # OD-214: the Reset answers at acceptance; the condition clears only
+    # when its row ends ``succeeded`` in the followed cycle status.
+    key = request.request_key
+    runner.reset_cycle = lambda body: _command_reply("reset", body["request_key"])
+    service.program_cycle_reset(request)
+    assert service.initial_scene_status()["initial_scene_failure"] is not None
+    other = {**_command_reply("reset", "c3" * 16)["command"], "end": _command_end("succeeded")}
+    service.observe_runner_commands({"in_progress": None, "ended": [other]})
+    assert service.initial_scene_status()["initial_scene_failure"] is not None
+    ended = {**_command_reply("reset", key, step="restoring_scene")["command"],
+             "end": _command_end("succeeded")}
+    service.observe_runner_commands({"in_progress": None, "ended": [ended]})
+    assert service.initial_scene_status()["initial_scene_failure"] is None
+    assert service._scene_reloading_resets == {}
+
+
+@pytest.mark.parametrize("outcome", ["refused", "failed", "unknown"])
+def test_initial_scene_condition_stays_after_a_reload_reset_that_did_not_succeed(outcome):
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    identity = service._current_apply_identity()
+    service._record_initial_scene_failure(identity, HeadlessApiError("authoring_not_ready", "not ready"), dispatched=False)
+    request = _cycle_reset_request().model_copy(update={"reload_initial_scene": True})
+    runner.reset_cycle = lambda body: _command_reply("reset", body["request_key"])
+    service.program_cycle_reset(request)
+    ended = {**_command_reply("reset", request.request_key)["command"],
+             "end": _command_end(outcome, "program_cycle_recovery_required")}
+    service.observe_runner_commands({"in_progress": None, "ended": [ended]})
+    assert service.initial_scene_status()["initial_scene_failure"] is not None
+    # The followed Reset ended: nothing is kept for it.
+    assert service._scene_reloading_resets == {}
+
+
+def test_initial_scene_condition_clears_at_once_when_the_reply_already_ended():
+    """An idle Reset whose row ended before the reply (a replay, or no
+    effects left) is acted on from the reply itself."""
+
+    runner = _NotifiedRunner()
+    service, _core = _scene_completion_service(runner)
+    identity = service._current_apply_identity()
+    service._record_initial_scene_failure(identity, HeadlessApiError("authoring_not_ready", "not ready"), dispatched=False)
+    request = _cycle_reset_request().model_copy(update={"reload_initial_scene": True})
+    runner.reset_cycle = lambda body: _command_reply(
+        "reset", body["request_key"], step="restoring_scene", end=_command_end("succeeded")
+    )
     service.program_cycle_reset(request)
     assert service.initial_scene_status()["initial_scene_failure"] is None
+    assert service._scene_reloading_resets == {}
 
 
 def test_initial_scene_success_clears_condition_for_same_apply():
@@ -5709,7 +6325,7 @@ def test_initial_scene_applied_status_failure_is_attributed_to_confirmed_apply()
         HeadlessApiError("program_status_unavailable", "selection unavailable"))
     service.notify_committed_apply()
     failure = service.runtime()["initial_scene_failure"]
-    assert failure["apply_id"] == "apply.2"
+    assert failure["apply_id"] == 2
     assert failure["state"] == "failed"
     assert failure["reason"]["message"] == "selection unavailable"
 
@@ -5745,7 +6361,6 @@ def test_preserve_apply_does_not_read_applied_status_or_create_scene_failure():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
     core.committed_activation["scene_initialization"] = "preserve"
-    core.committed_activation["committed_applies"][-1]["scene_initialization"] = "preserve"
     reads = []
     def failed_status():
         reads.append(True)
@@ -5771,13 +6386,19 @@ def test_motion_preview_http_failure_keeps_noncommittable_diagnostic() -> None:
 
     execution = FakeExecution()
     diagnostic = _bounded_diagnostic()
-    failure = {"api_version": "manyforge.execution_command_response.v4", "ok": False,
+    failure = {"api_version": "manyforge.execution_command_response.v6", "ok": False,
                "error": {"code": "validation_collision", "message": "collision", "details": {}},
                "diagnostic_preview": diagnostic}
     execution.preview_motion = lambda _request, **_kwargs: failure
     app = create_app(service=_service(FakeCore(), FakeManager(), execution))
     with TestClient(app) as client:
-        response = client.post("/api/execution/motion-previews", json=_direct_motion_request().model_dump(mode="json"))
+        response = client.post(
+            "/api/execution/motion-previews",
+            json={
+                **_direct_motion_request().model_dump(mode="json"),
+                "application_start_id": _APPLICATION_START_ID,
+            },
+        )
     assert response.status_code == 500  # Existing mapping for this native refusal.
     assert response.json() == failure
     assert "preview_receipt" not in response.json()
@@ -5788,7 +6409,7 @@ def test_cartesian_diagnostic_failure_details_survive_http() -> None:
 
     execution = FakeExecution()
     failure = {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "ok": False,
         "error": {
             "code": "cartesian_incomplete",
@@ -5805,7 +6426,10 @@ def test_cartesian_diagnostic_failure_details_survive_http() -> None:
     with TestClient(app) as client:
         response = client.post(
             "/api/execution/motion-previews",
-            json=_direct_motion_request().model_dump(mode="json"),
+            json={
+                **_direct_motion_request().model_dump(mode="json"),
+                "application_start_id": _APPLICATION_START_ID,
+            },
         )
     assert response.status_code >= 400
     assert response.json() == failure
@@ -5927,9 +6551,8 @@ def test_manager_reference_refusal_crosses_socket_to_http(tmp_path: Path, monkey
     path.chmod(0o600)
     server.listen(1)
     error = _reference_error()
-    wire = {"api_version": "manyforge.manager_command_response.v2", "ok": False,
-            "error": error, "request_id": "request.1",
-            "request_owner_epoch": "client.epoch.1"}
+    wire = {"api_version": "manyforge.manager_command_response.v3", "ok": False,
+            "error": error, "request_key": "b2" * 16}
 
     def serve() -> None:
         connection, _ = server.accept()
@@ -5942,7 +6565,13 @@ def test_manager_reference_refusal_crosses_socket_to_http(tmp_path: Path, monkey
     try:
         manager = ManagerCommandClient(tmp_path)
         with TestClient(create_app(service=_service(FakeCore(), manager))) as client:
-            response = client.post("/api/manager/apply", json=_request().model_dump(mode="json"))
+            response = client.post(
+                "/api/manager/apply",
+                json={
+                    **_request().model_dump(mode="json"),
+                    "application_start_id": _APPLICATION_START_ID,
+                },
+            )
         assert response.status_code == _error_status("program_reference_validation_failed")
         detail = response.json()["detail"]
         assert detail["code"] == error["code"]
@@ -5957,13 +6586,12 @@ def test_manager_reference_refusal_crosses_socket_to_http(tmp_path: Path, monkey
 # OD-93: assistant projection reads carry a strong content ETag.
 
 
-def _fresh_source(digest: str, epoch: str = "headless.epoch.1") -> dict[str, Any]:
+def _fresh_source(digest: str, age_ns: int = 7) -> dict[str, Any]:
     return {
         "available": True,
         "freshness": "fresh",
         "known_gaps": [],
-        "projection_owner_epoch": epoch,
-        "receiver_age_ns": 7,
+        "receiver_age_ns": age_ns,
         "source_content_digest": digest,
     }
 
@@ -5971,8 +6599,11 @@ def _fresh_source(digest: str, epoch: str = "headless.epoch.1") -> dict[str, Any
 def _conditional_app(reads: dict[str, Any]) -> TestClient:
     from types import SimpleNamespace
 
+    from manyforge_headless_api.identity import RequestAdmission
+
     # Only the three routes are exercised (no lifespan): a read-only stub.
     service = SimpleNamespace(
+        admission=RequestAdmission(_APPLICATION_START_ID),
         assistant_mode=lambda mode_id: copy.deepcopy(reads["mode"]),
         node_environment=lambda: copy.deepcopy(reads["environment"]),
         assistant_mode_context=lambda mode_id: copy.deepcopy(reads["context"]),
@@ -5980,13 +6611,13 @@ def _conditional_app(reads: dict[str, Any]) -> TestClient:
     return TestClient(create_app(service=service))  # type: ignore[arg-type]
 
 
-def _conditional_reads(epoch: str = "headless.epoch.1") -> dict[str, Any]:
-    mode = {"mode": "composer-assistant", "source": _fresh_source("sha256:" + "1" * 64, epoch)}
+def _conditional_reads(age_ns: int = 7) -> dict[str, Any]:
+    mode = {"mode": "composer-assistant", "source": _fresh_source("sha256:" + "1" * 64, age_ns)}
     environment = {
         "availability": {"execution_available": True},
-        "source": _fresh_source("sha256:" + "2" * 64, epoch),
+        "source": _fresh_source("sha256:" + "2" * 64, age_ns),
     }
-    source_model = {"source": _fresh_source("sha256:" + "3" * 64, epoch)}
+    source_model = {"source": _fresh_source("sha256:" + "3" * 64, age_ns)}
     return {
         "mode": mode,
         "environment": environment,
@@ -6022,8 +6653,8 @@ def test_assistant_projection_reads_answer_304_for_the_same_content(path: str) -
     assert again.content == b""
     assert again.headers["etag"] == etag
 
-    # A restarted Headless (new epoch and ages, same content) keeps the tag.
-    restarted = _conditional_app(_conditional_reads("headless.epoch.2"))
+    # A restarted Headless (new ages, same content) keeps the tag.
+    restarted = _conditional_app(_conditional_reads(99))
     assert restarted.get(path, headers={"If-None-Match": etag}).status_code == 304
 
     # Different content: a full answer with a different tag.
@@ -6079,3 +6710,457 @@ def test_headless_client_conditional_reads_return_none_on_304() -> None:
     )
     # Plain reads are unchanged.
     assert client.assistant_mode("composer-assistant") == reads["mode"]
+
+
+def test_program_stop_naming_two_runs_is_a_malformed_stop() -> None:
+    """A Program group Stop whose path and body name different runs is
+    invalid, so it goes through the recognized-malformed Stop call (the
+    Kernel widens it to Stop all)."""
+    execution = FakeExecution()
+    runner = FakeProgramRunner()
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution, program_runner=runner))
+    body = {
+        **_caller(),
+        "program_run_id": 2,
+        "reason": "operator stop",
+    }
+    with TestClient(app) as client:
+        replies = [
+            client.post(
+                f"/api/program/runs/1/{route}",
+                json=body,
+                headers={"x-request-id": f"program.mismatch.{index}"},
+            )
+            for index, route in enumerate(("motion-stop",))
+        ]
+    assert [reply.status_code for reply in replies] == [200], [r.text for r in replies]
+    # The body was validated, so the caller's label is kept.
+    assert [request for request in execution.requests if request[0] == "recognized_stop"] == [
+        ("recognized_stop", {
+            "request_key": _headless_key(index + 1),
+            "recognized_route": route,
+            "reason": "recognized_stop_payload_invalid",
+            "source_label": "operator_ui",
+        })
+        for index, route in enumerate(("/api/execution/stops",))
+    ]
+    assert [call[0] for call in runner.calls] == []
+
+
+def _stale_start_stop_post(
+    client: TestClient, entry: str, start: str | None
+) -> httpx.Response:
+    """A valid operation or group Stop on ``entry`` naming ``start``."""
+
+    from manyforge_headless_api.control_protocol import (
+        EXECUTION_COMMAND_SCHEMA,
+        ControlFreshnessAuthority,
+    )
+
+    named = {} if start is None else {"application_start_id": start}
+    operation_stop = {
+        **named,
+        "request_context": {"request_key": _CALLER_KEY, "source_label": "operator_ui"},
+        "operations": [{"operation_id": 7, "expected_operation_revision": 1}],
+    }
+    if entry == "/api/execution/stops":
+        return client.post(entry, json=operation_stop)
+    if entry == "/api/program/runs/1/motion-stop":
+        body = {**_caller(), "program_run_id": 1}
+        body.pop("application_start_id")
+        return client.post(entry, json={**body, **named})
+    freshness = ControlFreshnessAuthority(
+        clock_ns=lambda: 1_000_000_000, secret=b"x" * 32
+    ).issue(execution_control_revision=1)
+    return client.post(
+        entry,
+        json={
+            "command_envelope": {
+                "schema_version": EXECUTION_COMMAND_SCHEMA,
+                "command_kind": "operation_stop",
+                "source_label": "operator_ui",
+                "control_session_number": None,
+                "client_sequence": None,
+                "freshness": freshness.model_dump(mode="json"),
+                "expected_execution_control_revision": 1,
+            },
+            "payload": operation_stop,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        "/api/execution/stops",
+        "/api/program/runs/1/motion-stop",
+        "/api/control/commands",
+    ],
+)
+@pytest.mark.parametrize("start", [None, _OTHER_START_ID])
+def test_a_stop_naming_another_or_no_start_is_stop_all_recorded_stale_start(
+    entry: str, start: str | None
+) -> None:
+    """Never refused (OD-244): it goes as the recognized Stop of the
+    operation-Stop route with the caller's formed key, and the Kernel records
+    why it widened it (`stale_start`); the reply keeps its shape."""
+
+    execution = FakeExecution()
+    runner = FakeProgramRunner()
+    app = create_app(
+        service=_service(FakeCore(), FakeManager(), execution, program_runner=runner)
+    )
+    with TestClient(app) as client:
+        response = _stale_start_stop_post(client, entry, start)
+
+    assert response.status_code == 200, response.text
+    assert execution.requests == [
+        (
+            "recognized_stop",
+            {
+                "request_key": _FORMED_CALLER_KEY,
+                "recognized_route": "/api/execution/stops",
+                "reason": "recognized_stop_start_not_current",
+                "source_label": "operator_ui",
+            },
+        )
+    ]
+    reply = response.json()
+    if entry == "/api/control/commands":
+        assert reply["receipt"]["disposition"] == "received"
+        assert reply["receipt"]["code"] == "operation_stop_received"
+        assert reply["receipt"]["request_key"] == _FORMED_CALLER_KEY
+        reply = reply["result"]
+    assert reply["ok"] is True and reply["command"] == "recognized_stop"
+    assert reply["accepted"]["requested"] == "operation"
+    assert reply["accepted"]["applied"] == "stop_all"
+    assert reply["accepted"]["widen_reason"] == "stale_start"
+    assert runner.calls == []
+
+
+@pytest.mark.parametrize(
+    ("entry", "host_call"),
+    [
+        ("/api/execution/stops", "stop"),
+        ("/api/control/commands", "stop"),
+    ],
+)
+def test_a_stop_naming_the_current_start_is_not_widened(entry: str, host_call: str) -> None:
+    execution = FakeExecution()
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution))
+    with TestClient(app) as client:
+        response = _stale_start_stop_post(client, entry, _APPLICATION_START_ID)
+
+    assert response.status_code == 200, response.text
+    ((name, request),) = execution.requests
+    assert name == host_call
+    assert request.request_context.request_key == _FORMED_CALLER_KEY
+
+
+# Contract 1.6: the one ``A`` check of the runner-originated and preparation
+# routes; 1.5: replies naming an id carry ``A`` and its display form.
+
+
+def _model_attempt_body() -> dict[str, Any]:
+    digest = "sha256:" + "a" * 64
+    return {
+        "schema_version": "manyforge.program_model_attempt.v2",
+        "model_attempt_id": "80" + "00" * 6 + "01" + "00" * 5 + "01" + "0001",
+        "program_run_id": 1,
+        "node_instance_id": "query.1",
+        "node_attempt_id": 1,
+        "external_attempt_index": 1,
+        "assistant_projection_digest": digest,
+        "model_endpoint_alias": "selection",
+        "external_resource_alias": "site_llm",
+        "model_id": "model-a",
+        "prompt_template_id": "select-object",
+        "prompt_template_version": "v1",
+        "prompt_template_digest": digest,
+        "prompt_digest": digest,
+        "argument_digests": {},
+        "attachment_digest": None,
+        "audit_policy": {
+            "redact_argument_values": True,
+            "store_full_prompts": False,
+            "store_full_responses": False,
+        },
+        "prompt_text": None,
+        "argument_values": None,
+        "outcome": "timeout",
+        "error_code": "model_timeout",
+        "error_message": "deadline reached",
+        "response_digest": None,
+        "validated_output_digest": None,
+        "model_version": "",
+        "occurred_at_ns": 123,
+        "occurred_at_wall": "2026-08-10T00:00:00Z",
+        "latency_ms": 30_000.0,
+        "usage": None,
+        "response_value": None,
+    }
+
+
+def _diagnostic_body() -> dict[str, Any]:
+    return {
+        "schema_version": "manyforge.program_diagnostic.v5",
+        "program_run_id": 1,
+        "program_revision": "sha256:" + "a" * 64,
+        "program_binding_id": "sha256:" + "b" * 64,
+        "retained_bundle_id": "sha256:" + "c" * 64,
+        "graph_revision": "sha256:" + "d" * 64,
+        "state": "failed",
+        "reason_code": "value_mismatch",
+        "message": "Check failed",
+        "occurred_at_ns": "1",
+        "occurred_at_wall": "2026-09-08T10:00:00Z",
+        "blackboard": {},
+        "omitted_blackboard_count": 0,
+        "delivery_loss_count": 0,
+        "details": None,
+        "origin": {
+            "kind": "program_node",
+            "node_instance_id": "check.ready",
+            "owner_api": None,
+        },
+    }
+
+
+def _activation_preparation_body() -> dict[str, Any]:
+    return {
+        "request_key": "a7" * 16,
+        "scenario_id": "scenario_a",
+        "project_path": "/projects/scenario_a.scenario",
+        "source_document_digest": "sha256:" + "6" * 64,
+        "captured_input_digest": "sha256:" + "8" * 64,
+        "deployment": {"api_version": "manyforge.deployment.v1"},
+        "model_source_closure": {
+            "schema_version": "manyforge.activation_model_source_closure.v1",
+            "components": [],
+        },
+        "program": {"api_version": "manyforge.program.v3"},
+        "expected_admission_generation": _ADMISSION_GENERATION,
+    }
+
+
+@pytest.mark.parametrize(
+    ("path", "body"),
+    [
+        ("/api/program/model-attempts", _model_attempt_body),
+        ("/api/program/diagnostics", _diagnostic_body),
+        ("/api/activation-preparations", _activation_preparation_body),
+    ],
+)
+@pytest.mark.parametrize(
+    ("start", "code", "status"),
+    [
+        (None, "start_identity_required", 400),
+        (_OTHER_START_ID, "stale_application_start_id", 409),
+    ],
+)
+def test_runner_and_preparation_routes_check_the_application_start(
+    path: str, body, start: str | None, code: str, status: int
+) -> None:
+    core = FakeCore()
+    recorded: list[Any] = []
+
+    def record(value: Any) -> dict[str, Any]:
+        recorded.append(value)
+        return {
+            "schema_version": "manyforge.program_diagnostic_record.v1",
+            "recorded": True,
+        }
+
+    core.record_program_diagnostic = record  # type: ignore[attr-defined]
+    preparer = FakeActivationPreparer()
+    service = _service(core, FakeManager(), activation_preparer=preparer)
+    client = TestClient(create_app(service=service))
+    payload = body()
+    if start is not None:
+        payload["application_start_id"] = start
+    with client:
+        response = client.post(path, json=payload)
+        accepted = client.post(
+            path, json={**body(), "application_start_id": _APPLICATION_START_ID}
+        )
+
+    assert response.status_code == status, response.text
+    assert response.json()["detail"]["code"] == code
+    assert accepted.status_code == 200, accepted.text
+    if path == "/api/activation-preparations":
+        # Answered at acceptance (OD-214): the preparation ends after.
+        _preparation_ended(service, accepted.json()["command"]["request_key"])
+    # Only the request naming this start reached its owner.
+    assert len(core.model_attempts) + len(recorded) + len(preparer.calls) == 1
+
+
+def test_execution_stop_reply_carries_the_start_and_its_display() -> None:
+    class StopExecution(FakeExecution):
+        def stop(
+            self, request: object, *, trusted_principal_id: str | None
+        ) -> dict[str, Any]:
+            super().stop(request, trusted_principal_id=trusted_principal_id)
+            return {
+                "ok": True,
+                "command": "stop",
+                "accepted": {"request_key": "c0" + "b3" * 15, "event_id": 12},
+            }
+
+    execution = StopExecution()
+    app = create_app(service=_service(FakeCore(), FakeManager(), execution))
+    body = {
+        "application_start_id": _APPLICATION_START_ID,
+        "request_context": {"request_key": "b3" * 16, "source_label": "operator_ui"},
+        "operations": [
+            {
+                "operation_id": 7,
+                "expected_operation_revision": 1,
+            }
+        ],
+        "reason": None,
+    }
+    with TestClient(app) as client:
+        response = client.post("/api/execution/stops", json=body)
+
+    assert response.status_code == 200, response.text
+    reply = response.json()
+    assert reply["accepted"]["event_id"] == 12
+    assert reply["application_start_id"] == _APPLICATION_START_ID
+    assert reply["display"] == "3f9a/stop12"
+    # The Kernel receives the key formed from the client's (class 3).
+    assert execution.requests[0][1].request_context.request_key == "c0" + "b3" * 15
+
+
+def test_history_discovery_lists_starts_and_one_starts_runs() -> None:
+    client, core, _manager = _client()
+    calls: list[dict[str, Any]] = []
+
+    def history_discovery(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "schema_version": "manyforge.historian_discovery.v1",
+            "kind": kwargs["kind"],
+            "values": [],
+            "truncated": False,
+            "next_after": None,
+        }
+
+    core.history_discovery = history_discovery  # type: ignore[method-assign]
+    with client:
+        starts = client.get(
+            "/api/execution/history/discovery",
+            params={"kind": "application_start_id", "after": _OTHER_START_ID, "limit": 4},
+        )
+        runs = client.get(
+            "/api/execution/history/discovery",
+            params={"kind": "program_run_id", "application_start_id": _OTHER_START_ID},
+        )
+        too_many = client.get(
+            "/api/execution/history/discovery", params={"kind": "application_start_id", "limit": 33}
+        )
+    assert starts.status_code == 200, starts.text
+    assert runs.status_code == 200, runs.text
+    assert calls == [
+        {"kind": "application_start_id", "after": _OTHER_START_ID, "limit": 4, "application_start_id": None},
+        {"kind": "program_run_id", "after": "", "limit": 32, "application_start_id": _OTHER_START_ID},
+    ]
+    assert too_many.status_code == 422
+
+
+def test_history_start_is_a_filter_and_numbers_default_to_the_current_start() -> None:
+    client, core, _manager = _client()
+    calls: list[dict[str, Any]] = []
+
+    def history(**kwargs: Any) -> dict[str, Any]:
+        calls.append(kwargs)
+        return {
+            "schema_version": "manyforge.historian_summary_page.v3",
+            "events": [],
+            "next_before_sequence": None,
+            "truncated": False,
+        }
+
+    core.history = history  # type: ignore[method-assign]
+    with client:
+        accepted = [
+            client.get(
+                "/api/execution/history",
+                params={"operation_id": "3f9a/op7", "application_start_id": _APPLICATION_START_ID},
+            ),
+            # The copy form carries ``A`` in full: no separate parameter needed.
+            client.get("/api/execution/history", params={"operation_id": f"{_APPLICATION_START_ID}/op7"}),
+            # A bare number means the current start (the store binds it).
+            client.get("/api/execution/history", params={"operation_id": "7"}),
+            # An earlier start by number, by its copy form and as a whole.
+            client.get(
+                "/api/execution/history",
+                params={"operation_id": "7", "application_start_id": _OTHER_START_ID},
+            ),
+            client.get("/api/execution/history", params={"operation_id": f"{_OTHER_START_ID}/op7"}),
+            client.get("/api/execution/history", params={"application_start_id": _OTHER_START_ID}),
+            client.get("/api/execution/history", params={"limit": 3}),
+        ]
+        prefix_not_named = client.get("/api/execution/history", params={"operation_id": "0bad/op7"})
+        prefix_of_another = client.get(
+            "/api/execution/history",
+            params={"operation_id": "0bad/op7", "application_start_id": _APPLICATION_START_ID},
+        )
+        two_starts = client.get(
+            "/api/execution/history",
+            params={"operation_id": f"{_OTHER_START_ID}/op7", "application_start_id": _APPLICATION_START_ID},
+        )
+        malformed_start = client.get("/api/execution/history", params={"application_start_id": "3F9A"})
+        wrong_kind = client.get(
+            "/api/execution/history",
+            params={"operation_id": "3f9a/stop7", "application_start_id": _APPLICATION_START_ID},
+        )
+        # The removed filter name follows the rule for unknown parameters.
+        removed = client.get("/api/execution/history", params={"source_owner_epoch": _APPLICATION_START_ID})
+
+    for response in accepted:
+        assert response.status_code == 200, response.text
+    assert [(call["correlations"], call["application_start_id"]) for call in calls] == [
+        ({"operation_id": "7"}, _APPLICATION_START_ID),
+        ({"operation_id": "7"}, _APPLICATION_START_ID),
+        ({"operation_id": "7"}, None),
+        ({"operation_id": "7"}, _OTHER_START_ID),
+        ({"operation_id": "7"}, _OTHER_START_ID),
+        ({}, _OTHER_START_ID),
+        ({}, None),
+    ]
+    assert prefix_not_named.status_code == 400
+    assert prefix_not_named.json()["detail"]["code"] == "historian_query_invalid"
+    for response in (prefix_of_another, two_starts, malformed_start, wrong_kind):
+        assert response.status_code == 422, response.text
+    assert removed.status_code == 422
+    assert removed.json()["detail"]["code"] == "invalid_request"
+    assert removed.json()["detail"]["details"] == {"query.source_owner_epoch": "extra_forbidden"}
+
+
+@pytest.mark.parametrize("route,kind", [
+    ("/api/execution/stop-all", "stop_all"),
+    ("/api/execution/halt", "halt"),
+])
+def test_stop_all_and_halt_routes_reach_the_kernel_with_no_program(
+    route: str, kind: str
+) -> None:
+    """Stop all and Halt name no run and need no ``A``: they act with no
+    Program loaded and never through the Program runner."""
+
+    execution = FakeExecution()
+    runner = FakeProgramRunner()
+    app = create_app(
+        service=_service(FakeCore(), FakeManager(), execution, program_runner=runner)
+    )
+    with TestClient(app) as client:
+        response = client.post(
+            route,
+            json={"request_context": {"request_key": "b4" * 16, "source_label": "operator_ui"}},
+        )
+    assert response.status_code == 200, response.text
+    reply = response.json()
+    assert reply["command"] == kind
+    assert reply["display"].endswith(f"/stop{reply['accepted']['event_id']}")
+    ((called, request),) = [row for row in execution.requests if row[0] == kind]
+    assert request.request_context.request_key == "c0" + "b4" * 15
+    assert [call[0] for call in runner.calls] == []

@@ -3,10 +3,15 @@ from __future__ import annotations
 import pytest
 
 from manyforge_headless_api.control_dispatch import HeadlessExecutionControlDispatch
-from manyforge_headless_api.control_protocol import ExecutionIngressStamp
+from manyforge_headless_api.control_protocol import (
+    EXECUTION_COMMAND_SCHEMA,
+    ControlFreshnessAuthority,
+    ExecutionCommandRequestDTO,
+    ExecutionIngressStamp,
+)
 from manyforge_headless_api.execution import ExecutionCommandClient
+from manyforge_headless_api.identity import RequestAdmission
 from manyforge_headless_api.native import HeadlessApiError
-from manyforge_headless_api.tests.test_control_ingress import _Clock, _ingress, _request
 from manyforge_headless_api.tests.test_execution_events import (
     _direct_command_request,
     _direct_motion_request,
@@ -23,9 +28,8 @@ class _Service:
         return self.execution
 
     @staticmethod
-    def program_cycle_status():
+    def program_cycle_status(**_kwargs):
         return {
-            "program_runner_owner_epoch": "runner.1",
             "execution_control_revision": 7,
             "cycle_generation": 3,
             "program_run_id": None,
@@ -41,23 +45,40 @@ class _Service:
         return self._execution().stop(request, trusted_principal_id=attribution.principal_id)
 
 
+_APPLICATION_START_ID = "3f9a0000000000a1"
+
+
 def _dispatch(service, payload, kind="operation_start"):
-    ingress, _ = _ingress(_Clock())
-    try:
-        request = _request(ingress, kind=kind).model_copy(update={"payload": payload})
-    finally:
-        ingress.close()
-    return HeadlessExecutionControlDispatch(service)(
+    # A WebSocket command: its session and sequence are its key (class 0)
+    # and the session belongs to one start, so it names no ``A``.
+    freshness = ControlFreshnessAuthority(secret=b"x" * 32).issue(
+        execution_control_revision=7
+    )
+    request = ExecutionCommandRequestDTO.model_validate(
+        {
+            "command_envelope": {
+                "schema_version": EXECUTION_COMMAND_SCHEMA,
+                "command_kind": kind,
+                "source_label": "test",
+                "control_session_number": 1,
+                "client_sequence": "1",
+                "freshness": freshness.model_dump(mode="json"),
+                "expected_execution_control_revision": 7,
+            },
+            "payload": payload,
+        }
+    )
+    return HeadlessExecutionControlDispatch(
+        service, RequestAdmission(_APPLICATION_START_ID)
+    )(
         request,
-        ExecutionIngressStamp(transport_kind="websocket", receiver_incarnation="receiver.1",
+        ExecutionIngressStamp(transport_kind="websocket",
                               received_server_sequence=1, received_monotonic_ns=1),
     )
 
 
 def _payload(model):
-    value = model.model_dump(mode="json")
-    value["expected_execution_owner_epoch"] = "kernel.1"
-    return value
+    return model.model_dump(mode="json")
 
 
 def _client(exchange, calls, result):
@@ -127,7 +148,6 @@ def test_stop_does_not_sync():
     calls = []
     client = _client(lambda _command: pytest.fail("unexpected payload sync"), calls, {})
     response, _ = _dispatch(_Service(client), {
-        "expected_execution_owner_epoch": "kernel.1",
         "components": [{"controllable_component_id": "robot", "expected_graph_revision": "graph",
                         "expected_component_lifecycle_generation": 1}],
     }, kind="operation_stop")
@@ -152,7 +172,7 @@ def test_unavailable_motion_is_rejected_before_submit():
     service = _Service(client)
     status = service.program_cycle_status()
     status["allowed_commands"][0].update(allowed=False, disabled_reason="command_not_allowed")
-    service.program_cycle_status = lambda: status
+    service.program_cycle_status = lambda **_kwargs: status
     response, _ = _dispatch(service, _payload(_direct_motion_request()))
     assert response.disposition == "rejected"
     assert response.code == "command_not_allowed"

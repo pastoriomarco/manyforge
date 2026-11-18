@@ -9,6 +9,8 @@ import {
   heldRun,
 } from '../testFixtures/heldRun';
 import type {
+  ApplyCommandRow,
+  ApplyCommandRows,
   DeploymentWorkspaceResponse,
   JsonValue,
   ManagerApplyStatus,
@@ -33,6 +35,7 @@ const apiMock = vi.hoisted(() => ({
     get: vi.fn(),
     mutate: vi.fn(),
     apply: vi.fn(),
+    revert: vi.fn(),
     discard: vi.fn(),
   },
   deploymentWorkspace: {
@@ -82,7 +85,9 @@ import { useHeldNodePreview, type HeldNodePreviewController } from './useHeldNod
 import { useProgramRuntime, type ProgramRuntimeController } from './useProgramRuntime';
 import { useProgramWorkspace, type ProgramWorkspaceController } from './useProgramWorkspace';
 import { useResetApply, type ResetApplyController } from './useResetApply';
+import { useInitialSceneReload, type InitialSceneReloadController } from './useInitialSceneReload';
 import { applyPreviewFixture } from '../test/applyPreview';
+import { endedApplyRow, endedProgramApplyRow } from '../test/applyCommandRow';
 
 const digest = (fill: string) => `sha256:${fill.repeat(64)}`;
 const NO_TARGETS: readonly DirectControlMotionStatus[] = [];
@@ -109,8 +114,10 @@ interface Environment {
   admissionOpen?: boolean;
   /** The Saved Deployment revision; the Applied one by default. */
   savedDeployment?: string;
-  /** The native execution owner (Robot Control) epoch. */
-  executionOwnerEpoch?: string;
+  /** The application start of the snapshot and its execution status. */
+  applicationStartId?: string;
+  /** Composer's Apply-level command rows (OD-214); none by default. */
+  applyCommands?: ApplyCommandRows;
 }
 
 /** The holds in which nothing moves and nothing can start. */
@@ -131,7 +138,7 @@ const HELD: Environment = {
 function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycleStatus {
   const run = {
     ...heldRun(),
-    state: hold === 'halt' ? 'full_stopped'
+    state: hold === 'halt' ? 'halted'
       : hold === 'operator_stop' || hold === 'running' || hold === 'never_run'
         ? 'running' : 'intervention_required',
     activeOperationCount: hold === 'halt' ? 0 : null,
@@ -161,29 +168,26 @@ function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycle
       : hold === 'halt' ? 'unavailable'
         : hold === 'never_run' ? 'ready' : 'held';
   return {
-    programRunnerOwnerEpoch: 'runner.epoch.1',
     cycleGeneration: 7,
     state: 'running',
-    programRunId: 'run.1',
+    programRunId: 1,
     cycleClaimGeneration: 2,
     terminalOrSettlementReference: null,
     runRevision: 4,
     nodeStatusRevision: 1,
     runtimeControlRevision: 1,
     executionControlRevision: 1,
-    causalCorrelationId: null,
-    causalSessionId: null,
-    causalClientSequence: null,
-    currentCommandKind: null,
+    causalRequestKey: null,
+    causalDisplay: null,
+    currentCommandKind: null, runnerCommands: { inProgress: null, ended: [] },
     failure: null,
     resetPhase: null, resetOptions: null,
     resetRobotPosition: { available: false, reason: 'unsupported' },
-    allowedCommands: ['program_reset', 'program_motion_resume', 'program_resume_full_stop']
+    allowedCommands: ['program_reset', 'program_motion_resume', 'program_resume_halt']
       .map((commandKind) => ({ commandKind, semanticTarget: {}, allowed: true, disabledReason: null })),
     run,
     runtimeControls: {
-      ownerEpoch: 'runner.epoch.1',
-      programRunId: 'run.1',
+      programRunId: 1,
       runRevision: 4,
       runtimeControls: { runtimeControlRevision: 1 },
       recoveryOffer: offer,
@@ -191,7 +195,7 @@ function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycle
         motionGroupIds: ['all'], interventionStopScope: 'all', offer,
       }],
       executionSelections: {
-        selectionRevision: 1,
+        holdRevision: 1,
         motionHeld: groupState === 'held',
         groups: [{
           groupId: 'all', nodeCount: 3, heldNodeCount: groupState === 'held' ? 3 : 0,
@@ -207,10 +211,22 @@ function heldCycle(hold: Hold, patch: Partial<ProgramCycleStatus>): ProgramCycle
   } as unknown as ProgramCycleStatus;
 }
 
-function idleCycle(correlationId: string | null): Partial<ProgramCycleStatus> {
+/** The WebSocket Reset this suite's transport accepts: session 4, client sequence 118. */
+const RESET_COMMAND = { controlSessionNumber: 4, clientSequence: '118' };
+/** Another browser's command on the same Headless start. */
+const OTHER_COMMAND = { controlSessionNumber: 5, clientSequence: '118' };
+
+/** The Idle cycle whose last accepted command was `command`. */
+function idleCycle(
+  command: { controlSessionNumber: number; clientSequence: string } | null,
+): Partial<ProgramCycleStatus> {
   return {
     state: 'idle_after_reset', cycleGeneration: 8, programRunId: null,
-    causalCorrelationId: correlationId, allowedCommands: [],
+    // Class 0 key: session number in bytes 1-7, client sequence in bytes 8-15.
+    causalRequestKey: command === null
+      ? null
+      : `00${command.controlSessionNumber.toString(16).padStart(14, '0')}${BigInt(command.clientSequence).toString(16).padStart(16, '0')}`,
+    allowedCommands: [],
     run: null, runtimeControls: null,
   };
 }
@@ -243,7 +259,8 @@ function programWorkspace(environment: Environment): ProgramWorkspaceResponse {
 
 function deploymentWorkspace(environment: Environment): DeploymentWorkspaceResponse {
   return {
-    schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+    schemaVersion: 'manyforge.composer_deployment_workspace.v2',
+    applyCommands: { inProgress: null, ended: [] },
     authoringWorkspace: identity(environment),
     draft: {
       id: 'deployment-draft-1',
@@ -309,18 +326,18 @@ function headlessSnapshot(environment: Environment): ComposerHeadlessState {
     ? heldCycle('failure_pause', { ...idleCycle(null), ...environment.cycle })
     : heldCycle(environment.hold, environment.cycle);
   return {
-    receiverEpoch: 'receiver.1',
+    applicationStartId: environment.applicationStartId ?? '3f9a0000000000a1',
     executionControlStatus: {
-      ownerEpoch: environment.executionOwnerEpoch ?? 'execution.epoch.1',
+      applicationStartId: environment.applicationStartId ?? '3f9a0000000000a1',
       manualOperations: environment.hold === 'manual_operation'
-        ? [{ resident: true, state: 'executing', operationId: 'manual.1', programRunId: 'manual-run' }]
+        ? [{ resident: true, state: 'executing', operationId: 1 }]
         : [],
       cellStopAction: {
-        available: true, unavailableReason: null, expectedStopGeneration: 0, latestTerminal: null,
+        available: true, unavailableReason: null, lastEventId: null, lastCompleted: null,
       },
     },
-    componentOverview: { basis: { appliedProgramOwnerEpoch: 'applied.1', appliedProgramGeneration: 1 } },
-    runtime: { sections: { manager: { sourceOwnerEpoch: 'manager.1', payload: {} } } },
+    componentOverview: { basis: { appliedProgramGeneration: 1 } },
+    runtime: { sections: { manager: { sourceOwnerId: 'manager.1', payload: {} } } },
     authoringAdmission: {
       authoringAllowed: environment.admissionOpen ?? cycle.state === 'idle_after_reset',
       admissionGeneration: environment.admissionGeneration,
@@ -330,6 +347,7 @@ function headlessSnapshot(environment: Environment): ComposerHeadlessState {
     heldRunDraftEditAllowed: cycle.state === 'running'
       && STOPPED_HOLDS.includes(environment.hold),
     programCycle: cycle,
+    applyCommands: environment.applyCommands ?? { inProgress: null, ended: [] },
     authoringWorkspace: identity(environment),
     authoringWorkspaceContainment: null,
   } as unknown as ComposerHeadlessState;
@@ -345,6 +363,7 @@ function authoringController(
     unavailableReason: authoringUnavailableReason(published, snapshot),
     editUnavailableReason: draftEditUnavailableReason(published, snapshot),
     replaceUnavailableReason: scenarioReplacementUnavailableReason(published, snapshot),
+    failedApplyHoldsCell: false,
     project: projectFacts(published),
     reading: false,
     error: null,
@@ -367,6 +386,7 @@ interface Controllers {
   runtime: ProgramRuntimeController;
   resetApply: ResetApplyController;
   preview: HeldNodePreviewController;
+  sceneReload: InitialSceneReloadController;
 }
 
 const transport = { sendExecutionCommand: vi.fn() };
@@ -399,9 +419,13 @@ function Host({ environment }: { environment: Environment }) {
   useAppliedSettlementRefresh({
     settlement: managerApplySettlementKey(environment.activation), runtime, program,
   });
+  const sceneReload = useInitialSceneReload({
+    runtime, snapshot, authoringAllowed: snapshot.authoringAdmission.authoringAllowed,
+    deploymentApplyEnd: deployment.applyEnd, stoppedResetApply: null,
+  });
   useEffect(() => {
-    hooks = { program, deployment, runtime, resetApply, preview };
-  }, [deployment, preview, program, resetApply, runtime]);
+    hooks = { program, deployment, runtime, resetApply, preview, sceneReload };
+  }, [deployment, preview, program, resetApply, runtime, sceneReload]);
   return null;
 }
 
@@ -447,14 +471,18 @@ beforeEach(() => {
     ready: true, unavailableReasons: [], currentScenario: null,
   });
   apiMock.programs.applied.mockResolvedValue({
-    sourceOwnerEpoch: 'applied.1', sourceGeneration: 1, recordDigest: digest('r'),
+    sourceGeneration: 1, recordDigest: digest('r'),
     programRevision: digest('a'), program: heldProgram(), programBinding: null,
   });
   apiMock.programs.nodeCorrectionPreview.mockReturnValue(new Promise(() => undefined));
   apiMock.programWorkspace.get.mockImplementation(async () => programWorkspace(served));
   apiMock.deploymentWorkspace.get.mockImplementation(async () => deploymentWorkspace(served));
   apiMock.authoringWorkspace.recordResetApplyContext.mockResolvedValue(undefined);
-  transport.sendExecutionCommand.mockResolvedValue({ accepted: true });
+  transport.sendExecutionCommand.mockResolvedValue({
+    ...RESET_COMMAND, disposition: 'received', code: 'received', result: null,
+    receivedServerSequence: '1', receivedMonotonicNs: '1', emittedMonotonicNs: '1',
+    requestKey: null, command: null,
+  });
 });
 
 afterEach(async () => {
@@ -496,8 +524,8 @@ describe('Deployment Apply through the server', () => {
   it('previews first and sends Apply once, only after the operator confirms', async () => {
     await mount(edited);
     apiMock.cellApply.preview.mockResolvedValue(preview);
-    apiMock.cellApply.apply.mockResolvedValue({ outcome: 'succeeded', components: [
-      { component_id: 'arm', disposition: 'replace', lifecycle_after: 'prepared' }] });
+    apiMock.cellApply.apply.mockResolvedValue(endedApplyRow({ outcome: 'succeeded', components: [
+      { component_id: 'arm', disposition: 'replace', lifecycle_after: 'prepared' }] }, 'deployment_apply'));
     await act(async () => { await hooks!.deployment.applyDraft(); });
     expect(apiMock.cellApply.preview).toHaveBeenCalledOnce();
     expect(apiMock.cellApply.apply).not.toHaveBeenCalled();
@@ -551,14 +579,72 @@ describe('Deployment Apply through the server', () => {
     expect(apiMock.cellApply.apply).toHaveBeenCalledOnce();
   });
 
+  it('answers at acceptance, shows the published step while it runs, and the outcome at its end', async () => {
+    const render = await mount(edited);
+    apiMock.cellApply.preview.mockResolvedValue(preview);
+    const row: ApplyCommandRow = {
+      kind: 'deployment_apply', requestKey: 'f'.repeat(32), step: 'resetting_cycle',
+      stepSource: null, acceptedAtNs: 1, end: null,
+    };
+    apiMock.cellApply.apply.mockResolvedValueOnce(row);
+    await act(async () => { await hooks!.deployment.applyDraft(); });
+    let settled = false;
+    await act(async () => { void hooks!.deployment.confirmApply().then(() => { settled = true; }); });
+    await render({ ...edited, applyCommands: { inProgress: {
+      ...row, step: 'disabling', stepSource: { status: 'component_action', componentId: 'arm' },
+    }, ended: [] } });
+    // The step's words are tested with the busy tooltip (state/commandRows).
+    expect(hooks!.deployment.applying).toBe(true);
+    expect(settled).toBe(false);
+    await render({ ...edited, applyCommands: { inProgress: null, ended: [{
+      ...row, step: 'preparing_components', end: { outcome: 'succeeded', code: null, finishedAtNs: 2,
+        details: { components: [{ component_id: 'arm', disposition: 'replace', lifecycle_after: 'prepared' }] } },
+    }] } });
+    await flush();
+    expect(settled).toBe(true);
+    expect(hooks!.deployment.feedback).toBe('Applied: arm prepared.');
+    expect(hooks!.deployment.applying).toBe(false);
+  });
+
+  it('shows an Apply interrupted by a Stop with the catalogue text of its code', async () => {
+    await mount(edited);
+    apiMock.cellApply.preview.mockResolvedValue(preview);
+    apiMock.cellApply.apply.mockResolvedValueOnce({
+      kind: 'deployment_apply', requestKey: 'e'.repeat(32), step: 'preparing_components',
+      stepSource: null, acceptedAtNs: 1,
+      end: { outcome: 'interrupted', code: 'component_action_interrupted_by_stop', details: null, finishedAtNs: 2 },
+    } satisfies ApplyCommandRow);
+    await act(async () => { await hooks!.deployment.applyDraft(); });
+    await act(async () => { await hooks!.deployment.confirmApply(); });
+    expect(hooks!.deployment.error).toBe(
+      `Apply failed: ${codedErrorText({ code: 'component_action_interrupted_by_stop', message: '' })}.`);
+    expect(hooks!.deployment.error).not.toContain('component_action_interrupted_by_stop');
+  });
+
+  it('shows an Apply refused after acceptance as a refusal, with the preparer\'s typed cause', async () => {
+    await mount(edited);
+    apiMock.cellApply.preview.mockResolvedValue(preview);
+    apiMock.cellApply.apply.mockResolvedValueOnce({
+      kind: 'deployment_apply', requestKey: 'c'.repeat(32), step: 'previewing',
+      stepSource: null, acceptedAtNs: '1',
+      end: { outcome: 'refused', code: 'activation_preparation_failed',
+        details: { cause_code: 'program_binding_unresolved' }, finishedAtNs: '2' },
+    } satisfies ApplyCommandRow);
+    await act(async () => { await hooks!.deployment.applyDraft(); });
+    await act(async () => { await hooks!.deployment.confirmApply(); });
+    expect(hooks!.deployment.error).toBe(codedErrorText({ code: 'activation_preparation_failed', message: '' }));
+    expect(hooks!.deployment.errorCauseCode).toBe('program_binding_unresolved');
+    expect(hooks!.deployment.feedback).toBeNull();
+  });
+
   it('shows a failed ApplyResult as the error', async () => {
     await mount(edited);
     apiMock.cellApply.preview.mockResolvedValue(preview);
-    apiMock.cellApply.apply.mockResolvedValueOnce({ outcome: 'failed', components: [],
-      error: { code: 'fault_estop', message: 'e-stop' } });
+    apiMock.cellApply.apply.mockResolvedValueOnce(endedApplyRow({ outcome: 'failed', components: [],
+      error: { code: 'fault_protective_stop', message: 'protective stop' } }, 'deployment_apply'));
     await act(async () => { await hooks!.deployment.applyDraft(); });
     await act(async () => { await hooks!.deployment.confirmApply(); });
-    expect(hooks!.deployment.error).toBe(`Apply failed: ${codedErrorText({ code: 'fault_estop', message: 'e-stop' })}.`);
+    expect(hooks!.deployment.error).toBe(`Apply failed: ${codedErrorText({ code: 'fault_protective_stop', message: 'protective stop' })}.`);
   });
 });
 
@@ -639,7 +725,6 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
     expect(transport.sendExecutionCommand).toHaveBeenCalledExactlyOnceWith(
       'execution_recovery',
       expect.objectContaining({ action_id: 'retry_motion_from_current_state' }),
-      expect.any(String),
     );
   });
 
@@ -660,7 +745,6 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
         offer_revision: offer.offerRevision,
         action_id: 'continue_with_failure',
       }),
-      expect.any(String),
     );
     expect(hooks!.runtime.state.controlPending)
       .toBe(`recovery:${offer.offerId}:continue_with_failure`);
@@ -699,7 +783,6 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
         offer_revision: stop.offerRevision,
         action_id: 'retry_motion_from_current_state',
       }),
-      expect.any(String),
     );
     expect(hooks!.runtime.state.controlPending)
       .toBe(`recovery:${stop.offerId}:retry_motion_from_current_state`);
@@ -736,7 +819,6 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
     expect(transport.sendExecutionCommand).toHaveBeenCalledExactlyOnceWith(
       'execution_recovery',
       expect.objectContaining({ offer_id: stop.offerId, action_id: 'replan_from_stopped_state' }),
-      expect.any(String),
     );
     expect(hooks!.runtime.state.controlPending).toBeNull();
     expect(hooks!.runtime.state.errorRefusal).toEqual(refusal);
@@ -765,6 +847,18 @@ describe('Apply while a run exists', () => {
     return refusal;
   }
 
+  it('waits while the Runner publishes another Program command in progress (OD-144)', async () => {
+    const busy = 'Not available while another Program command is running: Resume, applying.';
+    const render = await mount({ ...HELD, cycle: { runnerCommands: { inProgress: {
+      kind: 'resume_motion', requestKey: 'a'.repeat(32), step: 'applying', acceptedAtNs: 1, end: null,
+    }, ended: [] } } });
+    expect(hooks!.runtime.runnerBusyReason).toBe(busy);
+    expect(hooks!.resetApply.unavailableReason()).toBe(busy);
+    await render(HELD);
+    expect(hooks!.runtime.runnerBusyReason).toBeNull();
+    expect(hooks!.resetApply.unavailableReason()).toBeNull();
+  });
+
   it('Resets exactly the held run, waits for its Idle, then Applies exactly the confirmed Program Draft', async () => {
     const render = await mount(HELD);
     expect(hooks!.resetApply.runExists).toBe(true);
@@ -772,46 +866,42 @@ describe('Apply while a run exists', () => {
     expect(await confirm()).toBeNull();
     const [context] = apiMock.authoringWorkspace.recordResetApplyContext.mock.calls[0];
     expect(context).toMatchObject({
-      document: 'program', programRunId: 'run.1', cycleGeneration: 7,
+      document: 'program', programRunId: 1, cycleGeneration: 7,
       draftId: 'draft-1', draftRevision: 3, draftContentRevision: digest('f'), appliedRevision: digest('a'),
     });
-    const [kind, request, correlationId] = transport.sendExecutionCommand.mock.calls[0] as [
-      string, Record<string, JsonValue>, string,
+    const [kind, request] = transport.sendExecutionCommand.mock.calls[0] as [
+      string, Record<string, JsonValue>,
     ];
     expect(kind).toBe('program_reset');
-    expect(correlationId).toBe(context.correlationId);
-    expect(request).toMatchObject({
-      program_run_id: 'run.1', expected_owner_epoch: 'runner.epoch.1', expected_cycle_generation: 7,
-    });
+    // The Reset is a WebSocket command: no correlation or request id names it.
+    expect(transport.sendExecutionCommand.mock.calls[0]).toHaveLength(2);
+    expect(request).not.toHaveProperty('correlation_id');
+    expect(request).toMatchObject({ program_run_id: 1, expected_cycle_generation: 7 });
     expect(hooks!.resetApply.sequence?.phase).toMatchObject({ kind: 'awaiting_idle', delivery: 'confirmed' });
     // A receipt is not settlement: nothing is Applied while the run is held.
     await render({ ...HELD, admissionGeneration: 10 });
     expect(apiMock.programWorkspace.apply).not.toHaveBeenCalled();
 
-    apiMock.programWorkspace.apply.mockResolvedValue({
-      status: 'accepted',
-      workspace: programWorkspace(HELD),
-      headless: { apply_id: 'apply-1', apply_generation: 2 },
-    });
-    const settled = { ...HELD, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(correlationId) };
+    apiMock.programWorkspace.apply.mockResolvedValue(
+      endedProgramApplyRow('program_apply', { applyId: 1, applyGeneration: 2 }),
+    );
+    const settled = { ...HELD, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(RESET_COMMAND) };
     await render(settled);
     await flush();
     expect(apiMock.programWorkspace.apply).toHaveBeenCalledExactlyOnceWith(
       expect.objectContaining({ draftId: 'draft-1', expectedDraftRevision: 3, expectedAdmissionGeneration: 11 }),
-      undefined,
-      correlationId,
     );
     expect(apiMock.programWorkspace.mutate).not.toHaveBeenCalled();
     expect(hooks!.resetApply.sequence?.phase).toEqual({
-      kind: 'awaiting_apply', apply: { applyId: 'apply-1', applyGeneration: 2 },
+      kind: 'awaiting_apply', apply: { applyId: 1, applyGeneration: 2 },
     });
     // Only the exact activation's success completes it; nothing else follows.
     await render({
       ...settled,
-      activation: { applyId: 'apply-1', applyGeneration: 2, state: 'succeeded', failure: null } as ManagerApplyStatus,
+      activation: { applyId: 1, applyGeneration: 2, state: 'succeeded', failure: null } as ManagerApplyStatus,
     });
     expect(hooks!.resetApply.sequence?.phase).toEqual({
-      kind: 'applied', apply: { applyId: 'apply-1', applyGeneration: 2 },
+      kind: 'applied', apply: { applyId: 1, applyGeneration: 2 },
     });
     expect(transport.sendExecutionCommand).toHaveBeenCalledOnce();
   });
@@ -826,14 +916,13 @@ describe('Apply while a run exists', () => {
     expect(refusal).toBeNull();
     const [context] = apiMock.authoringWorkspace.recordResetApplyContext.mock.calls[0];
     expect(context).toMatchObject({
-      document: 'deployment', programRunId: 'run.1', draftId: 'deployment-draft-1', draftRevision: 2,
+      document: 'deployment', programRunId: 1, draftId: 'deployment-draft-1', draftRevision: 2,
       draftContentRevision: digest('e'), appliedRevision: APPLIED_DEPLOYMENT,
     });
-    const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
     expect(apiMock.cellApply.apply).not.toHaveBeenCalled();
-    apiMock.cellApply.apply.mockResolvedValue({ outcome: 'succeeded', components: [
-      { component_id: 'arm', disposition: 'replace', lifecycle_after: 'prepared' }] });
-    await render({ ...edited, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(correlationId) });
+    apiMock.cellApply.apply.mockResolvedValue(endedApplyRow({ outcome: 'succeeded', components: [
+      { component_id: 'arm', disposition: 'replace', lifecycle_after: 'prepared' }] }, 'deployment_apply'));
+    await render({ ...edited, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(RESET_COMMAND) });
     await flush();
     expect(apiMock.cellApply.apply).toHaveBeenCalledExactlyOnceWith(scope);
     expect(hooks!.resetApply.sequence?.phase).toEqual({ kind: 'applied', apply: null });
@@ -844,10 +933,9 @@ describe('Apply while a run exists', () => {
     const edited = { ...HELD, programRevision: digest('a'), deploymentRevision: 2, deploymentContent: digest('e') };
     const render = await mount(edited);
     await act(async () => { await hooks!.resetApply.confirm('deployment', {}); });
-    const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
-    apiMock.cellApply.apply.mockResolvedValue({ outcome: 'failed', components: [],
-      error: { code: 'fault_estop', message: 'e-stop' } });
-    await render({ ...edited, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(correlationId) });
+    apiMock.cellApply.apply.mockResolvedValue(endedApplyRow({ outcome: 'failed', components: [],
+      error: { code: 'fault_protective_stop', message: 'protective stop' } }, 'deployment_apply'));
+    await render({ ...edited, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(RESET_COMMAND) });
     await flush();
     expect(apiMock.cellApply.apply).toHaveBeenCalledOnce();
     expect(hooks!.resetApply.sequence?.phase).toMatchObject({ kind: 'failed', stage: 'apply' });
@@ -933,22 +1021,22 @@ describe('Apply while a run exists', () => {
     expect(apiMock.cellApply.revertPreview).toHaveBeenCalledOnce();
     expect(hooks!.deployment.applyPreviewKind).toBe('revert');
     expect(hooks!.deployment.scenarioDraftInputResetEpoch).toBe(0);
-    apiMock.cellApply.revert.mockResolvedValueOnce({ outcome: 'failed', components: [],
-      error: { code: 'fault_estop', message: 'e-stop' } });
+    apiMock.cellApply.revert.mockResolvedValueOnce(endedApplyRow({ outcome: 'failed', components: [],
+      error: { code: 'fault_protective_stop', message: 'protective stop' } }, 'deployment_revert'));
     await act(async () => { await hooks!.deployment.confirmApply(); });
     expect(hooks!.deployment.scenarioDraftInputResetEpoch).toBe(0);
 
     apiMock.cellApply.revertPreview.mockResolvedValueOnce(applyPreviewFixture([]));
     await act(async () => { await hooks!.deployment.revert(); });
     apiMock.deploymentWorkspace.get.mockRejectedValueOnce(new Error('postimage unavailable'));
-    apiMock.cellApply.revert.mockResolvedValueOnce({ outcome: 'succeeded', components: [] });
+    apiMock.cellApply.revert.mockResolvedValueOnce(endedApplyRow({ outcome: 'succeeded', components: [] }, 'deployment_revert'));
     await act(async () => { await hooks!.deployment.confirmApply(); });
     expect(hooks!.deployment.scenarioDraftInputResetEpoch).toBe(0);
 
     apiMock.cellApply.revertPreview.mockResolvedValueOnce(applyPreviewFixture([]));
     await act(async () => { await hooks!.deployment.revert(); });
     expect(apiMock.cellApply.revertPreview).toHaveBeenCalledTimes(3);
-    apiMock.cellApply.revert.mockResolvedValueOnce({ outcome: 'succeeded', components: [] });
+    apiMock.cellApply.revert.mockResolvedValueOnce(endedApplyRow({ outcome: 'succeeded', components: [] }, 'deployment_revert'));
     await act(async () => { await hooks!.deployment.confirmApply(); });
     expect(hooks!.deployment.scenarioDraftInputResetEpoch).toBe(1);
     expect(hooks!.program.programDraftInputResetEpoch).toBe(0);
@@ -1045,7 +1133,7 @@ describe('Apply while a run exists', () => {
     const preview = applyPreviewFixture([
       { component_id: 'arm', disposition: 'replace', reasons: ['mount'], restarts: true }]);
     apiMock.cellApply.revertPreview.mockResolvedValue(preview);
-    apiMock.cellApply.revert.mockResolvedValue({ outcome: 'succeeded', components: [] });
+    apiMock.cellApply.revert.mockResolvedValue(endedApplyRow({ outcome: 'succeeded', components: [] }, 'deployment_revert'));
     // Revert goes through Preview → confirm → Apply.
     await act(async () => { await hooks!.deployment.revert(); });
     expect(apiMock.cellApply.revertPreview).toHaveBeenCalledOnce();
@@ -1060,16 +1148,15 @@ describe('Apply while a run exists', () => {
   it('rechecks the settled Reset identity before Apply: a later cycle refuses it', async () => {
     const render = await mount(HELD);
     expect(await confirm()).toBeNull();
-    const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
-    // Idle reached under this correlation, but authoring admission is not yet open.
-    const idle = { ...HELD, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(correlationId), admissionOpen: false };
+    // Idle reached by this Reset, but authoring admission is not yet open.
+    const idle = { ...HELD, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(RESET_COMMAND), admissionOpen: false };
     await render(idle);
     await flush();
     expect(hooks!.resetApply.sequence?.phase).toMatchObject({ kind: 'applying', sent: false, idle: { cycleGeneration: 8 } });
     // Meanwhile another request moved the cycle on; admission then opens.
     await render({
       ...idle, admissionOpen: true, admissionGeneration: 12,
-      cycle: { ...idleCycle('another-request'), cycleGeneration: 9 },
+      cycle: { ...idleCycle(OTHER_COMMAND), cycleGeneration: 9 },
     });
     await flush();
     expect(hooks!.resetApply.sequence?.phase).toMatchObject({
@@ -1079,44 +1166,25 @@ describe('Apply while a run exists', () => {
     expect(apiMock.programWorkspace.apply).not.toHaveBeenCalled();
   });
 
-  it('continues Reset-Apply when the runner owner changes but the confirmed cycle is unchanged', async () => {
-    const render = await mount(HELD);
-    expect(await confirm()).toBeNull();
-    const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
-    const idle = { ...HELD, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(correlationId), admissionOpen: false };
-    await render(idle);
-    await flush();
-    await render({
-      ...idle, admissionOpen: true, admissionGeneration: 12,
-      cycle: { ...idleCycle(correlationId), programRunnerOwnerEpoch: 'runner.epoch.2' },
-    });
-    await flush();
-    expect(apiMock.programWorkspace.apply).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ draftId: 'draft-1', expectedDraftRevision: 3, expectedAdmissionGeneration: 12 }),
-      undefined,
-      correlationId,
-    );
-  });
-
   it('reconciles a lost Reset reply from observation: unknown, no Apply, no resend', async () => {
     transport.sendExecutionCommand.mockRejectedValue(
-      new CommandDeliveryUnconfirmedError('Command delivery is unconfirmed; commands are disabled.'),
+      new CommandDeliveryUnconfirmedError(
+        'Command delivery is unconfirmed; commands other than Stop are disabled.',
+        { command: RESET_COMMAND },
+      ),
     );
     const render = await mount(HELD);
     expect(await confirm()).toBeNull();
     const phase = hooks!.resetApply.sequence!.phase;
     expect(phase).toMatchObject({ kind: 'awaiting_idle', delivery: 'unconfirmed' });
     expect(resetApplyPhaseText(phase)).toContain('unknown: reconciling');
-    const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
     // The resynchronized snapshot still shows the held run.
     await render({ ...HELD, admissionGeneration: 10 });
     expect(hooks!.resetApply.sequence?.phase).toMatchObject({ kind: 'awaiting_idle', delivery: 'unconfirmed' });
     expect(apiMock.programWorkspace.apply).not.toHaveBeenCalled();
-    // The run ends under this correlation: settlement is proven by observation.
-    apiMock.programWorkspace.apply.mockResolvedValue({
-      status: 'applied', workspace: programWorkspace(HELD), headless: null,
-    });
-    await render({ ...HELD, hold: 'idle', admissionGeneration: 11, cycle: idleCycle(correlationId) });
+    // This Reset ends the run: settlement is proven by observation.
+    apiMock.programWorkspace.apply.mockResolvedValue(endedProgramApplyRow('program_apply', null));
+    await render({ ...HELD, hold: 'idle', admissionGeneration: 11, cycle: idleCycle(RESET_COMMAND) });
     await flush();
     expect(apiMock.programWorkspace.apply).toHaveBeenCalledOnce();
     expect(hooks!.resetApply.sequence?.phase).toEqual({ kind: 'applied', apply: null });
@@ -1126,15 +1194,14 @@ describe('Apply while a run exists', () => {
   it('never Applies on an Idle another request reached, nor a Draft changed meanwhile', async () => {
     const render = await mount(HELD);
     expect(await confirm()).toBeNull();
-    await render({ ...HELD, hold: 'idle', admissionGeneration: 11, cycle: idleCycle('someone-else') });
+    await render({ ...HELD, hold: 'idle', admissionGeneration: 11, cycle: idleCycle(OTHER_COMMAND) });
     expect(hooks!.resetApply.sequence?.phase).toMatchObject({ kind: 'failed', stage: 'reset' });
 
     await act(async () => { hooks!.resetApply.dismiss(); });
     await render(HELD);
     expect(await confirm()).toBeNull();
-    const correlationId = transport.sendExecutionCommand.mock.calls[1][2] as string;
     await render({
-      ...HELD, hold: 'idle', admissionGeneration: 11, cycle: idleCycle(correlationId), draftRevision: 4,
+      ...HELD, hold: 'idle', admissionGeneration: 11, cycle: idleCycle(RESET_COMMAND), draftRevision: 4,
     });
     await flush();
     expect(hooks!.resetApply.sequence?.phase).toMatchObject({ kind: 'failed', stage: 'apply', unknown: false });
@@ -1149,7 +1216,7 @@ describe('Apply while a run exists', () => {
       string, Record<string, JsonValue>, string,
     ];
     expect(kind).toBe('program_reset');
-    expect(request).toMatchObject({ program_run_id: 'run.1', expected_cycle_generation: 7 });
+    expect(request).toMatchObject({ program_run_id: 1, expected_cycle_generation: 7 });
     expect(apiMock.programWorkspace.apply).not.toHaveBeenCalled();
   });
 
@@ -1158,6 +1225,231 @@ describe('Apply while a run exists', () => {
     expect(hooks!.resetApply.unavailableReason()).toContain('all Program motion stopped');
     expect(await confirm()).toContain('all Program motion stopped');
     expect(transport.sendExecutionCommand).not.toHaveBeenCalled();
+  });
+});
+
+describe('Revert while a run exists (Reset and Revert)', () => {
+  it('Program: Resets exactly the held run, waits for its Idle, then Reverts, never Applies', async () => {
+    // Saved (a) differs from Applied (b); the Draft is the Applied one.
+    const held = { ...HELD, programRevision: digest('b'), appliedRevision: digest('b') };
+    const render = await mount(held);
+    expect(hooks!.resetApply.unavailableReason('program', 'revert')).toBeNull();
+    let refusal: string | null = 'not called';
+    await act(async () => { refusal = await hooks!.resetApply.confirm('program', null, 'revert'); });
+    expect(refusal).toBeNull();
+    const [context] = apiMock.authoringWorkspace.recordResetApplyContext.mock.calls[0];
+    expect(context).toMatchObject({ document: 'program', action: 'revert', programRunId: 1 });
+    const [kind, request] = transport.sendExecutionCommand.mock.calls[0] as [string, Record<string, JsonValue>];
+    expect(kind).toBe('program_reset');
+    // The run's Reset never reloads: the Revert has not made the Saved Program active yet.
+    expect(request).toMatchObject({ program_run_id: 1, reload_initial_scene: false });
+    expect(apiMock.programWorkspace.revert).not.toHaveBeenCalled();
+    apiMock.programWorkspace.revert.mockResolvedValue(
+      endedProgramApplyRow('program_revert', { applyId: 3, applyGeneration: 1 }),
+    );
+    await render({ ...held, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(RESET_COMMAND) });
+    await flush();
+    expect(apiMock.programWorkspace.revert).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({ draftId: 'draft-1', expectedDraftRevision: 3, expectedAdmissionGeneration: 11 }),
+    );
+    expect(apiMock.programWorkspace.apply).not.toHaveBeenCalled();
+    expect(hooks!.resetApply.sequence?.phase).toEqual({
+      kind: 'awaiting_apply', apply: { applyId: 3, applyGeneration: 1 },
+    });
+  });
+
+  it('Deployment: Resets the held run, waits for its Idle, then Reverts exactly the confirmed Preview', async () => {
+    const held = { ...HELD, programRevision: digest('a'), savedDeployment: digest('5') };
+    const render = await mount(held);
+    expect(hooks!.resetApply.deploymentRunReset).toBe(true);
+    const scope = { deployment_draft_revision: 1 };
+    await act(async () => { await hooks!.resetApply.confirm('deployment', scope, 'revert'); });
+    expect(apiMock.authoringWorkspace.recordResetApplyContext.mock.calls[0][0])
+      .toMatchObject({ document: 'deployment', action: 'revert' });
+    apiMock.cellApply.revert.mockResolvedValue(endedApplyRow({ outcome: 'succeeded', components: [] }, 'deployment_revert'));
+    await render({ ...held, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(RESET_COMMAND) });
+    await flush();
+    expect(apiMock.cellApply.revert).toHaveBeenCalledExactlyOnceWith(scope);
+    expect(apiMock.cellApply.apply).not.toHaveBeenCalled();
+    expect(hooks!.resetApply.sequence?.phase).toEqual({ kind: 'applied', apply: null });
+  });
+
+  it('Deployment: refuses Reset and Revert without a confirmed Preview', async () => {
+    await mount({ ...HELD, programRevision: digest('a'), savedDeployment: digest('5') });
+    let refusal: string | null = null;
+    await act(async () => { refusal = await hooks!.resetApply.confirm('deployment', null, 'revert'); });
+    expect(refusal).toBe('Preview the Deployment Revert before Reset and Revert.');
+    expect(transport.sendExecutionCommand).not.toHaveBeenCalled();
+  });
+
+  it('Deployment: previews a Revert while the run is held, as Apply', async () => {
+    await mount({ ...HELD, programRevision: digest('a'), savedDeployment: digest('5') });
+    apiMock.cellApply.revertPreview.mockResolvedValue(applyPreviewFixture([]));
+    await act(async () => { await hooks!.deployment.revert(); });
+    expect(apiMock.cellApply.revertPreview).toHaveBeenCalledOnce();
+    expect(apiMock.cellApply.revert).not.toHaveBeenCalled();
+  });
+});
+
+describe('Reload initial scene after a Program Apply or Revert', () => {
+  const RESET_ALLOWED = [{ commandKind: 'program_reset', semanticTarget: {}, allowed: true, disabledReason: null }];
+  const moved = { ...heldProgram(), scene: [{ resource_id: 'box', pose: { position: [1, 0, 0] } }] };
+  const resetCalls = () => transport.sendExecutionCommand.mock.calls
+    .filter(([kind]) => kind === 'program_reset')
+    .map(([, request]) => request as Record<string, JsonValue>);
+  async function applyNewScene(revision: string) {
+    apiMock.programs.applied.mockResolvedValue({
+      sourceGeneration: 2, recordDigest: digest('s'), programRevision: revision, program: moved, programBinding: null,
+    });
+    await act(async () => { await hooks!.runtime.refresh(); });
+    await flush();
+  }
+
+  it('with no run: one idle Reset with reload, only after the new Program is Applied', async () => {
+    const idle = {
+      ...HELD, hold: 'idle' as const, admissionGeneration: 12,
+      cycle: { ...idleCycle(null), cycleClaimGeneration: null, allowedCommands: RESET_ALLOWED },
+    };
+    await mount(idle);
+    act(() => { hooks!.sceneReload.expect({ target: 'program', targetProgramRevision: digest('f'), reload: true }); });
+    await flush();
+    expect(resetCalls()).toEqual([]);
+    await applyNewScene(digest('f'));
+    expect(resetCalls()).toEqual([expect.objectContaining({
+      program_run_id: null, reload_initial_scene: true, reset_robot_position: false,
+    })]);
+    // Sent once, whatever re-renders.
+    await flush();
+    expect(resetCalls()).toHaveLength(1);
+  });
+
+  it('without the option: no Reset', async () => {
+    const idle = {
+      ...HELD, hold: 'idle' as const, admissionGeneration: 12,
+      cycle: { ...idleCycle(null), cycleClaimGeneration: null, allowedCommands: RESET_ALLOWED },
+    };
+    await mount(idle);
+    act(() => { hooks!.sceneReload.expect({ target: 'program', targetProgramRevision: digest('f'), reload: false }); });
+    await applyNewScene(digest('f'));
+    expect(resetCalls()).toEqual([]);
+    expect(hooks!.sceneReload.tracking).toMatchObject({ expectation: null, reload: null });
+  });
+
+  it('with a run: the run\'s Reset first, then the Apply, then the reload Reset', async () => {
+    const render = await mount(HELD);
+    act(() => { hooks!.sceneReload.expect({ target: 'program', targetProgramRevision: digest('f'), reload: true }); });
+    await act(async () => { await hooks!.resetApply.confirm(); });
+    expect(resetCalls()).toEqual([expect.objectContaining({ program_run_id: 1, reload_initial_scene: false })]);
+    apiMock.programWorkspace.apply.mockResolvedValue(
+      endedProgramApplyRow('program_apply', { applyId: 1, applyGeneration: 2 }),
+    );
+    await render({
+      ...HELD, hold: 'idle' as const, admissionGeneration: 11,
+      cycle: { ...idleCycle(RESET_COMMAND), cycleClaimGeneration: null, allowedCommands: RESET_ALLOWED },
+    });
+    await flush();
+    expect(apiMock.programWorkspace.apply).toHaveBeenCalledOnce();
+    // Not before the new Program is Applied.
+    expect(resetCalls()).toHaveLength(1);
+    await applyNewScene(digest('f'));
+    expect(resetCalls()).toHaveLength(2);
+    expect(resetCalls()[1]).toMatchObject({ program_run_id: null, reload_initial_scene: true });
+  });
+
+  it('a refused reload leaves the Apply applied and is not resent', async () => {
+    const idle = {
+      ...HELD, hold: 'idle' as const, admissionGeneration: 12,
+      cycle: { ...idleCycle(null), cycleClaimGeneration: null, allowedCommands: RESET_ALLOWED },
+    };
+    await mount(idle);
+    transport.sendExecutionCommand.mockRejectedValueOnce(new CommandRefusalError({
+      code: 'authoring_not_ready', message: 'not ready', details: null, origin: null,
+    }));
+    act(() => { hooks!.sceneReload.expect({ target: 'program', targetProgramRevision: digest('f'), reload: true }); });
+    await applyNewScene(digest('f'));
+    await flush();
+    expect(resetCalls()).toHaveLength(1);
+    expect(hooks!.sceneReload.tracking).toMatchObject({ reload: null });
+    expect(hooks!.runtime.state.applied?.programRevision).toBe(digest('f'));
+    // The refusal is the Reset's own typed error, shown where a Reset's is.
+    expect(hooks!.runtime.state.errorRefusal?.code).toBe('authoring_not_ready');
+  });
+});
+
+describe('Reload initial scene after a Deployment Apply or Revert', () => {
+  const RESET_ALLOWED = [{ commandKind: 'program_reset', semanticTarget: {}, allowed: true, disabledReason: null }];
+  const resetCalls = () => transport.sendExecutionCommand.mock.calls
+    .filter(([kind]) => kind === 'program_reset')
+    .map(([, request]) => request as Record<string, JsonValue>);
+  const idle = {
+    ...HELD, hold: 'idle' as const, admissionGeneration: 12, deploymentRevision: 2, deploymentContent: digest('e'),
+    savedDeployment: digest('5'),
+    cycle: { ...idleCycle(null), cycleClaimGeneration: null, allowedCommands: RESET_ALLOWED },
+  };
+
+  it('Apply: one idle Reset with reload, only after its Apply command ended without error', async () => {
+    await mount(idle);
+    apiMock.cellApply.preview.mockResolvedValue(applyPreviewFixture([]));
+    await act(async () => { await hooks!.deployment.applyDraft(); });
+    act(() => { hooks!.sceneReload.expect({ target: 'deployment', reload: true }); });
+    await flush();
+    expect(resetCalls()).toEqual([]);
+    let resolveApply: (row: unknown) => void = () => undefined;
+    apiMock.cellApply.apply.mockReturnValueOnce(new Promise((resolve) => { resolveApply = resolve; }));
+    let applying: Promise<unknown> = Promise.resolve();
+    act(() => { applying = hooks!.deployment.confirmApply(); });
+    await flush();
+    // Never before the Apply is Applied.
+    expect(resetCalls()).toEqual([]);
+    await act(async () => {
+      resolveApply(endedApplyRow({ outcome: 'succeeded', components: [] }, 'deployment_apply'));
+      await applying;
+    });
+    await flush();
+    expect(resetCalls()).toEqual([expect.objectContaining({
+      program_run_id: null, reload_initial_scene: true, reset_robot_position: false,
+    })]);
+    await flush();
+    expect(resetCalls()).toHaveLength(1);
+  });
+
+  it('Revert: one idle Reset with reload after it is Applied; none after a failed one or unchecked', async () => {
+    await mount(idle);
+    const revert = async (reload: boolean, outcome: 'succeeded' | 'failed') => {
+      apiMock.cellApply.revertPreview.mockResolvedValueOnce(applyPreviewFixture([]));
+      await act(async () => { await hooks!.deployment.revert(); });
+      act(() => { hooks!.sceneReload.expect({ target: 'deployment', reload }); });
+      apiMock.cellApply.revert.mockResolvedValueOnce(endedApplyRow(outcome === 'succeeded'
+        ? { outcome, components: [] }
+        : { outcome, components: [], error: { code: 'fault_protective_stop', message: 'protective stop' } },
+      'deployment_revert'));
+      await act(async () => { await hooks!.deployment.confirmApply(); });
+      await flush();
+    };
+    await revert(true, 'failed');
+    await revert(false, 'succeeded');
+    expect(resetCalls()).toEqual([]);
+    await revert(true, 'succeeded');
+    expect(resetCalls()).toEqual([expect.objectContaining({ program_run_id: null, reload_initial_scene: true })]);
+  });
+
+  it('with a run: the run\'s Reset first, then the Revert, then the reload Reset', async () => {
+    const held = { ...HELD, programRevision: digest('a'), savedDeployment: digest('5') };
+    const render = await mount(held);
+    act(() => { hooks!.sceneReload.expect({ target: 'deployment', reload: true }); });
+    await act(async () => { await hooks!.resetApply.confirm('deployment', { deployment_draft_revision: 1 }, 'revert'); });
+    expect(resetCalls()).toEqual([expect.objectContaining({ program_run_id: 1, reload_initial_scene: false })]);
+    apiMock.cellApply.revert.mockResolvedValue(endedApplyRow({ outcome: 'succeeded', components: [] }, 'deployment_revert'));
+    await render({
+      ...held, hold: 'idle' as const, admissionGeneration: 11,
+      cycle: { ...idleCycle(RESET_COMMAND), cycleClaimGeneration: null, allowedCommands: RESET_ALLOWED },
+    });
+    await flush();
+    expect(apiMock.cellApply.revert).toHaveBeenCalledOnce();
+    expect(hooks!.resetApply.sequence?.phase).toEqual({ kind: 'applied', apply: null });
+    await flush();
+    expect(resetCalls()).toHaveLength(2);
+    expect(resetCalls()[1]).toMatchObject({ program_run_id: null, reload_initial_scene: true });
   });
 });
 
@@ -1172,10 +1464,9 @@ describe('Applied view after an Apply settles', () => {
     expect(hooks!.runtime.composerRefusalReason).toMatch(/^Apply or Discard first/);
     expect(programActionUnavailableReason(hooks!.program.state.workspace, 'apply', null)).toBeNull();
 
-    apiMock.programWorkspace.apply.mockResolvedValue({
-      status: 'accepted', workspace: programWorkspace(before),
-      headless: { apply_id: 'apply-3', apply_generation: 6 },
-    });
+    apiMock.programWorkspace.apply.mockResolvedValue(
+      endedProgramApplyRow('program_apply', { applyId: 3, applyGeneration: 6 }),
+    );
     await act(async () => { await hooks!.program.apply(); });
     expect(apiMock.programWorkspace.apply).toHaveBeenCalledOnce();
     const appliedReads = apiMock.programs.applied.mock.calls.length;
@@ -1185,10 +1476,10 @@ describe('Applied view after an Apply settles', () => {
     // (its earlier wake raced the readback), so only settlement can re-read.
     const after: Environment = {
       ...before, admissionGeneration: 12, appliedRevision: digest('f'),
-      activation: { applyId: 'apply-3', applyGeneration: 6, state: 'succeeded', failure: null } as ManagerApplyStatus,
+      activation: { applyId: 3, applyGeneration: 6, state: 'succeeded', failure: null } as ManagerApplyStatus,
     };
     apiMock.programs.applied.mockResolvedValue({
-      sourceOwnerEpoch: 'applied.1', sourceGeneration: 2, recordDigest: digest('q'),
+      sourceGeneration: 2, recordDigest: digest('q'),
       programRevision: digest('f'), program: heldProgram(), programBinding: null,
     });
     await render(after);
@@ -1243,7 +1534,7 @@ describe('Advisory preview of the failed node in the ordinary editor', () => {
       await act(async () => { vi.advanceTimersByTime(1_000); });
       await flush();
       expect(hooks!.preview.preview?.status).toBe('ready');
-      await render({ ...HELD, authoring, executionOwnerEpoch: 'execution.epoch.2' });
+      await render({ ...HELD, authoring, applicationStartId: '3f9a0000000000a2' });
       expect(hooks!.preview.preview?.status).toBe('pending');
       await act(async () => { vi.advanceTimersByTime(1_000); });
       expect(apiMock.programs.nodeCorrectionPreview).toHaveBeenCalledTimes(2);
@@ -1263,7 +1554,7 @@ describe('Advisory preview of the failed node in the ordinary editor', () => {
       await act(async () => { vi.advanceTimersByTime(1_000); });
       expect(apiMock.programs.nodeCorrectionPreview).toHaveBeenCalledExactlyOnceWith(
         expect.objectContaining({
-          program_run_id: 'run.1', node_instance_id: 'move', node_attempt_id: 'move.attempt.1',
+          program_run_id: 1, node_instance_id: 'move', node_attempt_id: 1,
           proposed_inputs: [{ path: 'speed', value: 0.5 }],
         }),
       );

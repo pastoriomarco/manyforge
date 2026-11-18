@@ -37,9 +37,6 @@ from manyforge_behavior.program_clock import ProgramClock
 
 from .v3_fixtures import signal, target_binding
 
-# The Runner's execution transport timeout handed to owner task nodes.
-_TRANSPORT_TIMEOUT_S = 30.0
-
 _RUNNING = py_trees.common.Status.RUNNING
 _SUCCESS = py_trees.common.Status.SUCCESS
 _FAILURE = py_trees.common.Status.FAILURE
@@ -69,7 +66,7 @@ class _MockPort:
     def __init__(self, log: list[tuple[str, ...]], replies: list[Any] | None = None) -> None:
         self.log = log
         self.replies = list(replies or [])
-        self.built: list[tuple[str, int]] = []
+        self.built: list[tuple[int, int]] = []
         self.sent: list[dict[str, Any]] = []
 
     def request(self, identity, node_start_index, signals):
@@ -106,7 +103,7 @@ class _Attempts:
 
     def begin(self, node_instance_id: str) -> NodeAttemptIdentity:
         self.count += 1
-        return NodeAttemptIdentity("run.1", node_instance_id, f"attempt.{self.count}")
+        return NodeAttemptIdentity(1, node_instance_id, self.count)
 
 
 class _Store:
@@ -171,7 +168,7 @@ class _TaskPort:
     def acknowledge(self, task_id, identity) -> None:
         pass
 
-    def close(self, task_id, identity, *, request_id) -> bool:
+    def close(self, task_id, identity, *, request_key) -> bool:
         return True
 
     def release_preempted(self, task_id, identity) -> None:
@@ -193,7 +190,7 @@ def _clock() -> ProgramClock:
 
 def _motion(mock, events, log, rows=_ROWS):
     port = _TaskPort(log)
-    node = InterruptMotionTaskAdapter(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+    node = InterruptMotionTaskAdapter(
         **_common("motion.move_until_signal", mock, events, rows),
         port=port,
         owner_port_name="kernel_operations",
@@ -243,14 +240,14 @@ def test_one_send_per_attempt_before_the_action(kind: str) -> None:
     mock = _MockPort(log)
     node, _port = _ADAPTERS[kind](mock, events, log)
     _run(node)
-    assert log[0] == ("mock", "attempt.1", "1")
-    assert [entry for entry in log if entry[0] == "mock"] == [("mock", "attempt.1", "1")]
-    assert ("act", "attempt.1") in log
-    assert mock.built == [("attempt.1", 1)]
+    assert log[0] == ("mock", 1, "1")
+    assert [entry for entry in log if entry[0] == "mock"] == [("mock", 1, "1")]
+    assert ("act", 1) in log
+    assert mock.built == [(1, 1)]
     assert [event for event in events if event["kind"] == "program_node_mock_simulation"] == [{
         "kind": "program_node_mock_simulation",
         "node_instance_id": "node",
-        "node_attempt_id": "attempt.1",
+        "node_attempt_id": 1,
         "node_start_index": "1",
         "started_at_ns": "1000000",
         "applied": [signal("io.1", "ready")],
@@ -262,7 +259,7 @@ def test_an_instant_read_invokes_on_the_same_tick_after_the_ack() -> None:
     log: list[tuple[str, ...]] = []
     node, _port = _read(_MockPort(log), [], log)
     assert _tick(node) is _SUCCESS
-    assert log == [("mock", "attempt.1", "1"), ("act", "attempt.1"), ("end", "attempt.1", "1")]
+    assert log == [("mock", 1, "1"), ("act", 1), ("end", 1, "1")]
 
 
 @pytest.mark.parametrize("kind", sorted(_ADAPTERS))
@@ -274,7 +271,7 @@ def test_an_empty_or_absent_mock_simulation_sends_nothing(kind: str) -> None:
         _tick(node)
         node.stop(_INVALID)
         assert mock.sent == [] and mock.built == []
-        assert log == [("act", "attempt.1")]  # No start and no end.
+        assert log == [("act", 1)]  # No start and no end.
 
 
 @pytest.mark.parametrize("kind", sorted(_ADAPTERS))
@@ -290,10 +287,10 @@ def test_a_lost_ack_resends_the_identical_request_without_acting(kind: str) -> N
     _tick(node)
     # Same request three times: no new index, no new attempt.
     assert mock.sent == [mock.sent[0]] * 3
-    assert mock.built == [("attempt.1", 1)]
-    assert log[:4] == [("mock", "attempt.1", "1")] * 3 + [("act", "attempt.1")]
-    assert log.count(("end", "attempt.1", "1")) <= 1
-    assert node.attempt_identity.node_attempt_id == "attempt.1"
+    assert mock.built == [(1, 1)]
+    assert log[:4] == [("mock", 1, "1")] * 3 + [("act", 1)]
+    assert log.count(("end", 1, "1")) <= 1
+    assert node.attempt_identity.node_attempt_id == 1
     assert len([event for event in events if event["kind"] == "program_node_mock_simulation"]) == 1
 
 
@@ -311,7 +308,7 @@ def test_a_closed_refusal_fails_the_node_without_acting(kind: str) -> None:
     assert node.failure_reason_code == "mock_simulation_refused"
     assert node.failure_details == {"reason": "mock_simulation_stale"}
     assert "mock_simulation_stale" in node.failure_message
-    assert [entry for entry in log if entry[0] != "end"] == [("mock", "attempt.1", "1")]
+    assert [entry for entry in log if entry[0] != "end"] == [("mock", 1, "1")]
 
 
 @pytest.mark.parametrize("kind", sorted(_ADAPTERS))
@@ -322,9 +319,9 @@ def test_re_entry_takes_a_new_index(kind: str) -> None:
     _tick(node)
     node.stop(_INVALID)  # The parent ends the node (or retry_v1 re-enters it).
     _run(node)
-    assert mock.built == [("attempt.1", 1), ("attempt.2", 2)]
+    assert mock.built == [(1, 1), (2, 2)]
     assert [entry for entry in log if entry[0] != "act"][:3] == [
-        ("mock", "attempt.1", "1"), ("end", "attempt.1", "1"), ("mock", "attempt.2", "2")
+        ("mock", 1, "1"), ("end", 1, "1"), ("mock", 2, "2")
     ]
 
 
@@ -336,7 +333,7 @@ def test_parent_ending_a_waiting_node_stops_resends() -> None:
     node.stop(_INVALID)
     # A halted or stopped tree does not tick the node: nothing more is sent.
     assert len(mock.sent) == 1
-    assert log[-1] == ("end", "attempt.1", "1")
+    assert log[-1] == ("end", 1, "1")
 
 
 @pytest.mark.parametrize("kind", sorted(_ADAPTERS))
@@ -349,8 +346,8 @@ def test_end_is_sent_once_when_the_attempt_ends(kind: str) -> None:
         assert not any(entry[0] == "end" for entry in log)
     node.stop(_INVALID)  # Parent end, preemption or Program Stop/Reset.
     node.stop(_INVALID)
-    assert log.count(("end", "attempt.1", "1")) == 1
-    assert log[-1] == ("end", "attempt.1", "1")
+    assert log.count(("end", 1, "1")) == 1
+    assert log[-1] == ("end", 1, "1")
 
 
 def test_a_failed_attempt_ends_once() -> None:
@@ -359,7 +356,7 @@ def test_a_failed_attempt_ends_once() -> None:
     port.state = OwnerTaskState.FAILED
     assert _tick(node) is _FAILURE
     node.stop(_INVALID)
-    assert log == [("mock", "attempt.1", "1"), ("act", "attempt.1"), ("end", "attempt.1", "1")]
+    assert log == [("mock", 1, "1"), ("act", 1), ("end", 1, "1")]
 
 
 class _Interventions:
@@ -384,7 +381,7 @@ def test_operator_retry_takes_a_new_index() -> None:
         "authored_failure_policy_parameter": "no_feasible_plan_policy",
     }
     interventions = _Interventions()
-    node = OwnerTaskAdapter(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+    node = OwnerTaskAdapter(
         **_common("motion.move_until_signal", mock, [], _ROWS),
         port=port,
         owner_port_name="kernel_operations",
@@ -396,10 +393,10 @@ def test_operator_retry_takes_a_new_index() -> None:
     assert _tick(node) is _RUNNING  # Retry: a fresh attempt.
     port.state = OwnerTaskState.ACTIVE
     _tick(node)
-    assert mock.built == [("attempt.1", 1), ("attempt.2", 2)]
+    assert mock.built == [(1, 1), (2, 2)]
     assert log == [
-        ("mock", "attempt.1", "1"), ("act", "attempt.1"), ("end", "attempt.1", "1"),
-        ("mock", "attempt.2", "2"), ("act", "attempt.2"),
+        ("mock", 1, "1"), ("act", 1), ("end", 1, "1"),
+        ("mock", 2, "2"), ("act", 2),
     ]
 
 
@@ -408,7 +405,7 @@ class _StopState:
         self.revision = 1
 
     def snapshot(self):
-        return SimpleNamespace(selection_revision=self.revision, held_nodes=frozenset())
+        return SimpleNamespace(hold_revision=self.revision, held_nodes=frozenset())
 
     def observation_error(self):
         return None
@@ -423,7 +420,7 @@ def test_hold_before_admission_release_takes_a_new_index() -> None:
     port = _TaskPort(log)
     port.start_errors = [OwnerInvocationHeldError(1)]
     stop = _StopState()
-    node = OwnerTaskAdapter(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+    node = OwnerTaskAdapter(
         **_common("motion.move_until_signal", mock, [], _ROWS),
         port=port,
         owner_port_name="kernel_operations",
@@ -435,10 +432,10 @@ def test_hold_before_admission_release_takes_a_new_index() -> None:
     assert len(mock.sent) == 1
     stop.revision = 2  # The owner released the hold.
     _tick(node)
-    assert mock.built == [("attempt.1", 1), ("attempt.2", 2)]
+    assert mock.built == [(1, 1), (2, 2)]
     assert log == [
-        ("mock", "attempt.1", "1"), ("act", "attempt.1"), ("end", "attempt.1", "1"),
-        ("mock", "attempt.2", "2"), ("act", "attempt.2"),
+        ("mock", 1, "1"), ("act", 1), ("end", 1, "1"),
+        ("mock", 2, "2"), ("act", 2),
     ]
 
 
@@ -448,7 +445,7 @@ def test_interrupt_motion_has_no_automatic_retry_and_no_double_send() -> None:
     node, port = _motion(mock, [], log)
     port.state = OwnerTaskState.FAILED
     port.metadata = {
-        "operation_id": "op",
+        "operation_id": 1,
         "recovery_assessment": {
             "recovery_class": "planning_failed",
             "status": "retry_ready",
@@ -494,11 +491,11 @@ _END_EXAMPLE = _fixture("end.request.example.json")
 _END_ACK = _fixture("end.ack.example.json")
 _BINDING = _START["request"]["program_binding_id"]
 _OCCURRENCE = (
-    "owner_epoch", "program_binding_id", "program_runner_owner_epoch", "claim_generation",
-    "program_run_id", "node_instance_id", "node_attempt_id", "node_start_index",
+    "program_binding_id", "claim_generation", "program_run_id",
+    "node_instance_id", "node_attempt_id", "node_start_index",
 )
 _END = _END_EXAMPLE["request"]
-_RESPONSE = "manyforge.execution_command_response.v4"
+_RESPONSE = "manyforge.execution_command_response.v6"
 _LOST = "lost"
 
 
@@ -537,7 +534,7 @@ class _Host:
 def _context() -> ProgramRunPortContext:
     io_target = target_binding("io.1", "io.command", [])
     return ProgramRunPortContext(
-        program_run_id="run.1", applied_record_digest=_D, scenario_id="s",
+        program_run_id=1, applied_record_digest=_D, scenario_id="s",
         source_document_digest=_A, program_id="p", program_revision=_A,
         program_binding_id=_BINDING, retained_bundle_id=_B, graph_revision=_C,
         node_environment_digest=_D,
@@ -565,16 +562,15 @@ class _Transport:
 
     def identity(self) -> dict[str, Any]:
         return {"ok": True, "identity": {
-            "owner_epoch": "kernel.owner", "graph_revision": _C, "retained_bundle_id": _B,
+            "graph_revision": _C, "retained_bundle_id": _B,
             "scene_revision": {"scene_id": _D, "revision_id": 1, "content_hash": _D},
         }}
 
-    def read_program_execution_scope(self, program_run_id: str) -> dict[str, Any]:
+    def read_program_execution_scope(self, program_run_id: int) -> dict[str, Any]:
         return {"ok": True, "scope": {
-            "schema_version": "manyforge.program_execution_scope.v2",
-            "program_run_id": program_run_id, "request_owner_epoch": "kernel.owner",
-            "program_runner_owner_epoch": "runner.owner", "claim_generation": 1,
-            "selection_revision": 0,
+            "schema_version": "manyforge.program_execution_scope.v3",
+            "program_run_id": program_run_id, "claim_generation": 1,
+            "hold_revision": 0,
         }}
 
 
@@ -594,7 +590,7 @@ def _native(monkeypatch, tmp_path):
     return port, host
 
 
-_IDENTITY = NodeAttemptIdentity("run.1", "search_trip", "attempt:opaque")
+_IDENTITY = NodeAttemptIdentity(1, "search_trip", 1)
 
 
 def test_start_wire_round_trips_the_frozen_examples(monkeypatch, tmp_path) -> None:
@@ -602,7 +598,7 @@ def test_start_wire_round_trips_the_frozen_examples(monkeypatch, tmp_path) -> No
     host.script["start_mock_io_node_simulation"] = [_ACK]
     ack = wire.start_mock_io_node_simulation(deepcopy(_START["request"]))
     assert host.envelopes == [_START]
-    assert ack == _ACK and len(ack) == 14
+    assert ack == _ACK and len(ack) == 12
 
 
 def test_run_pause_wire_round_trips_the_frozen_examples(monkeypatch, tmp_path) -> None:
@@ -610,8 +606,8 @@ def test_run_pause_wire_round_trips_the_frozen_examples(monkeypatch, tmp_path) -
     host.script["set_mock_io_run_paused"] = [_PAUSE_ACK]
     ack = wire.set_mock_io_run_paused(deepcopy(_PAUSE["request"]))
     assert host.envelopes == [_PAUSE]
-    assert len(_PAUSE["request"]) == 9
-    assert ack == _PAUSE_ACK and len(ack) == 11
+    assert len(_PAUSE["request"]) == 7
+    assert ack == _PAUSE_ACK and len(ack) == 9
 
 
 def test_end_wire_is_the_start_occurrence_with_its_schema(monkeypatch, tmp_path) -> None:
@@ -619,9 +615,9 @@ def test_end_wire_is_the_start_occurrence_with_its_schema(monkeypatch, tmp_path)
     host.script["end_mock_io_node_simulation"] = [_END_ACK]
     ack = wire.end_mock_io_node_simulation(deepcopy(_END))
     assert host.envelopes == [_END_EXAMPLE]
-    assert _END == {"schema_version": "manyforge.mock_io_node_end.v1",
+    assert _END == {"schema_version": "manyforge.mock_io_node_end.v2",
                     **{name: _START["request"][name] for name in _OCCURRENCE}}
-    assert ack == _END_ACK and len(ack) == 11
+    assert ack == _END_ACK and len(ack) == 9
 
 
 def test_wire_error_keeps_its_code_and_details(monkeypatch, tmp_path) -> None:
@@ -704,7 +700,7 @@ def test_native_port_builds_the_canonical_request_with_a_decimal_index(
     request = port.mock_simulation.request(_IDENTITY, 2**64 - 1, _ROWS)
     assert request == {
         **{key: _START["request"][key] for key in _OCCURRENCE},
-        "schema_version": "manyforge.mock_io_node_start.v2",
+        "schema_version": "manyforge.mock_io_node_start.v3",
         "node_start_index": "18446744073709551615",
         # Canonical selector order; an omitted change is an explicit null.
         "signals": [
@@ -729,7 +725,7 @@ def test_a_start_without_the_runs_pause_state_is_refused_unsent(monkeypatch, tmp
 
 def test_the_initial_pause_state_precedes_the_first_start(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
-    port.mock_simulation.set_run_paused("run.1", 1, False)
+    port.mock_simulation.set_run_paused(1, 1, False)
     request = port.mock_simulation.request(_IDENTITY, 1, _ROWS[:1])
     assert port.mock_simulation.start(request)["status"] == "accepted"
     assert host.envelopes == [_PAUSE, _START]
@@ -740,7 +736,7 @@ def test_a_lost_pause_reply_is_resent_identically_before_the_start(
 ) -> None:
     port, host = _native(monkeypatch, tmp_path)
     host.script["set_mock_io_run_paused"] = [_LOST, _LOST]
-    port.mock_simulation.set_run_paused("run.1", 1, False)
+    port.mock_simulation.set_run_paused(1, 1, False)
     assert host.envelopes == []  # Recorded only: no START yet.
     request = port.mock_simulation.request(_IDENTITY, 1, _ROWS[:1])
     for _ in range(2):
@@ -758,58 +754,58 @@ def test_a_refused_resume_is_resent_identically_without_a_new_revision(
     port, host = _native(monkeypatch, tmp_path)
     refusal = {"api_version": _RESPONSE, "ok": False, "error": {
         "code": "stale_generation", "message": "not current", "details": {}}}
-    port.mock_simulation.set_run_paused("run.1", 1, False)
+    port.mock_simulation.set_run_paused(1, 1, False)
     port.mock_simulation.start(port.mock_simulation.request(_IDENTITY, 1, _ROWS[:1]))
-    port.mock_simulation.set_run_paused("run.1", 2, True)  # Halt.
+    port.mock_simulation.set_run_paused(1, 2, True)  # Halt.
     host.script["set_mock_io_run_paused"] = [refusal]
-    port.mock_simulation.set_run_paused("run.1", 3, False)  # Resume: refused.
-    assert port.mock_simulation.resend_run_pause("run.1") == ((), None)  # Resent: ACKed.
+    port.mock_simulation.set_run_paused(1, 3, False)  # Resume: refused.
+    assert port.mock_simulation.resend_run_pause(1) == ((), None)  # Resent: ACKed.
     resumes = [envelope["request"] for envelope in host.envelopes][3:]
     assert resumes == [{**_PAUSE["request"], "run_revision": "3"}] * 2
-    assert port.mock_simulation.resend_run_pause("run.1") == ((), None)
+    assert port.mock_simulation.resend_run_pause(1) == ((), None)
     assert len(host.envelopes) == 5  # Settled: no second revision, no resend.
 
 
 def test_a_stale_pause_refusal_is_logged_and_not_retried(monkeypatch, tmp_path, caplog) -> None:
     port, host = _native(monkeypatch, tmp_path)
     host.script["set_mock_io_run_paused"] = [_ERROR]
-    port.mock_simulation.set_run_paused("run.1", 1, False)
+    port.mock_simulation.set_run_paused(1, 1, False)
     port.mock_simulation.start(port.mock_simulation.request(_IDENTITY, 1, _ROWS[:1]))
     # No accepted receipt: reported unconfirmed once, never retried.
-    assert port.mock_simulation.resend_run_pause("run.1") == (
+    assert port.mock_simulation.resend_run_pause(1) == (
         ({"paused": False, "run_revision": "1", "held_node_instance_ids": []},), None
     )
-    assert port.mock_simulation.resend_run_pause("run.1") == ((), None)
+    assert port.mock_simulation.resend_run_pause(1) == ((), None)
     assert host.commands() == ["set_mock_io_run_paused", "start_mock_io_node_simulation"]
     assert "stale" in caplog.text
 
 
 def test_a_lower_pause_revision_is_never_sent(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
-    port.mock_simulation.set_run_paused("run.1", 1, False)
+    port.mock_simulation.set_run_paused(1, 1, False)
     port.mock_simulation.start(port.mock_simulation.request(_IDENTITY, 1, _ROWS[:1]))
-    port.mock_simulation.set_run_paused("run.1", 3, True)
-    port.mock_simulation.set_run_paused("run.1", 2, False)
-    port.mock_simulation.set_run_paused("run.1", 3, False)
+    port.mock_simulation.set_run_paused(1, 3, True)
+    port.mock_simulation.set_run_paused(1, 2, False)
+    port.mock_simulation.set_run_paused(1, 3, False)
     assert [envelope["request"]["run_revision"] for envelope in host.envelopes
             if envelope["command"] == "set_mock_io_run_paused"] == ["1", "3"]
 
 
 def test_a_pause_superseded_unanswered_is_reported_unconfirmed(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
-    port.mock_simulation.set_run_paused("run.1", 1, False)
+    port.mock_simulation.set_run_paused(1, 1, False)
     port.mock_simulation.start(port.mock_simulation.request(_IDENTITY, 1, _ROWS[:1]))
     host.script["set_mock_io_run_paused"] = [_LOST]
-    port.mock_simulation.set_run_paused("run.1", 2, True)  # Halt: reply lost.
-    port.mock_simulation.set_run_paused("run.1", 3, False)
-    assert port.mock_simulation.resend_run_pause("run.1") == (
+    port.mock_simulation.set_run_paused(1, 2, True)  # Halt: reply lost.
+    port.mock_simulation.set_run_paused(1, 3, False)
+    assert port.mock_simulation.resend_run_pause(1) == (
         ({"paused": True, "run_revision": "2", "held_node_instance_ids": []},), None
     )
 
 
 def test_native_port_maps_a_closed_refusal(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
-    port.mock_simulation.set_run_paused("run.1", 1, False)
+    port.mock_simulation.set_run_paused(1, 1, False)
     host.script["start_mock_io_node_simulation"] = [_ERROR]
     with pytest.raises(MockSimulationRefusedError) as caught:
         port.mock_simulation.start(port.mock_simulation.request(_IDENTITY, 1, _ROWS[:1]))
@@ -819,7 +815,7 @@ def test_native_port_maps_a_closed_refusal(monkeypatch, tmp_path) -> None:
 
 def test_native_port_leaves_an_unknown_reply_unknown(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
-    port.mock_simulation.set_run_paused("run.1", 1, False)
+    port.mock_simulation.set_run_paused(1, 1, False)
     host.script["start_mock_io_node_simulation"] = [{**_ACK, "status": "superseded"}]
     with pytest.raises(Exception) as caught:
         port.mock_simulation.start(port.mock_simulation.request(_IDENTITY, 1, _ROWS[:1]))
@@ -834,9 +830,12 @@ def _run_cleanup(port) -> tuple[Any, list[dict[str, Any]]]:
     events: list[dict[str, Any]] = []
     run = SimpleNamespace(
         _ports=SimpleNamespace(mock_simulation=port),
-        _capture=SimpleNamespace(program_run_id="run.1"),
+        _capture=SimpleNamespace(program_run_id=1),
         _mock_ends_reported=set(),
         _record_node_history_event=events.append,
+    )
+    run._report_unconfirmed_pauses = (
+        lambda facts: ExecutableProgramRun._report_unconfirmed_pauses(run, facts)
     )
     return (lambda final: ExecutableProgramRun._settle_mock_ends(run, final=final)), events
 
@@ -844,7 +843,7 @@ def _run_cleanup(port) -> tuple[Any, list[dict[str, Any]]]:
 def _read_node(port):
     log: list[tuple[str, ...]] = []
     attempts = SimpleNamespace(
-        begin=lambda instance: NodeAttemptIdentity("run.1", instance, "attempt:opaque")
+        begin=lambda instance: NodeAttemptIdentity(1, instance, 1)
     )
     common = _common("io.get_input", None, [], _ROWS[:1])
     common.update(node_instance_id="search_trip", attempt_source=attempts,
@@ -856,7 +855,7 @@ def test_a_lost_end_is_resent_identically_on_the_next_tick_and_acked(
     monkeypatch, tmp_path
 ) -> None:
     port, host = _native(monkeypatch, tmp_path)
-    port.mock_simulation.set_run_paused("run.1", 1, False)
+    port.mock_simulation.set_run_paused(1, 1, False)
     host.script["end_mock_io_node_simulation"] = [_LOST]
     node = _read_node(port.mock_simulation)
     assert _tick(node) is _SUCCESS  # START, read, END (reply lost).
@@ -875,7 +874,7 @@ def test_a_lost_end_is_resent_identically_on_the_next_tick_and_acked(
 
 def test_an_end_never_acked_is_reported_unconfirmed_once(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
-    port.mock_simulation.set_run_paused("run.1", 1, False)
+    port.mock_simulation.set_run_paused(1, 1, False)
     host.script["end_mock_io_node_simulation"] = [_LOST] * 4
     node = _read_node(port.mock_simulation)
     _tick(node)
@@ -885,14 +884,14 @@ def test_an_end_never_acked_is_reported_unconfirmed_once(monkeypatch, tmp_path) 
     assert events == [{
         "kind": "program_node_mock_simulation_end_unconfirmed",
         "node_instance_id": "search_trip",
-        "node_attempt_id": "attempt:opaque",
+        "node_attempt_id": 1,
         "node_start_index": "1",
     }]
     from manyforge_behavior.production_ports import ProductionPortError
 
     with pytest.raises(ProductionPortError, match="unconfirmed Mock simulation ends"):
-        port.unbind("run.1")  # Lost again: unbind fails, context kept.
-    port.unbind("run.1")  # The next unbind resends: OK, so it succeeds.
+        port.unbind(1)  # Lost again: unbind fails, context kept.
+    port.unbind(1)  # The next unbind resends: OK, so it succeeds.
     ends = [envelope["request"] for envelope in host.envelopes
             if envelope["command"] == "end_mock_io_node_simulation"]
     assert ends == [_END] * 5
@@ -901,7 +900,7 @@ def test_an_end_never_acked_is_reported_unconfirmed_once(monkeypatch, tmp_path) 
 def test_an_unanswered_pause_is_reported_when_the_run_ends(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
     host.script["set_mock_io_run_paused"] = [_LOST] * 3
-    port.mock_simulation.set_run_paused("run.1", 1, False)
+    port.mock_simulation.set_run_paused(1, 1, False)
     with pytest.raises(Exception):  # The first START establishes it: lost.
         port.mock_simulation.start(port.mock_simulation.request(_IDENTITY, 1, _ROWS[:1]))
     cleanup, events = _run_cleanup(port.mock_simulation)
@@ -918,24 +917,24 @@ def test_a_run_that_never_starts_a_mock_script_makes_no_mock_call(
 ) -> None:
     port, host = _native(monkeypatch, tmp_path)
     mock = port.mock_simulation
-    mock.set_run_paused("run.1", 1, False)  # Run start.
-    mock.set_run_paused("run.1", 2, True)  # Halt.
-    mock.set_run_paused("run.1", 3, False)  # Resume.
+    mock.set_run_paused(1, 1, False)  # Run start.
+    mock.set_run_paused(1, 2, True)  # Halt.
+    mock.set_run_paused(1, 3, False)  # Resume.
     cleanup, events = _run_cleanup(mock)
     cleanup(False)
     cleanup(True)  # Stop / tree end.
-    mock.release_run("run.1")
+    mock.release_run(1)
     assert host.envelopes == [] and events == []
 
 
 def test_the_first_start_sends_the_current_state_once(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
     mock = port.mock_simulation
-    mock.set_run_paused("run.1", 1, False)
-    mock.set_run_paused("run.1", 2, True)
-    mock.set_run_paused("run.1", 4, False)  # Resumed before any node start.
+    mock.set_run_paused(1, 1, False)
+    mock.set_run_paused(1, 2, True)
+    mock.set_run_paused(1, 4, False)  # Resumed before any node start.
     mock.start(mock.request(_IDENTITY, 1, _ROWS[:1]))
-    mock.start(mock.request(NodeAttemptIdentity("run.1", "search_trip", "attempt:2"), 2,
+    mock.start(mock.request(NodeAttemptIdentity(1, "search_trip", 2), 2,
                             _ROWS[:1]))
     pauses = [envelope["request"] for envelope in host.envelopes
               if envelope["command"] == "set_mock_io_run_paused"]
@@ -945,10 +944,10 @@ def test_the_first_start_sends_the_current_state_once(monkeypatch, tmp_path) -> 
 def test_a_halt_during_the_first_starts_pause_send_is_sent(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
     mock = port.mock_simulation
-    mock.set_run_paused("run.1", 1, False)
+    mock.set_run_paused(1, 1, False)
 
     def halt_meanwhile():
-        mock.set_run_paused("run.1", 2, True)  # Halt while paused=false is in flight.
+        mock.set_run_paused(1, 2, True)  # Halt while paused=false is in flight.
         return None
 
     host.script["set_mock_io_run_paused"] = [halt_meanwhile]
@@ -957,7 +956,7 @@ def test_a_halt_during_the_first_starts_pause_send_is_sent(monkeypatch, tmp_path
               for envelope in host.envelopes
               if envelope["command"] == "set_mock_io_run_paused"]
     assert pauses == [("1", False), ("2", True)]
-    assert mock.resend_run_pause("run.1") == ((), None)  # Both answered, nothing pending.
+    assert mock.resend_run_pause(1) == ((), None)  # Both answered, nothing pending.
 
 
 def _refusal(reason: str, code: str = "stale_generation") -> dict[str, Any]:
@@ -967,7 +966,7 @@ def _refusal(reason: str, code: str = "stale_generation") -> dict[str, Any]:
 
 def _started(port, host):
     mock = port.mock_simulation
-    mock.set_run_paused("run.1", 1, False)
+    mock.set_run_paused(1, 1, False)
     start = mock.request(_IDENTITY, 1, _ROWS[:1])
     mock.start(start)
     return mock, start
@@ -987,7 +986,7 @@ def test_a_refused_end_stays_pending_and_is_resent_until_acked(
     mock.end(start)
     cleanup, events = _run_cleanup(mock)
     cleanup(False)  # Refused again: still pending, never "cancelled".
-    assert mock.resend_unknown_ends("run.1") == ()  # Exact OK ACK.
+    assert mock.resend_unknown_ends(1) == ()  # Exact OK ACK.
     cleanup(True)
     assert events == []
     ends = [envelope["request"] for envelope in host.envelopes
@@ -1014,8 +1013,8 @@ def test_a_refused_end_never_acked_is_reported_when_the_run_ends(
 
     for _ in range(2):  # Refused: the unbind fails; nothing is "cancelled".
         with pytest.raises(ProductionPortError):
-            port.unbind("run.1")
-    port.unbind("run.1")  # Exact OK ACK: the Run unbinds with no END pending.
+            port.unbind(1)
+    port.unbind(1)  # Exact OK ACK: the Run unbinds with no END pending.
     ends = [envelope for envelope in host.envelopes
             if envelope["command"] == "end_mock_io_node_simulation"]
     assert [envelope["request"] for envelope in ends] == [_END] * 5
@@ -1028,7 +1027,7 @@ def test_a_new_start_waits_while_an_older_end_is_unanswered(monkeypatch, tmp_pat
     mock, start = _started(port, host)
     host.script["end_mock_io_node_simulation"] = [_LOST, _LOST]
     mock.end(start)  # Lost.
-    second = mock.request(NodeAttemptIdentity("run.1", "search_trip", "attempt:2"), 2,
+    second = mock.request(NodeAttemptIdentity(1, "search_trip", 2), 2,
                           _ROWS[:1])
     with pytest.raises(Exception) as caught:  # END resent, lost again: wait.
         mock.start(second)
@@ -1046,8 +1045,8 @@ def test_a_new_start_waits_while_an_older_end_is_unanswered(monkeypatch, tmp_pat
 def test_a_halt_before_the_first_start_sends_paused_true_first(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
     mock = port.mock_simulation
-    mock.set_run_paused("run.1", 1, False)
-    mock.set_run_paused("run.1", 2, True)  # Halted before any node start.
+    mock.set_run_paused(1, 1, False)
+    mock.set_run_paused(1, 2, True)  # Halted before any node start.
     mock.start(mock.request(_IDENTITY, 1, _ROWS[:1]))
     assert host.commands() == ["set_mock_io_run_paused", "start_mock_io_node_simulation"]
     assert host.envelopes[0]["request"] == {
@@ -1065,11 +1064,11 @@ def test_a_lost_end_fails_unbind_until_the_next_unbind_gets_its_ack(
     host.script["end_mock_io_node_simulation"] = [_LOST, _LOST]
     mock.end(start)  # Lost.
     with pytest.raises(ProductionPortError, match="unconfirmed Mock simulation ends"):
-        port.unbind("run.1")  # Resent, lost again: unbind fails.
-    assert port._context("run.1") is not None  # Still bound.
-    port.unbind("run.1")  # Resent, OK: unbound.
+        port.unbind(1)  # Resent, lost again: unbind fails.
+    assert port._context(1) is not None  # Still bound.
+    port.unbind(1)  # Resent, OK: unbound.
     with pytest.raises(ProductionPortError):
-        port._context("run.1")
+        port._context(1)
     ends = [envelope["request"] for envelope in host.envelopes
             if envelope["command"] == "end_mock_io_node_simulation"]
     assert ends == [_END] * 3
@@ -1087,7 +1086,7 @@ class _HeldState:
         return node_id in self.held
 
     def snapshot(self):
-        return SimpleNamespace(selection_revision=self.revision)
+        return SimpleNamespace(hold_revision=self.revision)
 
 
 def test_the_held_mask_is_every_node_under_a_wholly_held_hold_scope() -> None:
@@ -1112,11 +1111,11 @@ def test_the_held_mask_is_every_node_under_a_wholly_held_hold_scope() -> None:
 def test_the_snapshot_carries_the_held_mask_and_halt_together(monkeypatch, tmp_path) -> None:
     port, host = _native(monkeypatch, tmp_path)
     mock = port.mock_simulation
-    mock.set_run_paused("run.1", 1, False, ("wait",))  # Held before the first START.
+    mock.set_run_paused(1, 1, False, ("wait",))  # Held before the first START.
     mock.start(mock.request(_IDENTITY, 1, _ROWS[:1]))
-    mock.set_run_paused("run.1", 2, True, ("wait",))  # Halt: both causes.
-    mock.set_run_paused("run.1", 3, False, ("wait",))  # Resume: still held.
-    mock.set_run_paused("run.1", 4, False, ())  # Released.
+    mock.set_run_paused(1, 2, True, ("wait",))  # Halt: both causes.
+    mock.set_run_paused(1, 3, False, ("wait",))  # Resume: still held.
+    mock.set_run_paused(1, 4, False, ())  # Released.
     bodies = [(envelope["request"]["run_revision"], envelope["request"]["paused"],
                envelope["request"]["held_node_instance_ids"])
               for envelope in host.envelopes if envelope["command"] == "set_mock_io_run_paused"]
@@ -1137,14 +1136,14 @@ def test_an_older_pause_ack_cannot_confirm_a_newer_unknown_snapshot(
 
     port, host = _native(monkeypatch, tmp_path)
     mock = port.mock_simulation
-    mock.set_run_paused("run.1", 1, False)
+    mock.set_run_paused(1, 1, False)
     request = mock.request(_IDENTITY, 1, _ROWS[:1])
     original = deepcopy(request)
 
     def newer_snapshot_meanwhile():
         # The original running/unheld snapshot is still in flight. A newer
         # committed Halt/held snapshot has no confirmed reply when it returns.
-        mock.set_run_paused("run.1", 2, paused, held)
+        mock.set_run_paused(1, 2, paused, held)
         return None  # The older snapshot gets its ordinary successful ACK.
 
     host.script["set_mock_io_run_paused"] = [newer_snapshot_meanwhile, _LOST]
@@ -1164,4 +1163,20 @@ def test_an_older_pause_ack_cannot_confirm_a_newer_unknown_snapshot(
                                "set_mock_io_run_paused", "start_mock_io_node_simulation"]
     assert host.envelopes[2]["request"] == current
     assert host.envelopes[3]["request"] == original
-    assert mock.resend_run_pause("run.1") == ((), None)
+    assert mock.resend_run_pause(1) == ((), None)
+
+
+def test_a_recorded_halt_is_sent_once_by_the_runs_tick(monkeypatch, tmp_path) -> None:
+    port, host = _native(monkeypatch, tmp_path)
+    port.mock_simulation.set_run_paused(1, 1, False)
+    port.mock_simulation.start(port.mock_simulation.request(_IDENTITY, 1, _ROWS[:1]))
+    sent = len(host.envelopes)
+    # A Halt adoption on the event-stream follower: memory only.
+    assert port.mock_simulation.record_run_paused(1, 2, True) is True
+    assert len(host.envelopes) == sent
+    # The Run's tick (settle_mock_pause) sends it, exactly once.
+    assert port.mock_simulation.resend_run_pause(1) == ((), None)
+    assert port.mock_simulation.resend_run_pause(1) == ((), None)
+    assert [envelope["request"] for envelope in host.envelopes[sent:]] == [
+        {**_PAUSE["request"], "run_revision": "2", "paused": True}
+    ]

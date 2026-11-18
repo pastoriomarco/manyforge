@@ -46,11 +46,10 @@ _APPLIED_SOURCE_FIELDS = frozenset(
         "record_digest",
         "semantic_content_digest",
         "source_generation",
-        "source_owner_epoch",
         "source_owner_id",
     }
 )
-_OWNER_IDENTITY_FIELDS = frozenset({"owner_epoch", "owner_id", "owner_role"})
+_OWNER_IDENTITY_FIELDS = frozenset({"application_start_id", "role"})
 _SHA256_PREFIX = "sha256:"
 PROJECT_PATH_MAX_BYTES = 4096
 
@@ -67,6 +66,12 @@ def _sha256(value: object, path: str) -> str:
         or any(character not in "0123456789abcdef" for character in value[7:])
     ):
         _fail(path, "lowercase SHA-256 identity")
+    return value
+
+
+def _counter(value: object, path: str) -> int:
+    if type(value) is not int or not 1 <= value <= _MAXIMUM_SAFE_INTEGER:
+        _fail(path, "a positive integer")
     return value
 
 
@@ -166,8 +171,8 @@ def validate_applied_program_selection(
 
     if not isinstance(value, dict) or set(value) != _APPLIED_SELECTION_FIELDS:
         _fail(label, "the closed Applied Program selection record")
-    if value.get("schema_version") != "manyforge.applied_program_selection.v4":
-        _fail(f"{label}.schema_version", "manyforge.applied_program_selection.v4")
+    if value.get("schema_version") != "manyforge.applied_program_selection.v5":
+        _fail(f"{label}.schema_version", "manyforge.applied_program_selection.v5")
     if value.get("assistant_mode") not in {"required", "optional", "forbidden"}:
         _fail(f"{label}.assistant_mode", "a supported assistant mode")
     if value.get("assistant_projection") is not None and not isinstance(
@@ -183,9 +188,12 @@ def validate_applied_program_selection(
         owner_label = f"{label}.owner_identities[{index}]"
         if not isinstance(identity, dict) or set(identity) != _OWNER_IDENTITY_FIELDS:
             _fail(owner_label, "the closed owner identity record")
-        owner_roles.append(_text(identity.get("owner_role"), f"{owner_label}.owner_role", 256))
-        _text(identity.get("owner_id"), f"{owner_label}.owner_id", 256)
-        _text(identity.get("owner_epoch"), f"{owner_label}.owner_epoch", 256)
+        owner_roles.append(_text(identity.get("role"), f"{owner_label}.role", 32))
+        _text(
+            identity.get("application_start_id"),
+            f"{owner_label}.application_start_id",
+            16,
+        )
     if owner_roles != sorted(set(owner_roles)):
         _fail(f"{label}.owner_identities", "strictly role-sorted unique identities")
     if not isinstance(value.get("program"), dict):
@@ -232,7 +240,6 @@ def validate_applied_program_selection(
         or source["source_generation"] < 1
     ):
         _fail(f"{label}.source.source_generation", "a positive integer")
-    _text(source.get("source_owner_epoch"), f"{label}.source.source_owner_epoch", 256)
     _text(source.get("source_owner_id"), f"{label}.source.source_owner_id", 256)
     _binding_correspondence(value, label=label)
     return value
@@ -259,7 +266,6 @@ _COMMITTED_ACTIVATION_FIELDS = frozenset(
     {
         "apply_generation",
         "apply_id",
-        "committed_applies",
         "scene_initialization",
         "program",
         "program_frame_facts",
@@ -272,9 +278,6 @@ _COMMITTED_ACTIVATION_FIELDS = frozenset(
         "schema_version",
     }
 )
-_COMMITTED_APPLY_FIELDS = frozenset(
-    {"apply_generation", "apply_id", "record_digest", "origin", "scene_initialization"}
-)
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 
 
@@ -286,21 +289,19 @@ def validate_committed_scenario_activation(
     """Validate Manager's current committed Scenario activation.
 
     Publication 1 is the canonical-empty bootstrap and every later one is
-    one committed named Apply. Manager's journal is bounded by eviction, so
-    the committed Applies are the retained ones: never more than the Apply
-    publications, and always including the current one.
+    one committed named Apply; the activation names the current one.
     """
 
     if not isinstance(value, dict) or set(value) != _COMMITTED_ACTIVATION_FIELDS:
         _fail(label, "the closed committed Scenario activation record")
-    if value.get("schema_version") != "manyforge.committed_scenario_activation.v4":
+    if value.get("schema_version") != "manyforge.committed_scenario_activation.v6":
         _fail(
-            f"{label}.schema_version", "manyforge.committed_scenario_activation.v4"
+            f"{label}.schema_version", "manyforge.committed_scenario_activation.v6"
         )
     generation = value.get("publication_generation")
     if type(generation) is not int or not 2 <= generation <= _MAXIMUM_SAFE_INTEGER:
         _fail(f"{label}.publication_generation", "an integer of at least 2")
-    current = _committed_apply(value, label)
+    _committed_apply(value, label)
     if value.get("program") is not None and not isinstance(value.get("program"), dict):
         _fail(f"{label}.program", "an object or null")
     binding_id = value.get("program_binding_id")
@@ -322,24 +323,10 @@ def validate_committed_scenario_activation(
             })
         except ValueError as error:
             _fail(f"{label}.program_frame_facts", str(error))
-    committed = value.get("committed_applies")
-    if not isinstance(committed, list) or len(committed) > generation - 1:
-        _fail(f"{label}.committed_applies", "at most one record per Apply publication")
-    applies: list[tuple[str, dict[str, Any], str, int, str]] = []
-    for index, row in enumerate(committed):
-        row_label = f"{label}.committed_applies[{index}]"
-        if not isinstance(row, dict) or set(row) != _COMMITTED_APPLY_FIELDS:
-            _fail(row_label, "the closed committed Apply record")
-        applies.append(_committed_apply(row, row_label))
-    digests = [apply[0] for apply in applies]
-    if digests != sorted(set(digests)):
-        _fail(f"{label}.committed_applies", "unique records in digest order")
-    if current not in applies:
-        _fail(f"{label}.committed_applies", "the current Apply among them")
     return value
 
 
-def _committed_apply(value: dict[str, Any], label: str) -> tuple[str, dict[str, Any], str, int, str]:
+def _committed_apply(value: dict[str, Any], label: str) -> tuple[str, dict[str, Any], int, int, str]:
     """One committed Apply: record digest, exact origin, and Apply identity."""
 
     apply_generation = value.get("apply_generation")
@@ -355,7 +342,7 @@ def _committed_apply(value: dict[str, Any], label: str) -> tuple[str, dict[str, 
     return (
         _sha256(value.get("record_digest"), f"{label}.record_digest"),
         origin,
-        _text(value.get("apply_id"), f"{label}.apply_id", 256),
+        _counter(value.get("apply_id"), f"{label}.apply_id"),
         apply_generation,
         initialization,
     )

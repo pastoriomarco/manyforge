@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   acceptManagerApplyAcknowledgementStatus,
   acceptManagerApplyStatus,
+  newCanClearLatestFailedApply,
   selectManagerApplyInventoryIdentity,
   selectManagerApplyObservationIdentity,
 } from './managerApply';
@@ -18,9 +19,9 @@ function status(
 ): ManagerApplyStatus {
   const failed = state === 'failed' || state === 'unknown_effect';
   return {
-    apiVersion: 'manyforge.manager_command_response.v2',
+    apiVersion: 'manyforge.manager_command_response.v3',
     applyGeneration: 2,
-    applyId: 'apply-2',
+    applyId: 2,
     candidateProjectionRevision: state === 'succeeded' ? {
       retained_bundle_id: `sha256:${'1'.repeat(64)}`,
       graph_revision: `sha256:${'2'.repeat(64)}`,
@@ -55,8 +56,7 @@ function status(
       programBindingId: `sha256:${'8'.repeat(64)}`,
       preparedActivationId: `sha256:${'9'.repeat(64)}`,
     },
-    requestId: 'request-1',
-    requestOwnerEpoch: 'owner-1',
+    requestKey: '1'.repeat(32),
     state,
     failureAcknowledgement: 'unavailable',
   };
@@ -65,7 +65,7 @@ function status(
 describe('Manager Apply presentation state', () => {
   it('selects an incomplete operation, then a retained terminal failure', () => {
     const record = (
-      applyId: string,
+      applyId: number,
       applyGeneration: number,
       incomplete: boolean,
       terminalState: ManagerApplyRecord['terminalState'],
@@ -77,16 +77,55 @@ describe('Manager Apply presentation state', () => {
       terminalState,
     });
     expect(selectManagerApplyInventoryIdentity([
-      record('old-failure', 9, false, 'failed'),
-      record('current', 1, true, null),
-    ])).toEqual({ applyId: 'current', applyGeneration: 1 });
+      record(11, 9, false, 'failed'),
+      record(12, 1, true, null),
+    ])).toEqual({ applyId: 12, applyGeneration: 1 });
     expect(selectManagerApplyInventoryIdentity([
-      record('success', 20, false, 'succeeded'),
-      record('failed', 4, false, 'unknown_effect'),
-    ])).toEqual({ applyId: 'failed', applyGeneration: 4 });
+      record(13, 20, false, 'succeeded'),
+      record(14, 4, false, 'unknown_effect'),
+    ])).toEqual({ applyId: 14, applyGeneration: 4 });
     expect(selectManagerApplyInventoryIdentity([
-      record('success', 20, false, 'succeeded'),
+      record(13, 20, false, 'succeeded'),
     ])).toBeNull();
+  });
+
+  it('finds a newest failed or unknown-effect Apply, whatever its fence or publication', () => {
+    const record = (
+      applyGeneration: number,
+      terminalState: ManagerApplyRecord['terminalState'],
+      fence: ManagerApplyRecord['fence']['state'],
+      committed = false,
+    ): ManagerApplyRecord => ({
+      ...({} as ManagerApplyRecord),
+      applyId: applyGeneration,
+      applyGeneration,
+      committed,
+      incomplete: terminalState === null,
+      terminalState,
+      fence: { ...({} as ManagerApplyRecord['fence']), state: fence },
+    });
+    // Class 3: failed after the fence was accepted, nothing published.
+    expect(newCanClearLatestFailedApply([record(3, 'failed', 'held')])).toBe(true);
+    // Class 4, a timed-out or failed progression included (`unknown_effect`).
+    expect(newCanClearLatestFailedApply([
+      record(2, 'succeeded', 'released', true), record(3, 'unknown_effect', 'held'),
+    ])).toBe(true);
+    // Failed after its publication.
+    expect(newCanClearLatestFailedApply([record(3, 'unknown_effect', 'held', true)])).toBe(true);
+    expect(newCanClearLatestFailedApply([record(3, 'failed', 'held', true)])).toBe(true);
+    // The fence attempt was never accepted.
+    expect(newCanClearLatestFailedApply([record(3, 'unknown_effect', 'acquire_pending')])).toBe(true);
+    expect(newCanClearLatestFailedApply([record(3, 'failed', 'acquire_pending')])).toBe(true);
+    // A release in progress, done or of unknown outcome: New checks it again.
+    for (const fence of ['release_pending', 'released'] as const) {
+      expect(newCanClearLatestFailedApply([record(3, 'failed', fence)])).toBe(true);
+    }
+    // Only the newest record counts.
+    expect(newCanClearLatestFailedApply([
+      record(3, 'failed', 'held'), record(4, 'succeeded', 'released', true),
+    ])).toBe(false);
+    expect(newCanClearLatestFailedApply([record(4, null, 'held')])).toBe(false);
+    expect(newCanClearLatestFailedApply([])).toBe(false);
   });
 
   it('advances pending phases and suppresses a delayed stale observation', () => {
@@ -155,7 +194,7 @@ describe('Manager Apply presentation state', () => {
 
   it('does not replace one operation with a response for another identity', () => {
     const current = status('fence_acquired');
-    const another = { ...status('settled', 'succeeded'), applyId: 'apply-3' };
+    const another = { ...status('settled', 'succeeded'), applyId: 3 };
     expect(acceptManagerApplyStatus(current, another)).toBe(current);
   });
 
@@ -164,9 +203,9 @@ describe('Manager Apply presentation state', () => {
     expect(selectManagerApplyObservationIdentity({
       applyId: pending.applyId,
       applyGeneration: pending.applyGeneration,
-    }, null)).toEqual({ applyId: 'apply-2', applyGeneration: 2 });
+    }, null)).toEqual({ applyId: 2, applyGeneration: 2 });
     expect(selectManagerApplyObservationIdentity(null, pending)).toEqual({
-      applyId: 'apply-2',
+      applyId: 2,
       applyGeneration: 2,
     });
     expect(selectManagerApplyObservationIdentity(
@@ -174,7 +213,7 @@ describe('Manager Apply presentation state', () => {
       status('settled', 'succeeded'),
     )).toBeNull();
     expect(selectManagerApplyObservationIdentity(
-      { applyId: 'apply-2', applyGeneration: 2 },
+      { applyId: 2, applyGeneration: 2 },
       status('settled', 'succeeded'),
     )).toBeNull();
   });

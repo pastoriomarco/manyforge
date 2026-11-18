@@ -107,6 +107,14 @@ retained_ros2_control_armless_machines(
     // row's declared `runtime_scale`, which its written launch matches.
     bool supports_scale);
 
+/// The lane's hard-stop completion timeout (`hard_stop_completion_timeout_s`
+/// of the model lane row) as the participant's Stop configuration carries it
+/// (`participant.stop.hard_stop_completion_timeout_ns`); 0 when the row has
+/// none. The execution host puts it into the participant's Stop readiness
+/// for the Kernel's hard-stage watchdog (stop state model F4).
+[[nodiscard]] core::Duration retained_lane_hard_stop_completion_timeout_ns(
+    const ModelLaneRow &row);
+
 /// Read only the strict authored row for this exact selected component/target.
 /// Coordinate kind and transport names never select actuator semantics.
 [[nodiscard]] core::GripperActuationKind retained_ros2_control_gripper_actuation_kind(

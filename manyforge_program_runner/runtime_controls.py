@@ -25,8 +25,8 @@ from manyforge_behavior.recovery import (
 )
 
 
-RUNTIME_CONTROL_SCHEMA: Final = "manyforge.program_runtime_controls.v3"
-RECOVERY_OFFER_SCHEMA: Final = "manyforge.cycle_recovery_offer.v5"
+RUNTIME_CONTROL_SCHEMA: Final = "manyforge.program_runtime_controls.v4"
+RECOVERY_OFFER_SCHEMA: Final = "manyforge.cycle_recovery_offer.v6"
 _MAX_AUDIT: Final = 256
 _MAX_REVISION: Final = 9_007_199_254_740_991
 # One entry per captured Program node, never per request/attempt.
@@ -41,18 +41,6 @@ _RECOVERY_FENCE_FIELDS: Final = (
     "scene_admission_epoch",
     "pose_source_apply_generation",
 )
-_SNAPSHOT_FIELDS: Final = frozenset(
-    {
-        "schema_version",
-        "program_run_id",
-        "runtime_control_revision",
-        "recovery_fences",
-        "retry_counts",
-        "audit",
-    }
-)
-
-
 class ProgramRuntimeControlError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -144,7 +132,7 @@ class ProgramRuntimeControls:
         self._lock = RLock()
 
     @property
-    def program_run_id(self) -> str:
+    def program_run_id(self) -> int:
         return self._capture["program_run_id"]
 
     @property
@@ -152,61 +140,6 @@ class ProgramRuntimeControls:
         """Read the owner change key without copying retry or audit data."""
         with self._lock:
             return self._revision
-
-    @classmethod
-    def restore(
-        cls,
-        capture: Mapping[str, Any],
-        snapshot: Mapping[str, Any],
-    ) -> "ProgramRuntimeControls":
-        """Restore the latest journaled control state for one retained run."""
-
-        if (
-            not isinstance(snapshot, Mapping)
-            or snapshot.get("schema_version") != RUNTIME_CONTROL_SCHEMA
-        ):
-            raise ValueError("retained runtime controls have an unsupported schema")
-        if set(snapshot) != _SNAPSHOT_FIELDS:
-            raise ValueError("retained runtime controls have an invalid shape")
-        fences = snapshot.get("recovery_fences")
-        instance = cls(capture, recovery_fences=fences)
-        revision = snapshot.get("runtime_control_revision")
-        retry_counts = snapshot.get("retry_counts")
-        audit = snapshot.get("audit")
-        if (
-            type(revision) is not int
-            or not 1 <= revision <= _MAX_REVISION
-            or snapshot.get("program_run_id") != instance.program_run_id
-            or not isinstance(retry_counts, dict)
-            or len(retry_counts) > _MAX_RETRY_NODES
-            or not isinstance(audit, list)
-            or len(audit) > _MAX_AUDIT
-        ):
-            raise ValueError("retained runtime controls exceed their bounds")
-        restored_retries: dict[str, int] = {}
-        for node_instance_id, count in retry_counts.items():
-            if (
-                not _bounded_text(node_instance_id)
-                or type(count) is not int
-                or not 1 <= count <= _MAX_RETRY_COUNT
-            ):
-                raise ValueError("retained runtime retry count is invalid")
-            restored_retries[node_instance_id] = count
-        if len(audit) != min(revision - 1, _MAX_AUDIT):
-            raise ValueError("retained runtime-control revision is divergent")
-        for index, event in enumerate(audit, start=revision - len(audit)):
-            if (
-                not isinstance(event, dict)
-                or type(event.get("event_revision")) is not int
-                or event.get("event_revision") != index
-                or not isinstance(event.get("kind"), str)
-                or not event["kind"]
-            ):
-                raise ValueError("retained runtime-control audit is invalid")
-        instance._revision = revision
-        instance._retry_counts = restored_retries
-        instance._audit = deepcopy(audit)
-        return instance
 
     def _event(self, kind: str, *, reserved_after: int = 1, **facts: Any) -> None:
         self.require_event_revisions(reserved_after=reserved_after)
@@ -239,8 +172,7 @@ class ProgramRuntimeControls:
     def mark_reset(
         self,
         *,
-        request_id: str | None = None,
-        correlation_id: str | None = None,
+        request_key: bytes | None = None,
         source_label: str | None = None,
     ) -> None:
         with self._lock:
@@ -251,14 +183,13 @@ class ProgramRuntimeControls:
                 self._audit
                 and self._audit[-1]["kind"] == "program_runtime_controls_reset"
             )
-            if request_id is None or recorded:
+            if request_key is None or recorded:
                 return
             self.require_event_revisions(reserved_after=0)
             self._event(
                 "program_runtime_controls_reset",
                 reserved_after=0,
-                request_id=request_id,
-                correlation_id=correlation_id,
+                request_key=request_key.hex(),
                 source_label=source_label,
                 action_id="reset_cycle",
             )
@@ -343,10 +274,10 @@ class ProgramRuntimeControls:
         self,
         *,
         cycle_generation: int,
-        owner_epoch: str,
+        application_start_id: str,
         intervention,
         policy: Mapping[str, Any],
-        selection_revision: int | None = None,
+        hold_revision: int | None = None,
         containment_pending: bool = False,
     ) -> dict[str, Any] | None:
         """``containment_pending``: a failure pause has not yet confirmed that
@@ -477,12 +408,8 @@ class ProgramRuntimeControls:
             and owner.get("status") in {"retry_ready", "reset_required"}
             and owner.get("execution_state") == "Stopped"
             and owner.get("backend_stop_confirmed") is True
-            and isinstance(owner.get("stop_certificate_id"), str)
-            and bool(owner["stop_certificate_id"])
-            and type(owner.get("stop_certificate_revision")) is int
-            and owner["stop_certificate_revision"] > 0
-            and type(owner.get("stop_owner_generation")) is int
-            and owner["stop_owner_generation"] > 0
+            and type(owner.get("stop_event_id")) is int
+            and owner["stop_event_id"] > 0
             and "reset_cycle" in owner_actions
         )
         held_reset_enabled = (
@@ -519,7 +446,7 @@ class ProgramRuntimeControls:
             "program_run_id": identity.program_run_id,
             "node_instance_id": identity.node_instance_id,
             "node_attempt_id": identity.node_attempt_id,
-            "owner_epoch": owner_epoch,
+            "application_start_id": application_start_id,
             # The owner's observation deadline is Kernel freshness, not offer
             # semantics: a newer equivalent sample keeps the same offer (and
             # its command fence).
@@ -542,10 +469,10 @@ class ProgramRuntimeControls:
             "recovery_fences": deepcopy(self._recovery_fences),
             **deepcopy(failure),
         }
-        if selection_revision is not None:
+        if hold_revision is not None:
             # The opaque offer also fences a newer selection Stop even when
-            # it reuses the same physical Stop certificate.
-            material["selection_revision"] = selection_revision
+            # the operation's Stop event is the same.
+            material["hold_revision"] = hold_revision
         offer_key = _digest("manyforge.cycle_recovery_offer.semantic.v4", material)
         with self._lock:
             cached = self._offers.get(identity.node_instance_id)
@@ -572,7 +499,12 @@ class ProgramRuntimeControls:
                     if isinstance(owner, dict)
                     else 0
                 ),
-                "operation_id": intervention.owner_task_id,
+                # A task with no Kernel operation has no operation number.
+                "operation_id": (
+                    intervention.owner_task_id
+                    if type(intervention.owner_task_id) is int
+                    else None
+                ),
                 "operation_revision": (
                     owner.get("operation_revision") if isinstance(owner, dict) else None
                 ),
@@ -587,32 +519,6 @@ class ProgramRuntimeControls:
                 "retained_bundle_id": self._capture["retained_bundle_id"],
                 "cycle_generation": cycle_generation,
                 **self._recovery_fences,
-                "stop_id": (
-                    owner.get("stop_id")
-                    if isinstance(owner, dict)
-                    and isinstance(owner.get("stop_id"), str)
-                    and bool(owner["stop_id"])
-                    else None
-                ),
-                "stop_generation": (
-                    owner.get("stop_generation")
-                    if isinstance(owner, dict)
-                    and type(owner.get("stop_generation")) is int
-                    and owner["stop_generation"] > 0
-                    else None
-                ),
-                "stop_certificate_id": (
-                    owner.get("stop_certificate_id")
-                    if isinstance(owner, dict) and owner.get("stop_certificate_id")
-                    else None
-                ),
-                "stop_certificate_revision": (
-                    owner.get("stop_certificate_revision")
-                    if isinstance(owner, dict)
-                    and type(owner.get("stop_certificate_revision")) is int
-                    and owner["stop_certificate_revision"] > 0
-                    else None
-                ),
                 "status": (
                     "retry_ready"
                     if isinstance(owner, dict)

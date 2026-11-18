@@ -68,7 +68,7 @@ class RuntimeUnitExpectation final {
       std::string product_identity,
       std::string configuration_identity,
       std::uint64_t maximum_presence_age_ns,
-      std::uint64_t maximum_report_age_ns,
+      std::optional<std::uint64_t> maximum_report_age_ns = std::nullopt,
       std::optional<std::uint64_t> maximum_progress_age_ns = std::nullopt,
       std::vector<std::string> dependency_runtime_unit_ids = {},
       std::vector<std::string> required_runtime_role_ids = {},
@@ -81,7 +81,8 @@ class RuntimeUnitExpectation final {
   [[nodiscard]] const std::string& product_identity() const noexcept;
   [[nodiscard]] const std::string& configuration_identity() const noexcept;
   [[nodiscard]] std::uint64_t maximum_presence_age_ns() const noexcept;
-  [[nodiscard]] std::uint64_t maximum_report_age_ns() const noexcept;
+  [[nodiscard]] std::optional<std::uint64_t> maximum_report_age_ns()
+      const noexcept;
   [[nodiscard]] std::optional<std::uint64_t> maximum_progress_age_ns()
       const noexcept;
   [[nodiscard]] const std::vector<std::string>& dependency_runtime_unit_ids()
@@ -99,7 +100,7 @@ class RuntimeUnitExpectation final {
   std::string product_identity_;
   std::string configuration_identity_;
   std::uint64_t maximum_presence_age_ns_;
-  std::uint64_t maximum_report_age_ns_;
+  std::optional<std::uint64_t> maximum_report_age_ns_;
   std::optional<std::uint64_t> maximum_progress_age_ns_;
   std::vector<std::string> dependency_runtime_unit_ids_;
   std::vector<std::string> required_runtime_role_ids_;

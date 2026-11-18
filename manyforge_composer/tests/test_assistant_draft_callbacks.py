@@ -66,16 +66,13 @@ def _selection_source(*, content_digest: str, owner_kind: str) -> dict:
         "freshness": "fresh",
         "known_gaps": [],
         "projection_generation": 7,
-        "projection_owner_epoch": "headless.epoch.1",
         "receiver_age_ns": 10,
         "selection_projection_generation": 5,
         "selection_source_content_digest": _MANAGER_DIGEST,
         "selection_source_generation": 3,
-        "selection_source_owner_epoch": "manager.epoch.1",
         "selection_source_owner_id": "component-manager.cell-a",
         "source_content_digest": content_digest,
         "source_generation": 7,
-        "source_owner_epoch": "headless.epoch.1",
         "source_owner_id": f"headless-api.{owner_kind}",
         "source_owner_kind": owner_kind,
     }
@@ -110,7 +107,7 @@ def _node_environment() -> VerifiedActiveNodeEnvironment:
 
 def _source_model(node_environment: VerifiedActiveNodeEnvironment):
     projection = {
-        "schema_version": "manyforge.source_model_projection.v3",
+        "schema_version": "manyforge.source_model_projection.v4",
         "cell_id": "cell-a",
         "retained_bundle_id": "bundle.1",
         "graph_revision": "graph.1",
@@ -126,7 +123,7 @@ def _source_model(node_environment: VerifiedActiveNodeEnvironment):
     }
     projection["source"]["source_content_digest"] = _framed(
         "manyforge-source-model-projection-semantic",
-        "manyforge.source_model_projection.v3",
+        "manyforge.source_model_projection.v4",
         {key: value for key, value in projection.items() if key != "source"},
     )
     return verify_active_source_model(
@@ -172,7 +169,7 @@ def _assistant_mode(
     }
     environment = node_environment.payload
     projection = {
-        "schema_version": "manyforge.assistant_mode_projection.v2",
+        "schema_version": "manyforge.assistant_mode_projection.v3",
         "assistant_component_id": "assistant",
         "assistant_projection_digest": _ASSISTANT_PROJECTION_DIGEST,
         "catalog_hash": _framed(
@@ -214,7 +211,7 @@ def _assistant_mode(
     }
     projection_digest = _framed(
         "manyforge-assistant-mode-projection-semantic",
-        "manyforge.assistant_mode_projection.v2",
+        "manyforge.assistant_mode_projection.v3",
         projection,
     )
     projection["source"] = _selection_source(
@@ -281,18 +278,6 @@ class _AdmissionHeadless:
             }
         }
 
-    def recover_authoring_transaction(self, _body: dict) -> dict:
-        return {
-            "recovery_receipt": {
-                "status": "unknown",
-                "kernel_owner_epoch": "kernel.1",
-                "held_claims": [],
-                "current_owner_epochs": [],
-            }
-        }
-
-    def reconcile_authoring_owner(self, _body: dict) -> dict:
-        return {"admission": {"admission_generation": 7}}
 
 
 def _body(
@@ -336,7 +321,7 @@ def test_validate_callback_returns_reference_diagnostics_for_exact_captured_draf
     node_environment = _node_environment()
     context = _assistant_context(node_environment, "program_validate")
     environment = build_node_environment()
-    state = ComposerState(
+    state = ComposerState(application_start_id=0x3F9A0000000000A1,
         node_environment=environment,
         headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
     )
@@ -380,7 +365,7 @@ def test_callback_uses_exact_active_context_and_mutates_only_the_draft(
     assistant_mode = context.assistant_mode
     environment = build_node_environment()
     program = Program(_PROGRAM_PATH, environment.catalog)
-    state = ComposerState(
+    state = ComposerState(application_start_id=0x3F9A0000000000A1,
         node_environment=environment,
         program=program,
         program_source_path=str(_PROGRAM_PATH),
@@ -474,7 +459,7 @@ def test_allowed_tool_schema_error_is_a_non_mutating_http_200_result(
     source_model = context.source_model
     assistant_mode = context.assistant_mode
     environment = build_node_environment()
-    state = ComposerState(
+    state = ComposerState(application_start_id=0x3F9A0000000000A1,
         node_environment=environment,
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
@@ -519,7 +504,7 @@ def test_callback_reapplies_field_narrowing_before_draft_mutation(
     source_model = context.source_model
     assistant_mode = context.assistant_mode
     environment = build_node_environment()
-    state = ComposerState(
+    state = ComposerState(application_start_id=0x3F9A0000000000A1,
         node_environment=environment,
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
@@ -563,7 +548,7 @@ def test_malformed_assistant_mode_is_rejected_before_projection_lookup(
     source_model = _source_model(node_environment)
     assistant_mode = _assistant_mode(node_environment)
     environment = build_node_environment()
-    state = ComposerState(
+    state = ComposerState(application_start_id=0x3F9A0000000000A1,
         node_environment=environment,
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
@@ -601,7 +586,7 @@ def test_callback_cannot_mutate_a_program_that_forbids_assistant_authoring(
     source_model = context.source_model
     assistant_mode = context.assistant_mode
     environment = build_node_environment()
-    state = ComposerState(
+    state = ComposerState(application_start_id=0x3F9A0000000000A1,
         node_environment=environment,
         program=Program(_ASSISTANT_FORBIDDEN_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_ASSISTANT_FORBIDDEN_PROGRAM_PATH),
@@ -674,7 +659,7 @@ def test_real_bridge_reports_claimless_draft_edits_and_refuses_a_stale_fence(
     node_environment = _node_environment()
     context = _assistant_context(node_environment)
     environment = build_node_environment()
-    state = ComposerState(
+    state = ComposerState(application_start_id=0x3F9A0000000000A1,
         node_environment=environment,
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
@@ -816,7 +801,7 @@ def test_real_bridge_reports_claimless_draft_edits_and_refuses_a_stale_fence(
 def test_scene_inspect_callback_returns_the_draft_scene(monkeypatch) -> None:
     node_environment = _node_environment()
     context = _assistant_context(node_environment, "scene_inspect")
-    state = ComposerState(
+    state = ComposerState(application_start_id=0x3F9A0000000000A1,
         node_environment=build_node_environment(),
         headless_client=_AdmissionHeadless(),  # type: ignore[arg-type]
     )
@@ -871,7 +856,7 @@ def test_typed_arguments_with_local_references_validate_in_composer(
 
     context = _assistant_context(
         node_environment, tool_id, [entry.id for entry in _assistant_instruments().entries()])
-    state = ComposerState(
+    state = ComposerState(application_start_id=0x3F9A0000000000A1,
         node_environment=environment,
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
@@ -931,7 +916,7 @@ def _contact_policy_callback(monkeypatch, state, tool_id: str, arguments: dict) 
 
 def _contact_policy_state() -> ComposerState:
     environment = build_node_environment()
-    return ComposerState(
+    return ComposerState(application_start_id=0x3F9A0000000000A1,
         node_environment=environment,
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
@@ -990,7 +975,7 @@ def _setup_insert(monkeypatch):
 
     context = _assistant_context(node_environment, "tree_draft_insert_node",
                                  [entry.id for entry in _assistant_instruments().entries()])
-    state = ComposerState(
+    state = ComposerState(application_start_id=0x3F9A0000000000A1,
         node_environment=environment,
         program=Program(_PROGRAM_PATH, environment.catalog),
         program_source_path=str(_PROGRAM_PATH),
@@ -1067,7 +1052,7 @@ def test_diagnostic_paths_resolve_to_the_node_they_point_into() -> None:
 # OD-93: the last verified context is kept by its Headless identity (ETag).
 
 
-def _context_headless(reads: dict, *, epoch: str = "headless.epoch.1"):
+def _context_headless(reads: dict):
     """A real Headless app (stub service) behind the real HTTP client."""
 
     from types import SimpleNamespace
@@ -1080,7 +1065,6 @@ def _context_headless(reads: dict, *, epoch: str = "headless.epoch.1"):
             "available": True,
             "freshness": "fresh",
             "known_gaps": [],
-            "projection_owner_epoch": epoch,
             "source_content_digest": digest,
         }
 
@@ -1093,8 +1077,13 @@ def _context_headless(reads: dict, *, epoch: str = "headless.epoch.1"):
             "source_model": {"source": source("sha256:" + "3" * 64)},
         }
 
+    from manyforge_headless_api.identity import RequestAdmission
+
     app = create_headless_app(
-        service=SimpleNamespace(assistant_mode_context=context)  # type: ignore[arg-type]
+        service=SimpleNamespace(  # type: ignore[arg-type]
+            assistant_mode_context=context,
+            admission=RequestAdmission("3f9a0000000000a1"),
+        )
     )
     return HeadlessHttpClient("http://testserver", client=TestClient(app))
 
@@ -1173,7 +1162,7 @@ def test_changed_identity_and_restart_are_handled(monkeypatch) -> None:
     first = read_active_assistant_context(state, mode="composer-assistant")
 
     # A restarted Headless serving the same content: 304, no re-verify.
-    state.headless_client = _context_headless(reads, epoch="headless.epoch.2")
+    state.headless_client = _context_headless(reads)
     assert read_active_assistant_context(state, mode="composer-assistant") is first
     assert counts["verify"] == 1
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_ros2_control_execution VERSION 0.2.1 LANGUAGES CXX)
+project(manyforge_ros2_control_execution VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -167,6 +167,15 @@ if(BUILD_TESTING)
               $<TARGET_FILE:test_od55_motion_leaf_timing>
               --gtest_filter=Od55LeafTiming.LateAcceptanceReturnsWhileStopBarrierHeld)
     set_tests_properties(od55_late_accept_barrier PROPERTIES TIMEOUT 15)
+    # OD-111: no leaf lock in a ROS callback; the late cancel goes to StopControl.
+    foreach(od111 LateAcceptanceReturnsWhileGoalSendHoldsLeaf
+                  LateAcceptanceDuringAdmittedGoalSendDoesNotDeadlock)
+      add_test(NAME od55_${od111}
+        COMMAND ${CMAKE_CROSSCOMPILING_EMULATOR}
+                $<TARGET_FILE:test_od55_motion_leaf_timing>
+                --gtest_filter=Od55LeafTiming.${od111})
+      set_tests_properties(od55_${od111} PROPERTIES TIMEOUT 15)
+    endforeach()
 
     add_executable(test_ros2_transport_owner test/test_ros2_transport_owner.cpp)
     target_link_libraries(test_ros2_transport_owner PRIVATE

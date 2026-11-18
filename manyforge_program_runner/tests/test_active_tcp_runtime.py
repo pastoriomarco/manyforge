@@ -5,9 +5,14 @@ from types import SimpleNamespace
 
 import pytest
 
+from manyforge_behavior.kernel_client import (
+    KernelClientResponseError,
+    KernelOperationObservationUnavailableError,
+    PushedOperationTable,
+)
 from manyforge_program_runner.active_tcp_mirror import ActiveTcpMirror, ActiveTcpWireError
 from manyforge_program_runner.models import (
-    ProgramFullStopResumeRequest,
+    ProgramHaltResumeRequest,
     ProgramSelectionResumeRequest,
     ProgramSelectionStartRequest,
 )
@@ -57,13 +62,21 @@ def _runtime():
     runtime._active_tcp_stores = {}  # noqa: SLF001
     runtime._active_tcp_mirror = ActiveTcpMirror(on_change=runtime._write_active_tcp)  # noqa: SLF001
     runtime._kernel = SimpleNamespace(read_active_tcp=lambda **_kwargs: {"robots": []})  # noqa: SLF001
-    runtime._current_kernel_owner_epoch = lambda: "owner-1"  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._operation_table = PushedOperationTable()  # noqa: SLF001
+    # No runner command is held (OD-214 command rows).
+    runtime._command = None  # noqa: SLF001
     return runtime
 
 
-def _row(sequence, entry, *, owner="owner-1"):
+def _operations(change=0, resident=()):
+    # The stream v4 `state.operations` (OD-205 (b), OD-213).
+    return {"change": change, "faulted": [], "faulted_total": 0,
+            "resident": list(resident), "resident_total": len(resident)}
+
+
+def _row(sequence, entry):
     return {
-        "component_id": "robot", "owner_epoch": owner,
+        "component_id": "robot",
         "registration_generation": 1, "sequence": sequence, "entry": entry,
     }
 
@@ -72,17 +85,16 @@ def test_run_and_idle_stores_receive_stream_then_result_with_newer_winner() -> N
     runtime = _runtime()
     binding = _binding(include_io=True)
     run, idle = _Store(), _Store()
-    runtime._register_active_tcp_store(None, idle, binding, "owner-1")  # noqa: SLF001
-    runtime._register_active_tcp_store("run", run, binding, "owner-1")  # noqa: SLF001
+    runtime._register_active_tcp_store(None, idle, binding)  # noqa: SLF001
+    runtime._register_active_tcp_store("run", run, binding)  # noqa: SLF001
     first = _entry("tcp", target_component_id="tool", command_target_id="gripper")
     later = _entry("tip", target_component_id="tool", command_target_id="gripper")
     runtime._on_active_tcp_message({  # noqa: SLF001
-        "type": "snapshot", "owner_epoch": "owner-1",
-        "state": {"active_tcp_baseline": [_row(2, later)]},
+        "type": "snapshot",
+        "state": {"active_tcp_baseline": [_row(2, later)], "operations": _operations(),
+                  "planning_jobs": []},
     })
     runtime._apply_active_tcp_result("run", "robot", [_row(1, first)])  # noqa: SLF001
-    assert run.values == idle.values == {("robot", "arm"): later}
-    runtime._apply_active_tcp_result("run", "robot", [_row(3, first, owner="old")])  # noqa: SLF001
     assert run.values == idle.values == {("robot", "arm"): later}
     with pytest.raises(ActiveTcpWireError):
         runtime._apply_active_tcp_result("run", "robot", [])  # noqa: SLF001
@@ -91,19 +103,17 @@ def test_run_and_idle_stores_receive_stream_then_result_with_newer_winner() -> N
 def test_store_registration_seeds_known_state_without_a_bb_publisher() -> None:
     runtime = _runtime()
     entry = _entry()
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
     runtime._active_tcp_mirror.apply_rows([_row(0, entry)])  # noqa: SLF001
     runtime._kernel = SimpleNamespace(read_active_tcp=lambda **_kwargs: {"robots": [_row(0, entry)]})  # noqa: SLF001
     store = _Store()
     binding = _binding()
-    runtime._register_active_tcp_store(None, store, binding, "owner-1")  # noqa: SLF001
+    runtime._register_active_tcp_store(None, store, binding)  # noqa: SLF001
     assert store.values == {("robot", "arm"): entry}
 
 
 def test_unavailable_one_shot_read_leaves_new_store_unavailable() -> None:
     runtime = _runtime()
     entry = _entry()
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
     runtime._active_tcp_mirror.apply_rows([_row(1, entry)])  # noqa: SLF001
 
     def unavailable(**_kwargs):
@@ -112,47 +122,11 @@ def test_unavailable_one_shot_read_leaves_new_store_unavailable() -> None:
     runtime._kernel = SimpleNamespace(read_active_tcp=unavailable)  # noqa: SLF001
     store = _Store()
     binding = _binding()
-    runtime._register_active_tcp_store("run", store, binding, "owner-1")  # noqa: SLF001
+    runtime._register_active_tcp_store("run", store, binding)  # noqa: SLF001
     assert store.values == {}
     # A same-value Set TCP has no change event, but its successful receipt
     # still writes the previously unavailable Run key before it completes.
     runtime._apply_active_tcp_result("run", "robot", [_row(1, entry)])  # noqa: SLF001
-    assert store.values == {("robot", "arm"): entry}
-
-
-def test_late_old_registration_and_event_cannot_replace_stream_owner() -> None:
-    runtime = _runtime()
-    runtime._current_kernel_owner_epoch = lambda: "owner-2"  # type: ignore[method-assign]  # noqa: SLF001
-    entry = _entry()
-    runtime._on_active_tcp_message({  # noqa: SLF001
-        "type": "snapshot", "owner_epoch": "owner-2",
-        "state": {"active_tcp_baseline": [_row(0, entry, owner="owner-2")]},
-    })
-    runtime._kernel = SimpleNamespace(read_active_tcp=lambda **_kwargs: {"robots": [_row(5, entry)]})  # noqa: SLF001
-    store = _Store()
-    binding = _binding()
-    runtime._register_active_tcp_store("old-run", store, binding, "owner-1")  # noqa: SLF001
-    runtime._on_active_tcp_message({  # noqa: SLF001
-        "type": "event", "owner_epoch": "owner-1",
-        "event": {"record_kind": "active_tcp_changed", "payload": {
-            **_row(8, entry), "api_version": "manyforge.active_tcp_change.v2",
-        }},
-    })
-    assert runtime._active_tcp_mirror.owner_epoch == "owner-2"  # noqa: SLF001
-    assert store.values == {}
-
-
-def test_run_registration_uses_newer_stream_fence_not_start_capture() -> None:
-    runtime = _runtime()
-    runtime._active_tcp_mirror.set_owner("owner-2")  # noqa: SLF001
-    entry = _entry()
-    runtime._kernel = SimpleNamespace(
-        read_active_tcp=lambda **_kwargs: {"robots": [_row(1, entry, owner="owner-2")]}
-    )  # noqa: SLF001
-    store = _Store()
-    binding = _binding()
-    runtime._register_active_tcp_store("run", store, binding, "owner-1")  # noqa: SLF001
-    assert runtime._active_tcp_mirror.owner_epoch == "owner-2"  # noqa: SLF001
     assert store.values == {("robot", "arm"): entry}
 
 
@@ -162,7 +136,6 @@ def test_resume_refresh_failed_read_leaves_key_unavailable() -> None:
     entry = _entry()
     store = _Store()
     runtime._active_tcp_stores["run"] = (store, {"robot": ("arm",)})  # noqa: SLF001
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
     runtime._active_tcp_mirror.apply_rows([_row(1, entry)])  # noqa: SLF001
     def unavailable(*, ordered=False):
         assert ordered
@@ -178,7 +151,6 @@ def test_resume_refresh_does_not_blank_key_while_ordered_read_waits() -> None:
     entry = _entry()
     store = _Store()
     runtime._active_tcp_stores["run"] = (store, {"robot": ("arm",)})  # noqa: SLF001
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
     runtime._active_tcp_mirror.apply_rows([_row(1, entry)])  # noqa: SLF001
     entered, release = Event(), Event()
 
@@ -206,7 +178,6 @@ def test_resume_failed_read_keeps_stream_authority() -> None:
     entry = _entry()
     store = _Store()
     runtime._active_tcp_stores["run"] = (store, {"robot": ("arm",)})  # noqa: SLF001
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
     runtime._active_tcp_mirror.apply_rows([_row(1, entry)])  # noqa: SLF001
 
     def unavailable(*, ordered=False):
@@ -224,7 +195,6 @@ def test_resume_refresh_keeps_newer_stream_value_than_ordered_read() -> None:
     new = _entry("tip")
     store = _Store()
     runtime._active_tcp_stores["run"] = (store, {"robot": ("arm",)})  # noqa: SLF001
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
     runtime._active_tcp_mirror.apply_rows([_row(1, old)])  # noqa: SLF001
 
     def read(*, ordered=False):
@@ -259,66 +229,31 @@ def test_program_scene_reset_failure_preserves_typed_tcp_cause() -> None:
     }
 
 
-def test_reset_requires_every_registered_robot_from_current_owner() -> None:
+def test_reset_requires_every_registered_robot() -> None:
     runtime = _runtime()
     entry = _entry()
     store = _Store()
     runtime._active_tcp_stores["run"] = (store, {"robot": ("arm",)})  # noqa: SLF001
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
-    for rows in ([], [_row(1, entry, owner="old")]):
-        runtime._kernel = SimpleNamespace(reset_active_tcp=lambda: {"robots": rows})  # noqa: SLF001
-        with pytest.raises(ActiveTcpWireError):
-            runtime._reset_active_tcp()  # noqa: SLF001
+    runtime._kernel = SimpleNamespace(reset_active_tcp=lambda: {"robots": []})  # noqa: SLF001
+    with pytest.raises(ActiveTcpWireError):
+        runtime._reset_active_tcp()  # noqa: SLF001
     runtime._kernel = SimpleNamespace(reset_active_tcp=lambda: {"robots": [_row(1, entry)]})  # noqa: SLF001
     runtime._reset_active_tcp()  # noqa: SLF001
     assert store.values[("robot", "arm")] == entry
 
 
-def test_reset_installs_ordered_reply_owner_without_follower() -> None:
-    runtime = _runtime()
-    runtime._interrupt_state_follower = None  # noqa: SLF001
-    entry = _entry()
-    store = _Store()
-    runtime._active_tcp_stores["run"] = (store, {"robot": ("arm",)})  # noqa: SLF001
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
-    runtime._active_tcp_mirror.apply_rows([_row(5, entry)])  # noqa: SLF001
-    new = _entry("tip")
-    runtime._kernel = SimpleNamespace(  # noqa: SLF001
-        reset_active_tcp=lambda: {"robots": [_row(1, new, owner="owner-2")]},
-    )
-    runtime._reset_active_tcp()  # noqa: SLF001
-    assert runtime._active_tcp_mirror.owner_epoch == "owner-2"  # noqa: SLF001
-    assert store.values[("robot", "arm")] == new
-
-
-def test_invalid_reset_reply_cannot_install_a_new_owner() -> None:
-    runtime = _runtime()
-    runtime._interrupt_state_follower = None  # noqa: SLF001
-    entry = _entry()
-    runtime._active_tcp_stores["run"] = (_Store(), {"robot": ("arm",)})  # noqa: SLF001
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
-    other = {**_row(1, entry, owner="owner-3"), "component_id": "other"}
-    for rows in ([], [_row(1, entry, owner="owner-2"), other]):
-        runtime._kernel = SimpleNamespace(reset_active_tcp=lambda: {"robots": rows})  # noqa: SLF001
-        with pytest.raises(ActiveTcpWireError):
-            runtime._reset_active_tcp()  # noqa: SLF001
-        assert runtime._active_tcp_mirror.owner_epoch == "owner-1"  # noqa: SLF001
-
-
 @pytest.mark.parametrize("no_subscription", [False, True])
-def test_ordered_read_uses_owner_without_running_follower_even_with_liveness(no_subscription) -> None:
+def test_ordered_read_applies_without_running_follower_even_with_liveness(no_subscription) -> None:
     runtime = _runtime()
     if no_subscription:
         runtime._execution_transport = SimpleNamespace()  # noqa: SLF001
     else:
         runtime._interrupt_state_follower = SimpleNamespace(is_alive=lambda: False)  # noqa: SLF001
     entry = _entry()
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
     runtime._kernel = SimpleNamespace(  # noqa: SLF001
-        read_active_tcp=lambda **_kwargs: {"robots": [_row(1, entry, owner="owner-2")]},
+        read_active_tcp=lambda **_kwargs: {"robots": [_row(1, entry)]},
     )
     runtime._refresh_active_tcp()  # noqa: SLF001
-    assert runtime._active_tcp_mirror.owner_epoch == "owner-2"  # noqa: SLF001
     assert runtime._active_tcp_mirror.current()["robot"][2] == entry  # noqa: SLF001
 
 
@@ -327,7 +262,7 @@ def test_ordered_read_uses_owner_without_running_follower_even_with_liveness(no_
     [
         ("start_motion", ProgramSelectionStartRequest),
         ("resume_motion", ProgramSelectionResumeRequest),
-        ("resume_full_stop", ProgramFullStopResumeRequest),
+        ("resume_halt", ProgramHaltResumeRequest),
     ],
 )
 def test_motion_start_and_resume_refresh_tcp_before_host_action(method, request_type) -> None:
@@ -344,31 +279,11 @@ def test_motion_start_and_resume_refresh_tcp_before_host_action(method, request_
     runtime._control_effect = lambda _request, *, kind, effect: {"run": effect()}  # noqa: SLF001
     runtime._project_run = lambda run: run  # noqa: SLF001
     request = request_type.model_construct(
-        program_run_id="run", request_id="request", reason="operator",
-        group_ids=["arm"], expected_run_revision=1, expected_selection_revision=1,
+        program_run_id=1, request_key="0" * 32, reason="operator",
+        group_ids=["arm"], expected_run_revision=1, expected_hold_revision=1,
     )
-    getattr(runtime, method)("run", request)
+    getattr(runtime, method)(1, request)
     assert calls == ["tcp", "host"]
-
-
-def test_idle_no_liveness_seeds_own_ordered_read_not_previous_owner() -> None:
-    runtime = _runtime()
-    runtime._liveness = None  # noqa: SLF001
-    runtime._interrupt_state_follower = None  # noqa: SLF001
-    old = _entry()
-    new = _entry("tip")
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
-    runtime._active_tcp_mirror.apply_rows([_row(1, old)])  # noqa: SLF001
-    def read(*, ordered=False):
-        assert ordered
-        return {"robots": [_row(1, new, owner="owner-2")]}
-
-    runtime._kernel = SimpleNamespace(read_active_tcp=read)  # noqa: SLF001
-    store = _Store()
-    binding = _binding()
-    runtime._register_active_tcp_store(None, store, binding, "owner-1")  # noqa: SLF001
-    assert store.values == {("robot", "arm"): new}
-    assert runtime._active_tcp_mirror.owner_epoch == "owner-2"  # noqa: SLF001
 
 
 def test_idle_no_liveness_failed_ordered_read_does_not_seed_cache() -> None:
@@ -376,7 +291,6 @@ def test_idle_no_liveness_failed_ordered_read_does_not_seed_cache() -> None:
     runtime._liveness = None  # noqa: SLF001
     runtime._interrupt_state_follower = None  # noqa: SLF001
     old = _entry()
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
     runtime._active_tcp_mirror.apply_rows([_row(1, old)])  # noqa: SLF001
 
     def read(*, ordered=False):
@@ -386,7 +300,7 @@ def test_idle_no_liveness_failed_ordered_read_does_not_seed_cache() -> None:
     runtime._kernel = SimpleNamespace(read_active_tcp=read)  # noqa: SLF001
     store = _Store()
     binding = _binding()
-    runtime._register_active_tcp_store(None, store, binding, "owner-1")  # noqa: SLF001
+    runtime._register_active_tcp_store(None, store, binding)  # noqa: SLF001
     assert store.values == {}
 
 
@@ -394,7 +308,6 @@ def test_idle_registration_excludes_inflight_updates_until_own_read_fails() -> N
     runtime = _runtime()
     runtime._liveness = None  # noqa: SLF001
     runtime._interrupt_state_follower = None  # noqa: SLF001
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
     entry = _entry()
     entered, release = Event(), Event()
 
@@ -407,7 +320,7 @@ def test_idle_registration_excludes_inflight_updates_until_own_read_fails() -> N
     runtime._kernel = SimpleNamespace(read_active_tcp=read)  # noqa: SLF001
     store = _Store()
     binding = _binding()
-    worker = Thread(target=runtime._register_active_tcp_store, args=(None, store, binding, "owner-1"))  # noqa: SLF001
+    worker = Thread(target=runtime._register_active_tcp_store, args=(None, store, binding))  # noqa: SLF001
     worker.start()
     assert entered.wait(2)
     runtime._active_tcp_mirror.apply_rows([_row(1, entry)])  # noqa: SLF001
@@ -425,7 +338,6 @@ def test_idle_registration_seeds_latest_update_after_own_read() -> None:
     runtime = _runtime()
     runtime._liveness = None  # noqa: SLF001
     runtime._interrupt_state_follower = None  # noqa: SLF001
-    runtime._active_tcp_mirror.set_owner("owner-1")  # noqa: SLF001
     old = _entry()
     new = _entry("tip")
 
@@ -437,5 +349,36 @@ def test_idle_registration_seeds_latest_update_after_own_read() -> None:
     runtime._kernel = SimpleNamespace(read_active_tcp=read)  # noqa: SLF001
     store = _Store()
     binding = _binding()
-    runtime._register_active_tcp_store(None, store, binding, "owner-1")  # noqa: SLF001
+    runtime._register_active_tcp_store(None, store, binding)  # noqa: SLF001
     assert store.values == {("robot", "arm"): new}
+
+
+def test_stream_state_feeds_the_pushed_operations_until_the_stream_is_lost() -> None:
+    # OD-213: the follower thread keeps the nodes' copy of the operations.
+    runtime = _runtime()
+    entry = {"control_pending": False, "last_control": None, "operation_id": 3,
+             "operation": {"operation_id": 3, "state": "executing"}}
+    runtime._on_active_tcp_message({  # noqa: SLF001
+        "type": "state",
+        "state": {"active_tcp_baseline": [], "operations": _operations(5, [entry]),
+                  "planning_jobs": [{"job_id": "job-1", "kind": "pick",
+                                     "program_run_id": 1, "state": "planning"}]},
+    })
+    envelope = runtime._operation_table.envelope(3, 5)  # noqa: SLF001
+    assert envelope["operation"] == entry["operation"] and envelope["resident"] is True
+    # OD-213 (1): the same message's planning jobs, lost with it.
+    jobs = runtime._operation_table.planning_jobs  # noqa: SLF001
+    assert jobs.state("job-1") == "planning"
+    runtime._on_active_tcp_stream_lost(RuntimeError("lost"))  # noqa: SLF001
+    with pytest.raises(KernelOperationObservationUnavailableError):
+        runtime._operation_table.envelope(3, 5)  # noqa: SLF001
+    with pytest.raises(KernelOperationObservationUnavailableError):
+        jobs.state("job-1")
+    # A malformed table raises (the subscription reconnects) and stays unavailable.
+    with pytest.raises(KernelClientResponseError):
+        runtime._on_active_tcp_message({  # noqa: SLF001
+            "type": "snapshot",
+            "state": {"active_tcp_baseline": [], "operations": {"change": 6}},
+        })
+    with pytest.raises(KernelOperationObservationUnavailableError):
+        runtime._operation_table.envelope(3, 5)  # noqa: SLF001

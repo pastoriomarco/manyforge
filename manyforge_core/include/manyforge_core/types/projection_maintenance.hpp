@@ -45,7 +45,7 @@ struct ProjectionMaintenanceInitializationRequestDTO final {
   std::vector<AddObjectRequestDTO> initial_scene_objects{};
 
   [[nodiscard]] bool valid() const noexcept {
-    if (apply_id.empty() || !apply_generation.nonzero() ||
+    if (!apply_id.nonzero() || !apply_generation.nonzero() ||
         !expected_active_projection_revision.valid() ||
         candidate_retained_bundle.retained_bundle_id.empty() ||
         candidate_retained_bundle.cell_graph.graph_revision.empty() ||
@@ -102,7 +102,7 @@ struct ProjectionMaintenanceInitializationStatusDTO final {
   bool initial_scene_installed{false};
 
   [[nodiscard]] bool valid() const noexcept {
-    if (apply_id.empty() || !apply_generation.nonzero() ||
+    if (!apply_id.nonzero() || !apply_generation.nonzero() ||
         !predecessor_projection_revision.valid() ||
         !target_projection_revision.valid() ||
         !authoritative_snapshot_identity.valid() ||
@@ -160,7 +160,7 @@ struct ProjectionMaintenanceInitializationQueryDTO final {
   ApplyGeneration apply_generation;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero();
+    return apply_id.nonzero() && apply_generation.nonzero();
   }
 
   friend bool operator==(
@@ -176,7 +176,7 @@ struct ProjectionMaintenanceCompletionDTO final {
   ActiveBundlePublicationReceiptDTO publication_receipt;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero() &&
+    return apply_id.nonzero() && apply_generation.nonzero() &&
            target_projection_revision.valid() &&
            authoritative_snapshot_identity.valid() &&
            target_projection_revision.scene_revision ==

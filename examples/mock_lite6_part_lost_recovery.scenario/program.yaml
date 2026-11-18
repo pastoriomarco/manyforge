@@ -4,6 +4,14 @@
     "keys": [
       {
         "access": "read_write",
+        "description": "Set once the carry has detached the part, so the recovery does not detach it again.",
+        "initial": false,
+        "key": "part_detached",
+        "persistence": "run",
+        "type": "bool"
+      },
+      {
+        "access": "read_write",
         "initial": false,
         "key": "part_lost",
         "persistence": "run",
@@ -561,6 +569,15 @@
                     },
                     {
                       "children": [],
+                      "instance_id": "set_part_detached",
+                      "node_id": "logic.set_value",
+                      "parameters": {
+                        "key": "part_detached",
+                        "value": true
+                      }
+                    },
+                    {
+                      "children": [],
                       "execution_groups": [
                         "carry"
                       ],
@@ -744,16 +761,32 @@
                   }
                 },
                 {
-                  "children": [],
-                  "instance_id": "detach_graspable_after_loss",
-                  "node_id": "scene.detach_carried_object",
-                  "parameters": {
-                    "scene_resource_id": "graspable",
-                    "target": {
-                      "command_target_id": "gripper",
-                      "component_id": "lite_gripper"
+                  "children": [
+                    {
+                      "children": [],
+                      "instance_id": "part_already_detached",
+                      "node_id": "logic.check_value",
+                      "parameters": {
+                        "key": "part_detached",
+                        "value": true
+                      }
+                    },
+                    {
+                      "children": [],
+                      "instance_id": "detach_graspable_after_loss",
+                      "node_id": "scene.detach_carried_object",
+                      "parameters": {
+                        "scene_resource_id": "graspable",
+                        "target": {
+                          "command_target_id": "gripper",
+                          "component_id": "lite_gripper"
+                        }
+                      }
                     }
-                  }
+                  ],
+                  "instance_id": "detach_unless_placed",
+                  "node_id": "fallback",
+                  "parameters": {}
                 },
                 {
                   "children": [],
@@ -910,6 +943,10 @@
       "y": 1944
     },
     "detach_graspable_after_loss": {
+      "x": 1320,
+      "y": 3129
+    },
+    "detach_unless_placed": {
       "x": 1008,
       "y": 3050
     },
@@ -961,6 +998,10 @@
       "x": 696,
       "y": 1628
     },
+    "part_already_detached": {
+      "x": 1320,
+      "y": 2971
+    },
     "pick_retreat": {
       "x": 1320,
       "y": 1312
@@ -988,6 +1029,10 @@
     "sequence": {
       "x": 1008,
       "y": 1075
+    },
+    "set_part_detached": {
+      "x": 1320,
+      "y": 2023
     },
     "set_piece_lost": {
       "x": 1320,

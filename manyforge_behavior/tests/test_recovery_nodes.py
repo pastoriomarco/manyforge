@@ -66,9 +66,9 @@ def test_only_an_allowed_intervention_holds_a_failed_attempt(recovery, held) -> 
 
 @pytest.mark.parametrize("action", ["retry", "manual_success"])
 def test_parallel_recovery_never_reinvokes_an_unresolved_sibling(action):
-    attempts = ProgramRunAttemptSource("run")
+    attempts = ProgramRunAttemptSource(1)
     registry = ProgramInterventionRegistry(maximum_retained_runs=1)
-    registry.register_run("run", ["a", "b"])
+    registry.register_run(1, ["a", "b"])
 
     class FailingOwner(py_trees.behaviour.Behaviour):
         def __init__(self, name):
@@ -97,18 +97,18 @@ def test_parallel_recovery_never_reinvokes_an_unresolved_sibling(action):
         policy=py_trees.common.ParallelPolicy.SuccessOnAll(synchronise=True),
     )
     list(root.tick())
-    first, second = registry.read_all("run")
+    first, second = registry.read_all(1)
     assert [child.calls for child in children] == [1, 1]
     registry.resolve(first.identity, action=action)
     list(root.tick())
     assert [child.calls for child in children] == [1, 1]
     assert children[1].attempt_identity == second.identity
-    assert registry.read_all("run") == (second,)
+    assert registry.read_all(1) == (second,)
     if action == "manual_success":
         assert held[0].presented_status is py_trees.common.Status.SUCCESS
         held[0].observe_while_operator_stop_held()
         assert held[0].status is py_trees.common.Status.SUCCESS
-        assert registry.read_all("run") == (second,)
+        assert registry.read_all(1) == (second,)
     list(root.tick())
     assert children[0].calls == (2 if action == "retry" else 1)
     assert children[1].calls == 1

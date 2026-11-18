@@ -10,19 +10,16 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from contextlib import aclosing
 from dataclasses import dataclass, replace
 from functools import partial
 import json
 import logging
-from pathlib import Path
 import time
 import threading
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable
 
 import rfc8785
 from pydantic import ValidationError
-from watchfiles import awatch
 from websockets.asyncio.client import connect as connect_websocket
 from websockets.exceptions import ConnectionClosed
 
@@ -34,11 +31,18 @@ from .control_protocol import (
     ExecutionControlProjectionDTO,
 )
 from . import error_codes
-from .component_model import manual_operation_resident, run_readiness
+from .component_model import (
+    CycleUnknown,
+    RunCycleFacts,
+    manual_operation_resident,
+    run_cycle_facts,
+    run_readiness,
+)
 from .component_overview import ComponentOverviewFacts
 from .execution_control import ExecutionControlIngress
 from .held_run_authoring import held_run_draft_edit_allowed
 from .native import HeadlessApiError, strict_json_object
+from .identity import causal_display
 from .program_cycle import (
     PROGRAM_CONTROL_STATE_SCHEMA,
     ProgramCycleFrameDTO,
@@ -57,7 +61,7 @@ _ERROR_CODES = frozenset(
     if name.isupper() and isinstance(value, str)
 )
 _LOGGER = logging.getLogger(__name__)
-_PROGRAM_FAILURE_CONDITION_SCHEMA = "manyforge.program_failure_condition.v1"
+_PROGRAM_FAILURE_CONDITION_SCHEMA = "manyforge.program_failure_condition.v2"
 # Run states holding an unresolved failure: held for it, ended failed, or
 # stopped with it. Only the Run's own resolution clears the condition.
 _ORDINARY_FAILURE_EFFECTS = frozenset({"no_effect", "effect_settled"})
@@ -112,7 +116,6 @@ class ControlSemanticContext:
 
     status: str
     reason: str | None
-    semantic_owner_epoch: str | None = None
     execution_control_revision: int | None = None
 
 
@@ -133,7 +136,10 @@ def _runtime_payload_key(name: str, payload: Any) -> str:
                     {
                         key: value for key, value in row.items()
                         if key not in {
-                            "process_observation_sequence", "source_report_sequence"
+                            "process_observation_sequence",
+                            "source_report_sequence",
+                            # Information only (OD-295 (1)(a)).
+                            "report_age_ns",
                         }
                     } if isinstance(row, dict) else row
                     for row in rows
@@ -161,7 +167,6 @@ def _meaningful_runtime_key(runtime: dict[str, Any]) -> tuple[Any, ...]:
             row.get("freshness"),
             tuple(row.get("known_gaps", ())),
             row.get("source_owner_id"),
-            row.get("source_owner_epoch"),
             row.get("source_generation") if generation else None,
             row.get("source_content_digest") if generation else None,
             _runtime_payload_key(name, row.get("payload")) if not generation else None,
@@ -170,7 +175,6 @@ def _meaningful_runtime_key(runtime: dict[str, Any]) -> tuple[Any, ...]:
     return (
         json.dumps(runtime.get("initial_scene_failure"), sort_keys=True),
         runtime.get("projection_owner_id"),
-        runtime.get("projection_owner_epoch"),
         runtime.get("complete"),
         tuple(runtime.get("reasons", ())),
         tuple(runtime.get("unavailable_sections", ())),
@@ -314,13 +318,6 @@ def _shell_key(shell: dict[str, Any]) -> tuple[Any, ...]:
     )
 
 
-def _source_file_observation(path: Path) -> tuple[str | None, int | None]:
-    """Use the existing native codec off-loop, without holding Python's GIL."""
-    from manyforge_headless_py import read_control_source_file_hint
-
-    return read_control_source_file_hint(str(path)) or (None, None)
-
-
 def program_failure_origins(cycle: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Ordinary operation failures the accepted Run currently holds, by origin.
 
@@ -348,7 +345,6 @@ def program_failure_origins(cycle: dict[str, Any]) -> dict[str, dict[str, Any]]:
         ):
             continue
         origin = {
-            "program_runner_owner_epoch": cycle["program_runner_owner_epoch"],
             "program_run_id": cycle["program_run_id"],
             "occurrence": {
                 "node_instance_id": row["node_instance_id"],
@@ -360,9 +356,7 @@ def program_failure_origins(cycle: dict[str, Any]) -> dict[str, dict[str, Any]]:
             "failure": dict(row["failure"]),
         }
         key = json.dumps(
-            [origin[name] for name in (
-                "program_runner_owner_epoch", "program_run_id", "occurrence", "operation"
-            )],
+            [origin[name] for name in ("program_run_id", "occurrence", "operation")],
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -380,13 +374,7 @@ class _ProgramFailureOccurrence:
 def build_control_projection(
     cycle: dict[str, Any], ingress: ExecutionControlIngress
 ) -> ExecutionControlProjectionDTO:
-    owner_epoch = cycle.get("program_runner_owner_epoch")
     revision = cycle.get("execution_control_revision")
-    if not isinstance(owner_epoch, str) or not owner_epoch:
-        raise HeadlessApiError(
-            "execution_control_projection_invalid",
-            "Program owner omitted its owner epoch",
-        )
     if type(revision) is not int or revision < 1:
         raise HeadlessApiError(
             "execution_control_projection_invalid",
@@ -397,21 +385,21 @@ def build_control_projection(
     return ExecutionControlProjectionDTO.model_validate(
         {
             "schema_version": EXECUTION_CONTROL_PROJECTION_SCHEMA,
-            "receiver_incarnation": ingress.receiver_incarnation,
-            "semantic_owner_epoch": owner_epoch,
+            "application_start_id": ingress.application_start_id,
             "execution_control_revision": revision,
             "cycle_state": state,
             "cycle_generation": cycle.get("cycle_generation"),
             "program_run_id": cycle.get("program_run_id"),
             "run_revision": cycle.get("run_revision"),
             "allowed_commands": cycle.get("allowed_commands"),
-            "causal_correlation_id": cycle.get("causal_correlation_id"),
-            "causal_session_id": cycle.get("causal_session_id"),
-            "causal_client_sequence": cycle.get("causal_client_sequence"),
+            "causal_request_key": cycle.get("causal_request_key"),
+            "causal_display": causal_display(
+                ingress.application_start_id, cycle.get("causal_request_key")
+            ),
             "current_rejection": None,
             "current_failure": failure,
             "recovery_required": state == "recovery_required",
-            "freshness": ingress.freshness_for(owner_epoch, revision),
+            "freshness": ingress.freshness_for(revision),
         }
     )
 
@@ -427,7 +415,6 @@ def _component_model_events(facts: ComponentOverviewFacts) -> dict[str, Any]:
     model = facts.component_model
     if model is None:
         return {name: None for name in _COMPONENT_MODEL_EVENTS}
-    cycle = facts.program_cycle if isinstance(facts.program_cycle, Mapping) else None
     return {
         "component_state": list(model.component_states),
         "cell_latch": dict(model.cell_latch),
@@ -435,7 +422,7 @@ def _component_model_events(facts: ComponentOverviewFacts) -> dict[str, Any]:
         "run_readiness": dict(
             run_readiness(
                 model,
-                cycle,
+                run_cycle_facts(facts.program_cycle),
                 program_status=facts.applied_program_status,
                 manual_operation_in_progress=manual_operation_resident(
                     facts.execution_control_response
@@ -454,27 +441,13 @@ class HeadlessControlStateSource:
         ingress: ExecutionControlIngress,
         *,
         program_runner_websocket_url: str | None,
-        cold_watch_paths: Iterable[Path] = (),
-        cold_freshness_paths: Iterable[Path] = (),
-        cold_freshness_budget_ns: int | None = None,
         incident_recorder: Callable[..., dict[str, Any]] | None = None,
         program_failure_observer: Callable[[str], dict[str, Any]] | None = None,
+        runner_command_observer: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._service = service
         self._ingress = ingress
         self._runner_url = program_runner_websocket_url
-        self._watch_paths = tuple(
-            dict.fromkeys(Path(path).absolute() for path in cold_watch_paths)
-        )
-        self._watch_roots = tuple(
-            dict.fromkeys(path.parent for path in self._watch_paths)
-        )
-        self._freshness_paths = frozenset(
-            Path(path).absolute() for path in cold_freshness_paths
-        )
-        if cold_freshness_budget_ns is not None and cold_freshness_budget_ns < 1:
-            raise ValueError("cold freshness budget must be positive")
-        self._cold_freshness_budget_ns = cold_freshness_budget_ns
         self._incident_recorder = incident_recorder
         self._diagnostic_origin_ns = time.monotonic_ns()
         self._diagnostics = {
@@ -497,7 +470,6 @@ class HeadlessControlStateSource:
             "snapshot": 0,
             "delta": 0,
             "command_receipt": 0,
-            "resync_required": 0,
         }
         self._heartbeat_rtt_ns: deque[int] = deque(maxlen=256)
         self._active_client_incidents: dict[tuple[str, str], tuple[str, int, str]] = {}
@@ -505,11 +477,6 @@ class HeadlessControlStateSource:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._runner_task: asyncio.Task[None] | None = None
         self._cold_task: asyncio.Task[None] | None = None
-        self._watch_task: asyncio.Task[None] | None = None
-        self._cold_expiry_handle: asyncio.TimerHandle | None = None
-        self._watch_keys: dict[Path, str | None] = {}
-        self._watch_modified: dict[Path, int | None] = {}
-        self._watch_fresh: dict[Path, bool] = {}
         self._lifecycle_lock = asyncio.Lock()
         self._closed = False
         self._generation = 0
@@ -525,7 +492,6 @@ class HeadlessControlStateSource:
         self._program_wake: asyncio.Event | None = None
         self._program_source_current = False
         self._program_source_log_ns: int | None = None
-        self._watch_source_current = True
         self._source_incidents: dict[str, tuple[int, int]] = {}
         self._incident_recording_failed = False
         self._semantic_reason: str | None = None
@@ -540,7 +506,8 @@ class HeadlessControlStateSource:
         # Program-failure condition follows the Run without a browser.
         self._program_demand = False
         self._program_failure_observer = program_failure_observer
-        self._program_failure_epoch: str | None = None
+        # Told the runner command rows of every accepted cycle (OD-214).
+        self._runner_command_observer = runner_command_observer
         self._program_failure_control_revision: int | None = None
         self._program_failures: dict[str, _ProgramFailureOccurrence] = {}
         self._program_failures_resend = False
@@ -655,7 +622,6 @@ class HeadlessControlStateSource:
         scene_revision = mapping(projection.get("scene_revision"))
         context: dict[str, str] = {
             "program_source_current": str(self._program_source_current).lower(),
-            "cold_source_current": str(self._watch_source_current).lower(),
         }
         for source, names in (
             (
@@ -664,7 +630,6 @@ class HeadlessControlStateSource:
                     key: key
                     for key in (
                         "program_run_id",
-                        "program_runner_owner_epoch",
                         "cycle_generation",
                         "execution_control_revision",
                         "run_revision",
@@ -693,7 +658,6 @@ class HeadlessControlStateSource:
                     key: f"scene_{key}"
                     for key in (
                         "source_owner_id",
-                        "source_owner_epoch",
                         "source_generation",
                     )
                 }
@@ -757,7 +721,7 @@ class HeadlessControlStateSource:
             incident_id=f"{source}.{first}",
             incident_kind="control_source_unavailable",
             phase="activated" if failed else "resolved",
-            control_session_id=self._ingress.receiver_incarnation,
+            control_session_number=None,
             client_incarnation="headless-source",
             source_label=source,
             reason_code="source_unavailable" if failed else "source_recovered",
@@ -772,11 +736,6 @@ class HeadlessControlStateSource:
             if self._program_source_current:
                 self._report_program_failures_unknown()
             self._program_source_current = False
-        elif source == "file_watch":
-            self._watch_source_current = False
-            if self._cold_expiry_handle is not None:
-                self._cold_expiry_handle.cancel()
-                self._cold_expiry_handle = None
         self._source_transition(source, failed=True)
         self._facts = None
         for subscription in self._subscriptions:
@@ -789,7 +748,7 @@ class HeadlessControlStateSource:
         incident_id: str,
         incident_kind: str,
         phase: str,
-        control_session_id: str,
+        control_session_number: int,
         source_label: str,
         occurrence_count: int,
         maximum_delay_ns: int | None,
@@ -825,7 +784,7 @@ class HeadlessControlStateSource:
             incident_id=incident_id,
             incident_kind=incident_kind,
             phase=phase,
-            control_session_id=control_session_id,
+            control_session_number=control_session_number,
             client_incarnation=client_incarnation,
             source_label=source_label,
             reason_code=reason_code,
@@ -884,8 +843,6 @@ class HeadlessControlStateSource:
                 if self._runner_task is None or self._runner_task.done():
                     self._start_program_reader(loop)
                 self._cold_task = loop.create_task(self._run_cold_assembler())
-                if self._watch_roots:
-                    self._watch_task = loop.create_task(self._run_file_wakes())
                 self.notify_cold()
             elif self._is_synchronized():
                 subscription.frame = self._frame("critical")
@@ -910,7 +867,6 @@ class HeadlessControlStateSource:
             for task in (
                 None if self._program_demand else self._runner_task,
                 self._cold_task,
-                self._watch_task,
             )
             if task is not None
         )
@@ -920,18 +876,10 @@ class HeadlessControlStateSource:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._cold_task = None
-        self._watch_task = None
-        if self._cold_expiry_handle is not None:
-            self._cold_expiry_handle.cancel()
-            self._cold_expiry_handle = None
         self._facts = None
         self._shell = None
         self._shell_key = None
         self._cold_wake = None
-        self._watch_keys.clear()
-        self._watch_modified.clear()
-        self._watch_fresh.clear()
-        self._watch_source_current = True
         self._semantic_reason = None
         if self._program_demand:
             return
@@ -1010,10 +958,6 @@ class HeadlessControlStateSource:
             return ControlSemanticContext(
                 status="unavailable", reason="program_control_source_unavailable"
             )
-        if not self._watch_source_current:
-            return ControlSemanticContext(
-                status="unavailable", reason="control_file_watch_unavailable"
-            )
         if cycle is None:
             return ControlSemanticContext(
                 status="synchronizing",
@@ -1034,9 +978,8 @@ class HeadlessControlStateSource:
                 status="synchronizing",
                 reason="control_projection_synchronizing",
             )
-        owner_epoch = cycle.get("program_runner_owner_epoch")
         revision = cycle.get("execution_control_revision")
-        if not isinstance(owner_epoch, str) or type(revision) is not int:
+        if type(revision) is not int:
             return ControlSemanticContext(
                 status="unavailable",
                 reason="program_control_identity_invalid",
@@ -1044,9 +987,20 @@ class HeadlessControlStateSource:
         return ControlSemanticContext(
             status="current",
             reason=None,
-            semantic_owner_epoch=owner_epoch,
             execution_control_revision=revision,
         )
+
+    def held_cycle_facts(self) -> RunCycleFacts | CycleUnknown:
+        """Readiness's cycle facts from the held Program state."""
+
+        cycle = self._cycle
+        if "program" in self._source_incidents or (
+            cycle is not None and not self._program_source_current
+        ):
+            return CycleUnknown("program_control_source_unavailable")
+        if cycle is None:
+            return CycleUnknown("program_control_state_synchronizing")
+        return run_cycle_facts(cycle)
 
     def _is_synchronized(self) -> bool:
         cycle = self._cycle
@@ -1056,7 +1010,6 @@ class HeadlessControlStateSource:
             and facts is not None
             and self._shell is not None
             and self._program_source_current
-            and self._watch_source_current
             and self._semantic_reason is None
             and facts.program_cycle == cycle
         )
@@ -1114,6 +1067,8 @@ class HeadlessControlStateSource:
         self._source_transition("program", failed=False)
         self._cycle = cycle
         self._observe_program_failures(cycle)
+        if self._runner_command_observer is not None:
+            self._runner_command_observer(cycle["runner_commands"])
         if self._facts is None:
             self.notify_cold()
         else:
@@ -1122,7 +1077,9 @@ class HeadlessControlStateSource:
             # complete update, even if another owner advanced independently.
             facts = replace(self._facts, program_cycle=cycle)
             try:
-                shell = self._shell_from_facts(facts)
+                shell = self._shell_from_facts(
+                    facts, application_start_id=self._ingress.application_start_id
+                )
             except ControlStateUnavailableError as error:
                 self._semantic_reason = str(error)
                 return
@@ -1153,19 +1110,13 @@ class HeadlessControlStateSource:
         Active follows the Run's failure row. Clear comes only under a later
         accepted control revision: the row is gone from the same Run (that
         hold was released by Retry, Continue or a manual result, whatever
-        other holds remain), a completed Reset, or the same owner showing
-        another Run id (a new Run started). A missing run or an owner
-        replacement never clears; the native source registration makes a
-        replaced owner's conditions unknown.
+        other holds remain), a completed Reset, or another Run id (a new
+        Run started). A missing run never clears.
         """
 
         if self._program_failure_observer is None:
             return
-        epoch = cycle["program_runner_owner_epoch"]
         control = cycle["execution_control_revision"]
-        if epoch != self._program_failure_epoch:
-            self._program_failures.clear()
-            self._program_failure_epoch = epoch
         self._program_failure_control_revision = control
         run_id = cycle.get("program_run_id")
         run_revision = cycle.get("run_revision")
@@ -1184,7 +1135,7 @@ class HeadlessControlStateSource:
                 # so its failure) no longer exists, even without an observed
                 # idle_after_reset in between.
                 or (
-                    isinstance(run_id, str)
+                    type(run_id) is int
                     and run_id != occurrence.origin["program_run_id"]
                 )
             )
@@ -1219,7 +1170,6 @@ class HeadlessControlStateSource:
         origin = occurrence.origin
         condition = {
             "schema_version": _PROGRAM_FAILURE_CONDITION_SCHEMA,
-            "program_runner_owner_epoch": origin["program_runner_owner_epoch"],
             "execution_control_revision": control,
             "program_run_id": origin["program_run_id"],
             "run_revision": occurrence.run_revision,
@@ -1409,7 +1359,9 @@ class HeadlessControlStateSource:
         )
 
     @staticmethod
-    def _shell_from_facts(facts: ComponentOverviewFacts) -> dict[str, Any]:
+    def _shell_from_facts(
+        facts: ComponentOverviewFacts, *, application_start_id: str
+    ) -> dict[str, Any]:
         required = {
             "runtime": facts.runtime,
             "alarms": facts.alarms,
@@ -1451,7 +1403,15 @@ class HeadlessControlStateSource:
             ),
             "execution_targets": targets,
             "execution_control_state": control,
-            "program_cycle": dict(facts.program_cycle),
+            # Like `/api/cycle/status`: Headless adds the display of the
+            # causal key (1.16.2).
+            "program_cycle": {
+                **facts.program_cycle,
+                "causal_display": causal_display(
+                    application_start_id,
+                    facts.program_cycle.get("causal_request_key"),
+                ),
+            },
             # Component model v2 events: each key
             # is sent again in a delta whenever its value changes.
             **_component_model_events(facts),
@@ -1461,7 +1421,9 @@ class HeadlessControlStateSource:
         self,
     ) -> tuple[ComponentOverviewFacts, dict[str, Any], tuple[Any, ...]]:
         facts = await self._capture_facts()
-        shell = self._shell_from_facts(facts)
+        shell = self._shell_from_facts(
+            facts, application_start_id=self._ingress.application_start_id
+        )
         return facts, shell, _shell_key(shell)
 
     async def _run_cold_assembler(self) -> None:
@@ -1501,7 +1463,7 @@ class HeadlessControlStateSource:
                 self._invalidate_source("cold_projection")
                 _LOGGER.exception("Unexpected control projection failure")
                 raise
-            if not self._program_source_current or not self._watch_source_current:
+            if not self._program_source_current:
                 # Keep a pending settle refresh for the next current reduction.
                 self._observation_refresh_requested |= observation_refresh
                 continue
@@ -1527,90 +1489,6 @@ class HeadlessControlStateSource:
                 self._publish("cold")
             else:
                 self._diagnostics["unchanged_reductions"] += 1
-            if self._watch_source_current:
-                self._source_transition("file_watch", failed=False)
-
-    async def _refresh_file_watches(
-        self, *, notify: bool, paths: Iterable[Path] | None = None
-    ) -> None:
-        """Read each changed source once, using existing bounded work capacity."""
-        changed = False
-        selected = self._watch_paths if paths is None else paths
-        for path in selected:
-            key, modified = await _drained_owner_read(
-                _source_file_observation, path=path
-            )
-            if path in self._watch_keys and self._watch_keys[path] != key:
-                changed = True
-            self._watch_keys[path] = key
-            self._watch_modified[path] = modified
-        self._refresh_file_freshness(notify=notify, changed=changed)
-
-    def _refresh_file_freshness(self, *, notify: bool, changed: bool = False) -> None:
-        """One cached deadline; expiry does no file I/O, parsing or hashing."""
-        now_ns = time.time_ns()
-        budget_ns = self._cold_freshness_budget_ns or 0
-        deadlines = []
-        for path in self._freshness_paths:
-            modified = self._watch_modified.get(path)
-            fresh = modified is not None and modified <= now_ns <= modified + budget_ns
-            if path in self._watch_fresh and self._watch_fresh[path] != fresh:
-                changed = True
-            self._watch_fresh[path] = fresh
-            if fresh:
-                deadlines.append(modified + budget_ns + 1)
-
-        if self._cold_expiry_handle is not None:
-            self._cold_expiry_handle.cancel()
-            self._cold_expiry_handle = None
-        loop = self._loop
-        if deadlines and loop is not None and self._subscriptions:
-            delay_ns = max(1, min(deadlines) - now_ns)
-            self._cold_expiry_handle = loop.call_later(
-                delay_ns / 1_000_000_000,
-                partial(self._refresh_file_freshness, notify=True),
-            )
-        if changed and notify:
-            self.notify_cold()
-
-    async def _run_file_wakes(self) -> None:
-        retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
-        while self._subscriptions and not self._closed:
-            try:
-                await self._refresh_file_watches(notify=False)
-                self._watch_source_current = True
-                self.notify_cold()  # Recovery captures current owners once.
-                async with aclosing(awatch(*self._watch_roots)) as watcher:
-                    async for changes in watcher:
-                        if not self._subscriptions or self._closed:
-                            return
-                        paths = {Path(name) for _kind, name in changes}
-                        if any(
-                            root == path or path in root.parents
-                            for root in self._watch_roots
-                            for path in paths
-                        ):
-                            # A root-only remove/rename event invalidates every
-                            # read from that registration. Re-register the same
-                            # watcher and capture current files on recovery.
-                            break
-                        await self._refresh_file_watches(
-                            notify=True,
-                            paths=(path for path in self._watch_paths if path in paths),
-                        )
-                        self._source_transition("file_watch", failed=False)
-                        retry_seconds = _SOURCE_RETRY_INITIAL_SECONDS
-                self._invalidate_source("file_watch")
-            except asyncio.CancelledError:
-                raise
-            except OSError:
-                self._invalidate_source("file_watch")
-            except Exception:
-                self._invalidate_source("file_watch")
-                _LOGGER.exception("Unexpected control file-watch failure")
-                raise
-            await asyncio.sleep(retry_seconds)
-            retry_seconds = min(retry_seconds * 2, _SOURCE_RETRY_MAX_SECONDS)
 
 
 __all__ = [

@@ -140,14 +140,14 @@ component_manager::RuntimeUnitConvergencePlanRowDTO RuntimeRow() {
       "manyforge.runtime-publication.status",
       "status-revision-1",
       "private-controller",
-      "manyforge.posix_sh.retained_script",
+      "manyforge.installed_execution_target",
       "adapter-revision-1",
       "retained-raw-artifact",
       "retrieval-revision-1",
       core::ContentDigest(std::string(kDigestTwo)),
       1U,
       "linux",
-      "posix.1-2017",
+      "manyforge.ros2_control_execution_host.abi.v1",
       requirement.value(),
       core::RuntimeContractOfferDigest(std::string(kDigestOne)),
   };
@@ -215,12 +215,12 @@ component_manager::ManagerApplyIntentDTO ApplyIntent(
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission) {
   return {
       core::PublicRequestContextDTO{
-          core::RequestId("request-1"),
-          core::RequestOwnerEpoch("manager-client-epoch-1"),
+          core::RequestKey::Make(
+              core::RequestKeyClass::kInternal, 0U,
+              static_cast<std::uint64_t>(core::RequestKeyMinter::kManager), 1U),
           "owner-publication-test",
-          std::nullopt,
       },
-      core::ApplyId("apply-1"),
+      core::ApplyId(1U),
       core::ApplyGeneration(1U),
       admission.cell_id(),
       ProjectionRevision(admission),
@@ -311,7 +311,7 @@ TEST(ManagerSourcePublication,
       admission.retained_bundle(), admission, Runtime(admission), journal,
       ManagerApplyMutationAvailability::kKernelOwnerUnavailable);
   const auto bytes = content_identity::canonical_json(payload);
-  EXPECT_NE(bytes.find("\"api_version\":\"manyforge.manager_source.v1\""),
+  EXPECT_NE(bytes.find("\"api_version\":\"manyforge.manager_source.v2\""),
             std::string::npos);
   EXPECT_NE(bytes.find("\"cell_graph\":"), std::string::npos);
   const auto *const active = payload.find_object_member("active");
@@ -340,7 +340,7 @@ TEST(ManagerSourcePublication, NamedClosePublicationIsCanonicalEmptyByAdmissionI
       directory.path() / "apply.sqlite3", admission.cell_id());
   auto runtime = Runtime(admission);
   runtime.plan.active_publication.request.transaction_ref =
-      core::NamedApplyPublicationTransactionDTO{core::ApplyId("apply.close"), core::ApplyGeneration(1U)};
+      core::NamedApplyPublicationTransactionDTO{core::ApplyId(2U), core::ApplyGeneration(1U)};
   runtime.plan.active_publication.request.expected_previous_publication_generation =
       core::ActiveBundlePublicationGeneration(1U);
   runtime.plan.active_publication.publication_generation = core::ActiveBundlePublicationGeneration(2U);
@@ -354,7 +354,7 @@ TEST(ManagerSourcePublication, NamedClosePublicationIsCanonicalEmptyByAdmissionI
   ASSERT_NE(canonical_empty, nullptr);
   ASSERT_TRUE(canonical_empty->is_bool());
   EXPECT_TRUE(canonical_empty->as_bool());
-  EXPECT_NE(content_identity::canonical_json(*active).find("\"apply_id\":\"apply.close\""), std::string::npos);
+  EXPECT_NE(content_identity::canonical_json(*active).find("\"apply_id\":2,\"kind\":\"named_apply\""), std::string::npos);
 }
 
 TEST(ManagerSourcePublication, VerifiedNonemptyProductIsNotCanonicalEmpty) {
@@ -381,7 +381,7 @@ TEST(ManagerSourcePublication, VerifiedNonemptyProductIsNotCanonicalEmpty) {
   runtime.plan.active_publication.request.candidate_retained_bundle_id = projection.retained_bundle_id;
   runtime.plan.active_publication.request.candidate_graph_revision = projection.graph_revision;
   runtime.plan.active_publication.request.transaction_ref =
-      core::NamedApplyPublicationTransactionDTO{core::ApplyId("apply.nonempty"), core::ApplyGeneration(1U)};
+      core::NamedApplyPublicationTransactionDTO{core::ApplyId(3U), core::ApplyGeneration(1U)};
   runtime.plan.active_publication.request.expected_previous_publication_generation =
       core::ActiveBundlePublicationGeneration(1U);
   runtime.plan.active_publication.publication_generation = core::ActiveBundlePublicationGeneration(2U);
@@ -433,16 +433,100 @@ TEST(ManagerSourcePublication,
               admission.retained_bundle(), admission.retained_bundle(), deployment::SiteFacts{}),
       }));
 
-  const auto bytes = content_identity::canonical_json(BuildManagerSourcePayload(
+  const auto payload = BuildManagerSourcePayload(
       admission.retained_bundle(), admission, Runtime(admission), journal,
-      ManagerApplyMutationAvailability::kKernelOwnerUnavailable));
-  EXPECT_NE(bytes.find("\"apply_id\":\"apply-1\""), std::string::npos);
+      ManagerApplyMutationAvailability::kKernelOwnerUnavailable);
+  const auto bytes = content_identity::canonical_json(payload);
+  EXPECT_NE(bytes.find("\"apply_id\":1,"), std::string::npos);
   EXPECT_NE(bytes.find("\"phase\":\"scope_persisted\""), std::string::npos);
   EXPECT_NE(bytes.find("\"state\":\"scope_persisted\""), std::string::npos);
   EXPECT_NE(bytes.find("\"incomplete\":true"), std::string::npos);
   EXPECT_NE(bytes.find("\"manager_ready\":false"), std::string::npos);
   EXPECT_NE(bytes.find("\"converged\":false"), std::string::npos);
   EXPECT_EQ(bytes.find("\"configuration_fence_id\":\""), std::string::npos);
+  // OD-281: the status record's fence scope is the component scope only;
+  // domains, bindings and resources stay in the Apply journal.
+  const auto &records =
+      payload.find_object_member("apply")->find_object_member("records")->as_array();
+  ASSERT_EQ(records.size(), 1U);
+  const auto *scope =
+      records.front().find_object_member("fence")->find_object_member("scope");
+  ASSERT_NE(scope, nullptr);
+  ASSERT_TRUE(scope->is_object());
+  EXPECT_EQ(scope->as_object().size(), 1U);
+  EXPECT_NE(scope->find_object_member("controllable_component_ids"), nullptr);
+}
+
+TEST(ManagerSourcePublication,
+     ManyAppliesInOneStartCarryAtMostThreeRecordsUnderTheFrameBound) {
+  // OD-256: the status message once carried every Apply the journal kept;
+  // after some 40 Loads in one start it outgrew the status frame and Load,
+  // New and Execute were refused until restart. 80 Applies of a realistic
+  // ~8.5 KB record: only the running one, the one that installed the active
+  // configuration and the newest finished one are carried.
+  const auto admission = LoadAdmission();
+  TemporaryDirectory directory;
+  component_manager::SqliteManagerApplyJournal journal(
+      directory.path() / "apply.sqlite3", admission.cell_id());
+  auto applied = ApplyIntent(admission);
+  applied.prepared_activation.canonical_receipt_json =
+      R"({"padding":")" + std::string(8000U, 'p') +
+      R"(","schema_version":"test.prepared_activation_receipt.v1"})";
+  static_cast<void>(journal.EnsureIntent(applied));
+  const auto stored = journal.ReadStatusInventory();
+  ASSERT_EQ(stored.size(), 1U);
+  std::vector<component_manager::PersistedManagerApplyStatus> inventory;
+  for (std::uint64_t apply_id = 1U; apply_id <= 81U; ++apply_id) {
+    auto status = stored.front();
+    status.intent.intent.apply_id = core::ApplyId(apply_id);
+    if (apply_id <= 80U) {
+      status.terminal_outcome = component_manager::PersistedManagerApplyTerminalOutcome{
+          component_manager::ManagerApplyTerminalOutcomeDTO{
+              core::ApplyId(apply_id), core::ApplyGeneration(1U), std::nullopt,
+              std::nullopt, std::nullopt, std::nullopt,
+              apply_id == 40U
+                  ? component_manager::ManagerApplyTerminalOutcomeState::kSucceeded
+                  : component_manager::ManagerApplyTerminalOutcomeState::kFailed,
+              std::nullopt},
+          core::ContentDigest(std::string(kDigestOne))};
+    }
+    inventory.push_back(std::move(status));
+  }
+  auto runtime = Runtime(admission);
+  runtime.plan.active_publication.request.transaction_ref =
+      core::NamedApplyPublicationTransactionDTO{core::ApplyId(40U), core::ApplyGeneration(1U)};
+  runtime.plan.active_publication.request.expected_previous_publication_generation =
+      core::ActiveBundlePublicationGeneration(1U);
+  runtime.plan.active_publication.publication_generation = core::ActiveBundlePublicationGeneration(2U);
+  runtime.plan.runtime_convergence_intent_digest = core::ContentDigest(std::string(kDigestOne));
+  ASSERT_TRUE(runtime.plan.valid());
+
+  const auto payload = BuildManagerSourcePayload(
+      admission.retained_bundle(), admission, runtime, journal, inventory,
+      ManagerApplyMutationAvailability::kAvailable);
+  const auto &records =
+      payload.find_object_member("apply")->find_object_member("records")->as_array();
+  std::vector<double> carried;
+  for (const auto &record : records) {
+    carried.push_back(record.find_object_member("apply_id")->as_number());
+  }
+  EXPECT_EQ(carried, (std::vector<double>{40.0, 80.0, 81.0}));
+  // OD-281: only the record of the Apply that installed the active
+  // configuration carries the preparation receipt; the others carry null.
+  ASSERT_EQ(records.size(), 3U);
+  const auto *const active_receipt =
+      records[0].find_object_member("prepared_activation");
+  ASSERT_NE(active_receipt, nullptr);
+  ASSERT_TRUE(active_receipt->is_object());
+  EXPECT_NE(active_receipt->find_object_member("padding"), nullptr);
+  for (const std::size_t index : {1U, 2U}) {
+    const auto *const receipt =
+        records[index].find_object_member("prepared_activation");
+    ASSERT_NE(receipt, nullptr);
+    EXPECT_EQ(*receipt, content_identity::CanonicalValue(nullptr));
+  }
+  // ManagerStatusStream::kMaximumFrameBytes (manager_status_stream.hpp).
+  EXPECT_LT(content_identity::canonical_json(payload).size(), 409'600U);
 }
 
 TEST(ManagerSourcePublication,

@@ -1737,8 +1737,6 @@ decode_component_stream_overrides(const CanonicalValue &value) {
         require_string(require_member(object, "stream_id", path),
                        child_path(path, "stream_id")),
         std::nullopt,
-        std::nullopt,
-        std::nullopt,
     };
     if (!valid_stream_id(row.stream_id)) {
       fail(child_path(path, "stream_id"),

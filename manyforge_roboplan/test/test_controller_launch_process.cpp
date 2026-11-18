@@ -20,9 +20,13 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iomanip>
+#include <map>
+#include <mutex>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <sys/prctl.h>
@@ -2044,6 +2048,232 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_EQ(supervisor.observe("dual_lite6")->identity, command.identity);
 }
 
+/// A launch for the concurrency tests: `sh` marks its PID below
+/// `root/pids`, then becomes `sleep`, so SIGINT ends it at once and it starts
+/// no other process. Two variants per component differ in identity.
+[[nodiscard]] ControllerLaunchCommand
+concurrent_launch_command(const std::filesystem::path &root,
+                          const std::string &component, const int variant) {
+  auto command = ros2_control_launch_command(mock_artifacts(
+      root, "sha256:v" + std::to_string(variant), component));
+  command.argv = {"sh", "-c",
+                  ": > " + (root / "pids").string() + "/$$.pid; exec sleep 30"};
+  return command;
+}
+
+/// Concurrent ensure / restart / exact retirement on a few components, with
+/// a fixed operation sequence per thread (the interleaving is free).
+class ConcurrentLaunchMix final {
+public:
+  ConcurrentLaunchMix(ControllerLaunchSupervisor &supervisor,
+                      std::filesystem::path root)
+      : supervisor_(supervisor), root_(std::move(root)) {
+    std::filesystem::create_directories(root_ / "pids");
+  }
+
+  static constexpr int kThreads = 4;
+  static constexpr int kOperations = 6;
+  const std::vector<std::string> components{"mix_a", "mix_b", "mix_c"};
+
+  /// Runs every thread's operations; `after_operation` runs on the operating
+  /// thread after each one.
+  void run(const std::function<void()> &after_operation = {}) {
+    std::vector<std::thread> threads;
+    for (int thread = 0; thread < kThreads; ++thread) {
+      threads.emplace_back([this, thread, &after_operation] {
+        for (int step = 0; step < kOperations; ++step) {
+          operate(thread, step);
+          if (after_operation)
+            after_operation();
+        }
+      });
+    }
+    for (auto &thread : threads)
+      thread.join();
+  }
+
+  [[nodiscard]] ControllerLaunchCommand command(const std::string &component,
+                                                const int variant) const {
+    return concurrent_launch_command(root_, component, variant);
+  }
+  [[nodiscard]] std::filesystem::path artifacts(const std::string &component) const {
+    return root_ / "artifacts" / component;
+  }
+  [[nodiscard]] std::vector<std::shared_ptr<ControllerLaunchProcess>> returned() {
+    std::lock_guard lock(mutex_);
+    return {returned_.begin(), returned_.end()};
+  }
+  /// PIDs of every launch that reached its shell, tracked or not.
+  [[nodiscard]] std::vector<int> marked_pids() const {
+    std::vector<int> pids;
+    for (const auto &entry : std::filesystem::directory_iterator(root_ / "pids"))
+      pids.push_back(std::stoi(entry.path().stem().string()));
+    return pids;
+  }
+
+  std::atomic<bool> shutdown_begun{false};
+  std::atomic<bool> shutdown_returned{false};
+  std::atomic<int> completed{0};
+  std::atomic<int> refused{0};
+  std::atomic<int> unexpected_errors{0};
+  std::atomic<int> accepted_after_shutdown{0};
+
+private:
+  void operate(const int thread, const int step) {
+    const auto &component =
+        components[static_cast<std::size_t>(thread + step) % components.size()];
+    const auto operation = (thread * 7 + step * 3) % 4;
+    std::shared_ptr<ControllerLaunchProcess> latest;
+    {
+      std::lock_guard lock(mutex_);
+      if (const auto found = latest_.find(component); found != latest_.end())
+        latest = found->second;
+    }
+    // Restart and retirement only target a launch published before the
+    // shutdown began, so neither can hide a launch published after its cut.
+    const bool may_stop = latest != nullptr && !shutdown_begun.load();
+    try {
+      if (operation == 3 && may_stop) {
+        static_cast<void>(supervisor_.retire_exact(latest));
+      } else {
+        const bool after = shutdown_returned.load();
+        ControllerLaunchSupervisor::Ensured ensured;
+        if (operation == 2 && may_stop)
+          ensured = supervisor_.restart(latest, "mix restart");
+        else
+          ensured = supervisor_.ensure(command(component, (thread + step) % 2),
+                                       artifacts(component), "mix ensure");
+        if (after)
+          ++accepted_after_shutdown;
+        std::lock_guard lock(mutex_);
+        latest_[component] = ensured.process;
+        returned_.insert(ensured.process);
+      }
+    } catch (const ControllerLaunchProcessError &error) {
+      if (std::string(error.what()).find("closed for host shutdown") !=
+              std::string::npos &&
+          shutdown_begun.load())
+        ++refused;
+      else
+        ++unexpected_errors;
+    } catch (...) {
+      ++unexpected_errors;
+    }
+    ++completed;
+  }
+
+  ControllerLaunchSupervisor &supervisor_;
+  std::filesystem::path root_;
+  std::mutex mutex_;
+  std::map<std::string, std::shared_ptr<ControllerLaunchProcess>> latest_;
+  std::set<std::shared_ptr<ControllerLaunchProcess>> returned_;
+};
+
+TEST(ControllerLaunchSupervisor,
+     ConcurrentStartsRestartsAndRetirementsKeepOneTrackedLaunchPerComponent) {
+  TemporaryRoot root;
+  ControllerLaunchSupervisor supervisor(2s);
+  ConcurrentLaunchMix mix(supervisor, root.path());
+  mix.run();
+  EXPECT_EQ(mix.unexpected_errors.load(), 0);
+  EXPECT_EQ(mix.completed.load(),
+            ConcurrentLaunchMix::kThreads * ConcurrentLaunchMix::kOperations);
+  const auto returned = mix.returned();
+  // At most the supervisor's current launch of a component runs.
+  for (const auto &component : mix.components) {
+    std::vector<std::shared_ptr<ControllerLaunchProcess>> live;
+    for (const auto &process : returned)
+      if (process->command().controllable_component_id == component &&
+          alive(process->pid()))
+        live.push_back(process);
+    const auto observed = supervisor.observe(component);
+    if (observed && observed->running) {
+      ASSERT_EQ(live.size(), 1U) << component;
+      EXPECT_EQ(live.front()->command().identity, observed->identity);
+    } else {
+      EXPECT_TRUE(live.empty()) << component;
+    }
+  }
+  // Every component then has exactly one live launch, and no launch the
+  // supervisor does not hold runs.
+  std::set<int> current;
+  for (const auto &component : mix.components) {
+    const auto ensured =
+        supervisor.ensure(mix.command(component, 0), mix.artifacts(component));
+    current.insert(ensured.process->pid());
+    EXPECT_TRUE(alive(ensured.process->pid()));
+  }
+  EXPECT_EQ(current.size(), mix.components.size());
+  for (const auto &process : mix.returned()) {
+    if (!current.contains(process->pid())) {
+      EXPECT_FALSE(alive(process->pid())) << process->pid();
+    }
+  }
+  for (const auto pid : mix.marked_pids()) {
+    if (!current.contains(pid)) {
+      EXPECT_FALSE(alive(pid)) << pid;
+    }
+  }
+  supervisor.stop_all();
+  for (const auto pid : current)
+    EXPECT_FALSE(alive(pid));
+}
+
+TEST(ControllerLaunchSupervisor,
+     HostShutdownDuringConcurrentStartsSeesEveryPublishedLaunch) {
+  TemporaryRoot root;
+  ControllerLaunchSupervisor supervisor(2s);
+  ConcurrentLaunchMix mix(supervisor, root.path());
+  ControllerLaunchSupervisor::HostShutdownSnapshot snapshot;
+  std::once_flag cut;
+  const int halfway =
+      ConcurrentLaunchMix::kThreads * ConcurrentLaunchMix::kOperations / 2;
+  // The thread completing the middle operation takes the cut while the
+  // others keep starting, restarting and retiring.
+  mix.run([&] {
+    if (mix.completed.load() >= halfway) {
+      std::call_once(cut, [&] {
+        mix.shutdown_begun = true;
+        snapshot = supervisor.BeginHostShutdown();
+        mix.shutdown_returned = true;
+      });
+    }
+  });
+  ASSERT_TRUE(mix.shutdown_returned.load());
+  EXPECT_EQ(mix.unexpected_errors.load(), 0);
+  // An ensure begun after the cut is refused as before.
+  EXPECT_EQ(mix.accepted_after_shutdown.load(), 0);
+  EXPECT_THROW(static_cast<void>(supervisor.ensure(
+                   mix.command("mix_a", 1), mix.artifacts("mix_a"))),
+               ControllerLaunchProcessError);
+  // One tracked launch per component in the cut.
+  std::set<std::string> cut_components;
+  for (const auto &process : snapshot)
+    EXPECT_TRUE(
+        cut_components.insert(process->command().controllable_component_id)
+            .second);
+  // Every launch returned is in the cut, or was stopped before it.
+  const std::set<std::shared_ptr<ControllerLaunchProcess>> in_cut(
+      snapshot.begin(), snapshot.end());
+  for (const auto &process : mix.returned()) {
+    if (!in_cut.contains(process)) {
+      EXPECT_TRUE(process->exited().has_value()) << process->pid();
+    }
+  }
+  auto progress = supervisor.PollHostShutdown(snapshot);
+  for (int i = 0; i < 200 && progress.pending != 0U; ++i) {
+    std::this_thread::sleep_for(10ms);
+    progress = supervisor.PollHostShutdown(snapshot);
+  }
+  EXPECT_EQ(progress.total, snapshot.size());
+  EXPECT_EQ(progress.pending, 0U);
+  EXPECT_EQ(progress.unknown, 0U);
+  for (const auto &process : mix.returned())
+    EXPECT_FALSE(alive(process->pid())) << process->pid();
+  for (const auto pid : mix.marked_pids())
+    EXPECT_FALSE(alive(pid)) << pid;
+}
+
 TEST(ControllerLaunchSupervisor,
      StopAllSnapshotDoesNotBlockCountersOrClearLaterPublications) {
   FakeLaunch fake;
@@ -2929,7 +3159,7 @@ TEST(ControllerLaunchSupervisor, RetiredCompositionProtectsPreparedProcessAndRet
   const auto database = fake.root() / "retirement.sqlite";
   core::SqliteOperationJournal journal(database, core::CellId("retired-process"), 16U);
   core::ResourceAddressedExecutionKernelConfig kernel_config{
-      core::RequestOwnerEpoch("process-epoch"), core::CellId("retired-process"), 16U};
+      core::ApplicationStartId{0x3f9a0000000000a1ULL}, core::CellId("retired-process"), 16U};
   kernel_config.empty_runtime_retained_bundle_id = core::RetainedBundleId("retired-process-bundle");
   kernel_config.empty_runtime_graph_revision = core::GraphRevision("retired-process-graph");
   auto kernel = core::testing::make_heap_resource_addressed_kernel(

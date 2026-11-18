@@ -28,14 +28,12 @@ namespace core = manyforge::core;
 }
 
 [[nodiscard]] core::ConfigurationFenceStatusQueryDTO MakeStatusQuery(
-    const PersistedManagerApplyFenceAcceptance& acceptance,
-    const core::RuntimeEpoch& manager_runtime_epoch) {
+    const PersistedManagerApplyFenceAcceptance& acceptance) {
   core::ConfigurationFenceStatusQueryDTO query{
       core::ApplyFenceOwnerDTO{acceptance.apply_id, acceptance.apply_generation},
       acceptance.accepted_fence.configuration_fence_id,
       acceptance.accepted_fence.configuration_fence_generation,
       acceptance.accepted_fence.captured_scope,
-      manager_runtime_epoch,
   };
   if (!query.valid()) {
     Fail("durable fence acceptance cannot form a valid status query");
@@ -43,27 +41,14 @@ namespace core = manyforge::core;
   return query;
 }
 
+// The evidence's publication facts are the Manager's own, echoed by the host,
+// so only the host's facts are checked.
 [[nodiscard]] std::string CompletedActiveStateMismatch(
     const core::ConfigurationFenceStatusDTO &status,
-    const core::ConfigurationFenceStatusQueryDTO &query,
-    const core::ProjectionMaintenanceInitializationStatusDTO &completed,
-    const PersistedManagerApplyPublicationReceipt &publication) {
+    const core::ConfigurationFenceStatusQueryDTO &query) {
   const auto &evidence = status.reconciliation_evidence;
-  const auto &publication_receipt = publication.publication.publication_receipt;
   if (!status.matches(query))
     return "fence identity/scope";
-  if (!core::SameProjectionIdentity(evidence.active_projection_revision,
-                                    completed.target_projection_revision))
-    return "active projection";
-  if (evidence.active_graph_revision !=
-      completed.target_projection_revision.graph_revision)
-    return "active graph";
-  if (evidence.active_publication_generation !=
-      publication_receipt.publication_generation)
-    return "publication generation";
-  if (evidence.active_public_pointer_digest !=
-      publication_receipt.durable_public_pointer_content_digest)
-    return "public pointer digest";
   if (evidence.affected_queued_operation_count != 0U ||
       evidence.affected_active_operation_count != 0U)
     return "affected operations still present";
@@ -144,16 +129,10 @@ ManagerApplyFenceReleaseEffectUncertainError::observed_release() const noexcept 
 
 ManagerApplyFenceReleaseCoordinator::ManagerApplyFenceReleaseCoordinator(
     SqliteManagerApplyJournal& apply_journal, core::IManagerKernelApplyFencePort& kernel_fence,
-    core::IManagerSceneProjectionMaintenancePort& scene_owner,
-    core::RuntimeEpoch manager_runtime_epoch)
+    core::IManagerSceneProjectionMaintenancePort& scene_owner)
     : apply_journal_(apply_journal),
       kernel_fence_(kernel_fence),
-      scene_owner_(scene_owner),
-      manager_runtime_epoch_(std::move(manager_runtime_epoch)) {
-  if (manager_runtime_epoch_.empty()) {
-    Fail("Manager runtime epoch is empty");
-  }
-}
+      scene_owner_(scene_owner) {}
 
 ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRecover(
     const core::ApplyId& apply_id, const core::ApplyGeneration apply_generation) {
@@ -174,7 +153,7 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
         "fence release requires exact durable acceptance, publication, and "
         "Scene completion evidence");
   }
-  const auto query = MakeStatusQuery(*acceptance, manager_runtime_epoch_);
+  const auto query = MakeStatusQuery(*acceptance);
 
   const auto existing_intent = apply_journal_.ReadFenceReleaseIntent(apply_id, apply_generation);
   const auto existing_release = apply_journal_.ReadFenceReleased(apply_id, apply_generation);
@@ -225,8 +204,7 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
                       : std::nullopt);
   }
 
-  const auto mismatch =
-      CompletedActiveStateMismatch(*status, query, *completed, *publication);
+  const auto mismatch = CompletedActiveStateMismatch(*status, query);
   if (!mismatch.empty()) {
     FailUncertain(
         "Kernel status does not prove the exact completed active projection "
@@ -298,7 +276,6 @@ ManagerApplyFenceReleaseResult ManagerApplyFenceReleaseCoordinator::ReleaseOrRec
   } else {
     core::ConfigurationFenceReleaseDTO request{
         status->reconciliation_evidence,
-        manager_runtime_epoch_,
     };
     if (!request.valid()) {
       FailUncertain("held Kernel status cannot form a valid release request", false, query,

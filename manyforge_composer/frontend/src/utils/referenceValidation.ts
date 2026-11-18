@@ -1,5 +1,5 @@
 /** The server hashes the exact authoring body using RFC 8785 canonical JSON. */
-function canonical(value: unknown): string {
+export function canonical(value: unknown): string {
   if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value);
   if (typeof value === 'number' && Number.isFinite(value)) return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`;
@@ -8,12 +8,6 @@ function canonical(value: unknown): string {
     return `{${Object.keys(row).sort().map((key) => `${JSON.stringify(key)}:${canonical(row[key])}`).join(',')}}`;
   }
   throw new Error('Authoring document is not canonical JSON');
-}
-
-export async function authoringDigest(authoring: unknown): Promise<string> {
-  const bytes = new TextEncoder().encode(canonical(authoring));
-  const hash = await crypto.subtle.digest('SHA-256', bytes);
-  return `sha256:${Array.from(new Uint8Array(hash), (byte) => byte.toString(16).padStart(2, '0')).join('')}`;
 }
 
 export interface ReferenceIssue {
@@ -42,7 +36,7 @@ export interface ReferenceSelectorFacts {
   rules: { rule_id: string; scope: string | { execution_groups: string[] }; on_trip: 'stop' | 'notify'; active_at_start: boolean; condition: Record<string, unknown> }[];
 }
 
-export function referenceResult(value: unknown, digest: string, generation: Record<string, unknown>): { issues: ReferenceIssue[]; total: number; truncated: boolean; selectorFacts: ReferenceSelectorFacts } {
+export function referenceResult(value: unknown, generation: Record<string, unknown>): { issues: ReferenceIssue[]; total: number; truncated: boolean; selectorFacts: ReferenceSelectorFacts } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid reference validation');
   const row = value as Record<string, unknown>;
   const reference = row.reference_validation;
@@ -52,7 +46,7 @@ export function referenceResult(value: unknown, digest: string, generation: Reco
   if (!actual || typeof actual !== 'object' || Array.isArray(actual)
     || Object.keys(generation).some((key) => (actual as Record<string, unknown>)[key] !== generation[key])
     || Object.keys(actual).length !== Object.keys(generation).length
-    || result.program_content_digest !== digest || result.schema_version !== 'manyforge.program_reference_validation_response.v2'
+    || result.schema_version !== 'manyforge.program_reference_validation_response.v2'
     || !Array.isArray(result.diagnostics) || !Number.isSafeInteger(result.total_count)
     || (result.total_count as number) < result.diagnostics.length || typeof result.truncated !== 'boolean'
     || result.truncated !== ((result.total_count as number) > result.diagnostics.length)) throw new Error('Reference validation capture differs');

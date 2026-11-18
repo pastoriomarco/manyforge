@@ -23,13 +23,18 @@
 namespace manyforge::headless {
 
 inline constexpr std::string_view kOperatorAlarmSnapshotApiVersion =
-    "manyforge.operator_alarm_snapshot.v2";
+    "manyforge.operator_alarm_snapshot.v3";
 /// Wire schema of the Kernel-bound motion-attention publication; equal to
 /// manyforge::core::kOperatorAlarmAttentionSchemaVersion.
 inline constexpr std::string_view kOperatorAlarmMotionAttentionApiVersion =
-    "manyforge.operator_alarm_motion_attention.v3";
+    "manyforge.operator_alarm_motion_attention.v4";
 inline constexpr std::string_view kOperatorAlarmMetricsApiVersion =
-    "manyforge.operator_alarm_metrics.v1";
+    "manyforge.operator_alarm_metrics.v2";
+/// OD-215: the disk check's alarm. While it is active the projection says so
+/// (`disk_cannot_keep_records`), and the Kernel then also refuses manual
+/// moves and a Reset's move back, which other interlocks leave available.
+inline constexpr std::string_view kDiskCannotKeepRecordsAlarm =
+    "manyforge.runtime.disk_cannot_keep_records";
 inline constexpr std::size_t kDefaultAlarmConditionCapacity = 8192U;
 inline constexpr std::size_t kDefaultTerminalAlarmRetention = 4096U;
 inline constexpr std::size_t kMaximumLiveAlarmCapacity = 256U;
@@ -108,10 +113,9 @@ struct AlarmSourceCursor final {
 };
 
 struct AlarmCallerAttribution final {
-  std::string request_id;
-  std::string request_owner_epoch;
+  /// The request key Headless formed at its edge: exactly 32 lowercase hex.
+  std::string request_key;
   std::string source_label;
-  std::optional<std::string> correlation_id;
   std::string transport_kind;
   std::string adapter_id;
   std::string assurance;
@@ -183,7 +187,8 @@ struct AlarmLifecycleFact final {
   std::optional<AlarmLifecycleState> current_state;
   std::optional<std::uint64_t> record_revision;
   std::uint64_t owner_generation;
-  std::string owner_epoch;
+  /// This start's identity; History builds `clock_owner` from it.
+  std::string application_start_id;
   std::int64_t occurred_at_ns;
   std::string occurred_at_wall;
   std::optional<std::string> source_id;
@@ -251,7 +256,6 @@ struct OperatorAlarmSnapshot final {
   std::string catalog_version;
   std::string catalog_descriptor_digest;
   std::string owner_id;
-  std::string owner_epoch;
   std::uint64_t generation;
   std::uint64_t state_revision;
   bool reconciled;
@@ -292,11 +296,9 @@ struct AlarmMotionAttentionGate final {
 /// reserved resources at admission.
 struct AlarmMotionAttentionProjection final {
   std::string cell_id;
-  std::string owner_epoch;
-  /// This owner instance's incarnation (host boot id and CLOCK_BOOTTIME at
-  /// construction): the Kernel accepts a new owner epoch only from a strictly
-  /// later incarnation of the same host boot.
-  manyforge::core::HostBootStamp owner_incarnation;
+  /// The host boot this owner was constructed in; the Kernel accepts
+  /// attention only from its own host boot.
+  std::string owner_host_boot_id;
   std::uint64_t generation;
   /// False while unreconciled or unhealthy: no trustworthy scope exists.
   bool reconciled;
@@ -307,6 +309,8 @@ struct AlarmMotionAttentionProjection final {
   std::optional<AlarmConfigurationIdentity> active_configuration;
   /// Complete membership sorted by condition id.
   std::vector<AlarmMotionAttentionGate> members;
+  /// OD-215: a member is the active `kDiskCannotKeepRecordsAlarm`.
+  bool disk_cannot_keep_records;
 };
 
 struct AlarmDurationSummary final {
@@ -327,7 +331,6 @@ struct AlarmChatteringCandidate final {
 
 struct OperatorAlarmMetrics final {
   std::string owner_id;
-  std::string owner_epoch;
   std::uint64_t generation;
   std::uint64_t state_revision;
   std::map<std::string, std::uint64_t> totals;
@@ -387,7 +390,7 @@ public:
 
   AlarmLifecycleOwner(
       OperatorAlarmCatalog catalog, std::string cell_id, std::string owner_id,
-      std::string owner_epoch, manyforge::core::HostBootStamp owner_incarnation,
+      std::string application_start_id, std::string owner_host_boot_id,
       MonotonicClock monotonic_clock, WallClock wall_clock,
       std::set<std::string> required_domains = {"motion", "runtime_health",
                                                 "scene"},
@@ -418,7 +421,6 @@ public:
               std::optional<std::string> reason, bool confirmed);
   [[nodiscard]] AlarmMutation
   AcknowledgeAll(std::vector<AlarmAcknowledgementMember> members,
-                 std::string_view expected_owner_epoch,
                  std::uint64_t expected_generation,
                  const AlarmCallerAttribution &caller,
                  std::optional<std::string> reason, bool confirmed);
@@ -483,8 +485,7 @@ private:
                   std::optional<std::string> reason, bool confirmed);
   [[nodiscard]] AlarmMutation
   AcknowledgeAllImpl(std::vector<AlarmAcknowledgementMember> members,
-                     std::string_view expected_owner_epoch,
-                     std::uint64_t expected_generation,
+                         std::uint64_t expected_generation,
                      const AlarmCallerAttribution &caller,
                      std::optional<std::string> reason, bool confirmed);
   void RecordRejectedUpdateLocked(std::string_view code);
@@ -497,8 +498,10 @@ private:
   std::string cell_id_;
   std::optional<AlarmResourceRegistry> resource_registry_;
   std::string owner_id_;
-  std::string owner_epoch_;
-  manyforge::core::HostBootStamp owner_incarnation_;
+  /// This start's identity: the prefix of activation ids and the History
+  /// clock owner. It is not emitted in the snapshot, metrics or attention.
+  std::string application_start_id_;
+  std::string owner_host_boot_id_;
   MonotonicClock monotonic_clock_;
   WallClock wall_clock_;
   std::set<std::string> required_domains_;

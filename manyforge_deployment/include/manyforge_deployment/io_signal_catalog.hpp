@@ -146,6 +146,9 @@ inline constexpr std::string_view kCarriedObjectLostResourceRole =
 inline constexpr std::string_view kCarriedObjectLostSourceId =
     "system.carried_object_lost";
 inline constexpr std::size_t kCarriedObjectLostIngressDepth = 16U;
+/// Largest `ingress_depth` an Apply accepts: it bounds each source's queued
+/// samples and records, and the samples one I/O drain step processes.
+inline constexpr std::size_t kMaximumIoIngressDepth = 1024U;
 inline constexpr std::string_view kGripperCommandCapabilityId =
     "tool.gripper.command";
 

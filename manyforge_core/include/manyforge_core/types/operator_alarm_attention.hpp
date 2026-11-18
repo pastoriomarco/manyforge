@@ -13,7 +13,7 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kOperatorAlarmAttentionSchemaVersion =
-    "manyforge.operator_alarm_motion_attention.v3";
+    "manyforge.operator_alarm_motion_attention.v4";
 /// Matches the Alarm Lifecycle Owner hard live cap.
 inline constexpr std::size_t kMaximumOperatorAlarmAttentionMembers = 256U;
 /// Matches the owner's per-subject resource bound.
@@ -35,6 +35,11 @@ inline constexpr Duration kOperatorAlarmAttentionMaximumSnapshotAgeNs = 2'000'00
 /// Stable refusal reasons.
 inline constexpr std::string_view kOperatorAlarmInterlockActiveReason =
     "operator_alarm_interlock_active";
+/// OD-215: refusals while the disk cannot keep ManyForge's records.
+inline constexpr std::string_view kManualMoveDiskCannotKeepRecordsReason =
+    "manual_move_disk_cannot_keep_records";
+inline constexpr std::string_view kResetPositionDiskCannotKeepRecordsReason =
+    "reset_position_disk_cannot_keep_records";
 inline constexpr std::string_view kOperatorAlarmStateUnavailableReason =
     "operator_alarm_state_unavailable";
 
@@ -70,13 +75,9 @@ struct OperatorAlarmAttentionConfigurationDTO final {
 /// evaluates it against an operation's exact reserved resources.
 struct OperatorAlarmAttentionSnapshotDTO final {
   CellId cell_id{std::string{}};
-  std::string owner_epoch;
-  /// The owner instance's incarnation: the host boot it was constructed in
-  /// and its CLOCK_BOOTTIME at construction (core/time/host_boot_identity.hpp).
-  /// Strictly increasing across owner instances on one host and boot; it
-  /// orders owner epochs, whose text carries no order.
+  /// The host boot the owner was constructed in
+  /// (core/time/host_boot_identity.hpp); the Kernel refuses another boot's.
   std::string owner_host_boot_id;
-  std::uint64_t owner_incarnation_us{};
   std::uint64_t generation{};
   /// False while the owner is unreconciled or unhealthy; admission then
   /// fails closed with `operator_alarm_state_unavailable`.
@@ -88,6 +89,11 @@ struct OperatorAlarmAttentionSnapshotDTO final {
   std::optional<OperatorAlarmAttentionConfigurationDTO> active_configuration;
   /// Complete membership, sorted by condition id.
   std::vector<OperatorAlarmAttentionMemberDTO> members;
+  /// OD-215: one member is the disk check's alarm ("the disk cannot keep
+  /// ManyForge's records"). While it is, the Kernel also refuses manual moves
+  /// and a Reset's move back to the start position, which the interlock
+  /// otherwise leaves available.
+  bool disk_cannot_keep_records{};
 
   friend bool operator==(const OperatorAlarmAttentionSnapshotDTO&,
                          const OperatorAlarmAttentionSnapshotDTO&) = default;
@@ -98,9 +104,8 @@ struct OperatorAlarmAttentionSnapshotDTO final {
 /// stale and fails admission closed.
 struct OperatorAlarmAttentionPolicyDTO final {
   Duration maximum_snapshot_age_ns{};
-  /// The Kernel host's boot id. Single-host precondition: owner incarnations
-  /// are compared only when published from this same host boot; any other
-  /// boot id is refused rather than compared.
+  /// The Kernel host's boot id. Single-host precondition: a projection
+  /// published from any other boot id is refused.
   std::string host_boot_id;
 
   friend bool operator==(const OperatorAlarmAttentionPolicyDTO&,
@@ -109,7 +114,6 @@ struct OperatorAlarmAttentionPolicyDTO final {
 
 /// Kernel acknowledgement of one accepted publication.
 struct OperatorAlarmAttentionAcceptedDTO final {
-  std::string owner_epoch;
   std::uint64_t generation{};
 
   friend bool operator==(const OperatorAlarmAttentionAcceptedDTO&,
@@ -140,5 +144,14 @@ struct RetainedOperatorAlarmAttentionDTO final {
     const OperatorAlarmAttentionPolicyDTO& policy, const CellId& cell_id,
     const std::optional<OperatorAlarmAttentionConfigurationDTO>& active_configuration,
     TimePoint now_ns, const std::vector<ResourceId>& reserved_resources);
+
+/// OD-215: the refusal `reason` (one of the two disk reasons above) while the
+/// retained, current (not stale) projection of this cell says the disk cannot
+/// keep ManyForge's records; nothing otherwise. Manual moves are not
+/// attention-gated, so a missing or stale projection refuses nothing here.
+[[nodiscard]] std::optional<ErrorDTO> evaluate_disk_cannot_keep_records_refusal(
+    const std::optional<RetainedOperatorAlarmAttentionDTO>& retained,
+    const OperatorAlarmAttentionPolicyDTO& policy, const CellId& cell_id,
+    TimePoint now_ns, std::string_view reason, std::string message);
 
 }  // namespace manyforge::core

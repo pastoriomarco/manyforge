@@ -1,4 +1,5 @@
 import { parseNanoseconds } from '../../types/nanoseconds';
+import { isRequestKey } from '../applicationIdentity';
 import type {
   RetainedNeutralProjection,
   DraftMutationResponse,
@@ -431,8 +432,8 @@ export function parseSourceModelProjection(value: unknown): SourceModelProjectio
     'sourceModel',
   );
   const schemaVersion = stringAt(record.schema_version, 'sourceModel.schema_version');
-  if (schemaVersion !== 'manyforge.source_model_projection.v3') {
-    return fail('sourceModel.schema_version', 'manyforge.source_model_projection.v3');
+  if (schemaVersion !== 'manyforge.source_model_projection.v4') {
+    return fail('sourceModel.schema_version', 'manyforge.source_model_projection.v4');
   }
   const source = objectAt(record.source, 'sourceModel.source');
   exactKeysAt(
@@ -442,16 +443,13 @@ export function parseSourceModelProjection(value: unknown): SourceModelProjectio
       'freshness',
       'known_gaps',
       'projection_generation',
-      'projection_owner_epoch',
       'receiver_age_ns',
       'selection_projection_generation',
       'selection_source_content_digest',
       'selection_source_generation',
-      'selection_source_owner_epoch',
       'selection_source_owner_id',
       'source_content_digest',
       'source_generation',
-      'source_owner_epoch',
       'source_owner_id',
       'source_owner_kind',
     ],
@@ -518,16 +516,13 @@ export function parseSourceModelProjection(value: unknown): SourceModelProjectio
       freshness: 'fresh',
       known_gaps: [],
       projection_generation: integerAt(source.projection_generation, 'sourceModel.source.projection_generation'),
-      projection_owner_epoch: stringAt(source.projection_owner_epoch, 'sourceModel.source.projection_owner_epoch'),
       receiver_age_ns: integerAt(source.receiver_age_ns, 'sourceModel.source.receiver_age_ns'),
       selection_projection_generation: integerAt(source.selection_projection_generation, 'sourceModel.source.selection_projection_generation'),
       selection_source_content_digest: stringAt(source.selection_source_content_digest, 'sourceModel.source.selection_source_content_digest'),
       selection_source_generation: integerAt(source.selection_source_generation, 'sourceModel.source.selection_source_generation'),
-      selection_source_owner_epoch: stringAt(source.selection_source_owner_epoch, 'sourceModel.source.selection_source_owner_epoch'),
       selection_source_owner_id: stringAt(source.selection_source_owner_id, 'sourceModel.source.selection_source_owner_id'),
       source_content_digest: stringAt(source.source_content_digest, 'sourceModel.source.source_content_digest'),
       source_generation: integerAt(source.source_generation, 'sourceModel.source.source_generation'),
-      source_owner_epoch: stringAt(source.source_owner_epoch, 'sourceModel.source.source_owner_epoch'),
       source_owner_id: stringAt(source.source_owner_id, 'sourceModel.source.source_owner_id'),
       source_owner_kind: 'source_model_projection',
     },
@@ -1773,16 +1768,15 @@ export function parseSceneTransactionResponse(value: unknown): SceneTransactionR
       'ok',
       'projection_status',
       'replay_status',
-      'request_id',
-      'request_owner_epoch',
+      'request_key',
       'transaction_sequence',
       'update_status',
     ],
     'sceneTransaction',
   );
   const apiVersion = stringAt(record.api_version, 'sceneTransaction.api_version');
-  if (apiVersion !== 'manyforge.manager_command_response.v2') {
-    return fail('sceneTransaction.api_version', 'manyforge.manager_command_response.v2');
+  if (apiVersion !== 'manyforge.manager_command_response.v3') {
+    return fail('sceneTransaction.api_version', 'manyforge.manager_command_response.v3');
   }
   if (record.ok !== true || record.error !== null) {
     return fail('sceneTransaction', 'a successful committed response');
@@ -1791,10 +1785,10 @@ export function parseSceneTransactionResponse(value: unknown): SceneTransactionR
     record.committed_projection_revision,
     'sceneTransaction.committed_projection_revision',
   );
-  const requestOwnerEpoch = stringAt(
-    record.request_owner_epoch,
-    'sceneTransaction.request_owner_epoch',
-  );
+  const requestKey = record.request_key;
+  if (!isRequestKey(requestKey)) {
+    return fail('sceneTransaction.request_key', '32 lowercase hex characters');
+  }
   return {
     api_version: apiVersion,
     committed_projection_revision: committed,
@@ -1802,8 +1796,7 @@ export function parseSceneTransactionResponse(value: unknown): SceneTransactionR
     ok: true,
     projection_status: stringAt(record.projection_status, 'sceneTransaction.projection_status'),
     replay_status: stringAt(record.replay_status, 'sceneTransaction.replay_status'),
-    request_id: stringAt(record.request_id, 'sceneTransaction.request_id'),
-    request_owner_epoch: requestOwnerEpoch,
+    request_key: requestKey,
     transaction_sequence: positiveIntegerAt(
       record.transaction_sequence,
       'sceneTransaction.transaction_sequence',

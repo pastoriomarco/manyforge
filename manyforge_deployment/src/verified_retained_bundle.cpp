@@ -34,7 +34,6 @@
 #include "manyforge_deployment/runtime_profile_codec.hpp"
 #include "manyforge_deployment/structural_model_preparation.hpp"
 #include "planning_resource_map_internal.hpp"
-#include "reference_runtime_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
 
@@ -52,7 +51,7 @@ constexpr std::string_view kFlattenedModelPlacement =
 constexpr std::string_view kViewerModelContractId = "manyforge.viewer_model";
 constexpr std::string_view kViewerModelPlacement = "cell_viewer_model";
 constexpr std::string_view kControlDomainControlPlacement = "control_domain";
-constexpr std::string_view kReferenceRuntimePlacement = "runtime_unit";
+constexpr std::string_view kRuntimeUnitPlacement = "runtime_unit";
 constexpr std::string_view kSymbolRoleMapPlacement = "symbol_role_map";
 constexpr std::string_view kContentIdentityPrefix =
     "manyforge.content-identity.v1";
@@ -83,13 +82,6 @@ constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
          detail::kControlDomainControlMediaType, true},
         {core::kStopInterfaceCommissioningArtifactRole,
          core::kStopInterfaceCommissioningMediaType, false},
-    }};
-constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
-    kReferenceRuntimeArtifactRoles{{
-        {detail::kReferenceRuntimeLaunchableArtifactRole,
-         detail::kReferenceRuntimeLaunchableMediaType, true},
-        {detail::kReferenceRuntimeManifestArtifactRole,
-         detail::kReferenceRuntimeManifestMediaType, true},
     }};
 constexpr std::array<detail::QualifiedRetainedProductArtifactRole, 2U>
     kRos2ControlExecutionRuntimeArtifactRoles{{
@@ -309,17 +301,9 @@ qualified_product_contract_state(
     static const QualifiedProductContractState state = build_state();
     return state;
   }
-  if (contract_id == detail::kReferenceRuntimeProductContractId &&
-      product_kind == core::RetainedProductKind::kRuntimeUnitConfiguration &&
-      placement == kReferenceRuntimePlacement &&
-      artifact_roles.data() == kReferenceRuntimeArtifactRoles.data() &&
-      artifact_roles.size() == kReferenceRuntimeArtifactRoles.size()) {
-    static const QualifiedProductContractState state = build_state();
-    return state;
-  }
   if (contract_id == detail::kRos2ControlExecutionRuntimeProductContractId &&
       product_kind == core::RetainedProductKind::kRuntimeUnitConfiguration &&
-      placement == kReferenceRuntimePlacement &&
+      placement == kRuntimeUnitPlacement &&
       artifact_roles.data() ==
           kRos2ControlExecutionRuntimeArtifactRoles.data() &&
       artifact_roles.size() ==
@@ -1489,11 +1473,7 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
         continue;
       }
       std::string profile_document;
-      if (profile->record_id.value() == detail::kReferenceRuntimeProfileId &&
-          profile->record_revision.value() ==
-              detail::reference_runtime_profile_revision()) {
-        profile_document = detail::reference_runtime_profile_document();
-      } else if (profile->record_id.value() ==
+      if (profile->record_id.value() ==
                      detail::kRos2ControlExecutionRuntimeProfileId &&
                  profile->record_revision.value() ==
                      detail::
@@ -1733,12 +1713,6 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
     detail::require_retained_portable_identity(runtime_unit_id,
                                                path + ".runtime_unit_id");
     const auto &expected_unit = verified_graph.graph().runtime_units[index];
-    const bool expected_reference_unit =
-        expected_unit.runtime_profile_id.value() ==
-            detail::kReferenceRuntimeProfileId &&
-        expected_unit.runtime_profile_revision.value() ==
-            detail::reference_runtime_profile_revision() &&
-        expected_unit.configuration.empty();
     const bool expected_ros2_control_unit =
         expected_unit.runtime_profile_id.value() ==
             detail::kRos2ControlExecutionRuntimeProfileId &&
@@ -1748,7 +1722,7 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
             expected_unit.configuration);
     if (runtime_unit_id != expected_unit.runtime_unit_id.value() ||
         !expected_unit.dependency_runtime_unit_ids.empty() ||
-        (!expected_reference_unit && !expected_ros2_control_unit)) {
+        !expected_ros2_control_unit) {
       detail::fail_retained_bundle(
           "retained runtime-unit product group differs from its graph "
           "subject");
@@ -1762,19 +1736,6 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
     core::RetainedProductDTO product = parse_retained_product(
         group_products.front(), path + ".products[0]",
         core::RetainedProductKind::kRuntimeUnitConfiguration);
-    const bool reference =
-        expected_unit.runtime_unit_id.value() ==
-            detail::kReferenceRuntimeUnitId &&
-        expected_unit.runtime_profile_id.value() ==
-            detail::kReferenceRuntimeProfileId &&
-        expected_unit.runtime_profile_revision.value() ==
-            detail::reference_runtime_profile_revision() &&
-        product.product_id.value() == detail::reference_runtime_product_id(
-                                          expected_unit.runtime_unit_id) &&
-        product.product_contract_id.value() ==
-            detail::kReferenceRuntimeProductContractId &&
-        product.product_contract_revision ==
-            detail::reference_runtime_product_contract_revision();
     const bool ros2_control_execution =
         expected_unit.runtime_profile_id.value() ==
             detail::kRos2ControlExecutionRuntimeProfileId &&
@@ -1787,7 +1748,7 @@ verify_current_retained_bundle_projection(const CanonicalValue &root) {
             detail::kRos2ControlExecutionRuntimeProductContractId &&
         product.product_contract_revision ==
             detail::ros2_control_execution_runtime_product_contract_revision();
-    if (!reference && !ros2_control_execution) {
+    if (!ros2_control_execution) {
       detail::fail_retained_bundle(
           "runtime-unit product has no exact maintained product row");
     }
@@ -2062,32 +2023,6 @@ const CanonicalValue &control_domain_control_product_contract_descriptor() {
       .descriptor;
 }
 
-std::string_view reference_runtime_product_contract_id() noexcept {
-  return kReferenceRuntimeProductContractId;
-}
-
-const core::ProductContractRevision &
-reference_runtime_product_contract_revision() {
-  return qualified_product_contract_state(
-             kReferenceRuntimeProductContractId,
-             core::RetainedProductKind::kRuntimeUnitConfiguration,
-             kReferenceRuntimePlacement, kReferenceRuntimeArtifactRoles)
-      .revision;
-}
-
-std::span<const QualifiedRetainedProductArtifactRole>
-reference_runtime_product_artifact_roles() noexcept {
-  return kReferenceRuntimeArtifactRoles;
-}
-
-const CanonicalValue &reference_runtime_product_contract_descriptor() {
-  return qualified_product_contract_state(
-             kReferenceRuntimeProductContractId,
-             core::RetainedProductKind::kRuntimeUnitConfiguration,
-             kReferenceRuntimePlacement, kReferenceRuntimeArtifactRoles)
-      .descriptor;
-}
-
 std::string_view ros2_control_execution_runtime_product_contract_id() noexcept {
   return kRos2ControlExecutionRuntimeProductContractId;
 }
@@ -2097,7 +2032,7 @@ ros2_control_execution_runtime_product_contract_revision() {
   return qualified_product_contract_state(
              kRos2ControlExecutionRuntimeProductContractId,
              core::RetainedProductKind::kRuntimeUnitConfiguration,
-             kReferenceRuntimePlacement,
+             kRuntimeUnitPlacement,
              kRos2ControlExecutionRuntimeArtifactRoles)
       .revision;
 }
@@ -2112,7 +2047,7 @@ ros2_control_execution_runtime_product_contract_descriptor() {
   return qualified_product_contract_state(
              kRos2ControlExecutionRuntimeProductContractId,
              core::RetainedProductKind::kRuntimeUnitConfiguration,
-             kReferenceRuntimePlacement,
+             kRuntimeUnitPlacement,
              kRos2ControlExecutionRuntimeArtifactRoles)
       .descriptor;
 }
@@ -2229,13 +2164,6 @@ void require_current_retained_product_conformance(
              product.product_kind ==
                  core::RetainedProductKind::kSymbolRoleMap) {
     artifact_roles = kComposedModelSymbolRoleMapArtifactRoles;
-  } else if (product.product_contract_id.value() ==
-                 kReferenceRuntimeProductContractId &&
-             product.product_contract_revision ==
-                 reference_runtime_product_contract_revision() &&
-             product.product_kind ==
-                 core::RetainedProductKind::kRuntimeUnitConfiguration) {
-    artifact_roles = kReferenceRuntimeArtifactRoles;
   } else if (product.product_contract_id.value() ==
                  kRos2ControlExecutionRuntimeProductContractId &&
              product.product_contract_revision ==

@@ -4,7 +4,18 @@
     "vision_model": "vision_model"
   },
   "assistant_profile_id": "vision_pose_selection",
-  "attachments": [],
+  "attachments": [
+    {
+      "child": {
+        "component_id": "robotiq_2f_85",
+        "interface": "mount"
+      },
+      "parent": {
+        "component_id": "ur5_robot",
+        "interface": "flange"
+      }
+    }
+  ],
   "compatibility": {
     "lane": "manyforge-only",
     "provides": [
@@ -30,8 +41,74 @@
       "target_settings": {}
     },
     {
+      "component_id": "robotiq_2f_85",
+      "component_profile_id": "robotiq.robotiq_2f_85",
+      "configuration": {
+        "runtime_configuration": {
+          "component_streams": [
+            {
+              "budget_ns": 1000000000,
+              "controllable_component_id": "robotiq_2f_85",
+              "stream_id": "gripper_feedback"
+            },
+            {
+              "budget_ns": 250000000,
+              "controllable_component_id": "robotiq_2f_85",
+              "stream_id": "measured_joints"
+            }
+          ],
+          "gripper_target_configurations": [
+            {
+              "actuation_kind": "position_commanded",
+              "attach_frame": "robotiq_85_base_link",
+              "auxiliary_frames": [
+                "robotiq_85_base_link"
+              ],
+              "closed_state_ref": "closed",
+              "command_duration_s": 1.0,
+              "command_target_id": "gripper",
+              "controllable_component_id": "robotiq_2f_85",
+              "description": "Simulated Robotiq 2F-85 gripper.",
+              "mount_frame": "robotiq_2f_85_mount",
+              "open_state_ref": "open",
+              "output_mode": "commanded",
+              "tcp_frame": "robotiq_85_base_link",
+              "touch_links": [
+                "robotiq_85_base_link",
+                "robotiq_85_left_finger_link",
+                "robotiq_85_left_finger_tip_link",
+                "robotiq_85_left_inner_knuckle_link",
+                "robotiq_85_left_knuckle_link",
+                "robotiq_85_right_finger_link",
+                "robotiq_85_right_finger_tip_link",
+                "robotiq_85_right_inner_knuckle_link",
+                "robotiq_85_right_knuckle_link"
+              ]
+            }
+          ]
+        },
+        "runtime_kind": "ros2_control"
+      },
+      "frame_prefix": "",
+      "lane": "mock",
+      "model_source": {
+        "package_roots": {
+          "manyforge_example_models": {
+            "project_path": "../../manyforge_example_models"
+          }
+        },
+        "srdf": {
+          "project_path": "../../manyforge_example_models/models/robotiq_2f_85/robotiq_2f_85.srdf"
+        },
+        "urdf": {
+          "project_path": "../../manyforge_example_models/models/robotiq_2f_85/robotiq_2f_85.urdf"
+        }
+      },
+      "target_settings": {}
+    },
+    {
       "component_id": "ur5_robot",
-      "component_profile_id": "universal_robots.ur5_roboplan",
+      "component_profile_id": "universal_robots.ur5e",
       "configuration": {
         "default_fault_stop_profile": {
           "deceleration_time_s": 1.0,
@@ -44,6 +121,7 @@
             "wrist_3_joint": 10.0
           },
           "profile_id": "fault_spring_back_fast",
+          "require_backend_confirmation": true,
           "stop_mode": "spring_back_fast"
         },
         "runtime_configuration": {
@@ -72,15 +150,15 @@
       "lane": "mock",
       "model_source": {
         "package_roots": {
-          "roboplan_example_models": {
-            "project_path": "../../.docker/roboplan/roboplan_example_models"
+          "manyforge_example_models": {
+            "project_path": "../../manyforge_example_models"
           }
         },
         "srdf": {
-          "project_path": "../../manyforge_deployment/resources/maintained/model_sources/ur5_roboplan/ur5_gripper.structural.srdf"
+          "project_path": "../../manyforge_example_models/models/ur5e/ur5e.srdf"
         },
         "urdf": {
-          "project_path": "../../manyforge_deployment/resources/maintained/model_sources/ur5_roboplan/ur5_gripper.structural.urdf"
+          "project_path": "../../manyforge_example_models/models/ur5e/ur5e.urdf"
         }
       },
       "root_pose_in_cell": {

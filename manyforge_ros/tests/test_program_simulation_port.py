@@ -49,7 +49,7 @@ _SIMULATION_SCENE = {
 
 def _context(
     *,
-    program_run_id: str = "run.simulation",
+    program_run_id: int = 1,
     scene_resources: tuple[str, ...] = ("part",),
     simulation_scene: dict[str, object] | None = _SIMULATION_SCENE,
 ) -> ProgramRunPortContext:
@@ -91,9 +91,9 @@ def _context(
 
 def _identity(index: int = 1) -> NodeAttemptIdentity:
     return NodeAttemptIdentity(
-        program_run_id="run.simulation",
+        program_run_id=1,
         node_instance_id=f"simulation_node_{index}",
-        node_attempt_id=f"run.simulation/simulation_node_{index}/{index}",
+        node_attempt_id=index,
     )
 
 
@@ -244,7 +244,7 @@ def test_program_tasks_translate_all_four_nodes_without_blocking_ticks() -> None
             _identity(3),
             OwnerNodeInputs(parameters={"state": "pause"}),
         )
-    port.unbind("run.simulation")
+    port.unbind(1)
     port.close()
 
 
@@ -283,7 +283,7 @@ def test_pose_frames_resolve_robot_cell_and_scene_resource_references() -> None:
                 },
             ),
         )
-    port.unbind("run.simulation")
+    port.unbind(1)
     port.close()
 
 
@@ -303,7 +303,7 @@ def test_task_retention_evicts_the_oldest_finished_task_at_its_bound() -> None:
     # The newest task is retained: reusing its identity is still detected.
     with pytest.raises(ValueError, match="reused with new intent"):
         port.start("simulation.step", _identity(6), OwnerNodeInputs(parameters={"steps": 9}))
-    port.unbind("run.simulation")
+    port.unbind(1)
     port.close()
 
 
@@ -397,12 +397,12 @@ def test_cancel_fences_late_results_and_context_cleanup_waits_for_settlement() -
 
     port.cancel(started.task_id, identity)
     with pytest.raises(RuntimeError, match="still settling"):
-        port.unbind("run.simulation")
+        port.unbind(1)
     client.release.set()
     terminal = _settled(port, started.task_id)
     assert terminal.state is OwnerTaskState.INTERRUPTED
     assert terminal.reason_code == "simulation_request_cancelled"
-    port.unbind("run.simulation")
+    port.unbind(1)
     port.close()
 
 
@@ -472,3 +472,99 @@ def test_cell_frame_without_simulation_links_fails_the_node_typed() -> None:
         )
     assert client.calls == []
     port.close()
+
+
+def _fake_ros(monkeypatch, events: list[str]) -> None:
+    """rclpy stand-ins plus a spin thread that never ends (OD-236)."""
+
+    class FakeContext:
+        def ok(self) -> bool:
+            return True
+
+        def shutdown(self) -> None:
+            events.append("context:shutdown")
+
+    class FakeNode:
+        def destroy_node(self) -> None:
+            events.append("node:destroy")
+
+    class FakeExecutor:
+        def __init__(self, *, context: FakeContext) -> None:
+            del context
+
+        def add_node(self, node: FakeNode) -> None:
+            del node
+
+        def spin(self) -> None:
+            pass
+
+        def shutdown(self, *, timeout_sec: float) -> None:
+            events.append(f"executor:shutdown:{timeout_sec}")
+
+    class StuckThread:
+        def __init__(self, *, target, name: str, daemon: bool) -> None:
+            del target, name, daemon
+
+        def start(self) -> None:
+            pass
+
+        def join(self, *, timeout: float) -> None:
+            events.append(f"thread:join:{timeout}")
+
+        def is_alive(self) -> bool:
+            return True
+
+    fake_rclpy = ModuleType("rclpy")
+    fake_rclpy.__path__ = []
+    fake_rclpy.init = lambda *, args, context: None
+    fake_rclpy.create_node = lambda name, *, context: FakeNode()
+    context_module = ModuleType("rclpy.context")
+    context_module.Context = FakeContext
+    executor_module = ModuleType("rclpy.executors")
+    executor_module.SingleThreadedExecutor = FakeExecutor
+    monkeypatch.setitem(sys.modules, "rclpy", fake_rclpy)
+    monkeypatch.setitem(sys.modules, "rclpy.context", context_module)
+    monkeypatch.setitem(sys.modules, "rclpy.executors", executor_module)
+    monkeypatch.setattr(simulation_port, "Thread", StuckThread)
+
+
+def test_a_spin_thread_that_outlives_close_is_reported_and_keeps_ros_live(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    _fake_ros(monkeypatch, events)
+    monkeypatch.setattr(
+        simulation_port,
+        "SimulationControlClient",
+        lambda node, **kwargs: _ControlClient(),
+    )
+    port = simulation_port.RosSimulationProgramTaskPort(_site())
+    assert port.ros_left_running is False
+
+    with pytest.raises(RuntimeError, match="^simulation rclpy executor did not stop$") as raised:
+        port.close()
+
+    assert isinstance(raised.value.__cause__, simulation_port.SimulationRosThreadNotStopped)
+    assert port.ros_left_running is True
+    # The wait is unchanged; node and context are left alone.
+    timeout = _site().service_timeout_s + 1.0
+    assert events == [f"executor:shutdown:{timeout}", f"thread:join:{timeout}"]
+
+
+def test_a_spin_thread_that_outlives_a_failed_construction_is_typed(
+    monkeypatch,
+) -> None:
+    events: list[str] = []
+    _fake_ros(monkeypatch, events)
+
+    def unavailable(node, **kwargs):
+        raise RuntimeError("simulation services unavailable")
+
+    monkeypatch.setattr(simulation_port, "SimulationControlClient", unavailable)
+
+    with pytest.raises(simulation_port.SimulationRosThreadNotStopped) as raised:
+        simulation_port.RosSimulationProgramTaskPort(_site())
+
+    assert str(raised.value) == "simulation rclpy executor did not stop"
+    assert raised.value.ros_left_running is True
+    assert "node:destroy" not in events and "context:shutdown" not in events

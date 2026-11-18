@@ -71,7 +71,7 @@ struct PlannerCapabilityBindingDTO final {
 /// Immutable Kernel-selected source for one speculative moving replacement.
 /// This carries provenance, not Replace permission or an execution owner.
 struct MovingReplacementInputDTO final {
-  ExecutionGoalKey source_goal;
+  ControllerGoalId source_goal;
   ExecutionBindingEpoch source_binding_epoch;
   double source_cursor_s{};
   TrajectoryDTO source_prefix_trajectory;
@@ -91,12 +91,13 @@ struct MovingReplacementInputDTO final {
 /// a singleton robot/group spelling. Generated frame/joint names appear only
 /// inside their exact compiler-owned model/resource binding.
 struct PlanRequestDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationParticipantId participant_id;
   ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
-  ProgramRunId program_run_id;
+  std::optional<ProgramRunNumber> program_run_id;
+
   MoveId move_id;
 
   ControllableComponentId controllable_component_id;

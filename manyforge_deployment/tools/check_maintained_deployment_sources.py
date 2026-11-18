@@ -178,50 +178,6 @@ _EXPECTED_MODEL_FAMILIES: Final = {
             "urdf_projection_kind": "remove_unsupported_collision_materials",
         },
     },
-    "ur5_roboplan": {
-        "frames": {
-            "base": "base_link",
-            "flange": "tool0",
-            "gripper_tcp": "tool0",
-            "root": "world",
-            "tcp": "tool0",
-        },
-        "groups": {"arm": "arm"},
-        "resources": {
-            "arm_joints": (
-                "shoulder_pan_joint",
-                "shoulder_lift_joint",
-                "elbow_joint",
-                "wrist_1_joint",
-                "wrist_2_joint",
-                "wrist_3_joint",
-            )
-        },
-        "collisions": {
-            "arm_collision": (
-                "base_link",
-                "forearm_link",
-                "shoulder_link",
-                "upper_arm_link",
-                "wrist_1_link",
-                "wrist_2_link",
-                "wrist_3_link",
-            ),
-            "gripper_collision": ("ee_link", "tool0"),
-            "tool_collision": ("ee_link", "tool0"),
-        },
-        "root": "root",
-        "source": {
-            "accepted_package_uri_prefix": "package://roboplan_example_models/models/ur_robot_model/",
-            "historical_srdf_path": ".docker/roboplan/roboplan_example_models/models/ur_robot_model/ur5_gripper.srdf",
-            "historical_urdf_path": ".docker/roboplan/roboplan_example_models/models/ur_robot_model/ur5_gripper.urdf",
-            "resource_root": ".docker/roboplan/roboplan_example_models/models/ur_robot_model",
-            "srdf_path": "manyforge_deployment/resources/maintained/model_sources/ur5_roboplan/ur5_gripper.structural.srdf",
-            "srdf_projection_kind": "remove_hpp_gripper_extension",
-            "urdf_path": "manyforge_deployment/resources/maintained/model_sources/ur5_roboplan/ur5_gripper.structural.urdf",
-            "urdf_projection_kind": "remove_unused_xacro_namespace",
-        },
-    },
 }
 
 
@@ -669,7 +625,7 @@ def _validate_assistant_profiles(source: Path) -> set[str]:
                 )
             )
             request_path = f"{endpoint_path}.request_contract"
-            # EXPERIMENTAL optional `reasoning: on|off` (model reasoning switch).
+            # Optional `reasoning: on|off` (model reasoning switch).
             reasoning = endpoint["request_contract"].get("reasoning")
             if reasoning not in (None, "on", "off"):
                 raise SourceDescriptionError(f"{request_path}.reasoning must be on or off")

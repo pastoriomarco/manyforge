@@ -42,8 +42,8 @@ class Client:
 
 
 def execution(sequence, position):
-    return {"api_version": "manyforge.execution_command_response.v4", "command": "observation", "ok": True,
-            "observation": {"schema_version": "manyforge.execution_observation.v4", "owner_epoch": "owner",
+    return {"api_version": "manyforge.execution_command_response.v6", "command": "observation", "ok": True,
+            "observation": {"schema_version": "manyforge.execution_observation.v5", "application_start_id": "owner",
                 "cell_id": "cell", "retained_bundle_id": "bundle", "graph_revision": "graph",
                 "source_epoch": "execution", "source_sequence": sequence, "measured_targets": [],
                 "targets": [{"controllable_component_id": "robot", "command_target_id": "arm",
@@ -61,7 +61,7 @@ def pose(generation):
 
 
 def cursor(frame):
-    return (frame["owner_epoch"], frame["source_epoch"], frame["source_sequence"], frame["delivery_sequence"])
+    return (frame["source_epoch"], frame["source_sequence"], frame["delivery_sequence"])
 
 
 def test_outside_only_frames_cannot_starve_execution_owner_reads():
@@ -150,7 +150,7 @@ def test_outside_update_consumes_rearmed_credit_and_keeps_latest_execution():
             assert await asyncio.to_thread(
                 client.execution.cursors.get, True, 1
             ) == {
-                "owner_epoch": "owner",
+                "application_start_id": "owner",
                 "source_epoch": "execution",
                 "source_sequence": 1,
             }
@@ -160,7 +160,7 @@ def test_outside_update_consumes_rearmed_credit_and_keeps_latest_execution():
             assert await asyncio.to_thread(
                 client.execution.cursors.get, True, 1
             ) == {
-                "owner_epoch": "owner",
+                "application_start_id": "owner",
                 "source_epoch": "execution",
                 "source_sequence": 2,
             }
@@ -187,7 +187,7 @@ def test_outside_update_consumes_rearmed_credit_and_keeps_latest_execution():
 
             source.grant_credit(browser, cursor(outside_only))
             assert await asyncio.to_thread(client.execution.cursors.get, True, 1) == {
-                "owner_epoch": "owner",
+                "application_start_id": "owner",
                 "source_epoch": "execution",
                 "source_sequence": 3,
             }

@@ -11,10 +11,7 @@ from types import MappingProxyType
 from typing import Any
 
 from manyforge_behavior.catalog import NodeCatalog
-from manyforge_behavior.orchestration_ports import (
-    PersistentKeyRegisterPort,
-    PersistentValueUncertainError,
-)
+from manyforge_behavior.orchestration_ports import PersistentKeyRegisterPort
 from manyforge_behavior.catalog_schema import validate_value
 from manyforge_behavior.program import (
     BlackboardFieldDeclaration,
@@ -193,10 +190,6 @@ class ExpressionEvaluationError(ProgramValueError):
                 source_reference=source_reference,
             ),
         )
-
-
-class ProgramValueUncertainError(ProgramValueError):
-    """A persistent change is visible and stored but may not be durable."""
 
 
 # Why a run start dropped a restored value the committed Program refuses.
@@ -501,7 +494,7 @@ class ProgramValueStore:
         *,
         project_path: str | None = None,
         register: PersistentKeyRegisterPort | None = None,
-        program_run_id: str | None = None,
+        program_run_id: int | None = None,
     ) -> "ProgramValueStore":
         if not isinstance(program, Program):
             raise TypeError("value store requires one validated Program")
@@ -838,14 +831,6 @@ class ProgramValueStore:
                     self._persistent_commit(  # type: ignore[misc]
                         declaration, record.value, record.metadata
                     )
-                except PersistentValueUncertainError as error:
-                    # Stored, so visible: the store never contradicts the register.
-                    self._values[key] = record
-                    self._publish_locked(key, current)
-                    raise ProgramValueUncertainError(
-                        f"blackboard key {key!r} was stored but may not be "
-                        f"durable: {error}"
-                    ) from error
                 except Exception as error:
                     raise ProgramValueError(
                         f"blackboard key {key!r} could not be stored: {error}"
@@ -963,11 +948,8 @@ class ProgramValueStore:
                 "persistent blackboard keys require the persistent-key register"
             )
         with self._lock:
-            uncertain: PersistentValueUncertainError | None = None
             try:
                 self._persistent_forget(declaration, dict(metadata or {}))
-            except PersistentValueUncertainError as error:
-                uncertain = error
             except Exception as error:
                 raise ProgramValueError(
                     f"blackboard key {key!r} could not be reset: {error}"
@@ -978,11 +960,6 @@ class ProgramValueStore:
             else:
                 self._values.pop(key, None)
             self._publish_locked(key, current)
-            if uncertain is not None:
-                raise ProgramValueUncertainError(
-                    f"blackboard key {key!r} was reset but may not be durable: "
-                    f"{uncertain}"
-                ) from uncertain
 
     def read_bundle(self, key: str) -> dict[str, Any]:
         """Return the atomic diagnostic record without changing logical reads."""
@@ -1550,7 +1527,6 @@ __all__ = [
     "MOTION_VALUE_ABOVE_PROGRAM_LIMIT",
     "MotionLimitInputError",
     "NODE_INPUT_UNAVAILABLE",
-    "ProgramValueUncertainError",
     "NodeAttemptInputResolver",
     "NodeAttemptInputSnapshot",
     "NodeInputError",

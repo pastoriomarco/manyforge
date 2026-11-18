@@ -38,7 +38,9 @@ ToString(ManagerApplyMutationAvailability availability) noexcept;
 
 /// Builds one immutable Manager-owned source value from an independently
 /// verified active bundle, the Manager's own runtime observation result, and
-/// one transactionally consistent durable Apply-journal inventory.
+/// one transactionally consistent durable Apply-journal inventory. The value
+/// carries at most three Apply records: the running one, the one that
+/// installed the active configuration and the newest finished one.
 ///
 /// The active publication and the Apply history are one generation: the
 /// builder refuses a runtime result that predates a committed Apply in the

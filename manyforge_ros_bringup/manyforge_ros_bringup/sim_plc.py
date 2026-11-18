@@ -606,6 +606,27 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
     return parser.parse_args(list(argv))
 
 
+def start_spinning(executor) -> threading.Thread:
+    """Run ``executor.spin()`` on an ordinary (non-daemon) thread (OD-259).
+
+    A daemon thread could be ended by interpreter finalization inside rclpy's
+    wait and abort the process; ``stop_spinning`` always joins this one.
+    """
+    spinner = threading.Thread(target=executor.spin, name="sim_plc_spin")
+    spinner.start()
+    return spinner
+
+
+def stop_spinning(executor, spinner: Optional[threading.Thread]) -> None:
+    """Shut the executor down and join its spin thread, without a time limit.
+
+    ``executor.shutdown()`` wakes ``spin()`` and makes it return (OD-259).
+    """
+    executor.shutdown()
+    if spinner is not None:
+        spinner.join()
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     import rclpy
     from rclpy.executors import MultiThreadedExecutor
@@ -660,8 +681,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # stop flag, so signal handling never depends on the wait set waking.
         # (A main-thread spin_once(timeout) loop hung intermittently in rclpy's
         # wait set after SIGINT.) executor.shutdown() wakes and ends spin().
-        spinner = threading.Thread(target=executor.spin, name="sim_plc_spin", daemon=True)
-        spinner.start()
+        spinner = start_spinning(executor)
         while not stop.wait(0.2):
             if not spinner.is_alive():
                 raise RuntimeError("simulated PLC executor stopped unexpectedly")
@@ -675,9 +695,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         return EXIT_OK
     finally:
         if executor is not None:
-            executor.shutdown(timeout_sec=1.0)
-            if spinner is not None:
-                spinner.join(timeout=2.0)
+            stop_spinning(executor, spinner)
         if node is not None:
             node.destroy_node()
         rclpy.try_shutdown()

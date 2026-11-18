@@ -28,9 +28,7 @@ from manyforge_behavior.orchestration_ports import (
 from manyforge_behavior.program import Program, ProgramValidationError
 from manyforge_behavior.program_clock import ProgramClock
 from manyforge_behavior.recovery import RecoveryAwareNode
-
-# The Runner's execution transport timeout handed to owner task nodes.
-_TRANSPORT_TIMEOUT_S = 30.0
+from manyforge_behavior.request_keys import Phase, format_request_key, program_key
 
 _ROOT = Path(__file__).resolve().parents[2]
 _RUNNING = py_trees.common.Status.RUNNING
@@ -103,8 +101,8 @@ class _MotionPort:
     def acknowledge(self, task_id, identity) -> None:
         self.acknowledged.append(task_id)
 
-    def close(self, task_id, identity, *, request_id) -> bool:
-        self.closes.append({"task_id": task_id, "request_id": request_id, "identity": identity})
+    def close(self, task_id, identity, *, request_key) -> bool:
+        self.closes.append({"task_id": task_id, "request_key": request_key, "identity": identity})
         self.log.entries.append(("close",))
         effect = self._close_effects.pop(0) if self._close_effects else True
         if isinstance(effect, BaseException):
@@ -134,10 +132,10 @@ class _Attention:
     def __init__(self, log: _Log, *, blocked: bool = False) -> None:
         self._log = log
         self.blocked = blocked
-        self.calls: list[tuple[str, str]] = []
+        self.calls: list[tuple[str, bytes]] = []
 
-    def __call__(self, node_instance_id: str, request_id: str) -> None:
-        self.calls.append((node_instance_id, request_id))
+    def __call__(self, node_instance_id: str, request_key: bytes) -> None:
+        self.calls.append((node_instance_id, request_key))
         self._log.entries.append(("attention", node_instance_id))
         if self.blocked:
             raise RuntimeError("operator alarm gates these resources")
@@ -192,9 +190,9 @@ class _Attempts:
     def begin(self, node_instance_id: str) -> NodeAttemptIdentity:
         self.count += 1
         return NodeAttemptIdentity(
-            program_run_id="run.motion",
+            program_run_id=1,
             node_instance_id=node_instance_id,
-            node_attempt_id=f"attempt.{self.count}",
+            node_attempt_id=self.count,
         )
 
 
@@ -226,7 +224,7 @@ def _assessment(
 
 
 _FACT = {
-    "operation": {"source_owner_epoch": "kernel.1", "operation_id": "op", "operation_revision": 3},
+    "operation": {"operation_id": 1, "operation_revision": 3},
     "resource_ids": ["arm"],
     "failure": {"code": "planning_failed", "message": "no feasible path"},
     "terminal_facts": [{"kind": "local_failure", "effect": "no_effect"}],
@@ -240,7 +238,7 @@ def _failed(
     state: OwnerTaskState = OwnerTaskState.FAILED,
 ) -> OwnerTaskSnapshot:
     metadata: dict[str, Any] = {} if assessment is None else {"recovery_assessment": assessment}
-    metadata["operation_id"] = "op"  # An admitted Kernel operation.
+    metadata["operation_id"] = 1  # An admitted Kernel operation.
     metadata["operation_failure"] = _FACT
     if pause:
         metadata.update(
@@ -258,7 +256,7 @@ def _failed(
 
 def _active(**metadata: Any) -> OwnerTaskSnapshot:
     return OwnerTaskSnapshot(
-        task_id="task", state=OwnerTaskState.ACTIVE, metadata={"operation_id": "op", **metadata}
+        task_id="task", state=OwnerTaskState.ACTIVE, metadata={"operation_id": 1, **metadata}
     )
 
 
@@ -282,7 +280,7 @@ def _motion(
     store: _Store | None = None,
 ) -> MotionTaskAdapter:
     audit: list[dict[str, Any]] = []
-    adapter = MotionTaskAdapter(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+    adapter = MotionTaskAdapter(
         name="motion",
         node_id=node_id,
         node_instance_id="motion",
@@ -335,7 +333,10 @@ def test_eligible_failure_closes_before_the_wait_then_submits_a_fresh_execute() 
     assert [entry[0] for entry in log.entries] == ["start", "close", "attention", "start", ]
     assert port.acknowledged == ["task-2"]
     assert port.closes[0]["task_id"] == "task-1"
-    assert port.closes[0]["request_id"].startswith("program-close:")
+    first = port.starts[0][0]
+    assert port.closes[0]["request_key"] == program_key(
+        first.program_run_id, first.node_attempt_id, Phase.PROGRAM_CLOSE
+    )
     assert port.starts[0][0].node_attempt_id != port.starts[1][0].node_attempt_id
     # The superseded per-attempt retry context is gone from the owner inputs.
     assert not hasattr(OwnerNodeInputs(parameters={}), "automatic_retry_context")
@@ -439,7 +440,7 @@ def test_an_unknown_close_outcome_replays_the_same_request() -> None:
 
     assert _tick(adapter) is _RUNNING  # The node waits on the exact pending close.
     assert _tick(adapter) is _FAILURE  # The same request resumes and is accepted.
-    assert port.closes[0]["request_id"] == port.closes[1]["request_id"]
+    assert port.closes[0]["request_key"] == port.closes[1]["request_key"]
     assert adapter.failure_reason_code == "planning_failed"
 
 
@@ -487,7 +488,7 @@ def test_delay_counts_on_the_program_clock_and_stands_still_while_halted() -> No
     _tick(adapter)
     time.now = 0.5
     clock.freeze()  # Halt: nothing is resident, so Execute after Halt is free.
-    assert adapter.reconcile_full_stop_task() == "inactive"
+    assert adapter.reconcile_halt_task() == "inactive"
     time.now = 10.0
     assert _tick(adapter) is _RUNNING
     assert len(port.starts) == 1
@@ -625,7 +626,7 @@ def test_a_malformed_assessment_read_never_replaces_the_operation_failure() -> N
         task_id="task",
         state=OwnerTaskState.FAILED,
         metadata={
-            "operation_id": "op",
+            "operation_id": 1,
             "recovery_assessment_failure": {
                 "reason_code": "owner_recovery_assessment_invalid",
                 "message": "headless recovery assessment has no owner projection",
@@ -658,7 +659,7 @@ def _lead_expired(state: OwnerTaskState, **metadata: Any) -> OwnerTaskSnapshot:
     return OwnerTaskSnapshot(
         task_id="task",
         state=state,
-        metadata={"operation_id": "op", "operation_failure": _FACT, **metadata},
+        metadata={"operation_id": 1, "operation_failure": _FACT, **metadata},
         reason_code=_LEAD_EXPIRED,
         message="replacement recognition lead expired",
         details={"reason": "lead_expired"},
@@ -669,7 +670,7 @@ def _owner_task(port: _MotionPort) -> v2_owner.OwnerTaskAdapter:
     """A plain owner task (no motion retry): its failure reaches the tree
     first, then the close waits for the assessment (`_advance_close`)."""
 
-    return v2_owner.OwnerTaskAdapter(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+    return v2_owner.OwnerTaskAdapter(
         name="owner",
         node_id="motion.move_to_pose",
         node_instance_id="owner",
@@ -814,7 +815,7 @@ def test_an_unknown_admission_is_never_closed_or_waited_for() -> None:
     unknown = OwnerTaskSnapshot(
         task_id="task",
         state=OwnerTaskState.FAILED,
-        metadata={"request_id": "program-node:1"},
+        metadata={"request_key": format_request_key(program_key(1, 1, Phase.PROGRAM_NODE))},
         reason_code="operation_admission_outcome_unknown",
         message="the reply was lost",
     )
@@ -831,7 +832,7 @@ def test_the_retry_audit_fact_carries_the_failed_attempt_code_or_null() -> None:
     silent = OwnerTaskSnapshot(
         task_id="task",
         state=OwnerTaskState.FAILED,
-        metadata={"recovery_assessment": _assessment(), "operation_id": "op"},
+        metadata={"recovery_assessment": _assessment(), "operation_id": 1},
         reason_code="planning_failed",
         message="",
     )
@@ -910,7 +911,7 @@ def test_a_logically_preempted_move_ends_with_the_default_failure_and_its_outcom
     preempted = _active(
         preemption={
             "kind": "preempted",
-            "by": {"operation_id": "op.2", "node_instance_id": "other", "node_attempt_id": "a.2"},
+            "by": {"operation_id": 2, "node_instance_id": "other", "node_attempt_id": 2},
         }
     )
     port = _MotionPort([_active()], observes=[preempted])
@@ -927,7 +928,7 @@ def test_a_logically_preempted_move_ends_with_the_default_failure_and_its_outcom
     assert [(key, value) for key, value, _meta in store.writes] == [
         ("node_outcome.motion", "preempted")
     ]
-    assert store.writes[0][2]["node_attempt_id"] == "attempt.1"
+    assert store.writes[0][2]["node_attempt_id"] == 1
 
 
 @pytest.mark.parametrize("kind, outcome", [("preempted", "preempted"), ("superseded_unsent", "superseded")])
@@ -936,7 +937,7 @@ def test_a_preempted_result_set_to_success_succeeds(kind, outcome) -> None:
     preempted = _active(
         preemption={
             "kind": kind,
-            "by": {"operation_id": "op.2", "node_instance_id": "other", "node_attempt_id": "a.2"},
+            "by": {"operation_id": 2, "node_instance_id": "other", "node_attempt_id": 2},
         }
     )
     port = _MotionPort([preempted])
@@ -951,7 +952,7 @@ def test_a_preempted_result_set_to_success_succeeds(kind, outcome) -> None:
 def test_a_newcomer_refused_by_priority_ends_at_once_with_its_configured_result() -> None:
     store = _Store()
     refused = OwnerInvocationRefusedByPriorityError(
-        "refused", {"operation_id": "op.1", "node_instance_id": "winner", "node_attempt_id": "a.1"}
+        "refused", {"operation_id": 1, "node_instance_id": "winner", "node_attempt_id": 1}
     )
     port = _MotionPort([refused])
     _time, clock = _clocked()
@@ -969,7 +970,7 @@ def test_a_newcomer_refused_by_priority_ends_at_once_with_its_configured_result(
             "node_instance_id": "motion",
             "outcome": "refused_by_priority",
             "by_node_instance_id": "winner",
-            "by_operation_id": "op.1",
+            "by_operation_id": 1,
             "result": "failure",
         }
     ]
@@ -977,7 +978,7 @@ def test_a_newcomer_refused_by_priority_ends_at_once_with_its_configured_result(
 
 def test_a_refused_by_priority_node_under_an_intervention_policy_returns_its_result() -> None:
     refused = OwnerInvocationRefusedByPriorityError(
-        "refused", {"operation_id": "op.1", "node_instance_id": "winner", "node_attempt_id": "a.1"}
+        "refused", {"operation_id": 1, "node_instance_id": "winner", "node_attempt_id": 1}
     )
     port = _MotionPort([refused])
     _time, clock = _clocked()
@@ -1016,7 +1017,7 @@ def test_the_node_outcome_key_receives_completed_or_failed_once(starts, status, 
     adapter = _motion(port, clock, store=store)
     assert _tick(adapter) is status
     assert [(key, value) for key, value, _meta in store.writes] == [("node_outcome.motion", outcome)]
-    assert store.writes[0][2]["node_attempt_id"] == "attempt.1"
+    assert store.writes[0][2]["node_attempt_id"] == 1
 
 
 def test_the_node_outcome_keeps_its_value_until_the_node_ends_again() -> None:
@@ -1143,26 +1144,87 @@ def test_an_uncertain_failure_under_an_intervention_policy_is_held_with_its_iden
 
 
 @pytest.mark.parametrize("unavailable", [False, True], ids=["unassessed", "observation-unavailable"])
-def test_an_assessment_that_stays_unavailable_is_reread_boundedly_then_retained(
-    monkeypatch, unavailable
+def test_an_assessment_that_stays_undecided_is_reread_every_tick_without_giving_up(
+    unavailable,
 ) -> None:
-    monkeypatch.setattr(v2_owner, "_ASSESSMENT_REREAD_LIMIT", 4)
-    port = _MotionPort([_failed(None)], observes=[_failed(None)] * 10)
+    """OD-257: a long undecided phase (150 ticks) neither retains the
+    operation nor returns the failure; the decided read closes it."""
+
+    decided = _failed(_assessment(eligible=False))
+    undecided = [] if unavailable else [_failed(None)] * 150
+    port = _MotionPort([_failed(None)], observes=undecided + [decided])
     if unavailable:
         def observe(task_id):
-            port.observations += 1
-            raise OwnerTaskObservationUnavailableError("owner unreachable")
+            if port.observations < 150:
+                port.observations += 1
+                raise OwnerTaskObservationUnavailableError("owner unreachable")
+            return _MotionPort.observe(port, task_id)
         port.observe = observe
     _time, clock = _clocked()
     adapter = _motion(port, clock)
 
-    statuses = [_tick(adapter) for _ in range(4)]
-    assert statuses == [_RUNNING, _RUNNING, _RUNNING, _FAILURE]  # Never indefinitely RUNNING.
-    assert port.observations == 5  # Only exact rereads of the same operation.
+    statuses = [_tick(adapter) for _ in range(150)]
+    assert statuses == [_RUNNING] * 150  # Never gives up while undecided.
     assert port.closes == []
+    assert _tick(adapter) is _FAILURE  # Decided: closed, then the failure.
+    assert port.observations == 151  # Only exact rereads of the same operation.
+    assert len(port.closes) == 1
     assert len(port.starts) == 1
     assert adapter.failure_reason_code == "planning_failed"
-    assert adapter.cached_control_state() == "unrecoverable"  # Retained for Reset.
+    assert adapter.cached_control_state() == "inactive"
+
+
+def _cleanup_pending_assessment() -> dict[str, Any]:
+    """The Kernel's failed execution while its terminal cleanup still runs
+    (OD-257): waiting, no close permission yet."""
+
+    return {
+        **_assessment(eligible_close=False),
+        "status": "waiting",
+        "reason_code": "terminal_cleanup_pending",
+    }
+
+
+def test_a_failed_move_with_retries_is_retried_after_its_terminal_cleanup() -> None:
+    """OD-257: the move is retried once the cleanup ended, however long it ran."""
+
+    pending = _failed(_cleanup_pending_assessment())
+    port = _MotionPort(
+        [pending, _succeeded()], observes=[pending] * 150 + [_failed(_assessment())]
+    )
+    _time, clock = _clocked()
+    adapter = _motion(
+        port, clock, parameters={"automatic_retries": 1, "automatic_retry_delay_s": 0.0}
+    )
+
+    statuses = [_tick(adapter) for _ in range(150)]
+    assert statuses == [_RUNNING] * 150
+    assert port.closes == []  # No close permission while the cleanup runs.
+    for _ in range(5):
+        if _tick(adapter) is not _RUNNING:
+            break
+    assert adapter.status is _SUCCESS
+    assert len(port.closes) == 1  # Closed on the decided read, then retried.
+    assert len(port.starts) == 2
+
+
+def test_a_held_failure_after_its_terminal_cleanup_offers_continue() -> None:
+    """OD-257: the hold carries the decided assessment with its close
+    permission (Continue), never the cleanup wait."""
+
+    pending = _failed(_cleanup_pending_assessment())
+    port = _MotionPort([pending], observes=[pending] * 150 + [_failed(_assessment())])
+    _time, clock = _clocked()
+    adapter = _motion(port, clock, parameters={"automatic_retries": 0})
+    adapter.hold_failures_for_intervention()
+
+    statuses = [_tick(adapter) for _ in range(150)]
+    assert statuses == [_RUNNING] * 150
+    assert _tick(adapter) is _FAILURE  # The wrapper holds it with owner actions.
+    assert port.closes == []
+    assessment = adapter.owner_recovery_context["owner_assessment"]
+    assert assessment["status"] == "retry_ready"
+    assert assessment["eligible_close"] is True  # Continue closes it.
 
 
 def test_a_transiently_unavailable_assessment_closes_once_it_is_readable() -> None:
@@ -1190,64 +1252,55 @@ def test_a_successful_read_showing_no_residency_is_already_retired() -> None:
     assert adapter.cached_control_state() == "inactive"
 
 
-def test_an_abandoned_move_whose_assessment_stays_unavailable_is_left_for_reset(monkeypatch) -> None:
-    monkeypatch.setattr(v2_owner, "_ASSESSMENT_REREAD_LIMIT", 3)
+def test_an_abandoned_move_whose_assessment_stays_undecided_is_reread_until_it_closes() -> None:
     interrupted = _failed(None, state=OwnerTaskState.INTERRUPTED)
-    port = _MotionPort([_active()], observes=[_active()] + [interrupted] * 10)
+    decided = _failed(_assessment(execution_state="Stopped"), state=OwnerTaskState.INTERRUPTED)
+    port = _MotionPort([_active()], observes=[_active()] + [interrupted] * 150 + [decided])
     _time, clock = _clocked()
     adapter = _motion(port, clock)
     _tick(adapter)
     adapter.stop(_INVALID)
 
-    # One observation still active, then two unavailable rereads, then left.
-    assert [adapter.drain_invalidated() for _ in range(4)] == [False, False, False, True]
+    # One observation still active, then 150 undecided rereads (OD-257).
+    assert [adapter.drain_invalidated() for _ in range(151)] == [False] * 151
     assert port.closes == []
+    assert adapter.has_pending_drain
+    assert adapter.drain_invalidated() is True  # Decided: closed.
+    assert len(port.closes) == 1
     assert not adapter.has_pending_drain
 
 
 class _UnreadablePort(_MotionPort):
-    """Every observation of the stopped task fails to read."""
+    """Observations of the stopped task fail to read (the event stream is
+    lost) until ``readable`` is set; then the scripted observations follow."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.readable = False
 
     def observe(self, task_id: str) -> OwnerTaskSnapshot:
+        if self.readable:
+            return super().observe(task_id)
         self.observations += 1
-        raise OwnerTaskObservationUnavailableError("execution host unreachable")
+        raise OwnerTaskObservationUnavailableError("pushed operations table is unavailable")
 
 
-def test_a_stopped_move_whose_state_reads_keep_failing_fails_after_the_transport_timeout(
-    monkeypatch,
-) -> None:
-    # The node waits for its component, but never forever when
-    # its state can't be read: after the Runner's transport timeout it fails
-    # with a typed error and the tree handles it.
-    now = [100.0]
-    monkeypatch.setattr(v2_owner, "_monotonic", lambda: now[0])
-    port = _UnreadablePort([_failed(None, state=OwnerTaskState.INTERRUPTED)])
-    _time, clock = _clocked()
-    adapter = _motion(port, clock)
-
-    assert _tick(adapter) is _RUNNING  # First failed read starts the bound.
-    now[0] += _TRANSPORT_TIMEOUT_S - 0.1
-    assert _tick(adapter) is _RUNNING
-    now[0] += 0.1
-    assert _tick(adapter) is _FAILURE
-    assert adapter.failure_reason_code == "stopped_node_state_unreadable"
-    assert port.observations == 3
-    assert port.closes == []  # Undecided: retained for Reset, never closed blind.
-
-
-def test_a_stopped_move_whose_reads_recover_keeps_waiting_without_the_bound(monkeypatch) -> None:
-    # A readable but still undecided stopped task (activity `unknown`) waits
-    # as long as it takes; only consecutive failed reads count.
-    now = [0.0]
-    monkeypatch.setattr(v2_owner, "_monotonic", lambda: now[0])
+def test_a_stopped_move_whose_state_reads_keep_failing_waits_until_they_recover() -> None:
+    # OD-214: no time limit. The node waits for its component while its
+    # state can't be read (RUNNING, never closed blind); the wait ends when
+    # the state is readable again, or at the run's Reset.
     interrupted = _failed(None, state=OwnerTaskState.INTERRUPTED)
-    port = _MotionPort([interrupted], observes=[interrupted] * 5)
+    port = _UnreadablePort([interrupted], observes=[interrupted])
     _time, clock = _clocked()
     adapter = _motion(port, clock)
 
-    for _ in range(5):
+    for _ in range(50):
         assert _tick(adapter) is _RUNNING
-        now[0] += _TRANSPORT_TIMEOUT_S
+    assert port.observations == 50
+    assert port.closes == []
+    port.readable = True
+    assert _tick(adapter) is _RUNNING  # Readable, still undecided: it waits.
+    assert port.observations == 51
     assert port.closes == []
 
 
@@ -1269,7 +1322,7 @@ def test_a_preempted_node_under_an_intervention_policy_is_neither_held_nor_retri
     preempted = _active(
         preemption={
             "kind": "preempted",
-            "by": {"operation_id": "op.2", "node_instance_id": "other", "node_attempt_id": "a.2"},
+            "by": {"operation_id": 2, "node_instance_id": "other", "node_attempt_id": 2},
         }
     )
     port = _MotionPort([_active()], observes=[preempted])
@@ -1299,7 +1352,7 @@ def test_a_preempted_node_under_an_intervention_policy_is_neither_held_nor_retri
             "node_instance_id": "motion",
             "outcome": "preempted",
             "by_node_instance_id": "other",
-            "by_operation_id": "op.2",
+            "by_operation_id": 2,
             "result": "failure",
         }
     ]
@@ -1336,9 +1389,8 @@ def test_raw_co_participant_facts_never_replace_the_selected_cause_and_permissio
 def _rule_row(cause: str, stop_result: str | None, *, trip: bool = True) -> dict[str, Any]:
     return {
         "registration": {
-            "owner_epoch": "kernel-1",
             "policy_id": "door_rule",
-            "scope": {"kind": "operation", "operation_id": "op"},
+            "scope": {"kind": "operation", "operation_id": 1},
         },
         "evidence": {
             "state": "retired",
@@ -1346,23 +1398,65 @@ def _rule_row(cause: str, stop_result: str | None, *, trip: bool = True) -> dict
             "source_losses": [],
             "evaluation_error": None,
         },
-        "stop_id": "stop" if stop_result else None,
-        "stop_generation": 1 if stop_result else None,
-        "stop_certificate_id": "cert" if stop_result else None,
-        "stop_certificate_revision": 1 if stop_result else None,
+        "stop_event_id": 1 if stop_result else None,
         "stop_result": stop_result,
         "terminal_cause": cause,
         "error": None,
     }
 
 
+# A participant id is the object {operation_id, ordinal} (contract 1.5).
+_ARM_PARTICIPANT = {"operation_id": 1, "ordinal": 1}
+_CHAIN = ["controlled_stop", "controller_goal_cancel", "software_hard_stop"]
+
+
+def _participant_stop(
+    stage: str | None = "controlled_stop", *, phase: str = "stopped",
+    attribution: str = "rule", mode: str = "interrupt",
+) -> dict[str, Any]:
+    """The arm participant's ``stop`` object in the operation read."""
+
+    return {
+        "phase": phase, "attempt": 1, "stop_event_id": 1, "mode": mode,
+        "attribution_class": attribution, "plan_digest": None,
+        "containing_stage_id": stage,
+        "containing_stage_index": None if stage is None else _CHAIN.index(stage),
+        "escalated": stage not in (None, "controlled_stop"),
+    }
+
+
+_UNSET: Any = object()
+
+
 def _interrupt_task(
-    state: OwnerTaskState, row: dict[str, Any] | None, **metadata: Any
+    state: OwnerTaskState,
+    row: dict[str, Any] | None,
+    *,
+    stop: Any = _UNSET,
+    participant_state: str | None = None,
+    **metadata: Any,
 ) -> OwnerTaskSnapshot:
-    participants = [{"participant_id": "arm", "io_rule_outcomes": [] if row is None else [row]}]
+    """``stop``: the participant's Stop object; by default the rule's own
+    plan contained it (stopped, or failed for ``some_failed``) when the row
+    names a Stop result, else none. ``participant_state``: the participant's
+    reported terminal state, when given."""
+
+    if stop is _UNSET:
+        result = None if row is None else row.get("stop_result")
+        stop = None if result is None else _participant_stop(
+            "controller_goal_cancel" if result == "stopped_escalated" else "controlled_stop",
+            phase="failed" if result == "some_failed" else "stopped",
+        )
+    participants = [{
+        "participant_id": _ARM_PARTICIPANT,
+        "io_rule_outcomes": [] if row is None else [row],
+        "stop": stop,
+    }]
+    if participant_state is not None:
+        participants[0]["state"] = participant_state
     meta: dict[str, Any] = {
-        "operation_id": "op",
-        "interrupt_operation": {"operation_id": "op", "participants": participants},
+        "operation_id": 1,
+        "interrupt_operation": {"operation_id": 1, "participants": participants},
         **metadata,
     }
     if state is not OwnerTaskState.SUCCEEDED:
@@ -1375,11 +1469,17 @@ def _interrupt_task(
     )
 
 
-def _interrupt_motion(port: _MotionPort, node_id: str = "motion.move_until_signal", **parameters: Any):
+def _interrupt_motion(
+    port: _MotionPort,
+    node_id: str = "motion.move_until_signal",
+    *,
+    interventions: _Interventions | None = None,
+    **parameters: Any,
+):
     _, clock = _clocked()
     store = _Store()
     audit: list[dict[str, Any]] = []
-    adapter = v2_owner.InterruptMotionTaskAdapter(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
+    adapter = v2_owner.InterruptMotionTaskAdapter(
         name="probe",
         node_id=node_id,
         node_instance_id="probe",
@@ -1389,7 +1489,7 @@ def _interrupt_motion(port: _MotionPort, node_id: str = "motion.move_until_signa
         input_resolver=_Resolver(None, store),
         port=port,
         owner_port_name="kernel_operations",
-        intervention_port=None,
+        intervention_port=interventions,
         program_clock=clock,
         motion_attention=_Attention(_Log()),
         audit_sink=audit.append,
@@ -1409,12 +1509,12 @@ def test_interrupt_adapter_uses_the_mapper_for_a_contained_trip(monkeypatch) -> 
 
     monkeypatch.setattr(v2_owner, "map_interrupt_result", spy)
     port = _MotionPort([_interrupt_task(
-        OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "succeeded_nominal"),
+        OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "stopped"),
         recovery_assessment=_assessment(execution_state="Stopped"),
     )])
     adapter, store, audit = _interrupt_motion(port)
     assert _tick(adapter) is _SUCCESS
-    assert calls and calls[0][0] == "motion.move_until_signal" and calls[0][2] == "op"
+    assert calls and calls[0][0] == "motion.move_until_signal" and calls[0][2] == 1
     # The stopped operation is closed before the success.
     assert len(port.closes) == 1
     assert store.writes[0][:2] == ("node_outcome.probe", "signal_trip")
@@ -1429,7 +1529,7 @@ def _captured_stop_assessment(execution_state: str = "Stopped", **overrides: Any
     close_operation in allowed_actions (Core skips it for CloseOperation)."""
 
     return {
-        "schema_version": "manyforge.kernel_recovery_assessment.v1",
+        "schema_version": "manyforge.kernel_recovery_assessment.v2",
         "allowed_actions": ["replan_from_stopped_state", "reset_cycle"],
         "assessment_revision": 5,
         "backend_stop_confirmed": True,
@@ -1444,19 +1544,18 @@ def _captured_stop_assessment(execution_state: str = "Stopped", **overrides: Any
             "eligible": False, "reason": "not_retryable_state",
         },
         "status": "retry_ready",
-        "stop_certificate_id": "cert",
-        "stop_certificate_revision": 1,
+        "stop_event_id": 1,
+        "stop_phase": "stopped",
+        "containing_stage_id": "controlled_stop",
         "stop_owner_active": False,
         "operation_revision": 2,
-        "stop_id": "stop",
-        "stop_generation": 1,
         **overrides,
     }
 
 
 def test_interrupt_adapter_closes_a_contained_trip_on_the_captured_stopped_assessment() -> None:
     task = _interrupt_task(
-        OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "succeeded_nominal"),
+        OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "stopped"),
         recovery_assessment=_captured_stop_assessment(),
     )
     port = _MotionPort([task], observes=[task] * 5)
@@ -1469,7 +1568,7 @@ def test_interrupt_adapter_closes_a_contained_trip_on_the_captured_stopped_asses
 
 def test_interrupt_adapter_retains_a_trip_whose_assessment_requires_intervention() -> None:
     task = _interrupt_task(
-        OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "succeeded_nominal"),
+        OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "stopped"),
         recovery_assessment=_captured_stop_assessment(
             "InterventionRequired", eligible_close=False, status="reset_required",
         ),
@@ -1483,14 +1582,13 @@ def test_interrupt_adapter_retains_a_trip_whose_assessment_requires_intervention
 
 @pytest.mark.parametrize("spelling", ["stopped", "intervention_required", "STOPPED", "Unknown"])
 def test_interrupt_adapter_does_not_decide_on_an_unknown_execution_state_spelling(
-    monkeypatch, spelling
+    spelling,
 ) -> None:
     # Only Core's exact TitleCase spellings qualify: an unknown one is neither
     # stopped nor intervention, so the stopped operation stays undecided and
     # the node keeps rereading (it waits, never decides).
-    monkeypatch.setattr(v2_owner, "_ASSESSMENT_REREAD_LIMIT", 3)
     task = _interrupt_task(
-        OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "succeeded_nominal"),
+        OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "stopped"),
         recovery_assessment=_captured_stop_assessment(spelling),
     )
     port = _MotionPort([task], observes=[task] * 10)
@@ -1515,7 +1613,7 @@ def _program_stop_assessment(*, pending: bool = False) -> dict[str, Any]:
 
 def _program_stop_trip(*, pending: bool) -> OwnerTaskSnapshot:
     return _interrupt_task(
-        OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "succeeded_nominal"),
+        OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "stopped"),
         recovery_assessment=_program_stop_assessment(pending=pending),
     )
 
@@ -1585,7 +1683,7 @@ def _stuck_stop() -> OwnerTaskSnapshot:
         task_id="task",
         state=OwnerTaskState.INTERRUPTED,
         metadata={
-            "operation_id": "op",
+            "operation_id": 1,
             "operation_state": "stopped",
             "recovery_assessment": _program_stop_assessment(pending=True),
             "operation_failure": _FACT,
@@ -1595,15 +1693,12 @@ def _stuck_stop() -> OwnerTaskSnapshot:
     )
 
 
-def test_an_unconfirmed_stop_waits_for_the_component_then_gets_its_normal_result(
-    monkeypatch,
-) -> None:
+def test_an_unconfirmed_stop_waits_for_the_component_then_gets_its_normal_result() -> None:
     """A stopped operation whose result can't be
     confirmed (the component's activity is `unknown`) neither holds for an
-    operator acknowledgement nor advances the tree: the node waits past the
-    old reread bound, then gets the Stop's normal result once it settles."""
+    operator acknowledgement nor advances the tree: the node waits without a
+    time limit, then gets the Stop's normal result once it settles."""
 
-    monkeypatch.setattr(v2_owner, "_ASSESSMENT_REREAD_LIMIT", 3)
     stuck = _program_stop_trip(pending=True)
     ready = _program_stop_trip(pending=False)
     port = _MotionPort([stuck], observes=[stuck] * 6 + [ready])
@@ -1674,61 +1769,34 @@ def test_interrupt_adapter_maps_no_signal_per_node_default() -> None:
 
 
 def test_interrupt_adapter_escalated_trip_needs_the_containing_stage() -> None:
-    row = _rule_row("signal_trip", "succeeded_escalated")
-    terminal = {
-        "details_truncated": False, "stop_id": "stop", "stop_generation": 1,
-        "stop_certificate_id": "cert", "stop_certificate_revision": 1,
-        "attempted_stages": [{
-            "authority": "authoritative", "error": None, "operation_id": "op", "outcome": "succeeded",
-            "participant_id": "arm", "participant_stop_invocation_plan_digest": "plan",
-            "scope_key": {"subject": {"kind": "participant", "operation_id": "op", "participant_id": "arm"}},
-            "stage": {"stage_id": "controller_goal_cancel", "stage_index": 1},
-        }],
-        "participant_settlement": [{
-            "scope_key": {"subject": {"kind": "participant", "operation_id": "op", "participant_id": "arm"}},
-            "participant_stop_invocation_plan_digest": "plan",
-        }],
-    }
-    chain = ["controlled_stop", "controller_goal_cancel", "software_hard_stop"]
+    row = _rule_row("signal_trip", "stopped_escalated")
     allowed = _interrupt_task(
-        OwnerTaskState.INTERRUPTED, row, interrupt_stop_terminal=terminal, interrupt_stop_chain=chain,
+        OwnerTaskState.INTERRUPTED, row, interrupt_stop_chain=_CHAIN,
         recovery_assessment=_assessment(execution_state="Stopped"),
     )
     adapter, store, _ = _interrupt_motion(_MotionPort([allowed]), success_through_stage_id="controller_goal_cancel")
     assert _tick(adapter) is _SUCCESS
     assert store.writes[0][1] == "signal_trip"
-    # Without the Stop terminal projection the stage is unproven: Failure.
-    unproven = _interrupt_task(OwnerTaskState.INTERRUPTED, row, interrupt_stop_chain=chain)
+    # No stage contained the participant: unproven, Failure.
+    unproven = _interrupt_task(
+        OwnerTaskState.INTERRUPTED, row, interrupt_stop_chain=_CHAIN,
+        stop=_participant_stop(None))
     adapter, store, _ = _interrupt_motion(_MotionPort([unproven]), success_through_stage_id="controller_goal_cancel")
     assert _tick(adapter) is _FAILURE
     assert adapter.feedback_message.startswith("motion_interrupt_containing_stage_unproven")
     assert store.writes[0][1] == "failed"
 
 
-def _escalated_terminal() -> dict[str, Any]:
-    scope = {"subject": {"kind": "participant", "operation_id": "op", "participant_id": "arm"}}
-    return {
-        "details_truncated": False, "stop_id": "stop", "stop_generation": 1,
-        "stop_certificate_id": "cert", "stop_certificate_revision": 1,
-        "attempted_stages": [{
-            "authority": "authoritative", "error": None, "operation_id": "op", "outcome": "succeeded",
-            "participant_id": "arm", "participant_stop_invocation_plan_digest": "plan",
-            "scope_key": scope, "stage": {"stage_id": "controller_goal_cancel", "stage_index": 1},
-        }],
-        "participant_settlement": [{"scope_key": scope, "participant_stop_invocation_plan_digest": "plan"}],
-    }
-
-
-def test_interrupt_adapter_waits_while_the_stop_terminal_is_pending() -> None:
-    # The record may follow the terminal operation; the node stays
-    # RUNNING and re-observes once per tick until it is there.
-    row = _rule_row("signal_trip", "succeeded_escalated")
-    chain = ["controlled_stop", "controller_goal_cancel", "software_hard_stop"]
-    meta = dict(interrupt_stop_chain=chain, recovery_assessment=_assessment(execution_state="Stopped"))
-    pending = _interrupt_task(OwnerTaskState.INTERRUPTED, row, interrupt_stop_terminal_pending=True, **meta)
-    recorded = _interrupt_task(
-        OwnerTaskState.INTERRUPTED, row, interrupt_stop_terminal=_escalated_terminal(), **meta)
-    port = _MotionPort([pending], observes=[pending, recorded])
+def test_interrupt_adapter_waits_while_a_participant_is_stopping() -> None:
+    # The operation may be terminal while a covered participant is still
+    # stopping; the node stays RUNNING and re-observes once per tick.
+    row = _rule_row("signal_trip", "stopped_escalated")
+    meta = dict(interrupt_stop_chain=_CHAIN, recovery_assessment=_assessment(execution_state="Stopped"))
+    pending = _interrupt_task(
+        OwnerTaskState.INTERRUPTED, row, stop=_participant_stop(None, phase="stopping"), **meta)
+    stopped = _interrupt_task(
+        OwnerTaskState.INTERRUPTED, row, stop=_participant_stop("controller_goal_cancel"), **meta)
+    port = _MotionPort([pending], observes=[pending, stopped])
     adapter, store, audit = _interrupt_motion(port, success_through_stage_id="controller_goal_cancel")
     assert _tick(adapter) is _RUNNING and port.observations == 0
     assert _tick(adapter) is _RUNNING and port.observations == 1
@@ -1737,24 +1805,35 @@ def test_interrupt_adapter_waits_while_the_stop_terminal_is_pending() -> None:
     assert store.writes[0][1] == "signal_trip"
 
 
-def test_interrupt_adapter_maps_an_unproven_stop_terminal_after_the_wait() -> None:
-    # failed / truncated / missing or unknown projection: the port attaches
-    # no usable record and no pending flag, so the node fails as unproven.
-    row = _rule_row("signal_trip", "succeeded_escalated")
-    chain = ["controlled_stop", "controller_goal_cancel", "software_hard_stop"]
-    meta = dict(interrupt_stop_chain=chain, recovery_assessment=_assessment(execution_state="Stopped"))
-    pending = _interrupt_task(OwnerTaskState.INTERRUPTED, row, interrupt_stop_terminal_pending=True, **meta)
-    truncated = {**_escalated_terminal(), "details_truncated": True, "attempted_stages": []}
-    for unproven in (
-        _interrupt_task(OwnerTaskState.INTERRUPTED, row, **meta),
-        _interrupt_task(OwnerTaskState.INTERRUPTED, row, interrupt_stop_terminal=truncated, **meta),
-    ):
-        port = _MotionPort([pending], observes=[unproven])
-        adapter, store, _ = _interrupt_motion(port, success_through_stage_id="controller_goal_cancel")
-        assert _tick(adapter) is _RUNNING
-        assert _tick(adapter) is _FAILURE
-        assert adapter.feedback_message.startswith("motion_interrupt_containing_stage_unproven")
-        assert store.writes[0][1] == "failed"
+@pytest.mark.parametrize("mode", ["ordinary", "fault"])
+def test_interrupt_adapter_fails_a_trip_stopped_by_a_non_interrupt_plan(mode) -> None:
+    row = _rule_row("signal_trip", "stopped_escalated")
+    task = _interrupt_task(
+        OwnerTaskState.INTERRUPTED, row,
+        stop=_participant_stop("controller_goal_cancel", mode=mode),
+        interrupt_stop_chain=_CHAIN,
+        recovery_assessment=_assessment(execution_state="Stopped"))
+    adapter, store, _ = _interrupt_motion(
+        _MotionPort([task]), success_through_stage_id="controller_goal_cancel")
+    assert _tick(adapter) is _FAILURE
+    assert adapter.feedback_message.startswith("interrupt_fault")
+    assert store.writes[0][1] == "failed"
+
+
+def test_interrupt_adapter_keeps_operator_stop_handling(monkeypatch) -> None:
+    # An operator Stop reached the participant first: an operator hold, the
+    # existing motion Stop handling, never a rule outcome.
+    seen: list[str] = []
+    monkeypatch.setattr(
+        v2_owner.MotionTaskAdapter, "_settle",
+        lambda self, task: seen.append(task.task_id) or _FAILURE,
+    )
+    port = _MotionPort([_interrupt_task(
+        OwnerTaskState.INTERRUPTED, _rule_row("signal_trip", "stopped"),
+        stop=_participant_stop(attribution="operator"))])
+    adapter, _, audit = _interrupt_motion(port)
+    assert _tick(adapter) is _FAILURE
+    assert seen == ["task-1"] and audit == []
 
 
 def test_interrupt_adapter_keeps_ordinary_stop_handling(monkeypatch) -> None:
@@ -1763,10 +1842,66 @@ def test_interrupt_adapter_keeps_ordinary_stop_handling(monkeypatch) -> None:
         v2_owner.MotionTaskAdapter, "_settle",
         lambda self, task: seen.append(task.task_id) or _FAILURE,
     )
-    port = _MotionPort([_interrupt_task(OwnerTaskState.INTERRUPTED, _rule_row("stopped", "succeeded_nominal"))])
+    port = _MotionPort([_interrupt_task(OwnerTaskState.INTERRUPTED, _rule_row("stopped", "stopped"))])
     adapter, _, audit = _interrupt_motion(port)
     assert _tick(adapter) is _FAILURE
     assert seen == ["task-1"] and audit == []
+
+
+# OD-241: a motion that did not run to its end and left no rule result gets
+# the ordinary handling of that motion's end.
+def test_interrupt_adapter_holds_a_stop_before_its_rule_was_armed_as_any_stop() -> None:
+    # Case 1: the operator's Stop cancelled the motion before its dispatch
+    # barrier armed the rule: no rule row. Held as an operator Stop with the
+    # Stop's own reason, never an interrupt result.
+    task = replace(
+        _interrupt_task(
+            OwnerTaskState.INTERRUPTED, None, participant_state="cancelled_pre_dispatch",
+            recovery_assessment=_captured_stop_assessment(),
+            authored_failure_policy="pause_for_operator",
+            authored_failure_policy_parameter="operator_stop_policy",
+            stop_event_id=1,
+        ),
+        reason_code="operation_cancelled_pre_dispatch",
+    )
+    interventions = _Interventions(_Log())
+    port = _MotionPort([task])
+    adapter, store, audit = _interrupt_motion(port, interventions=interventions)
+    assert _tick(adapter) is _RUNNING
+    assert len(interventions.required) == 1
+    assert interventions.required[0]["reason_code"] == "operation_cancelled_pre_dispatch"
+    assert interventions.required[0]["policy_parameter"] == "operator_stop_policy"
+    assert port.closes == []
+    assert audit == []
+
+
+def test_interrupt_adapter_fails_a_refused_arm_with_the_kernels_reason() -> None:
+    # Case 2: the signal was already on at the start; the Kernel ended the
+    # operation intervention required with its typed error and retired it.
+    task = replace(
+        _interrupt_task(
+            OwnerTaskState.FAILED, None, participant_state="intervention_required",
+            recovery_assessment=None, resident=False,
+        ),
+        reason_code="motion_interrupt_source_active_at_arm",
+        message="I/O rule is active at arm",
+    )
+    port = _MotionPort([task])
+    adapter, store, audit = _interrupt_motion(port, "motion.probe_search")
+    assert _tick(adapter) is _FAILURE
+    assert adapter.feedback_message.startswith("motion_interrupt_source_active_at_arm")
+    assert len(port.starts) == 1
+    assert audit == []
+
+
+def test_interrupt_adapter_keeps_result_missing_for_a_completed_motion_without_a_rule() -> None:
+    # It ran to its end unwatched: still an uncertain interrupt failure.
+    port = _MotionPort([_interrupt_task(
+        OwnerTaskState.SUCCEEDED, None, participant_state="completed")])
+    adapter, store, audit = _interrupt_motion(port)
+    assert _tick(adapter) is _FAILURE
+    assert adapter.feedback_message.startswith("motion_interrupt_result_missing")
+    assert audit[0]["effect_uncertain"] is True
 
 
 def test_interrupt_nodes_are_qualified_and_build_the_interrupt_adapter() -> None:
@@ -1790,14 +1925,13 @@ def test_interrupt_nodes_are_qualified_and_build_the_interrupt_adapter() -> None
         audit_sink=None, name="probe", node_instance_id="probe", attempt_source=_Attempts(),
         parameters={"target": {"component_id": "robot", "command_target_id": "arm"}},
         value_sources={}, input_resolver=_Resolver(), operator_stop_state=None,
-        transport_timeout_s=5.0,
     )
     assert type(build(context)) is v2_owner.InterruptMotionTaskAdapter
 
 
 @pytest.mark.parametrize("node_id", ["motion.move_until_signal", "motion.probe_search"])
 def test_interrupt_adapter_maps_a_trip_to_its_authored_outcome(node_id) -> None:
-    trip = _rule_row("signal_trip", "succeeded_nominal")
+    trip = _rule_row("signal_trip", "stopped")
     for on_signal, status in (("success", _SUCCESS), ("failure", _FAILURE)):
         port = _MotionPort([_interrupt_task(
             OwnerTaskState.INTERRUPTED, trip, recovery_assessment=_assessment(execution_state="Stopped"),
@@ -1820,12 +1954,10 @@ def test_interrupt_adapter_maps_no_trip_to_its_authored_outcome(node_id) -> None
 
 
 def test_interrupt_adapter_fails_a_trip_contained_beyond_its_success_limit() -> None:
-    row = _rule_row("signal_trip", "succeeded_escalated")
-    terminal = _escalated_terminal()
-    terminal["attempted_stages"][0]["stage"] = {"stage_id": "software_hard_stop", "stage_index": 2}
-    chain = ["controlled_stop", "controller_goal_cancel", "software_hard_stop"]
+    row = _rule_row("signal_trip", "stopped_escalated")
     port = _MotionPort([_interrupt_task(
-        OwnerTaskState.INTERRUPTED, row, interrupt_stop_terminal=terminal, interrupt_stop_chain=chain,
+        OwnerTaskState.INTERRUPTED, row, stop=_participant_stop("software_hard_stop"),
+        interrupt_stop_chain=_CHAIN,
         recovery_assessment=_assessment(execution_state="Stopped"),
     )])
     adapter, store, audit = _interrupt_motion(port, success_through_stage_id="controller_goal_cancel")
@@ -1841,7 +1973,7 @@ def test_interrupt_adapter_fails_a_source_loss_without_automatic_retry() -> None
     # D2: the guard source was lost; the Kernel stopped the move. Even an
     # assessment that would allow a retry starts no second attempt.
     loss = {"source_id": "station.io", "source_epoch": "e1", "kind": "stale"}
-    row = _rule_row("failed", "succeeded_nominal", trip=False)
+    row = _rule_row("failed", "stopped", trip=False)
     row["evidence"]["source_losses"] = [loss]
     task = _interrupt_task(
         OwnerTaskState.INTERRUPTED, row, recovery_assessment=_assessment(execution_state="Stopped"))
@@ -1884,14 +2016,14 @@ def test_probe_search_refused_by_its_unavailable_contact_capability_fails() -> N
 
 def _takeover(path: str, cause: dict[str, Any] | None) -> dict[str, Any]:
     return {
-        "incumbent_operation_id": "op.1",
+        "incumbent_operation_id": 1,
         "path": path,
         "cause": cause,
         "decided_at_ns": 9,
         "elapsed_since_acceptance_ns": 40_500_000,
         "preparation_budget_ns": 30_000_000,
         "planning_budget_ns": 24_000_000,
-        "stop_certificate": None,
+        "stop_event_id": None,
     }
 
 
@@ -1922,7 +2054,7 @@ def test_a_takeover_fallback_is_recorded_once_per_attempt(path, cause, code, mes
         {
             "kind": "program_node_takeover_fallback",
             "node_instance_id": "motion",
-            "incumbent_operation_id": "op.1",
+            "incumbent_operation_id": 1,
             "path": path,
             "code": code,
             "message": message,
@@ -2044,3 +2176,230 @@ def test_a_motion_refused_while_the_simulation_is_not_playing_holds_for_run() ->
     assert adapter.status is _SUCCESS
     assert len(port.starts) == 3
     assert adapter.audit_events[-1]["kind"] == "program_node_simulation_hold_ended"
+
+
+def _retired_refusal() -> OwnerTaskSnapshot:
+    """A move refused before sending (here a rule's `rule_holds` at the final
+    recheck) whose operation the Kernel already retired: no assessment."""
+
+    task = _failed(None)
+    return replace(
+        task,
+        metadata={**task.metadata, "resident": False, "operation_state": "intervention_required"},
+        reason_code="rule_holds",
+        message="Rule light_curtain holds its scope (its condition holds)",
+    )
+
+
+def test_a_held_failure_of_a_retired_operation_holds_without_an_owner_task() -> None:
+    """OD-263: nothing is left to hold, so the hold carries no owner task and
+    its offers follow the node's policy (Continue, Retry, manual result)."""
+
+    port = _MotionPort([_retired_refusal()])
+    _time, clock = _clocked()
+    adapter = _motion(port, clock)
+    adapter.hold_failures_for_intervention()
+    recovery = _Interventions(_Log())
+    node = RecoveryAwareNode(
+        child=adapter,
+        node_instance_id="motion",
+        policy=SimpleNamespace(recovery_policy={"allow_intervention": True, "max_retries": 0}),
+        attempt_source=_Attempts(),
+        recovery_port=recovery,
+    )
+
+    node.tick_once()
+    assert node.status is _RUNNING  # Held for the operator.
+    assert port.closes == []
+    assert adapter.owner_recovery_context is None
+    assert len(recovery.required) == 1
+    required = recovery.required[0]
+    assert required["reason_code"] == "rule_holds"
+    assert "owner_task_id" not in required and "owner_assessment" not in required
+
+
+def _stopped_newcomer(
+    effect: str = "no_effect", kind: str = "cancelled_before_dispatch"
+) -> OwnerTaskSnapshot:
+    """A take-over newcomer ended by the operator's Stop (by default before it
+    was sent), already retired by the Kernel (its assessment is unreadable)."""
+
+    task = _failed(None, state=OwnerTaskState.INTERRUPTED)
+    return replace(
+        task,
+        metadata={
+            **task.metadata,
+            "resident": False,
+            "operation_state": "stopped",
+            "stop_event_id": 49,
+            "operation_failure": {
+                **_FACT,
+                "failure": {"code": "operation_stopped", "message": "native operation was interrupted"},
+                "terminal_facts": [{"kind": kind, "effect": effect}],
+            },
+            "recovery_assessment_failure": {
+                "reason_code": "owner_recovery_assessment_invalid",
+                "message": "operation has no resident recovery owner",
+            },
+        },
+        reason_code="operation_stopped",
+        message="native operation was interrupted",
+    )
+
+
+def test_a_newcomer_ended_by_the_stop_that_holds_it_holds_and_resubmits_on_resume() -> None:
+    """OD-264: nothing of it started, so the node holds like a Stop-fence
+    refusal at admission, and Resume makes a fresh attempt; the run is not
+    failed."""
+
+    from manyforge_behavior.nodes.stop_policy import (
+        OperatorMotionStopSnapshot,
+        OperatorMotionStopState,
+    )
+
+    port = _MotionPort([_stopped_newcomer(), _succeeded()])
+    _time, clock = _clocked()
+    stop_state = OperatorMotionStopState({"motion": ()})
+    stop_state.publish(OperatorMotionStopSnapshot(3, frozenset({"motion"})))
+    adapter = _motion(port, clock, hold=stop_state)
+
+    assert _tick(adapter) is _RUNNING
+    assert adapter.presented_held
+    assert adapter.failure_reason_code is None
+    assert port.closes == [] and adapter.owner_recovery_context is None
+    assert _tick(adapter) is _RUNNING and len(port.starts) == 1  # Held: nothing sent.
+    stop_state.publish(OperatorMotionStopSnapshot(4))  # Resume.
+    for _ in range(3):
+        if _tick(adapter) is not _RUNNING:
+            break
+    assert adapter.status is _SUCCESS
+    assert len(port.starts) == 2
+    assert port.starts[1][0].node_attempt_id != port.starts[0][0].node_attempt_id
+
+
+def _moved_newcomer() -> OwnerTaskSnapshot:
+    """A take-over newcomer that moved before the operator's Stop ended it:
+    its effect settled, retired by the Kernel, which kept its rest."""
+
+    return _stopped_newcomer("effect_settled", "preempted_by_addressed_stop")
+
+
+def test_a_moved_newcomer_ended_by_the_stop_that_holds_it_holds_and_resubmits_on_resume() -> None:
+    """OD-269: the node holds as for a newcomer that never moved (the run is
+    not failed), and Resume's next attempt, a new node attempt, is the one
+    the Kernel plans from the kept rest."""
+
+    from manyforge_behavior.nodes.stop_policy import (
+        OperatorMotionStopSnapshot,
+        OperatorMotionStopState,
+    )
+
+    port = _MotionPort([_moved_newcomer(), _succeeded()])
+    _time, clock = _clocked()
+    stop_state = OperatorMotionStopState({"motion": ()})
+    stop_state.publish(OperatorMotionStopSnapshot(3, frozenset({"motion"})))
+    adapter = _motion(port, clock, hold=stop_state)
+
+    assert _tick(adapter) is _RUNNING
+    assert adapter.presented_held
+    assert adapter.failure_reason_code is None
+    assert port.closes == [] and adapter.owner_recovery_context is None
+    assert _tick(adapter) is _RUNNING and len(port.starts) == 1  # Held: nothing sent.
+    stop_state.publish(OperatorMotionStopSnapshot(4))  # Resume.
+    for _ in range(3):
+        if _tick(adapter) is not _RUNNING:
+            break
+    assert adapter.status is _SUCCESS
+    assert len(port.starts) == 2
+    assert port.starts[1][0].node_attempt_id != port.starts[0][0].node_attempt_id
+    assert port.starts[1][1] == port.starts[0][1]  # The same inputs; the Kernel plans the rest.
+
+
+def test_a_moved_newcomer_stopping_until_the_old_stop_ends_holds_and_resubmits_on_resume() -> None:
+    """OD-272: before the old motion's Stop ends, the Kernel shows the sent
+    newcomer stopping (resident, no terminal fact): the node waits and
+    rereads, then holds on the final Stopped fact (OD-269); the run is not
+    failed."""
+
+    from manyforge_behavior.nodes.stop_policy import (
+        OperatorMotionStopSnapshot,
+        OperatorMotionStopState,
+    )
+
+    stopping = _active(operation_state="stopping", resident=True, stop_event_id=49)
+    port = _MotionPort(
+        [stopping, _succeeded()], observes=[stopping, stopping, _moved_newcomer()]
+    )
+    _time, clock = _clocked()
+    stop_state = OperatorMotionStopState({"motion": ()})
+    stop_state.publish(OperatorMotionStopSnapshot(3, frozenset({"motion"})))
+    adapter = _motion(port, clock, hold=stop_state)
+
+    assert _tick(adapter) is _RUNNING  # Started: stopping.
+    assert _tick(adapter) is _RUNNING and _tick(adapter) is _RUNNING  # Rereads.
+    assert not adapter.presented_held and adapter.failure_reason_code is None
+    assert _tick(adapter) is _RUNNING  # The final Stopped fact: held.
+    assert adapter.presented_held
+    assert adapter.failure_reason_code is None
+    assert port.closes == [] and adapter.owner_recovery_context is None
+    assert _tick(adapter) is _RUNNING and len(port.starts) == 1  # Held: nothing sent.
+    stop_state.publish(OperatorMotionStopSnapshot(4))  # Resume.
+    for _ in range(3):
+        if _tick(adapter) is not _RUNNING:
+            break
+    assert adapter.status is _SUCCESS
+    assert len(port.starts) == 2
+
+
+def test_a_moved_newcomer_whose_rest_is_refused_on_resume_fails_its_node() -> None:
+    """OD-269: when the Kernel could not capture the rest (a Cartesian path
+    stopped before its hand-over), Resume's next attempt is refused as Resume
+    of any such stopped motion is, and the node fails with that refusal."""
+
+    from manyforge_behavior.nodes.stop_policy import (
+        OperatorMotionStopSnapshot,
+        OperatorMotionStopState,
+    )
+
+    refusal = KernelOperationAdmissionRejectedError(
+        "operation_recovery_invalid",
+        "Cartesian continuation lacks exact original-path progress",
+        {"reason": "cartesian_resume_progress_unavailable",
+         "continuation_error_code": "execution_rejected"},
+    )
+    port = _MotionPort([_moved_newcomer(), refusal])
+    _time, clock = _clocked()
+    stop_state = OperatorMotionStopState({"motion": ()})
+    stop_state.publish(OperatorMotionStopSnapshot(3, frozenset({"motion"})))
+    adapter = _motion(port, clock, hold=stop_state)
+
+    assert _tick(adapter) is _RUNNING and adapter.presented_held
+    stop_state.publish(OperatorMotionStopSnapshot(4))  # Resume.
+    for _ in range(3):
+        if _tick(adapter) is not _RUNNING:
+            break
+    assert adapter.status is _FAILURE
+    assert len(port.starts) == 2
+    assert "original-path progress" in adapter.feedback_message
+
+
+def test_a_stopped_newcomer_whose_node_is_not_held_still_fails() -> None:
+    """A Stop that does not hold the node (the Program's own Stop) keeps the
+    failure path, as does a newcomer whose effect is uncertain."""
+
+    from manyforge_behavior.nodes.stop_policy import (
+        OperatorMotionStopSnapshot,
+        OperatorMotionStopState,
+    )
+
+    for task, held in ((_stopped_newcomer(), frozenset()),
+                       (_moved_newcomer(), frozenset()),
+                       (_stopped_newcomer("effect_uncertain", "local_failure"),
+                        frozenset({"motion"}))):
+        port = _MotionPort([task])
+        _time, clock = _clocked()
+        stop_state = OperatorMotionStopState({"motion": ()})
+        stop_state.publish(OperatorMotionStopSnapshot(3, held))
+        adapter = _motion(port, clock, hold=stop_state)
+        assert _tick(adapter) is _FAILURE
+        assert adapter.failure_reason_code == "operation_stopped"

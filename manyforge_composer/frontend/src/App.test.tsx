@@ -44,48 +44,16 @@ afterEach(() => {
 });
 
 describe('Composer shell continuity', () => {
-  it('shows only the backend-projected session notice in the existing warning rail', async () => {
+  it('shows a refused startup project in the warning rail until it is cleared', async () => {
     const health: HealthResponse = {
       status: 'ok', mode: 'headless_client', components: {},
       runtimeAvailability: null, headless: null, timestamp: 1,
     };
-    healthProjection.value = health;
-    expect(renderToStaticMarkup(<App />)).not.toContain('ManyForge did not close correctly last time.');
     // Resolve the existing lazy viewport so its real runtime overlay is rendered.
+    healthProjection.value = health;
+    renderToStaticMarkup(<App />);
     await import('./components/StructuralViewer');
     await Promise.resolve();
-    healthProjection.value = { ...health, workbenchSessionNotice: {
-      schemaVersion: 'manyforge.workbench_previous_session.v1',
-      sessionId: 'a'.repeat(32),
-      archiveRelativePath: `previous-sessions/${'a'.repeat(32)}`,
-      shutdown: 'clean', effects: 'unknown', historyCoverage: 'not_imported',
-      journalFamilies: ['program_cycle', 'scene', 'manager', 'kernel_operation'],
-      message: 'Session a: journals retained; motion effects unknown. Nothing was resumed.',
-    } };
-    const markup = renderToStaticMarkup(<App />);
-    expect(markup).toContain('ManyForge did not close correctly last time.');
-    expect(markup).toContain('The cell started empty; nothing from the previous session was resumed. Its records are kept; details in History.');
-    expect(markup).toContain('workbench-notice-row severity-warning');
-    const noticeHealth = healthProjection.value;
-    for (const status of ['registered', 'acknowledged', 'quiet']) {
-      healthProjection.value = { ...noticeHealth, headless: {
-        workbench_previous_session_registration: { session_id: 'a'.repeat(32), status },
-      } };
-      expect(renderToStaticMarkup(<App />)).not.toContain('ManyForge did not close correctly last time.');
-    }
-    healthProjection.value = { ...noticeHealth, headless: {
-      workbench_previous_session_registration: { session_id: 'b'.repeat(32), status: 'registered' },
-    } };
-    expect(renderToStaticMarkup(<App />)).toContain('ManyForge did not close correctly last time.');
-    healthProjection.value = { ...health, workbenchSessionNotice: null };
-    expect(renderToStaticMarkup(<App />)).not.toContain('ManyForge did not close correctly last time.');
-  });
-
-  it('shows a refused startup project in the warning rail until it is cleared', () => {
-    const health: HealthResponse = {
-      status: 'ok', mode: 'headless_client', components: {},
-      runtimeAvailability: null, headless: null, timestamp: 1,
-    };
     const message = 'Startup project /p/cell.scenario was not opened: a Scenario is still applied. Start a New Scenario, then Load.';
     healthProjection.value = { ...health, startupScenarioNotice: {
       path: '/p/cell.scenario', code: 'scenario_new_required', message,
@@ -114,7 +82,7 @@ describe('Composer shell continuity', () => {
     const viewer = markup.indexOf('id="viewer-title"');
 
     expect(markup).toContain('aria-label="ManyForge Composer"');
-    expect(markup).toContain('aria-label="Workbench sections"');
+    expect(markup).toContain('aria-label="ManyForge sections"');
     expect(markup).toContain('>Program</button>');
     expect(markup).toContain('>Scene</button>');
     // Components sits with Program, Scene and Deployment, before Deployment.
@@ -182,6 +150,13 @@ describe('Composer shell continuity', () => {
     for (const readiness of ['ready', 'degraded', 'fault', 'waiting']) {
       expect(shell).toContain(`.workspace-switcher .deployment-status-button.readiness-${readiness},\n.workspace-switcher .components-status-button.readiness-${readiness} {`);
     }
+  });
+
+  it('titles a latch on an open control connection apart from a connection fault', () => {
+    const source = readFileSync(new URL('./App.tsx', import.meta.url), 'utf8');
+    const notice = source.slice(source.indexOf('const controlNotices'), source.indexOf("id: 'control.state'"));
+    // Both keep the latch or fault sentence as the body and offer Reconnect.
+    expect(notice).toMatch(/title: headlessState\.commandLatch\s*\? 'Control commands unavailable' : 'Control connection unavailable',\s*message: headlessState\.transportError,\s*actions: \[\{\s*id: 'reconnect',/);
   });
 
   it('keeps the canvas fixed and gives scrolling to bounded side surfaces', () => {

@@ -1,4 +1,5 @@
-import type { ManagerApplyPhase, ProgramCycleStatus } from './api';
+import type { ApplicationStartId } from '../api/applicationIdentity';
+import type { ApplyCommandRows, ManagerApplyPhase, ProgramCycleStatus } from './api';
 import type { Nanoseconds } from './nanoseconds';
 import type { ExecutionOwnerStatus } from './robotControl';
 
@@ -10,7 +11,6 @@ export interface HeadlessSourceSection {
   knownGaps: string[];
   payload: Record<string, unknown> | null;
   sourceGeneration: number | null;
-  sourceOwnerEpoch: string | null;
   sourceOwnerId: string | null;
   receiverAgeNs: number | null;
 }
@@ -22,13 +22,12 @@ export interface ActiveConfigurationIdentity {
 }
 
 export interface HeadlessRuntimeSnapshot {
-  schemaVersion: 'manyforge.headless_runtime_snapshot.v1';
+  schemaVersion: 'manyforge.headless_runtime_snapshot.v3';
   /** The configuration Manager publishes as active; null before one. */
   activeConfiguration: ActiveConfigurationIdentity | null;
   complete: boolean;
   initialSceneFailure?: { state: 'failed' | 'unknown'; reason: { code: string; message: string } } | null;
   projectionGeneration: number;
-  projectionOwnerEpoch: string;
   projectionOwnerId: string;
   reasons: string[];
   unavailableSections: string[];
@@ -95,16 +94,14 @@ export interface OperatorAlarmRecord extends AlarmMembership {
  * owner snapshot by up to one publication period plus its deadline.
  */
 export interface KernelAlarmAttention {
-  ownerEpoch: string;
   generation: number;
   reconciled: boolean;
   activeConfiguration: ActiveConfigurationIdentity | null;
 }
 
 export interface OperatorAlarmSnapshot {
-  schemaVersion: 'manyforge.operator_alarm_snapshot.v2';
+  schemaVersion: 'manyforge.operator_alarm_snapshot.v3';
   ownerId: string;
-  ownerEpoch: string;
   generation: number;
   stateRevision: number;
   reconciled: boolean;
@@ -145,7 +142,6 @@ export interface ComponentOverviewComponent {
   required: boolean;
   requiredFor: string[];
   ownerId: string | null;
-  ownerEpoch: string | null;
   generation: number | null;
   reasonCode: string | null;
   scope: string;
@@ -153,7 +149,7 @@ export interface ComponentOverviewComponent {
 }
 
 export interface ComponentOverviewProjection {
-  schemaVersion: 'manyforge.component_overview.v2';
+  schemaVersion: 'manyforge.component_overview.v3';
   overviewRevision: string;
   readiness: ComponentOverviewReadiness;
   summaryLabel: string;
@@ -163,29 +159,21 @@ export interface ComponentOverviewProjection {
   capabilities: string[];
   components: ComponentOverviewComponent[];
   maintenanceOperation: {
-    applyId: string;
+    applyId: number;
     applyGeneration: number;
     phase: ManagerApplyPhase;
     affectedRuntimeUnitIds: string[];
     reasonCode: 'planned_maintenance_in_progress';
   } | null;
   basis: {
-    runtimeProjectionOwnerEpoch: string | null;
     runtimeProjectionGeneration: number | null;
-    managerSourceOwnerEpoch: string | null;
-    logicalSceneSourceOwnerEpoch: string | null;
     logicalSceneSourceGeneration: number | null;
-    sceneRuntimeSourceOwnerEpoch: string | null;
     sceneRuntimeSourceGeneration: number | null;
-    alarmOwnerEpoch: string | null;
     alarmGeneration: number | null;
     alarmStateRevision: number | null;
     admissionGeneration: number | null;
-    programRunnerOwnerEpoch: string | null;
     programCycleGeneration: number | null;
-    appliedProgramOwnerEpoch: string | null;
     appliedProgramGeneration: number | null;
-    executionOwnerEpoch: string | null;
     executionPublicationGeneration: number | null;
   };
 }
@@ -210,7 +198,7 @@ export interface AuthoringWorkspaceContainment {
 }
 
 export interface ComposerHeadlessState {
-  schemaVersion: 'manyforge.composer_headless_state.v2';
+  schemaVersion: 'manyforge.composer_headless_state.v4';
   complete: true;
   runtime: HeadlessRuntimeSnapshot;
   alarms: OperatorAlarmSnapshot;
@@ -227,6 +215,8 @@ export interface ComposerHeadlessState {
   heldRunDraftEditAllowed: boolean;
   executionControlStatus: ExecutionOwnerStatus | null;
   programCycle: ProgramCycleStatus;
+  /** Composer's Apply-level commands (Apply, Revert, Load, New, ...). */
+  applyCommands: ApplyCommandRows;
   /**
    * The one composite authoring workspace identity: the workspace epoch and
    * revision plus both Draft identities. It replaces the old Program-only
@@ -236,12 +226,19 @@ export interface ComposerHeadlessState {
   authoringWorkspace: AuthoringWorkspaceIdentity;
   /** Published with the identity; non-null while authoring is contained. */
   authoringWorkspaceContainment: AuthoringWorkspaceContainment | null;
-  receiverEpoch: string;
+  /**
+   * The application-start id `A` (16 hex) from Composer's snapshot
+   * enrichment. Composer lives exactly one start, so a different value is a
+   * new start (the browser resynchronizes); the same value orders snapshots
+   * by `snapshotSequence`. HTTP requests that name a start-minted value carry
+   * this value as `application_start_id`.
+   */
+  applicationStartId: ApplicationStartId;
   snapshotSequence: number;
 }
 
 export interface HistorianEvent {
-  schemaVersion: 'manyforge.historian_event.v2';
+  schemaVersion: 'manyforge.historian_event.v3';
   eventId: string;
   component: string;
   eventType: string;
@@ -254,18 +251,20 @@ export interface HistorianEvent {
 export interface HistorianStoredEvent {
   sequence: number;
   event: HistorianEventSummary;
+  /** The application start the row belongs to (16 hex). */
+  applicationStartId: string;
 }
 
 export interface HistorianDiscovery {
   schemaVersion: 'manyforge.historian_discovery.v1';
-  kind: 'program_run_id' | 'component' | 'channel' | 'event_type';
+  kind: 'program_run_id' | 'component' | 'channel' | 'event_type' | 'application_start_id';
   values: string[];
   truncated: boolean;
   nextAfter: string | null;
 }
 
 export interface HistorianPage {
-  schemaVersion: 'manyforge.historian_summary_page.v2';
+  schemaVersion: 'manyforge.historian_summary_page.v3';
   events: HistorianStoredEvent[];
   nextBeforeSequence: number | null;
   truncated: boolean;
@@ -335,13 +334,19 @@ export interface HistorianCapturePage {
 }
 
 export interface HistorianRetention {
-  schemaVersion: 'manyforge.historian_retention.v2';
+  schemaVersion: 'manyforge.historian_retention.v3';
   captures: HistorianCaptureRetention;
   partitionRowLimit: string;
   partitionRecordByteLimit: string;
   databasePageByteLimit: string;
   durationGuaranteed: false;
   priorPruningKnown: boolean;
+  /** Earlier-format History files beside the current one; never opened. */
+  olderHistoryFiles: Array<{
+    fileName: string;
+    /** Format number from the file name; null for the unversioned file. */
+    format: string | null;
+  }>;
   partitions: Array<{
     partition: 'routine' | 'important';
     retainedCount: string;
@@ -358,7 +363,7 @@ export interface HistorianRetention {
 }
 
 export interface HistorianEventSummary {
-  schemaVersion: 'manyforge.historian_event_summary.v2';
+  schemaVersion: 'manyforge.historian_event_summary.v3';
   eventId: string;
   component: string;
   eventType: string;
@@ -366,8 +371,8 @@ export interface HistorianEventSummary {
   occurredAtNs: string;
   occurredAtWall: string;
   message: string;
-  programRunId: string | null;
-  operationId: string | null;
+  programRunId: number | null;
+  operationId: number | null;
   conditionId: string | null;
   conditionSeverity: string;
   occurredAtUtcNs: string | null;
@@ -388,7 +393,7 @@ export interface HistorianDetailSection {
 }
 
 export interface HistorianDetail {
-  schemaVersion: 'manyforge.historian_detail.v2';
+  schemaVersion: 'manyforge.historian_detail.v3';
   sequence: number;
   event: HistorianEvent;
   sections: Record<HistorianDetailSectionName, HistorianDetailSection>;

@@ -1,23 +1,21 @@
 {
   "allowed_commands": [
     {
-      "allowed": true,
-      "command_kind": "cell_full_stop",
-      "disabled_reason": null,
-      "semantic_target": {
-        "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
-      }
-    },
-    {
       "allowed": false,
       "command_kind": "execution_recovery",
       "disabled_reason": "program_cycle_state_idle_after_reset",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "halt",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null
       }
     },
     {
@@ -26,8 +24,7 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
@@ -36,8 +33,7 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
@@ -46,8 +42,7 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
@@ -56,28 +51,16 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
       "allowed": false,
-      "command_kind": "program_discard_full_stop",
+      "command_kind": "program_discard_halt",
       "disabled_reason": "program_run_state_unavailable",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
-      }
-    },
-    {
-      "allowed": false,
-      "command_kind": "program_full_stop",
-      "disabled_reason": "program_run_state_unavailable",
-      "semantic_target": {
-        "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
@@ -86,8 +69,7 @@
       "disabled_reason": "program_run_state_unavailable",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
@@ -96,8 +78,7 @@
       "disabled_reason": "program_run_state_unavailable",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
@@ -106,8 +87,7 @@
       "disabled_reason": "program_run_state_unavailable",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
@@ -116,8 +96,7 @@
       "disabled_reason": "program_run_state_unavailable",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
@@ -126,8 +105,7 @@
       "disabled_reason": "program_run_state_unavailable",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
@@ -136,18 +114,16 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
       "allowed": false,
-      "command_kind": "program_resume_full_stop",
+      "command_kind": "program_resume_halt",
       "disabled_reason": "program_run_state_unavailable",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
@@ -156,8 +132,7 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
@@ -166,18 +141,7 @@
       "disabled_reason": "program_run_state_unavailable",
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
-      }
-    },
-    {
-      "allowed": false,
-      "command_kind": "program_stop",
-      "disabled_reason": "program_run_state_unavailable",
-      "semantic_target": {
-        "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
       }
     },
     {
@@ -186,14 +150,20 @@
       "disabled_reason": null,
       "semantic_target": {
         "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
+        "program_run_id": null
+      }
+    },
+    {
+      "allowed": true,
+      "command_kind": "stop_all",
+      "disabled_reason": null,
+      "semantic_target": {
+        "cycle_generation": 1,
+        "program_run_id": null
       }
     }
   ],
-  "causal_client_sequence": null,
-  "causal_correlation_id": null,
-  "causal_session_id": null,
+  "causal_request_key": null,
   "current_command_kind": null,
   "cycle_claim_generation": null,
   "cycle_generation": 1,
@@ -201,7 +171,6 @@
   "failure": null,
   "node_status_revision": null,
   "program_run_id": null,
-  "program_runner_owner_epoch": "program-runner.epoch.1",
   "recovery_offer": null,
   "reset_options": null,
   "reset_phase": null,
@@ -212,6 +181,10 @@
   "run": null,
   "run_end": null,
   "run_revision": null,
+  "runner_commands": {
+    "ended": [],
+    "in_progress": null
+  },
   "runtime_control_revision": null,
   "runtime_controls": null,
   "state": "idle_after_reset",

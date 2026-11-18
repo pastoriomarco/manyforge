@@ -105,10 +105,10 @@ TEST(OperatorAlarmCatalog,
 TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   const auto catalog = OperatorAlarmCatalog::Load(PackagedCatalog());
   EXPECT_EQ(catalog.schema_version(), "manyforge.operator_alarm_catalog.v1");
-  EXPECT_EQ(catalog.catalog_version(), "2.9.0");
+  EXPECT_EQ(catalog.catalog_version(), "2.13.0");
   EXPECT_EQ(catalog.descriptor_digest(),
             "sha256:"
-            "366e2643d348456d350b638b9b2c2ab22828f2475e05f26b6d9f6b1941623413");
+            "5d3199014adcc6b3dba1fc832cccf09e6ec195178668b51a70780a15e17e5a9e");
   ASSERT_FALSE(catalog.definitions().empty());
   // The dedicated carried-object alarm repeats its error row's compact text,
   // needs acknowledgement and gates no motion.
@@ -123,12 +123,48 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
                           "manyforge.runtime.kernel_internal_fault"}) {
     const auto* fault = catalog.Find(name);
     ASSERT_NE(fault, nullptr);
-    EXPECT_EQ(fault->priority, "high");
-    EXPECT_TRUE(fault->acknowledgement_required);
+    const bool journal =
+        std::string_view(name) == "manyforge.runtime.operation_journal_write_fault";
+    EXPECT_EQ(fault->priority, journal ? "low" : "high");
+    EXPECT_EQ(fault->acknowledgement_required, !journal);
     EXPECT_FALSE(fault->requires_motion_attention);  // V2-5
     EXPECT_EQ(fault->adapter_id, "manyforge.alarm_adapter.runtime_fault_condition");
     EXPECT_EQ(fault->max_evidence_refs, 1U);
   }
+  // OD-215: the disk check's alarm gates motion exactly while active, clears
+  // by itself and needs no acknowledgement.
+  const auto *disk = catalog.Find("manyforge.runtime.disk_cannot_keep_records");
+  ASSERT_NE(disk, nullptr);
+  EXPECT_EQ(disk->title, "Disk cannot keep ManyForge's records");
+  EXPECT_EQ(disk->priority, "high");
+  EXPECT_FALSE(disk->acknowledgement_required);
+  EXPECT_TRUE(disk->requires_motion_attention);
+  EXPECT_EQ(disk->adapter_id, "manyforge.alarm_adapter.runtime_health_condition");
+  // OD-247/OD-248: one generic row for every component fault; acknowledged,
+  // never a motion gate (the cell latch already blocks execution).
+  const auto *component_fault =
+      catalog.Find("manyforge.runtime.component_fault");
+  ASSERT_NE(component_fault, nullptr);
+  EXPECT_EQ(component_fault->title, "Component fault");
+  EXPECT_EQ(component_fault->message_template, "Fault on component {subject_id}");
+  EXPECT_EQ(component_fault->alarm_class, "runtime_health");
+  EXPECT_EQ(component_fault->priority, "high");
+  EXPECT_TRUE(component_fault->acknowledgement_required);
+  EXPECT_FALSE(component_fault->acknowledgement_reason_required);
+  EXPECT_FALSE(component_fault->requires_motion_attention);
+  EXPECT_EQ(component_fault->adapter_id,
+            "manyforge.alarm_adapter.runtime_health_condition");
+  EXPECT_EQ(component_fault->set_authority,
+            "manyforge.component_coordinator.fault_condition");
+  EXPECT_EQ(component_fault->clear_authority, component_fault->set_authority);
+  EXPECT_EQ(component_fault->runtime_modes, (std::vector<std::string>{"all"}));
+  EXPECT_EQ(component_fault->max_evidence_refs, 1U);
+  // Lost operation records clear by themselves and gate no motion.
+  const auto *records_lost =
+      catalog.Find("manyforge.runtime.operation_journal_write_fault");
+  EXPECT_EQ(records_lost->title, "Operation records are being lost");
+  EXPECT_FALSE(records_lost->acknowledgement_reason_required);
+  EXPECT_EQ(records_lost->version, 2U);
   // Neutral: the details say whether its containment Full Stop was accepted.
   EXPECT_EQ(catalog.Find("manyforge.runtime.kernel_internal_fault")->title,
             "Internal fault");
@@ -151,6 +187,19 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   EXPECT_FALSE(observation_lost->requires_motion_attention);  // V2-5
   EXPECT_TRUE(observation_lost->acknowledgement_required);
   EXPECT_EQ(observation_lost->max_evidence_refs, 32U);
+  // OD-217: collision checks that did not run in time stop motion through
+  // the same containment; their alarm differs only in its wording.
+  const auto *checks_stopped =
+      catalog.Find("manyforge.motion.runtime_monitor_checks_stopped");
+  ASSERT_NE(checks_stopped, nullptr);
+  EXPECT_EQ(checks_stopped->title, "Collision checks stopped");
+  EXPECT_EQ(checks_stopped->priority, collision->priority);
+  EXPECT_EQ(checks_stopped->set_authority, collision->set_authority);
+  EXPECT_EQ(checks_stopped->clear_authority, collision->clear_authority);
+  EXPECT_EQ(checks_stopped->adapter_id, collision->adapter_id);
+  EXPECT_FALSE(checks_stopped->requires_motion_attention);  // V2-5
+  EXPECT_TRUE(checks_stopped->acknowledgement_required);
+  EXPECT_EQ(checks_stopped->max_evidence_refs, 32U);
   const auto *scope = catalog.Find("manyforge.runtime.alarm_scope_unavailable");
   ASSERT_NE(scope, nullptr);
   EXPECT_EQ(scope->alarm_class, "runtime_health");
@@ -168,6 +217,17 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   EXPECT_TRUE(previous->acknowledgement_required);
   EXPECT_FALSE(previous->acknowledgement_reason_required);
   EXPECT_FALSE(previous->requires_motion_attention);
+  // History's own loss alarm: it clears by itself and gates nothing.
+  const auto *history = catalog.Find("manyforge.runtime.history_missing_records");
+  ASSERT_NE(history, nullptr);
+  EXPECT_EQ(history->title, "History is missing records");
+  EXPECT_EQ(history->alarm_class, "runtime_health");
+  EXPECT_EQ(history->priority, "low");
+  EXPECT_EQ(history->adapter_id,
+            "manyforge.alarm_adapter.runtime_health_condition");
+  EXPECT_FALSE(history->acknowledgement_required);
+  EXPECT_FALSE(history->acknowledgement_reason_required);
+  EXPECT_FALSE(history->requires_motion_attention);
   EXPECT_EQ(catalog.Find("manyforge.unknown"), nullptr);
 }
 

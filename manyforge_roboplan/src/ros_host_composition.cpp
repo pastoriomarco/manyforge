@@ -361,9 +361,8 @@ void BindHostIoRuleEvidenceProcessor(
         const auto access = weak.lock();
         if (!access)
           return core::Result<bool>::Ok(false);
-        // Same existing pin protects every borrowed facade/component callback.
-        // Neither this callback nor Core may upgrade/reenter it exclusively.
-        std::shared_lock lock(access->mutex);
+        // No composition lock: the stable cell Kernel is destroyed only after
+        // the scheduler drain that waits for this task; it owns its I/O services.
         auto *kernel = access->addressed_kernel.load(std::memory_order_acquire);
         if (!kernel)
           return core::Result<bool>::Ok(false);

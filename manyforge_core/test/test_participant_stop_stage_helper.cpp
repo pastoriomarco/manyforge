@@ -28,10 +28,9 @@ namespace {
 using testing::FakeExecutionPort;
 
 constexpr Duration kTick = 10'000'000;  // one controller_state sample per tick
-const ControllerGoalId kGoalId("goal.direct");
-const ExecutionGoalKey kOriginal{kGoalId, ControllerGoalGeneration(1U)};
-const ExecutionGoalKey kSecond{kGoalId, ControllerGoalGeneration(2U)};
-const ExecutionGoalKey kThird{kGoalId, ControllerGoalGeneration(3U)};
+const ControllerGoalId kOriginal{OperationNumber(901U), 1U, 1U};
+const ControllerGoalId kSecond{OperationNumber(901U), 1U, 2U};
+const ControllerGoalId kThird{OperationNumber(901U), 1U, 3U};
 const RuntimeEpoch kEpoch("runtime-epoch.1");
 
 std::shared_ptr<GoalCancelAttempt> TestCancelAttempt() {
@@ -164,16 +163,14 @@ ResolvedParticipantStopStageDTO Stage(std::size_t index, Nominal nominal = Nomin
                  RegisteredStopCommandKindId("manyforge.stop.software_hard")},
                 Evidence("hard.rest", StopEvidenceRequirementKind::kMotionRest)),
        std::nullopt, std::nullopt});
-  const OperationId operation("operation.direct");
-  const OperationParticipantId participant("participant.direct");
+  const OperationNumber operation(901U);
+  const OperationParticipantId participant{operation, 1U};
   return ResolvedParticipantStopStageDTO{
-      StopId("stop.direct"),
-      StopGeneration(1U),
+      StopEventId(1000U),
       operation,
       OperationRevision(1U),
       participant,
-      kGoalId,
-      ControllerGoalGeneration(1U),
+      kOriginal,
       ControllableComponentId("robot.1"),
       CommandTargetId("arm.target"),
       CapabilityId("execution.trajectory.execute"),
@@ -202,7 +199,7 @@ ResolvedParticipantStopStageDTO Stage(std::size_t index, Nominal nominal = Nomin
           ProgramId("program.direct"),
           ProgramRevision("program-revision"),
           ProgramBindingId("program-binding"),
-          ProgramRunId("program.run"),
+          ProgramRunNumber(106U),
           std::nullopt,
           ParticipantStopProfilePurposeDTO::kOrdinary,
           std::nullopt,
@@ -216,7 +213,7 @@ ResolvedParticipantStopStageDTO Stage(std::size_t index, Nominal nominal = Nomin
 /// or cancel stage carries none (the lane bounds it).
 RemainingStopBudgetDTO Budget(const ResolvedParticipantStopStageDTO& stage,
                               std::int64_t elapsed_ns = 0) {
-  RemainingStopBudgetDTO budget{stage.stop_id, stage.stop_generation, elapsed_ns, std::nullopt};
+  RemainingStopBudgetDTO budget{stage.stop_event_id, elapsed_ns, std::nullopt};
   const auto& command = stage.participant_stop_plan.stage_commands.at(stage.stage_index);
   if (command.resolved_stage.containment_command.command_kind ==
           StopContainmentCommandKind::kMotionControlledStop &&
@@ -280,8 +277,8 @@ std::vector<FakeExecutionPort::ReplaceCall> Replaces(const FakeExecutionPort& po
   return calls;
 }
 
-std::vector<ExecutionGoalKey> Cancels(const FakeExecutionPort& port) {
-  std::vector<ExecutionGoalKey> keys;
+std::vector<ControllerGoalId> Cancels(const FakeExecutionPort& port) {
+  std::vector<ControllerGoalId> keys;
   for (const auto& command : port.commands()) {
     if (const auto* call = std::get_if<FakeExecutionPort::CancelCall>(&command)) {
       keys.push_back(call->key);
@@ -313,16 +310,16 @@ class GoalReadObservingPort final : public IExecutionPort {
  public:
   explicit GoalReadObservingPort(FakeExecutionPort& port) : port_(port) {}
 
-  ExecutionPortCommandResultDTO Submit(const ExecutionGoalKey& key,
+  ExecutionPortCommandResultDTO Submit(const ControllerGoalId& key,
                                        const TrajectoryDTO& trajectory, std::shared_ptr<ExecutionDispatchToken> token = {}) override {
     return port_.Submit(key, trajectory, std::move(token));
   }
   ExecutionPortCommandResultDTO Replace(
-      const ExecutionGoalKey& active, const ExecutionGoalKey& next,
+      const ControllerGoalId& active, const ControllerGoalId& next,
       const TrajectoryDTO& trajectory, std::shared_ptr<ExecutionDispatchToken> token = {}) override {
     return port_.Replace(active, next, trajectory, std::move(token));
   }
-  ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
+  ExecutionPortCommandResultDTO Cancel(const ControllerGoalId& key, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
     if (on_cancel) return on_cancel(key);
     return port_.Cancel(key, deadline);
   }
@@ -330,7 +327,7 @@ class GoalReadObservingPort final : public IExecutionPort {
   bool IsLatestScaleSequence(std::uint64_t sequence) const noexcept override { return port_.IsLatestScaleSequence(sequence); }
   ScaleSnapshot SnapshotScaleAfterFence(std::chrono::steady_clock::time_point deadline) override { return port_.SnapshotScaleAfterFence(deadline); }
   ExecutionPortCommandResultDTO SetScale(double value, std::uint64_t sequence) override { return port_.SetScale(value, sequence); }
-  std::optional<ExecutionGoalObservationDTO> ReadGoal(const ExecutionGoalKey& key) const override {
+  std::optional<ExecutionGoalObservationDTO> ReadGoal(const ControllerGoalId& key) const override {
     auto goal = port_.ReadGoal(key);
     if (on_read_goal) on_read_goal(goal);
     return goal;
@@ -343,7 +340,7 @@ class GoalReadObservingPort final : public IExecutionPort {
   ExecutionLaneFactsDTO ReadLaneFacts() const override { return port_.ReadLaneFacts(); }
 
   std::function<void(std::optional<ExecutionGoalObservationDTO>&)> on_read_goal;
-  std::function<ExecutionPortCommandResultDTO(const ExecutionGoalKey&)> on_cancel;
+  std::function<ExecutionPortCommandResultDTO(const ControllerGoalId&)> on_cancel;
 
  private:
   FakeExecutionPort& port_;
@@ -406,12 +403,12 @@ class World {
     Executing(kOriginal);
   }
 
-  void Executing(const ExecutionGoalKey& key) {
+  void Executing(const ControllerGoalId& key) {
     ExecutionGoalObservationDTO goal;
     goal.key = key;
     goal.binding_epoch = ExecutionBindingEpoch(1U);
     goal.phase = ExecutionGoalPhase::kExecuting;
-    goal.mechanism_goal_id = MechanismGoalId("uuid-" + std::to_string(key.controller_goal_generation.value()));
+    goal.mechanism_goal_id = manyforge::core::testing::TestMechanismGoalId(key.generation);
     ExecutionGoalFeedbackDTO feedback;
     feedback.source_stamp_ns = clock.now() - 1;
     feedback.local_receipt_stamp_ns = clock.now() - 1;
@@ -427,12 +424,12 @@ class World {
   }
 
   /// Positive acknowledgement of a cancel and the goal's CANCELED result.
-  void Cancelled(const ExecutionGoalKey& key) {
+  void Cancelled(const ControllerGoalId& key) {
     port.AcknowledgeCancel(key, clock.now());
     port.FinishGoal(key, ExecutionGoalResult::kCanceled, std::nullopt, clock.now());
   }
 
-  void Finish(const ExecutionGoalKey& key, ExecutionGoalResult result) {
+  void Finish(const ControllerGoalId& key, ExecutionGoalResult result) {
     port.FinishGoal(key, result, std::nullopt, clock.now());
   }
 
@@ -472,7 +469,7 @@ class World {
 
 /// Scripts the mechanism executing a Replace: accepted on the next tick,
 /// samples restart on the new trajectory, terminal `result` after `ticks`.
-void ScriptReplacement(World& world, const ExecutionGoalKey& key, std::size_t ticks,
+void ScriptReplacement(World& world, const ControllerGoalId& key, std::size_t ticks,
                        std::optional<ExecutionGoalResult> result) {
   auto count = std::make_shared<std::size_t>(0U);
   world.on_tick = [&world, key, ticks, result, count] {
@@ -517,7 +514,7 @@ TEST(ParticipantStopStageHelperTest, ConcurrentAndLateCallersShareExactCancelAtt
   std::promise<void> release;
   const auto released = release.get_future().share();
   std::atomic<unsigned> calls{0};
-  observed.on_cancel = [&](const ExecutionGoalKey& key) {
+  observed.on_cancel = [&](const ControllerGoalId& key) {
     if (calls.fetch_add(1) == 0) entered.set_value();
     released.wait();
     return world.port.Cancel(key);
@@ -571,7 +568,7 @@ TEST(ParticipantStopStageHelperTest, MissingPendingSuccessorRemainsLiveAndIsCanc
   EXPECT_FALSE(world.helper->CanCompleteNaturally(kOriginal));
   EXPECT_TRUE(world.helper->HasLiveGoal());
   EXPECT_TRUE(world.helper->CancelLiveGoals());
-  EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kSecond});
+  EXPECT_EQ(Cancels(world.port), std::vector<ControllerGoalId>{kSecond});
 }
 
 TEST(ParticipantStopStageHelperTest, PendingFaultCancellationRequestsBothKeysNewestFirst) {
@@ -583,7 +580,7 @@ TEST(ParticipantStopStageHelperTest, PendingFaultCancellationRequestsBothKeysNew
   world.port.QueueCommandResult(
       {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey, std::nullopt});
   EXPECT_TRUE(world.helper->CancelLiveGoals());
-  EXPECT_EQ(Cancels(world.port), (std::vector<ExecutionGoalKey>{kSecond, kOriginal}));
+  EXPECT_EQ(Cancels(world.port), (std::vector<ControllerGoalId>{kSecond, kOriginal}));
 }
 
 TEST(ParticipantStopStageHelperTest, KnownSupersededTerminalSurvivesNativeRecordEviction) {
@@ -601,7 +598,7 @@ TEST(ParticipantStopStageHelperTest, KnownSupersededTerminalSurvivesNativeRecord
   world.port.SetGoal(std::move(rejected));
   ASSERT_FALSE(world.port.ReadGoal(kOriginal));
   EXPECT_TRUE(world.helper->CancelLiveGoals());
-  EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kSecond});
+  EXPECT_EQ(Cancels(world.port), std::vector<ControllerGoalId>{kSecond});
 }
 
 TEST(ParticipantStopStageHelperTest, PendingCancelThrowStillRequestsOtherRetainedKey) {
@@ -610,13 +607,13 @@ TEST(ParticipantStopStageHelperTest, PendingCancelThrowStillRequestsOtherRetaine
   world.Build(&observed);
   world.Dispatch(Stage(0U));
   RecordPendingReplacement(world);
-  observed.on_cancel = [&](const ExecutionGoalKey& key) {
+  observed.on_cancel = [&](const ControllerGoalId& key) {
     const auto result = world.port.Cancel(key);
     if (key == kSecond) throw std::runtime_error("send outcome unknown");
     return result;
   };
   EXPECT_TRUE(world.helper->CancelLiveGoals());
-  EXPECT_EQ(Cancels(world.port), (std::vector<ExecutionGoalKey>{kSecond, kOriginal}));
+  EXPECT_EQ(Cancels(world.port), (std::vector<ControllerGoalId>{kSecond, kOriginal}));
 }
 
 TEST(ParticipantStopStageHelperTest, PendingCancelProofCannotHideAnotherUnresolvedKey) {
@@ -642,7 +639,7 @@ TEST(ParticipantStopStageHelperTest, PendingCancelProofCannotHideAnotherUnresolv
     const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
     EXPECT_EQ(result.outcome, superseded ? ParticipantStopStageOutcomeDTO::kSucceeded
                                          : ParticipantStopStageOutcomeDTO::kFailed);
-    EXPECT_EQ(Cancels(world.port), (std::vector<ExecutionGoalKey>{kSecond, kOriginal}));
+    EXPECT_EQ(Cancels(world.port), (std::vector<ControllerGoalId>{kSecond, kOriginal}));
     EXPECT_LE(world.clock.now() - 1'000'000'000, world.config.hard_stop_completion_timeout_ns);
   }
 }
@@ -659,7 +656,7 @@ TEST(ParticipantStopStageHelperTest, RejectedPendingSuccessorRecancelsRestoredPr
     world.Sample(1.0, 1.0, 1.0, 1.0);
     RecordPendingReplacement(world);
     unsigned old_cancel_count = 0U;
-    observed.on_cancel = [&](const ExecutionGoalKey& key) {
+    observed.on_cancel = [&](const ControllerGoalId& key) {
       if (key == kSecond) {
         world.port.QueueCommandResult(
             {ExecutionPortDispatch::kEffectUncertain, std::nullopt, std::nullopt});
@@ -685,7 +682,7 @@ TEST(ParticipantStopStageHelperTest, RejectedPendingSuccessorRecancelsRestoredPr
     };
     const auto started = world.clock.now();
     const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
-    EXPECT_EQ(Cancels(world.port), (std::vector<ExecutionGoalKey>{kSecond, kOriginal, kOriginal}));
+    EXPECT_EQ(Cancels(world.port), (std::vector<ControllerGoalId>{kSecond, kOriginal, kOriginal}));
     EXPECT_EQ(old_cancel_count, 2U);
     EXPECT_LE(world.clock.now() - started, world.config.hard_stop_completion_timeout_ns);
     EXPECT_EQ(result.outcome, finish ? ParticipantStopStageOutcomeDTO::kSucceeded
@@ -709,12 +706,12 @@ TEST(ParticipantStopStageHelperTest, RefusesBeforeEffectWithoutExactMembershipOr
 
   world.Dispatch(stage);
   auto other_generation = stage;
-  other_generation.controller_goal_generation = ControllerGoalGeneration(2U);
+  other_generation.controller_goal_id.generation = 2U;
   EXPECT_EQ(world.helper->TranslateStopStage(other_generation, Budget(other_generation), {})
                 .error->details.at("reason"),
             "resolved_stop_stage_dispatch_membership_unavailable");
   auto other_operation = stage;
-  other_operation.operation_id = OperationId("operation.other");
+  other_operation.operation_id = OperationNumber(1001U);
   EXPECT_EQ(world.helper->TranslateStopStage(other_operation, Budget(other_operation), {})
                 .error->details.at("reason"),
             "resolved_stop_stage_dispatch_membership_mismatch");
@@ -723,7 +720,7 @@ TEST(ParticipantStopStageHelperTest, RefusesBeforeEffectWithoutExactMembershipOr
   EXPECT_EQ(world.helper->TranslateStopStage(stage, expired, {}).error->details.at("reason"),
             "resolved_stop_stage_budget_invalid");
   auto foreign = Budget(stage);
-  foreign.stop_generation = StopGeneration(2U);
+  foreign.stop_event_id = StopEventId(1001U);
   EXPECT_EQ(world.helper->TranslateStopStage(stage, foreign, {}).error->details.at("reason"),
             "resolved_stop_stage_budget_invalid");
   EXPECT_TRUE(world.port.commands().empty());
@@ -964,24 +961,24 @@ class SendTimeRecordingPort final : public IExecutionPort {
  public:
   SendTimeRecordingPort(FakeExecutionPort& port, const FakeClock& clock)
       : port_(port), clock_(clock) {}
-  ExecutionPortCommandResultDTO Submit(const ExecutionGoalKey& key,
+  ExecutionPortCommandResultDTO Submit(const ControllerGoalId& key,
                                        const TrajectoryDTO& trajectory, std::shared_ptr<ExecutionDispatchToken> token = {}) override {
     return port_.Submit(key, trajectory, std::move(token));
   }
   ExecutionPortCommandResultDTO Replace(
-      const ExecutionGoalKey& active, const ExecutionGoalKey& next,
+      const ControllerGoalId& active, const ControllerGoalId& next,
       const TrajectoryDTO& trajectory, std::shared_ptr<ExecutionDispatchToken> token = {}) override {
     replace_clock.push_back(clock_.now());
     return port_.Replace(active, next, trajectory, std::move(token));
   }
-  ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
+  ExecutionPortCommandResultDTO Cancel(const ControllerGoalId& key, std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) override {
     return port_.Cancel(key, deadline);
   }
   std::uint64_t ReserveScaleSequence() noexcept override { return port_.ReserveScaleSequence(); }
   bool IsLatestScaleSequence(std::uint64_t sequence) const noexcept override { return port_.IsLatestScaleSequence(sequence); }
   ScaleSnapshot SnapshotScaleAfterFence(std::chrono::steady_clock::time_point deadline) override { return port_.SnapshotScaleAfterFence(deadline); }
   ExecutionPortCommandResultDTO SetScale(double value, std::uint64_t sequence) override { return port_.SetScale(value, sequence); }
-  std::optional<ExecutionGoalObservationDTO> ReadGoal(const ExecutionGoalKey& key) const override {
+  std::optional<ExecutionGoalObservationDTO> ReadGoal(const ControllerGoalId& key) const override {
     return port_.ReadGoal(key);
   }
   std::optional<ExecutionControllerSampleDTO> ReadSample() const override {
@@ -1294,7 +1291,7 @@ TEST(ParticipantStopStageHelperTest, ReplacementNotAcceptedWithinTheLeadInIsCanc
   EXPECT_EQ(result.attempt_disposition, StopStageAttemptDispositionDTO::kDispatched);
   EXPECT_EQ(result.actual_provider_contract_mode, MotionControlledStopMode::kSoftOnPath);
   EXPECT_EQ(result.error->details.at("reason"), "soft_on_path_stop_delta_budget_exceeded");
-  EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kSecond});
+  EXPECT_EQ(Cancels(world.port), std::vector<ControllerGoalId>{kSecond});
 }
 
 TEST(ParticipantStopStageHelperTest, RefusedOrRejectedReplacementFailsTheStage) {
@@ -1327,7 +1324,7 @@ TEST(ParticipantStopStageHelperTest, RefusedOrRejectedReplacementFailsTheStage) 
                                  ExecutionPortRefusal::kStaleKey, std::nullopt});
   const auto hard = Stage(1U);
   (void)world.helper->TranslateStopStage(hard, Budget(hard, 100'000'000), {});
-  EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kOriginal});
+  EXPECT_EQ(Cancels(world.port), std::vector<ControllerGoalId>{kOriginal});
 }
 
 // A sent Stop trajectory finishes like a normal motion, on the
@@ -2044,7 +2041,7 @@ TEST(ParticipantStopStageHelperTest, PathDeviationDuringTheStopIsMeasuredFromSam
 /// cursor restarts on the brake; the brake's own sampled reference stays
 /// nonzero; on tick `succeeded_tick` JTC reports kSucceeded and from the next
 /// tick on publishes its success hold (cursor reset, reference velocity 0).
-void ScriptBrake(World& world, const ExecutionGoalKey& key, std::size_t succeeded_tick = 4U,
+void ScriptBrake(World& world, const ControllerGoalId& key, std::size_t succeeded_tick = 4U,
                  double factor = 0.5) {
   auto started = std::make_shared<std::size_t>(0U);
   world.on_tick = [&world, key, succeeded_tick, started, factor] {
@@ -2215,6 +2212,25 @@ TEST(ParticipantStopStageHelperTest, ControlledHardStopFinishesOnItsSuccessThenT
   EXPECT_LE(held.clock.now() - started_at, 10'000'000'000 + kTick);
 }
 
+// F3 (stop state model §3.6): a brake trajectory that never reports its
+// finish still gets the cancel of every live goal before the stage fails.
+TEST(ParticipantStopStageHelperTest, BrakeWithoutFinishReportStillSendsCancel) {
+  World held;
+  const auto stage = Stage(1U);
+  held.Dispatch(stage);
+  held.Sample(0.5, 0.5, 1.0);
+  held.on_tick = [&] {
+    const auto replaces = Replaces(held.port);
+    if (replaces.empty()) return;
+    held.Executing(kSecond);
+    held.Sample(0.0, 0.6, 0.0);
+  };
+  const auto failed = held.helper->TranslateStopStage(stage, Budget(stage, 0), {});
+  EXPECT_EQ(failed.outcome, ParticipantStopStageOutcomeDTO::kFailed);
+  EXPECT_EQ(failed.error->details.at("reason"), "stop_evidence_phase_expired");
+  EXPECT_FALSE(Cancels(held.port).empty());
+}
+
 // The brake finishes on the controller's report even after the lane's
 // hard-stop timeout (here 1 s; e.g. Isaac UR10e's 0.5 s below its 1.0 s
 // goal_time). Within tolerance it succeeds; a goal-tolerance abort falls to
@@ -2327,7 +2343,7 @@ TEST(ParticipantStopStageHelperTest, RefusedOrUninstalledBrakeFallsBackToTheCanc
     const auto result = world.helper->TranslateStopStage(stage, Budget(stage, 1'800'000'000), {});
     ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
         << result.error->details.at("reason");
-    EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kOriginal});
+    EXPECT_EQ(Cancels(world.port), std::vector<ControllerGoalId>{kOriginal});
     const auto& evidence = EvidenceObject(result);
     EXPECT_EQ(Text(evidence, "hard_stop_level"), "jtc_cancel_decelerate_on_cancel");
     EXPECT_EQ(Text(evidence, "hard_stop_fallback_reason"), "controlled_hard_stop_refused");
@@ -2349,7 +2365,7 @@ TEST(ParticipantStopStageHelperTest, RefusedOrUninstalledBrakeFallsBackToTheCanc
   ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
       << result.error->details.at("reason");
   // Both goals that may run are cancelled, newest first.
-  EXPECT_EQ(Cancels(world.port), (std::vector<ExecutionGoalKey>{kSecond, kOriginal}));
+  EXPECT_EQ(Cancels(world.port), (std::vector<ControllerGoalId>{kSecond, kOriginal}));
   EXPECT_EQ(Text(EvidenceObject(result), "hard_stop_fallback_reason"),
             "controlled_hard_stop_not_installed");
 }
@@ -2430,7 +2446,7 @@ TEST(ParticipantStopStageHelperTest, BrakeWithoutOwnFeedbackWithinTheLeadInFalls
   const auto result = world.helper->TranslateStopStage(stage, Budget(stage, 1'800'000'000), {});
   ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
       << result.error->details.at("reason");
-  EXPECT_EQ(Cancels(world.port), (std::vector<ExecutionGoalKey>{kSecond, kOriginal}));
+  EXPECT_EQ(Cancels(world.port), (std::vector<ControllerGoalId>{kSecond, kOriginal}));
   EXPECT_EQ(Text(EvidenceObject(result), "hard_stop_fallback_reason"),
             "controlled_hard_stop_not_installed");
   ASSERT_NE(sent_tick, 0U);
@@ -2466,7 +2482,7 @@ void ScriptLateWakeBrake(World& world, const Duration receipt_after, const Durat
       goal.key = kSecond;
       goal.binding_epoch = ExecutionBindingEpoch(1U);
       goal.phase = ExecutionGoalPhase::kExecuting;
-      goal.mechanism_goal_id = MechanismGoalId("uuid-2");
+      goal.mechanism_goal_id = manyforge::core::testing::TestMechanismGoalId(2U);
       ExecutionGoalFeedbackDTO feedback;
       feedback.source_stamp_ns = sent_at + receipt_after;
       feedback.local_receipt_stamp_ns = sent_at + receipt_after;
@@ -2503,7 +2519,7 @@ TEST(ParticipantStopStageHelperTest, BrakeFeedbackReceivedAfterTheLeadInFallsBac
       << result.error->details.at("reason");
   EXPECT_EQ(Text(EvidenceObject(result), "hard_stop_fallback_reason"),
             "controlled_hard_stop_not_installed");
-  EXPECT_EQ(Cancels(world.port), (std::vector<ExecutionGoalKey>{kSecond, kOriginal}));
+  EXPECT_EQ(Cancels(world.port), (std::vector<ControllerGoalId>{kSecond, kOriginal}));
 }
 
 TEST(ParticipantStopStageHelperTest, BrakeFeedbackReceivedInsideTheLeadInCountsWhenThePollWakesLate) {
@@ -2582,7 +2598,7 @@ TEST(ParticipantStopStageHelperTest, ReplacementFeedbackReceivedAfterTheLeadInIs
         goal.key = kSecond;
         goal.binding_epoch = ExecutionBindingEpoch(1U);
         goal.phase = ExecutionGoalPhase::kExecuting;
-        goal.mechanism_goal_id = MechanismGoalId("uuid-2");
+        goal.mechanism_goal_id = manyforge::core::testing::TestMechanismGoalId(2U);
         ExecutionGoalFeedbackDTO feedback;
         feedback.source_stamp_ns = sent_at + receipt_after;
         feedback.local_receipt_stamp_ns = sent_at + receipt_after;
@@ -2600,7 +2616,7 @@ TEST(ParticipantStopStageHelperTest, ReplacementFeedbackReceivedAfterTheLeadInIs
     if (receipt_after > 100'000'000) {
       ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kFailed);
       EXPECT_EQ(result.error->details.at("reason"), "soft_on_path_stop_delta_budget_exceeded");
-      EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kSecond});
+      EXPECT_EQ(Cancels(world.port), std::vector<ControllerGoalId>{kSecond});
     } else {
       ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
           << result.error->details.at("reason");
@@ -2689,7 +2705,7 @@ TEST(ParticipantStopStageHelperTest, CancelAtFactorZeroFinishesOnTheAcknowledgem
   ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
   EXPECT_TRUE(Replaces(world.port).empty());  // no level 3 at factor 0
   EXPECT_EQ(Scales(world.port), std::vector<double>{0.0});
-  EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kOriginal});  // also at 0
+  EXPECT_EQ(Cancels(world.port), std::vector<ControllerGoalId>{kOriginal});  // also at 0
   const auto& evidence = EvidenceObject(result);
   EXPECT_EQ(Text(evidence, "hard_stop_fallback_reason"), "controlled_hard_stop_factor_zero");
   EXPECT_EQ(Text(std::get<JsonObjectDTO>(evidence.at("post_command_sample").value),
@@ -3288,7 +3304,7 @@ TEST(ParticipantStopStageHelperTest, CancelBaselineMustBeAttributedToTheCancelle
   goal.key = kOriginal;
   goal.binding_epoch = ExecutionBindingEpoch(1U);
   goal.phase = ExecutionGoalPhase::kExecuting;
-  goal.mechanism_goal_id = MechanismGoalId("uuid-1");
+  goal.mechanism_goal_id = manyforge::core::testing::TestMechanismGoalId(1U);
   world.port.SetGoal(goal);
   bool sent = false;
   world.on_tick = [&] {
@@ -3301,7 +3317,7 @@ TEST(ParticipantStopStageHelperTest, CancelBaselineMustBeAttributedToTheCancelle
     }
   };
   const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
-  EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kOriginal});
+  EXPECT_EQ(Cancels(world.port), std::vector<ControllerGoalId>{kOriginal});
   ASSERT_NE(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded)
       << "false finish on the original goal's start sample";
   ASSERT_TRUE(result.error.has_value());
@@ -3519,7 +3535,7 @@ TEST(ParticipantStopStageHelperTest, FirstCycleStopCancelsAtOnceWhileOnlyTheComp
   goal.key = kOriginal;
   goal.binding_epoch = ExecutionBindingEpoch(1U);
   goal.phase = ExecutionGoalPhase::kExecuting;
-  goal.mechanism_goal_id = MechanismGoalId("uuid-1");
+  goal.mechanism_goal_id = manyforge::core::testing::TestMechanismGoalId(1U);
   world.port.SetGoal(goal);
   const auto started = world.clock.now();
   std::optional<std::size_t> cancel_seen_at_tick;
@@ -3540,7 +3556,7 @@ TEST(ParticipantStopStageHelperTest, FirstCycleStopCancelsAtOnceWhileOnlyTheComp
   // Containment: the cancel was already sent when the first wait returned.
   ASSERT_TRUE(cancel_seen_at_tick.has_value());
   EXPECT_EQ(*cancel_seen_at_tick, 1U);
-  EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kOriginal});
+  EXPECT_EQ(Cancels(world.port), std::vector<ControllerGoalId>{kOriginal});
   EXPECT_TRUE(Replaces(world.port).empty());
   EXPECT_LE(*cancel_seen_at - started, 10'000'000);  // within the first tick
   // Completion evidence: never proven; the stage fails only at the deadline.
@@ -4009,7 +4025,7 @@ TEST(ParticipantStopStageHelperTest, ScheduledMissedHardReleaseUsesTheExistingCa
   const auto result = world.helper->TranslateStopStage(stage, Budget(stage), {});
   ASSERT_EQ(result.outcome, ParticipantStopStageOutcomeDTO::kSucceeded);
   EXPECT_TRUE(Replaces(world.port).empty());
-  EXPECT_EQ(Cancels(world.port), std::vector<ExecutionGoalKey>{kOriginal});
+  EXPECT_EQ(Cancels(world.port), std::vector<ControllerGoalId>{kOriginal});
   EXPECT_EQ(Text(EvidenceObject(result), "hard_stop_fallback_reason"),
             "controlled_hard_stop_release_expired");
 }
@@ -4065,7 +4081,7 @@ TEST(ParticipantStopStageHelperTest, SourceOffsetSurvivesBindingRecordingAndAdop
       world.port.FinishGoal(kOriginal, ExecutionGoalResult::kPreemptedBy, kSecond, world.clock.now());
       std::optional<StopStageDispatchedGoalDTO> candidate(goal);
       world.helper->AdoptReplacement(candidate);
-      stage.controller_goal_generation = kSecond.controller_goal_generation;
+      stage.controller_goal_id.generation = kSecond.generation;
       world.Executing(kSecond);
     } else {
       world.helper->BindDispatchedGoal(goal, association, TestCancelAttempt());

@@ -64,14 +64,6 @@ void Receive(core::ComponentStreamHealth &health, std::unique_ptr<Status> messag
     const core::ControllableComponentId component(std::move(message->hardware_id));
     (void)health.RecordDeclared(component, message->name,
                                 *stamp == 0 ? std::optional<std::int64_t>{} : stamp);
-    return;
-  }
-  if (message->level == Status::ERROR && !message->message.empty()) {
-    const std::string *const detail = FindValue(*message, "detail");
-    const core::ControllableComponentId component(std::move(message->hardware_id));
-    (void)health.ReportDeclaredFault(component, message->name, message->message,
-                                     detail == nullptr ? std::string_view{}
-                                                       : std::string_view{*detail});
   }
 }
 

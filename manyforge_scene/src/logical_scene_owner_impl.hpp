@@ -12,21 +12,22 @@ public:
        const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
        const core::IActiveBundlePublicationReader &publication_reader)
       : Impl(std::move(database_path), AuthorityFromAdmission(admission),
-             publication_reader, nullptr, nullptr, nullptr) {}
+             publication_reader, nullptr, nullptr, nullptr, nullptr) {}
 
   Impl(std::filesystem::path database_path,
        const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
        const core::IActiveBundlePublicationReader &publication_reader,
        core::IKernelCellAdmissionPort &cell_admission)
       : Impl(std::move(database_path), AuthorityFromAdmission(admission),
-             publication_reader, nullptr, nullptr, &cell_admission) {}
+             publication_reader, nullptr, nullptr, &cell_admission, nullptr) {}
 
   Impl(std::filesystem::path database_path,
        const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
        const core::IActiveBundlePublicationReader &publication_reader,
        const deployment::IVerifiedRetainedBundleSource &retained_bundle_source)
       : Impl(std::move(database_path), AuthorityFromAdmission(admission),
-             publication_reader, &retained_bundle_source, nullptr, nullptr) {}
+             publication_reader, &retained_bundle_source, nullptr, nullptr,
+             nullptr) {}
 
   Impl(std::filesystem::path database_path,
        const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
@@ -35,24 +36,26 @@ public:
        const core::IPlannerSceneProjectionResolver &projection_resolver)
       : Impl(std::move(database_path), AuthorityFromAdmission(admission),
              publication_reader, &retained_bundle_source,
-             &projection_resolver, nullptr) {}
+             &projection_resolver, nullptr, nullptr) {}
 
   Impl(std::filesystem::path database_path,
        const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
        const core::IActiveBundlePublicationReader &publication_reader,
        const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
        const core::IPlannerSceneProjectionResolver &projection_resolver,
-       core::IKernelCellAdmissionPort &cell_admission)
+       core::IKernelCellAdmissionPort &cell_admission,
+       persistence::SqliteRecordWriter *record_writer = nullptr)
       : Impl(std::move(database_path), AuthorityFromAdmission(admission),
              publication_reader, &retained_bundle_source, &projection_resolver,
-             &cell_admission) {}
+             &cell_admission, record_writer) {}
 
   Impl(std::filesystem::path database_path,
        AdmittedBootstrapAuthority authority,
        const core::IActiveBundlePublicationReader &publication_reader,
        const deployment::IVerifiedRetainedBundleSource *retained_bundle_source,
        const core::IPlannerSceneProjectionResolver *projection_resolver,
-       core::IKernelCellAdmissionPort *cell_admission)
+       core::IKernelCellAdmissionPort *cell_admission,
+       persistence::SqliteRecordWriter *record_writer)
       : database_path_(std::move(database_path)),
         fixed_query_(std::move(authority.query)),
         admission_digest_(std::move(authority.admission_digest)),
@@ -95,32 +98,7 @@ public:
           },
           [&](sqlite3 *preflight) {
             if (!IsExactUninitializedDatabase(preflight)) {
-              const auto version =
-                  ScalarInteger(preflight, "PRAGMA user_version");
-              if (version == kCanonicalEmptySceneStoreSchemaVersion) {
-                ValidateBaseDatabase(preflight, fixed_query_,
-                                     admission_digest_);
-              } else if (version ==
-                         kLogicalSceneTransactionStoreSchemaVersion) {
-                ValidateTransactionDatabase(preflight, fixed_query_,
-                                            admission_digest_);
-              } else if (version ==
-                         kNativeProjectionHandoffStoreSchemaVersion) {
-                ValidateNativeHandoffDatabase(preflight, fixed_query_,
-                                              admission_digest_);
-              } else if (version == kBoundedHistoryStoreSchemaVersion) {
-                ValidateBoundedHistoryDatabase(preflight, fixed_query_,
-                                               admission_digest_);
-              } else if (version ==
-                         kMaintenanceInitializationSchemaVersion) {
-                ValidateMaintenanceDatabase(preflight, fixed_query_,
-                                            admission_digest_);
-              } else if (version == kInitialSceneBaselineSchemaVersion) {
-                ValidateInitialSceneBaselineDatabase(preflight, fixed_query_,
-                                                     admission_digest_);
-              } else {
-                ValidateDatabase(preflight, fixed_query_, admission_digest_);
-              }
+              ValidateDatabase(preflight, fixed_query_, admission_digest_);
             }
           }));
     } catch (const LogicalSceneOwnerError &) {
@@ -161,8 +139,7 @@ public:
               "metadata");
         }
         ConfigureDurability(database_);
-        Transaction transaction(database_, "BEGIN IMMEDIATE",
-                                &maintenance_snapshot_cache_);
+        Transaction transaction(database_, "BEGIN IMMEDIATE");
         Exec(database_, detail::kEmbeddedCanonicalEmptySceneSchema);
         InsertMetadata(database_, fixed_query_, admission_digest_);
         Exec(database_, detail::kEmbeddedLogicalSceneTransactionMigration);
@@ -175,113 +152,34 @@ public:
         InsertMaintenanceInitializationMigrationMetadata(database_);
         Exec(database_, detail::kEmbeddedInitialSceneBaselineMigration);
         InsertInitialSceneBaselineMigrationMetadata(database_);
+        // The numbered resources stamp their own step numbers; the store is
+        // created at the current version in this one transaction.
+        Exec(database_, "PRAGMA user_version = " +
+                            std::to_string(kLogicalSceneStoreSchemaVersion));
         transaction.Commit();
         changed_schema = true;
       } else {
-        const auto version = ScalarInteger(database_, "PRAGMA user_version");
-        if (version == kCanonicalEmptySceneStoreSchemaVersion) {
-          ValidateBaseDatabase(database_, fixed_query_, admission_digest_);
-          ConfigureDurability(database_);
-          Transaction transaction(database_, "BEGIN IMMEDIATE",
-                                &maintenance_snapshot_cache_);
-          Exec(database_, detail::kEmbeddedLogicalSceneTransactionMigration);
-          InsertMigrationMetadata(database_);
-          Exec(database_, detail::kEmbeddedNativeProjectionHandoffMigration);
-          InsertNativeHandoffMigrationMetadata(database_);
-          Exec(database_, detail::kEmbeddedBoundedHistoryMigration);
-          InsertBoundedHistoryMigrationMetadata(database_);
-          Exec(database_, detail::kEmbeddedMaintenanceInitializationMigration);
-          InsertMaintenanceInitializationMigrationMetadata(database_);
-          Exec(database_, detail::kEmbeddedInitialSceneBaselineMigration);
-          InsertInitialSceneBaselineMigrationMetadata(database_);
-          transaction.Commit();
-          changed_schema = true;
-        } else if (version == kLogicalSceneTransactionStoreSchemaVersion) {
-          ValidateTransactionDatabase(database_, fixed_query_,
-                                      admission_digest_);
-          ConfigureDurability(database_);
-          Transaction transaction(database_, "BEGIN IMMEDIATE",
-                                &maintenance_snapshot_cache_);
-          Exec(database_, detail::kEmbeddedNativeProjectionHandoffMigration);
-          InsertNativeHandoffMigrationMetadata(database_);
-          Exec(database_, detail::kEmbeddedBoundedHistoryMigration);
-          InsertBoundedHistoryMigrationMetadata(database_);
-          Exec(database_, detail::kEmbeddedMaintenanceInitializationMigration);
-          InsertMaintenanceInitializationMigrationMetadata(database_);
-          Exec(database_, detail::kEmbeddedInitialSceneBaselineMigration);
-          InsertInitialSceneBaselineMigrationMetadata(database_);
-          transaction.Commit();
-          changed_schema = true;
-        } else if (version == kNativeProjectionHandoffStoreSchemaVersion) {
-          ValidateNativeHandoffDatabase(database_, fixed_query_,
-                                        admission_digest_);
-          ConfigureDurability(database_);
-          Transaction transaction(database_, "BEGIN IMMEDIATE",
-                                &maintenance_snapshot_cache_);
-          Exec(database_, detail::kEmbeddedBoundedHistoryMigration);
-          InsertBoundedHistoryMigrationMetadata(database_);
-          Exec(database_, detail::kEmbeddedMaintenanceInitializationMigration);
-          InsertMaintenanceInitializationMigrationMetadata(database_);
-          Exec(database_, detail::kEmbeddedInitialSceneBaselineMigration);
-          InsertInitialSceneBaselineMigrationMetadata(database_);
-          transaction.Commit();
-          changed_schema = true;
-        } else if (version == kBoundedHistoryStoreSchemaVersion) {
-          ConfigureDurability(database_);
-          Transaction transaction(database_, "BEGIN IMMEDIATE",
-                                &maintenance_snapshot_cache_);
-          Exec(database_, detail::kEmbeddedMaintenanceInitializationMigration);
-          InsertMaintenanceInitializationMigrationMetadata(database_);
-          Exec(database_, detail::kEmbeddedInitialSceneBaselineMigration);
-          InsertInitialSceneBaselineMigrationMetadata(database_);
-          transaction.Commit();
-          changed_schema = true;
-        } else if (version == kMaintenanceInitializationSchemaVersion) {
-          ConfigureDurability(database_);
-          Transaction transaction(database_, "BEGIN IMMEDIATE",
-                                &maintenance_snapshot_cache_);
-          Exec(database_, detail::kEmbeddedInitialSceneBaselineMigration);
-          InsertInitialSceneBaselineMigrationMetadata(database_);
-          transaction.Commit();
-          changed_schema = true;
-        } else if (version == kInitialSceneBaselineSchemaVersion) {
-          ValidateInitialSceneBaselineDatabase(database_, fixed_query_,
-                                               admission_digest_);
-          ConfigureDurability(database_);
-        } else {
-          ValidateDatabase(database_, fixed_query_, admission_digest_);
-          ConfigureDurability(database_);
-        }
-      }
-      if (ScalarInteger(database_, "PRAGMA user_version") ==
-          kInitialSceneBaselineSchemaVersion) {
-        Transaction transaction(database_, "BEGIN IMMEDIATE",
-                                &maintenance_snapshot_cache_);
-        ConvertProviderObservationEvidence(database_);
-        transaction.Commit();
-        changed_schema = true;
-      }
-      const bool interrupted_initialization =
-          SettleInterruptedMaintenanceInitializations(database_);
-      ValidateDatabase(database_, fixed_query_, admission_digest_);
-      const bool recovered_scene_transaction =
-          RecoverIncompleteSceneTransaction(database_, fixed_query_);
-      if (recovered_scene_transaction) {
         ValidateDatabase(database_, fixed_query_, admission_digest_);
+        ConfigureDurability(database_);
       }
-      if (cell_admission_ != nullptr) {
-        try {
-          SettleRecoveredAuthoredSceneClaims(database_, *cell_admission_);
-        } catch (const CellAdmissionTemporarilyUnavailable &) {
-          // The immutable scene and durable outcomes remain readable. Kernel
-          // admission stays closed until Manager retries exact settlement.
-        }
-      }
-      if (changed_schema || recovered_scene_transaction ||
-          interrupted_initialization) {
+      ValidateDatabase(database_, fixed_query_, admission_digest_);
+      if (changed_schema) {
         FsyncDatabaseDirectory(database_path_);
       }
+      memory_ = LoadSceneStoreMemory(database_, fixed_query_);
+      if (record_writer == nullptr) {
+        owned_writer_ = std::make_unique<persistence::SqliteRecordWriter>();
+        record_writer = owned_writer_.get();
+      }
+      writer_ = record_writer;
+      // From here on only the writer thread uses the connection.
+      slot_ = writer_->RegisterConnection(
+          database_,
+          "logical-scene",
+          "UPDATE logical_scene_store_metadata SET records_lost = 1 "
+          "WHERE singleton = 1");
     } catch (...) {
+      owned_writer_.reset();
       sqlite3_close(database_);
       database_ = nullptr;
       throw;
@@ -290,26 +188,23 @@ public:
 
   ~Impl() {
     try {
-      std::lock_guard operation_lock(maintenance_operation_mutex_);
-      std::lock_guard lock(mutex_);
-      auto lifecycle_lock = sqlite_lifecycle_internal::
-          AcquireCanonicalEmptySceneStoreLifecycleLockForClose();
-      if (database_ != nullptr) {
-        maintenance_statements_.Clear();
-        if (sqlite3_close_v2(database_) == SQLITE_OK) {
-          database_ = nullptr;
-        }
-      }
+      Close();
     } catch (...) {
+      if (database_ != nullptr && sqlite3_close_v2(database_) == SQLITE_OK) {
+        database_ = nullptr;
+      }
     }
   }
 
+  // An owned writer drains here; a handed-in writer is drained by its owner
+  // before this runs.
   void Close() {
+    if (owned_writer_ != nullptr) {
+      owned_writer_->DrainAndStop();
+    }
     std::lock_guard operation_lock(maintenance_operation_mutex_);
     std::lock_guard lock(mutex_);
     InvalidateSceneCommitState();
-    maintenance_snapshot_cache_.Clear();
-    maintenance_statements_.Clear();
     auto lifecycle_lock = sqlite_lifecycle_internal::
         AcquireCanonicalEmptySceneStoreLifecycleLockForClose();
     if (database_ == nullptr) {
@@ -328,67 +223,50 @@ public:
     database_ = nullptr;
   }
 
-  [[nodiscard]] sqlite3 *database() const {
+  // Throws once the owner is closed, as every operation did when it opened
+  // its database connection.
+  void RequireOpen() const {
     if (database_ == nullptr) {
       throw LogicalSceneOwnerClosedError(
           "logical-scene owner is closed");
     }
-    return database_;
   }
 
   [[nodiscard]] DurableState ReadStateTransaction() const {
-    auto *value = database();
-    Transaction transaction(value, "BEGIN", &maintenance_snapshot_cache_);
-    auto state = ReadCompleteDurableState(value, fixed_query_,
-                                          &maintenance_snapshot_cache_,
-                                          &maintenance_statements_);
-    transaction.Commit();
-    return state;
+    RequireOpen();
+    return ReadCompleteDurableState(memory_);
   }
 
   [[nodiscard]] const SceneCommitStateCache &ReadSceneCommitState() const {
-    auto *value = database();
-    const auto data_version = ScalarInteger(value, "PRAGMA data_version");
-    if (scene_commit_state_cache_.has_value() &&
-        scene_commit_state_cache_->external_data_version == data_version) {
+    RequireOpen();
+    if (scene_commit_state_cache_.has_value()) {
       return *scene_commit_state_cache_;
     }
-
-    Transaction transaction(value, "BEGIN", &maintenance_snapshot_cache_);
-    auto durable_state = ReadCompleteDurableState(value, fixed_query_,
-                                          &maintenance_snapshot_cache_,
-                                          &maintenance_statements_);
+    auto durable_state = ReadCompleteDurableState(memory_);
     std::optional<SceneTransactionStoreState> transaction_state;
     if (durable_state.accepted.has_value() &&
         durable_state.finalization_receipt.has_value()) {
-      transaction_state = ReadSceneTransactionStoreState(value, durable_state);
-    }
-    const auto stable_data_version =
-        ScalarInteger(value, "PRAGMA data_version");
-    transaction.Commit();
-    if (stable_data_version != data_version) {
-      throw LogicalSceneOwnerConflictError(
-          "logical-scene database changed while rebuilding the live commit "
-          "state");
+      transaction_state =
+          ReadSceneTransactionStoreState(memory_, durable_state);
     }
     scene_commit_state_cache_ = SceneCommitStateCache{
-        std::move(durable_state), std::move(transaction_state), data_version};
+        std::move(durable_state), std::move(transaction_state)};
     return *scene_commit_state_cache_;
   }
 
-  [[nodiscard]] bool SceneCommitStateStillCurrent(
-      const std::int64_t expected_external_data_version) const {
-    return ScalarInteger(database(), "PRAGMA data_version") ==
-           expected_external_data_version;
+  // Queues the record for the file; called while `mutex_` is held, after
+  // `memory_` has changed.
+  void Post(persistence::SqliteRecord record) const {
+    if (!record.empty()) {
+      static_cast<void>(writer_->Post(slot_, std::move(record)));
+    }
   }
 
   void StoreSceneCommitState(
       DurableState durable_state,
-      std::optional<SceneTransactionStoreState> transaction_state,
-      const std::int64_t external_data_version) {
+      std::optional<SceneTransactionStoreState> transaction_state) {
     scene_commit_state_cache_ = SceneCommitStateCache{
-        std::move(durable_state), std::move(transaction_state),
-        external_data_version};
+        std::move(durable_state), std::move(transaction_state)};
   }
 
   void InvalidateSceneCommitState() noexcept {
@@ -407,14 +285,17 @@ public:
   // adoption. Durable rows are evidence, not a replacement for that request.
   // Historical ordinary maintenance also preserved Scene revisions, so the
   // revision shape cannot distinguish a private operation from those rows.
-  std::optional<std::variant<QualifiedSceneProductAdoptionRequest,
-                             QualifiedSceneConfigurationAdoptionRequest>> live_product_adoption_;
+  std::optional<QualifiedSceneConfigurationAdoptionRequest> live_adoption_;
   mutable std::mutex maintenance_operation_mutex_;
   mutable std::mutex mutex_;
   sqlite3 *database_{};
+  SceneStoreMemory memory_;
   mutable std::optional<SceneCommitStateCache> scene_commit_state_cache_;
-  mutable MaintenanceSnapshotCache maintenance_snapshot_cache_;
-  mutable PersistentStatementCache maintenance_statements_;
+  // Numbers each ReadPublication under `mutex_` (OD-302).
+  mutable std::uint64_t publication_read_sequence_{};
+  std::unique_ptr<persistence::SqliteRecordWriter> owned_writer_;
+  persistence::SqliteRecordWriter *writer_{};
+  persistence::SqliteRecordWriter::StoreSlot slot_{};
 };
 
 } // namespace manyforge::scene

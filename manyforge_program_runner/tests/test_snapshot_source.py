@@ -40,7 +40,6 @@ def test_capture_returns_bounded_owner_attributed_inline_image() -> None:
                 "Cache-Control": "no-store",
                 "Content-Type": "image/jpeg",
                 "X-ManyForge-Viewer-Generation": "19",
-                "X-ManyForge-Viewer-Owner-Epoch": "headless.epoch.1",
             },
         )
 
@@ -55,9 +54,8 @@ def test_capture_returns_bounded_owner_attributed_inline_image() -> None:
     assert attachment["source"] == {
         "height": 480,
         "image_sha256": "sha256:" + sha256(_JPEG).hexdigest(),
-        "schema_version": "manyforge.program_snapshot_source.v1",
+        "schema_version": "manyforge.program_snapshot_source.v2",
         "viewer_generation": 19,
-        "viewer_owner_epoch": "headless.epoch.1",
         "width": 640,
     }
     query = requests[0].url.params
@@ -91,7 +89,7 @@ def test_capture_rejects_missing_observer_and_invalid_owner_metadata() -> None:
                     headers={
                         "Cache-Control": "no-store",
                         "Content-Type": "image/jpeg",
-                        "X-ManyForge-Viewer-Generation": "19",
+                        "X-ManyForge-Viewer-Generation": "-1",
                     },
                 )
             )
@@ -147,7 +145,6 @@ def test_capture_rejects_oversized_image_before_encoding() -> None:
                         "Cache-Control": "no-store",
                         "Content-Type": "image/jpeg",
                         "X-ManyForge-Viewer-Generation": "19",
-                        "X-ManyForge-Viewer-Owner-Epoch": "headless.epoch.1",
                     },
                 )
             )

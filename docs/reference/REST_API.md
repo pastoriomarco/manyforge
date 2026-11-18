@@ -3,15 +3,15 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py structural-rest
-  Last regenerated: 2026-11-09 11:41:08 UTC
+  Last regenerated: 2026-11-14 12:33:17 UTC
   Generator source: scripts/regen-public-contracts.py:gen_rest_api
 -->
 
 # Composer REST API
 
-This is the structural, authoring, and thin runtime-client Composer surface retained during the composable-cell runtime cutover. Catalog reads, sandboxed artifact browsing, structural URDF assets, health, and the strict revision-fenced Program Draft/Saved workflow remain available. When Headless and the independent Program runner are configured, Composer also forwards scenario, Applied, Program Run, status, explicit Program Stop, component actions and the server-run Apply/Load/New requests without owning their state. Generic `/api/control/state` and `/api/control/commands` expose the same state-conditioned ingress used by the versioned `/ws/control` session; callers submit once and observe backend-owned lifecycle state. Complete product launch and remaining provider-specific capabilities remain unavailable. Build-owned skills are discovered and expanded into ordinary Program trees through `/api/skills`; expansion does not edit Draft or execute a command. The catch-all `/api/{unavailable_path}` operations return the typed runtime-unavailable response for former product routes.
+This is the structural, authoring, and thin runtime-client Composer surface retained during the composable-cell runtime cutover. Catalog reads, sandboxed artifact browsing, structural URDF assets, health, and the strict revision-fenced Program Draft/Saved workflow remain available. When Headless and the independent Program runner are configured, Composer also forwards scenario, Applied, Program Run, status, Stops, component actions and the server-run Apply/Load/New requests without owning their state. Generic `/api/control/state` and `/api/control/commands` expose the same state-conditioned ingress used by the versioned `/ws/control` session; callers submit once and observe backend-owned lifecycle state. Complete product launch and remaining provider-specific capabilities remain unavailable. Build-owned skills are discovered and expanded into ordinary Program trees through `/api/skills`; expansion does not edit Draft or execute a command. The catch-all `/api/{unavailable_path}` operations return the typed runtime-unavailable response for former product routes.
 
-**Real robot.** A real robot's address is a site fact (`device_addresses` in the `manyforge.site.v1` site settings file); a Scenario names only its key (`configuration.device_address_ref` of the machine owner). Component states, faults, the cell latch and readiness are readable here; the site file, robot power, network and e-stop are the operator's. See [Real robot setup](../operations/REAL_ROBOT_SETUP.md).
+**Real robot.** A real robot's address is a site fact (`device_addresses` in the `manyforge.site.v2` site settings file); a Scenario names only its key (`configuration.device_address_ref` of the machine owner). Component states, faults, the cell latch and readiness are readable here; the site file, robot power, network and e-stop are the operator's. See [Real robot setup](../operations/REAL_ROBOT_SETUP.md).
 
 The live schema is available at `/openapi.json` and `/docs` while the API process is running.
 
@@ -75,13 +75,12 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/execution/capability-command-previews` | headless-runtime-client | Execution Preview Capability Command |
 | `GET` | `/api/execution/control-state` | headless-runtime-client | Execution Control State |
 | `GET` | `/api/execution/diagnostics` | headless-runtime-client | Execution Diagnostics |
-| `POST` | `/api/execution/full-stop` | headless-runtime-client | Execution Full Stop |
+| `POST` | `/api/execution/halt` | headless-runtime-client | Execution Halt |
 | `GET` | `/api/execution/history` | headless-runtime-client | History |
 | `GET` | `/api/execution/history/captures` | headless-runtime-client | History Captures |
 | `GET` | `/api/execution/history/discovery` | headless-runtime-client | History Discovery |
 | `GET` | `/api/execution/history/export` | headless-runtime-client | History Export |
 | `GET` | `/api/execution/history/health` | headless-runtime-client | Historian Health |
-| `POST` | `/api/execution/history/reconcile` | headless-runtime-client | Historian Reconcile |
 | `GET` | `/api/execution/history/{sequence}` | headless-runtime-client | Historian Detail |
 | `GET` | `/api/execution/identity` | headless-runtime-client | Execution Identity |
 | `POST` | `/api/execution/io-signals/mock-input` | headless-runtime-client | Execution Set Mock Io Input |
@@ -94,9 +93,13 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/execution/operations/{operation_id}/reset` | headless-runtime-client | Execution Reset |
 | `POST` | `/api/execution/pick-place/plans/pick` | headless-runtime-client | Execution Plan Pick |
 | `POST` | `/api/execution/pick-place/plans/place` | headless-runtime-client | Execution Plan Place |
+| `GET` | `/api/execution/pick-place/plans/{job_id}` | headless-runtime-client | Execution Read Planning Job |
+| `POST` | `/api/execution/pick-place/plans/{job_id}/cancel` | headless-runtime-client | Execution Cancel Planning Job |
+| `POST` | `/api/execution/pick-place/plans/{job_id}/release` | headless-runtime-client | Execution Release Planning Job |
 | `GET` | `/api/execution/program-runs/{program_run_id}/admitted-speeds` | headless-runtime-client | Program Run Admitted Speeds |
 | `GET` | `/api/execution/runtime-scale-control` | headless-runtime-client | Execution Get Runtime Scale Control |
 | `POST` | `/api/execution/runtime-scale-control` | headless-runtime-client | Execution Set Runtime Scale Control |
+| `POST` | `/api/execution/stop-all` | headless-runtime-client | Execution Stop All |
 | `POST` | `/api/execution/stops` | headless-runtime-client | Execution Stop |
 | `GET` | `/api/execution/targets` | headless-runtime-client | Execution Targets |
 | `GET` | `/api/files/browse` | files | Browse Filesystem |
@@ -133,16 +136,14 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Composer (replaceable client)`.
 | `POST` | `/api/program/runs` | headless-runtime-client | Program Run Start |
 | `GET` | `/api/program/runs/{program_run_id}` | headless-runtime-client | Program Run Read |
 | `POST` | `/api/program/runs/{program_run_id}/blackboard-values` | headless-runtime-client | Write Runtime Blackboard |
-| `POST` | `/api/program/runs/{program_run_id}/full-stop` | headless-runtime-client | Program Run Full Stop |
 | `POST` | `/api/program/runs/{program_run_id}/manual-result` | headless-runtime-client | Stage Manual Result |
 | `POST` | `/api/program/runs/{program_run_id}/motion-start` | headless-runtime-client | Program Run Motion Start |
 | `POST` | `/api/program/runs/{program_run_id}/motion-stop` | headless-runtime-client | Program Run Motion Stop |
 | `POST` | `/api/program/runs/{program_run_id}/node-correction-previews` | headless-runtime-client | Program Node Correction Preview |
-| `POST` | `/api/program/runs/{program_run_id}/reset` | headless-runtime-client | Program Run Reset Full Stop |
-| `POST` | `/api/program/runs/{program_run_id}/resume-full-stop` | headless-runtime-client | Program Run Resume Full Stop |
+| `POST` | `/api/program/runs/{program_run_id}/reset` | headless-runtime-client | Program Run Discard Halt |
+| `POST` | `/api/program/runs/{program_run_id}/resume-halt` | headless-runtime-client | Program Run Resume Halt |
 | `POST` | `/api/program/runs/{program_run_id}/resume-motion` | headless-runtime-client | Program Run Motion Resume |
 | `GET` | `/api/program/runs/{program_run_id}/runtime-controls` | headless-runtime-client | Program Runtime Controls |
-| `POST` | `/api/program/runs/{program_run_id}/stop` | headless-runtime-client | Program Run Stop |
 | `POST` | `/api/program/save` | composer-draft | Save Draft |
 | `POST` | `/api/program/save-as` | composer-draft | Save Draft As |
 | `POST` | `/api/program/scene-preparations` | headless-runtime-client | Program Scene Prepare |

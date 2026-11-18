@@ -9,11 +9,13 @@
 #include <atomic>
 #include <filesystem>
 #include <gtest/gtest.h>
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include <manyforge_core/io_signal_subsystem.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/program_io_condition_compiler.hpp>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <unistd.h>
@@ -92,8 +94,7 @@ protected:
   c::IoRuleAppliedContextDTO Context() const {
     // This helper test supplies prospective identity only. It does not forge
     // successful Apply, a current facade, an admission claim or driver facts.
-    return {c::RequestOwnerEpoch("host.catalog"),
-            c::ActiveBundlePublicationGeneration(7U),
+    return {c::ActiveBundlePublicationGeneration(7U),
             bundle->retained_bundle_id(),
             bundle->value().cell_graph.graph_revision};
   }
@@ -133,8 +134,7 @@ protected:
                                          artifacts);
   }
   std::shared_ptr<c::IoSignalSubsystem>
-  Service(const c::RequestOwnerEpoch &owner =
-              c::RequestOwnerEpoch("host.catalog")) {
+  Service() {
     const auto configured =
         d::ResolveRetainedIoSignalCatalog(bundle->value().cell_graph);
     if (!configured.ok())
@@ -147,7 +147,7 @@ protected:
         synthetic.insert(row.descriptor.source_id);
     }
     auto created = c::IoSignalSubsystem::Create(
-        {owner, 19U, std::move(descriptors),
+        {19U, std::move(descriptors),
          std::vector<c::InterruptSourceId>(synthetic.begin(), synthetic.end())},
         {16U, 32U, 8U, 8U, 256U, 1024U}, clock);
     if (!created.ok())
@@ -245,9 +245,7 @@ TEST_F(AppliedGlobalIoRuleInstallationTest,
       {prototype.value()}, {}, fixture.program_artifact_root);
   const auto &identity = fixture.binding->value();
   const c::ProgramRunExecutionCaptureDTO request{
-      c::RequestOwnerEpoch("capture.fixture.kernel"),
-      c::RequestOwnerEpoch("capture.fixture.runner"),
-      c::CellAdmissionClaimGeneration(1U), c::ProgramRunId("capture.fixture.run"),
+      c::CellAdmissionClaimGeneration(1U), c::ProgramRunNumber(139U),
       identity.program_id, identity.program_revision, identity.program_binding_id,
       identity.retained_bundle_id, identity.graph_revision, {}};
   const auto captured = resolver.ResolveProgramCapture(request);
@@ -294,7 +292,6 @@ TEST_F(AppliedGlobalIoRuleInstallationTest,
   ASSERT_NE(compiled.value().catalog, nullptr);
   EXPECT_EQ(compiled.value().waiting_for_program, nullptr);
   const auto &catalog = *compiled.value().catalog;
-  EXPECT_EQ(catalog.context.owner_epoch, before.value().owner_epoch);
   EXPECT_EQ(catalog.context.catalog_generation,
             before.value().catalog_generation);
   EXPECT_EQ(catalog.context.active_publication_generation,
@@ -333,12 +330,6 @@ TEST_F(AppliedGlobalIoRuleInstallationTest,
   ASSERT_FALSE(no_service_waiting.ok());
   EXPECT_EQ(no_service_waiting.error().details.at("reason"),
             "io_global_rule_service_missing");
-  const auto foreign_service = Service(c::RequestOwnerEpoch("foreign.owner"));
-  const auto foreign = CompileGlobalIoRuleCatalog(
-      Context(), *bundle, program.get(), binding.get(), foreign_service);
-  ASSERT_FALSE(foreign.ok());
-  EXPECT_EQ(foreign.error().details.at("reason"),
-            "io_global_rule_service_context_mismatch");
   auto context = Context();
   context.graph_revision = c::GraphRevision("foreign.graph");
   const auto wrong_product = CompileGlobalIoRuleCatalog(
@@ -437,6 +428,151 @@ TEST_F(AppliedGlobalIoRuleInstallationTest,
   EXPECT_EQ(waiting->context, Context());
   for (const auto &rule : waiting->rules)
     EXPECT_EQ(rule.condition, nullptr);
+}
+
+
+// A Program move resolves its TCP from the moving robot's TCP list, whether
+// or not the Program references the mounted tool (0.2.1 regression: an
+// arm-only Program on a Lite6 with its gripper failed with
+// runtime_motion_endpoint_unresolved).
+struct ProgramTcpResolution final {
+  d::test::MaintainedInterruptProgramFixture fixture;
+  c::RuntimeParticipantBinding physical;
+};
+
+ProgramTcpResolution ResolveMaintainedProgram(const std::filesystem::path &root,
+                                              std::string_view tree) {
+  auto fixture = d::test::LoadMaintainedInterruptProgram(
+      MANYFORGE_PROGRAM_CAPTURE_PACKAGE_ROOT, root, tree);
+  const c::ProgramTargetReferenceDTO arm{c::ControllableComponentId("lite6_robot"),
+                                         c::CommandTargetId("arm")};
+  const auto target = d::resolve_runtime_program_target(
+      *fixture.binding, arm, c::CapabilityId("execution.trajectory.execute"),
+      *fixture.bundle, fixture.model_map);
+  const std::vector supporting{d::resolve_runtime_program_target(
+      *fixture.binding, arm, c::CapabilityId("planning.motion.joint_goal"),
+      *fixture.bundle, fixture.model_map)};
+  if (!target.control_binding() || !target.control_domain() || !target.desired_route())
+    throw std::logic_error("maintained arm target has no control route");
+  std::set<c::RuntimeUnitId> units(target.component().runtime_unit_ids.begin(),
+                                   target.component().runtime_unit_ids.end());
+  units.insert(target.control_domain()->runtime_unit_ids.begin(),
+               target.control_domain()->runtime_unit_ids.end());
+  std::map<c::ProviderInstanceId, c::RuntimeUnitId> providers{
+      {target.control_binding()->provider_instance_id,
+       target.control_binding()->provider_runtime_unit_id}};
+  for (const auto *bound : {&target, &supporting.front()})
+    if (const auto &provider = bound->capability_provider_binding())
+      providers.emplace(provider->provider_instance_id, retained_provider_runtime_unit(*provider));
+  std::vector<d::RuntimeProviderEpochFactDTO> provider_epochs;
+  for (const auto &[provider, unit] : providers) {
+    units.insert(unit);
+    provider_epochs.push_back({provider, unit, c::RuntimeEpoch("tcp.fixture." + unit.value())});
+  }
+  std::vector<c::RuntimeUnitEpochBindingDTO> epochs;
+  for (const auto &id : units)
+    epochs.push_back({id, c::RuntimeEpoch("tcp.fixture." + id.value())});
+  auto physical = c::verify_runtime_participant_binding(d::build_runtime_participant_binding_dto(
+      target,
+      {*target.desired_route(), c::ActiveControlConfigurationId("tcp.fixture.configuration"),
+       c::ActiveControlConfigurationGeneration(1U), std::move(epochs), std::move(provider_epochs)},
+      supporting));
+  if (!physical.ok()) throw std::logic_error(physical.error().message);
+  return {std::move(fixture), std::move(physical.value())};
+}
+
+c::OperationIntentDTO JointMove(const c::RuntimeParticipantBinding &physical,
+                                c::TcpSelectorDTO tcp) {
+  const auto &value = physical.value();
+  std::vector<std::string> joints;
+  for (const auto &resource : value.resources) joints.push_back(*resource.source_joint_name);
+  std::vector<double> goal(joints.size(), 0.0);
+  return c::OperationIntentDTO{
+      c::PublicRequestContextDTO{c::TestRequestKey("request.tcp.fixture"), "tcp_fixture"},
+      value.program_id, value.program_revision, value.program_binding_id,
+      c::ProgramRunNumber(113U), value.graph_revision, value.retained_bundle_id,
+      std::nullopt,
+      {c::OperationParticipantIntentDTO{
+          {value.controllable_component_id, value.command_target_id}, value.capability_id,
+          std::nullopt,
+          c::MotionParticipantIntentDTO{
+              c::MoveId("move.tcp.fixture"),
+              {value.controllable_component_id, c::FrameRoleId("base")}, std::move(tcp),
+              c::TolerancesDTO{1.0e-4, 5.0e-3, 1.0e-2}, c::SpeedProfileDTO{0.5, 0.5, std::nullopt},
+              c::TimeoutsDTO{3.0, 5.0}, c::CacheMode::kDefault, c::PlannerOverrideDTO{},
+              c::MotionTargetModeDTO::kAbsolute, std::nullopt, std::nullopt,
+              c::JointGoalDTO{std::move(joints), std::move(goal)}, std::nullopt, {}, {}}}},
+      c::OperationCoordinationPolicy::kIndependent};
+}
+
+void ExpectToolTcpResolves(const std::filesystem::path &root, std::string_view tree,
+                           const std::optional<c::TcpSelectorDTO> &default_of_tool) {
+  const auto resolution = ResolveMaintainedProgram(root, tree);
+  const auto &fixture = resolution.fixture;
+  const auto &targets = fixture.binding->value().target_bindings;
+  const auto arm = std::find_if(targets.begin(), targets.end(), [](const auto &row) {
+    return row.target.component_id == c::ControllableComponentId("lite6_robot");
+  });
+  ASSERT_NE(arm, targets.end());
+  ASSERT_TRUE(arm->robot_tcps);
+  const auto tool = std::find_if(arm->robot_tcps->begin(), arm->robot_tcps->end(),
+                                 [](const auto &row) { return row.end_effector; });
+  ASSERT_NE(tool, arm->robot_tcps->end());
+  ASSERT_EQ(tool->entry.target.component_id, c::ControllableComponentId("lite_gripper"));
+  // The robot's own Active TCP owner, with the End-effector (the gripper's
+  // TCP) active. Its association table plays no part in a Program move.
+  const RobotTcpReader robot_tcps = [rows = *arm->robot_tcps](const c::ControllableComponentId &robot)
+      -> std::optional<ActiveTcp> {
+    if (robot != c::ControllableComponentId("lite6_robot")) return std::nullopt;
+    return ActiveTcp(rows, {});
+  };
+  ProductBackedRuntimeParticipantResolver resolver(
+      fixture.package_root, fixture.bundle, fixture.model_map, {resolution.physical}, {},
+      fixture.program_artifact_root);
+  std::vector<c::TcpSelectorDTO> selectors{
+      // The Program runner sends Current as the Active TCP's explicit entry.
+      c::TcpSelectorDTO(tool->entry), c::TcpSelectorDTO(c::CurrentTcpDTO{})};
+  if (default_of_tool) selectors.push_back(*default_of_tool);
+  for (const auto &selector : selectors) {
+    const auto resolved = resolver.Resolve(JointMove(resolution.physical, selector), 0U, robot_tcps);
+    ASSERT_TRUE(resolved.ok()) << resolved.error().message;
+    const auto &endpoint = resolved.value().value().motion_endpoint;
+    ASSERT_TRUE(endpoint);
+    EXPECT_EQ(endpoint->target, tool->entry.target);
+    EXPECT_EQ(endpoint->frame, tool->frame);
+    EXPECT_EQ(endpoint->contact_body_role_ids, tool->contact_body_role_ids);
+    ASSERT_EQ(endpoint->contact_body_bindings.size(), tool->contact_body_role_ids.size());
+    for (const auto &body : endpoint->contact_body_bindings)
+      EXPECT_EQ(body.body.component_id, c::ControllableComponentId("lite_gripper"));
+  }
+}
+
+constexpr std::string_view kArmOnlyTree = R"({
+  "node_id":"motion.move_to_joint_target","instance_id":"start_rest","children":[],
+  "parameters":{"target":{"component_id":"lite6_robot","command_target_id":"arm"},
+    "base_frame":{"component_id":"lite6_robot","frame_id":"base"},
+    "tcp_endpoint":{"kind":"current"},"velocity_scale":0.4,
+    "goal":[{"joint_name":"joint1","position_rad":0.0},{"joint_name":"joint2","position_rad":-0.785},
+      {"joint_name":"joint3","position_rad":0.785},{"joint_name":"joint4","position_rad":0.0},
+      {"joint_name":"joint5","position_rad":1.57},{"joint_name":"joint6","position_rad":0.0}]}})";
+
+TEST_F(AppliedGlobalIoRuleInstallationTest,
+       ArmOnlyProgramResolvesTheMountedToolTcpFromTheRobotTcpList) {
+  ExpectToolTcpResolves(root, kArmOnlyTree, std::nullopt);
+}
+
+TEST_F(AppliedGlobalIoRuleInstallationTest,
+       GripperCommandProgramResolvesTheToolTcpItNeverNamesAsAFrame) {
+  // The gripper is a Program target (it is commanded) but no frame of it is
+  // referenced, so its target row has no association for its TCP.
+  const std::string tree = std::string(R"({"node_id":"sequence","instance_id":"root","parameters":{},
+    "children":[{"node_id":"gripper.command_position","instance_id":"open","children":[],
+      "parameters":{"target":{"component_id":"lite_gripper","command_target_id":"gripper"},
+        "command_duration_s":0.8,"max_effort":{"kind":"linear_newton","value_n":10.0},
+        "position":{"kind":"linear_m","value_m":0.0081}}},)") +
+      std::string(kArmOnlyTree) + "]}";
+  ExpectToolTcpResolves(root, tree, c::TcpSelectorDTO(c::DefaultTcpOfTargetDTO{
+      {c::ControllableComponentId("lite_gripper"), c::CommandTargetId("gripper")}}));
 }
 
 } // namespace

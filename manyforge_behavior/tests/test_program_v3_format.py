@@ -192,7 +192,7 @@ def test_mock_signal_rows_are_matched_by_direct_identity():
 
 
 @pytest.mark.parametrize("tree", [
-    {"node_id": "kernel.full_stop", "instance_id": "stop", "parameters": {}, "children": []},
+    {"node_id": "kernel.cell_stop", "instance_id": "stop", "parameters": {}, "children": []},
     {"node_id": "io.set_output", "instance_id": "set", "parameters": {
         "signal": {"component_id": "robot_io", "signal_name": "TO0"}, "value": True
     }, "children": []},

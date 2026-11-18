@@ -12,6 +12,7 @@ from manyforge_headless_api.activity_history import (
     SCHEMA_VERSION,
     apply_record,
     component_action_record,
+    program_reset_record,
 )
 from manyforge_headless_api.app import create_app
 from manyforge_headless_api.execution import ExecutionEventPump
@@ -27,13 +28,14 @@ from manyforge_headless_api.tests.test_component_model import (
     _state,
 )
 from manyforge_headless_api.tests.test_execution_event_stream import (
-    _EPOCH,
     _SubscribedExecution,
     _host_snapshot,
     _host_state,
     _message,
 )
 from manyforge_headless_api.tests.test_execution_events import _RecordingCore
+
+_APPLICATION_START_ID = "3f9a0000000000a1"
 
 
 def _result(action: str, outcome: str, started: int, error: dict[str, str] | None = None):
@@ -121,7 +123,9 @@ def _model(*states: dict[str, Any]) -> dict[str, Any]:
 
 def test_the_pump_records_each_new_last_action_once_after_its_baseline() -> None:
     core = _PumpCore()
-    pump = ExecutionEventPump(core, _SubscribedExecution())  # type: ignore[arg-type]
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, _SubscribedExecution(), application_start_id=_APPLICATION_START_ID
+    )
     old = _result("prepare", "succeeded", 1)
     pump._record_finished_actions(_model(_state("lite6", last_action=old)))  # noqa: SLF001
     assert core.activity == []  # Finished before this Headless: not recorded again.
@@ -145,7 +149,9 @@ def test_a_lost_history_record_never_breaks_the_pump() -> None:
         raise RuntimeError("historian queue closed")
 
     core.record_activity = fail  # type: ignore[method-assign]
-    pump = ExecutionEventPump(core, _SubscribedExecution())  # type: ignore[arg-type]
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, _SubscribedExecution(), application_start_id=_APPLICATION_START_ID
+    )
     pump._record_finished_actions(_model())  # noqa: SLF001
     pump._record_finished_actions(_model(  # noqa: SLF001
         _state("lite6", last_action=_result("prepare", "succeeded", 1))))
@@ -156,11 +162,13 @@ def test_the_running_pump_records_an_action_the_host_finished() -> None:
     finished = _result("prepare", "failed", 3, {"code": "component_launch_not_settled",
                                                 "message": "lite6 didn't start"})
     execution = _SubscribedExecution(_host_snapshot())
-    pump = ExecutionEventPump(core, execution, poll_seconds=0.01)  # type: ignore[arg-type]
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, application_start_id=_APPLICATION_START_ID, poll_seconds=0.01
+    )
     pump.start()
     try:
         assert core.completed.wait(3.0)  # The first model is the baseline.
-        execution.script.append(_message("state", _EPOCH, state={
+        execution.script.append(_message("state", state={
             **_host_state(), "component_states": [_state("lite6", "not_prepared",
                                                          last_action=finished)]}))
         deadline = time.monotonic() + 3.0
@@ -232,3 +240,62 @@ def test_an_apply_outcome_is_recorded_with_its_rows() -> None:
     assert record["subject"] == "scenario_load" and record["outcome"] == "failed"
     assert record["error"] == {"code": "execution_owner_unavailable"}
     assert record["components"][0]["error"]["code"] == "execution_owner_unavailable"
+
+
+# Program Reset terminals from the Program Runner (OD-305) -------------------------
+
+
+def _reset_facts(**changes: Any) -> dict[str, Any]:
+    return {
+        "reload_initial_scene": True, "reset_robot_position": False,
+        "program_run_id": 7, "program_revision": "sha256:" + "1" * 64,
+        "applied_record_digest": "sha256:" + "2" * 64,
+        "scene_revision_id": 10, "scene_content_hash": "sha256:" + "3" * 64,
+        "cause_code": None, **changes,
+    }
+
+
+def test_a_program_reset_record_names_its_options_and_scene_revision() -> None:
+    record = program_reset_record("succeeded", None, _reset_facts())
+    assert record["kind"] == "program_reset" and record["subject"] == "program_reset"
+    assert record["action"] is None and record["components"] == []
+    assert record["error"] is None and record["reset"] == _reset_facts()
+    assert record["message"] == (
+        "Program reset succeeded · run 7 · reloaded initial scene (scene revision 10)")
+    refused = program_reset_record(
+        "refused", {"code": "authoring_not_ready", "message": "not ready"},
+        _reset_facts(program_run_id=None, scene_revision_id=None, scene_content_hash=None,
+                     reset_robot_position=True))
+    assert refused["message"] == (
+        "Program reset refused: authoring_not_ready: not ready"
+        " · reload initial scene · reset robot position")
+
+
+def test_a_program_reset_outcome_is_recorded_through_the_route() -> None:
+    core = _ActivityCore()
+    service = _service(core, FakeManager(), _ModelExecution(_reply()),
+                       program_runner=FakeProgramRunner(active=False))
+    with TestClient(create_app(service=service)) as client:
+        response = client.post("/api/execution/history/program-reset-outcomes", json={
+            "outcome": "failed",
+            "error": {"code": "program_cycle_recovery_required", "message": "scene owner lost"},
+            "reset": _reset_facts(scene_revision_id=None, scene_content_hash=None,
+                                  cause_code="program_cycle_reset_scene_preparation_failed"),
+        })
+        bad_outcome = client.post("/api/execution/history/program-reset-outcomes",
+                                  json={"outcome": "accepted", "reset": _reset_facts()})
+        bad_revision = client.post("/api/execution/history/program-reset-outcomes",
+                                   json={"outcome": "succeeded",
+                                         "reset": _reset_facts(scene_revision_id=0)})
+        no_facts = client.post("/api/execution/history/program-reset-outcomes",
+                               json={"outcome": "succeeded"})
+    assert response.status_code == 200 and response.json() == {"recorded": True}
+    assert {bad_outcome.status_code, bad_revision.status_code, no_facts.status_code} == {422}
+    [record] = core.activity
+    assert record["kind"] == "program_reset" and record["outcome"] == "failed"
+    assert record["error"] == {"code": "program_cycle_recovery_required",
+                               "message": "scene owner lost"}
+    assert record["reset"]["cause_code"] == "program_cycle_reset_scene_preparation_failed"
+    assert record["reset"]["scene_revision_id"] is None
+    assert record["message"].startswith(
+        "Program reset failed: program_cycle_recovery_required: scene owner lost · run 7")

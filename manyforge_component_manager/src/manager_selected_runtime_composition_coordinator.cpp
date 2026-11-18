@@ -1,6 +1,8 @@
 #include "manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp"
 
 #include <limits>
+#include <manyforge_component_manager/retained_execution_host_unit_adapter.hpp>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/content_identity.hpp>
 #include <string>
@@ -46,14 +48,39 @@ HostApplyResult ManagerSelectedRuntimeCompositionCoordinator::ApplyOnHost(
               candidate.value().cell_graph.graph_revision == intent.candidate_graph_revision &&
               candidate.value().cell_graph.cell_id == apply_journal_.cell_id(),
           "host Apply bundles differ from the durable Apply");
+  // The host loads the bound Program's products from these accepted facts.
+  std::optional<HostApplyProgramSelection> program;
+  if (const auto &binding = intent.prepared_activation.program_binding_id) {
+    const auto receipt = content_identity::parse_canonical_json(
+        intent.prepared_activation.canonical_receipt_json);
+    const auto text = [&](const std::string_view name) {
+      const auto *value = receipt.find_object_member(name);
+      Require(value != nullptr && value->is_string(),
+              "host Apply prepared activation lacks its bound Program");
+      return value->as_string();
+    };
+    program = HostApplyProgramSelection{core::ProgramId(text("program_id")),
+                                        core::ProgramRevision(text("program_revision")),
+                                        *binding};
+  }
   const auto request = MakeHostApplyRequest(
       {apply_id, apply_generation}, predecessor, candidate,
-      status->affected_scope->affected_scope.component_delta);
+      status->affected_scope->affected_scope.component_delta, std::move(program));
   Require(request.valid(), "host Apply request is invalid");
   const auto &runtime_unit =
       status->latest_runtime_staged_ready->staged_ready.runtime_units.front();
   auto result = runtime_composition_.ApplyOnHost(runtime_unit.runtime_unit_id, request);
-  if (!result.ok()) throw core::TypedError(result.error(), std::string(kExecutionHostProducer));
+  // An answer the host never gave (an outstanding earlier exchange, the
+  // host's exit, the application's stop) is the Manager adapter's own, so
+  // it names the Manager as producer, as the adapter does.
+  if (!result.ok()) {
+    const auto &code = result.error().code;
+    throw core::TypedError(result.error(), code == kExecutionHostLateCode ||
+                                                   code == kExecutionHostExitedCode ||
+                                                   code == kApplicationStoppingCode
+                                               ? std::string("component_manager")
+                                               : std::string(kExecutionHostProducer));
+  }
   Require(result.value().valid(), "execution host returned an invalid Apply result");
   if (result.value().outcome == HostApplyOutcome::kFailed)
     throw core::TypedError(*result.value().error, std::string(kExecutionHostProducer));

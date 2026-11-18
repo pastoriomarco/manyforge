@@ -59,9 +59,8 @@ def _client_applied() -> dict[str, object]:
         "graph_revision": binding["graph_revision"],
         "node_environment_digest": binding["node_environment"]["environment_digest"],
         "owner_identities": [{
-            "owner_role": "headless_projection",
-            "owner_id": "owner.cell-a",
-            "owner_epoch": "owner.epoch.1",
+            "role": "headless_projection",
+            "application_start_id": "3f9a0000000000a1",
         }],
         "preparation_digest": "sha256:" + "f" * 64,
         "program": {
@@ -76,7 +75,7 @@ def _client_applied() -> dict[str, object]:
         "source_document_digest": "sha256:" + "1" * 64,
         "scenario_id": "cell-pick",
         "project_path": "/projects/cell-pick.scenario",
-        "schema_version": "manyforge.applied_program_selection.v4",
+        "schema_version": "manyforge.applied_program_selection.v5",
         "simulation_scene": None,
         "program_frame_facts": {
             "applied_record_digest": "sha256:" + "2" * 64,
@@ -91,7 +90,6 @@ def _client_applied() -> dict[str, object]:
             "record_digest": "sha256:" + "2" * 64,
             "semantic_content_digest": "sha256:" + "3" * 64,
             "source_generation": 1,
-            "source_owner_epoch": "owner.epoch.1",
             "source_owner_id": "owner.cell-a",
         },
     }
@@ -103,7 +101,7 @@ def _sized_context_payload(size: int, *, native: bool = False) -> bytes:
         b'{"schema_version":"manyforge.source_model_context.v1",'
         b'"node_environment":{"schema_version":"manyforge.'
         b'node_environment_projection.v2"},'
-        b'"source_model":{"schema_version":"manyforge.source_model_projection.v3",'
+        b'"source_model":{"schema_version":"manyforge.source_model_projection.v4",'
         b'"padding":"'
     )
     suffix = b'"}}' + (b"}" if native else b"")
@@ -133,14 +131,14 @@ def test_client_returns_bounded_strict_json_object() -> None:
     transport = httpx.MockTransport(
         lambda request: httpx.Response(
             200,
-            json={"schema_version": "manyforge.headless_runtime_snapshot.v1"},
+            json={"schema_version": "manyforge.headless_runtime_snapshot.v3"},
             request=request,
         )
     )
     raw = httpx.Client(base_url="http://headless.test", transport=transport)
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
-        assert client.runtime()["schema_version"].endswith("snapshot.v1")
+        assert client.runtime()["schema_version"].endswith("snapshot.v3")
     finally:
         raw.close()
 
@@ -201,7 +199,7 @@ def test_client_uses_the_dedicated_node_environment_route() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.node_environment_projection.v2"},
+            json={"schema_version": "manyforge.node_environment_projection.v3"},
             request=request,
         )
 
@@ -211,7 +209,7 @@ def test_client_uses_the_dedicated_node_environment_route() -> None:
     )
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
-        assert client.node_environment()["schema_version"].endswith("projection.v2")
+        assert client.node_environment()["schema_version"].endswith("projection.v3")
     finally:
         raw.close()
     assert [request.url.path for request in requests] == ["/api/node-environment"]
@@ -290,7 +288,7 @@ def test_client_uses_the_dedicated_source_model_route() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.source_model_projection.v3"},
+            json={"schema_version": "manyforge.source_model_projection.v4"},
             request=request,
         )
 
@@ -300,7 +298,7 @@ def test_client_uses_the_dedicated_source_model_route() -> None:
     )
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
-        assert client.source_model()["schema_version"].endswith("projection.v3")
+        assert client.source_model()["schema_version"].endswith("projection.v4")
     finally:
         raw.close()
     assert [request.url.path for request in requests] == ["/api/source-model"]
@@ -455,15 +453,15 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
     try:
         client.program_applied()
         client.program_runs(active_only=True, limit=7)
-        client.program_run_start({"request_id": "request.1"})
-        client.program_run("program run:1")
-        client.program_run_stop(
-            "program run:1",
-            {"request_id": "request.2"},
+        client.program_run_start({"request_key": "11111111111111111111111111111111"})
+        client.program_run(1, application_start_id="3f9a0000000000a1")
+        client.program_run_resume_halt(
+            1,
+            {"request_key": "22222222222222222222222222222222"},
         )
         client.program_run_motion_stop(
-            "program run:1",
-            {"request_id": "request.3"},
+            1,
+            {"request_key": "33333333333333333333333333333333"},
         )
     finally:
         raw.close()
@@ -472,17 +470,18 @@ def test_client_uses_exact_program_selection_and_run_routes() -> None:
         "/api/program/applied",
         "/api/program/runs",
         "/api/program/runs",
-        "/api/program/runs/program run:1",
-        "/api/program/runs/program run:1/stop",
-        "/api/program/runs/program run:1/motion-stop",
+        "/api/program/runs/1",
+        "/api/program/runs/1/resume-halt",
+        "/api/program/runs/1/motion-stop",
     ]
     assert dict(requests[1].url.params) == {
         "active_only": "true",
         "limit": "7",
     }
-    assert json.loads(requests[2].read()) == {"request_id": "request.1"}
-    assert json.loads(requests[4].read()) == {"request_id": "request.2"}
-    assert json.loads(requests[5].read()) == {"request_id": "request.3"}
+    assert dict(requests[3].url.params) == {"application_start_id": "3f9a0000000000a1"}
+    assert json.loads(requests[2].read()) == {"request_key": "11111111111111111111111111111111"}
+    assert json.loads(requests[4].read()) == {"request_key": "22222222222222222222222222222222"}
+    assert json.loads(requests[5].read()) == {"request_key": "33333333333333333333333333333333"}
 
 
 def test_client_uses_the_revision_fenced_scene_pose_route() -> None:
@@ -606,7 +605,7 @@ def test_client_uses_the_selected_assistant_mode_route() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.assistant_mode_projection.v2"},
+            json={"schema_version": "manyforge.assistant_mode_projection.v3"},
             request=request,
         )
 
@@ -617,7 +616,7 @@ def test_client_uses_the_selected_assistant_mode_route() -> None:
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
         assert client.assistant_mode("composer-assistant")["schema_version"].endswith(
-            "projection.v2"
+            "projection.v3"
         )
         with pytest.raises(ValueError, match="assistant mode ID is invalid"):
             client.assistant_mode("../runtime")
@@ -635,7 +634,7 @@ def test_client_uses_the_owner_issued_assistant_mode_index() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.assistant_mode_index.v2", "modes": []},
+            json={"schema_version": "manyforge.assistant_mode_index.v3", "modes": []},
             request=request,
         )
 
@@ -658,7 +657,7 @@ def test_client_requests_the_bounded_attention_newest_alarm_page() -> None:
         requests.append(request)
         return httpx.Response(
             200,
-            json={"schema_version": "manyforge.operator_alarm_snapshot.v2"},
+            json={"schema_version": "manyforge.operator_alarm_snapshot.v3"},
             request=request,
         )
 
@@ -715,7 +714,9 @@ def test_client_distinguishes_transport_timeout_from_other_unavailability() -> N
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
         with pytest.raises(HeadlessClientError) as captured:
-            client.manager_apply_status("apply-1", 1, timeout_seconds=0.1)
+            client.manager_apply_status(
+                1, 1, application_start_id="3f9a0000000000a1", timeout_seconds=0.1
+            )
         assert captured.value.code == "headless_http_timeout"
         assert captured.value.status_code is None
     finally:
@@ -736,12 +737,13 @@ def test_client_posts_one_apply_acknowledgement_with_identity_in_query() -> None
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
         response = client.manager_apply_acknowledge(
-            "apply/1",
+            1,
             1,
             {
-                "request_id": "composer-ack.request.1",
+                "request_key": "11111111111111111111111111111111",
                 "source_label": "manyforge_composer",
             },
+            application_start_id="3f9a0000000000a1",
         )
         assert response == {"ok": True}
     finally:
@@ -751,14 +753,15 @@ def test_client_posts_one_apply_acknowledgement_with_identity_in_query() -> None
     assert requests[0].method == "POST"
     assert requests[0].url.path == "/api/manager/apply/acknowledge"
     assert parse_qsl(requests[0].url.query.decode("ascii")) == [
-        ("apply_id", "apply/1"),
+        ("apply_id", "1"),
         ("apply_generation", "1"),
     ]
     assert json.loads(requests[0].content) == {
+        "application_start_id": "3f9a0000000000a1",
         "request_context": {
-            "request_id": "composer-ack.request.1",
+            "request_key": "11111111111111111111111111111111",
             "source_label": "manyforge_composer",
-        }
+        },
     }
 
 
@@ -785,7 +788,7 @@ def test_http_refusal_keeps_the_reported_producer() -> None:
     assert forwarded.code == "stale_generation"
     assert forwarded.producer == "kernel"
     raw_manager = HeadlessHttpClient._error_from_response(
-        {"api_version": "manyforge.manager_command_response.v2", "ok": False,
+        {"api_version": "manyforge.manager_command_response.v3", "ok": False,
          "error": {"code": "apply_busy", "message": "busy", "details": {},
                    "producer": "component_manager"}},
         409,
@@ -794,3 +797,110 @@ def test_http_refusal_keeps_the_reported_producer() -> None:
     unnamed = HeadlessHttpClient._error_from_response({"detail": "text"}, 500)
     assert unnamed.code == "headless_http_error"
     assert unnamed.producer == "headless_api"
+
+
+def test_client_names_the_stop_all_and_halt_routes() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test",
+        transport=httpx.MockTransport(handler),
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    body = {"request_context": {"request_key": "44" * 16, "source_label": "ui"}}
+    try:
+        client.stop_all(body)
+        client.halt(body)
+        for path in ("/api/execution/stop-all", "/api/execution/halt"):
+            client.recognized_malformed_stop(path)
+        with pytest.raises(ValueError):
+            client.recognized_malformed_stop("/api/execution/full-stop")
+    finally:
+        raw.close()
+
+    assert [request.url.path for request in requests] == [
+        "/api/execution/stop-all",
+        "/api/execution/halt",
+        "/api/execution/stop-all",
+        "/api/execution/halt",
+    ]
+    assert json.loads(requests[0].read()) == body
+    assert json.loads(requests[2].read()) == {}
+
+
+def test_command_calls_bound_only_the_connection_and_reads_keep_their_limit() -> None:
+    # OD-214 (T3, T38): a command answers at acceptance and is followed
+    # through its status; the wait for its reply has no read limit.
+    timeouts: dict[tuple[str, str], dict[str, float | None]] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeouts[(request.method, request.url.path)] = request.extensions["timeout"]
+        return httpx.Response(200, json={"ok": True}, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test", transport=httpx.MockTransport(handler)
+    )
+    client = HeadlessHttpClient("http://unused.test", timeout_seconds=7.0, client=raw)
+    commands = (
+        "/api/program/runs",
+        "/api/program/runs/3/motion-start",
+        "/api/program/runs/3/resume-motion",
+        "/api/program/runs/3/resume-halt",
+        "/api/program/runs/3/reset",
+        "/api/program/runs/3/blackboard-values",
+        "/api/program/runs/3/manual-result",
+        "/api/program/cycle/reset",
+        "/api/cycle/recovery-actions",
+        "/api/program/persistent-values",
+        "/api/program/persistent-values/reset",
+        "/api/program/persistent-values/clear",
+        "/api/control/commands",
+        "/api/activation-preparations",
+        "/api/manager/apply",
+        "/api/manager/apply/release-for-new",
+        "/api/scene/runtime-latch",
+        "/api/scene/transactions",
+    )
+    try:
+        for path in commands:
+            client.request("POST", path, body={})
+        client.request("GET", "/api/cycle/status")
+        client.request("POST", "/api/program/runs/3/node-correction-previews", body={})
+        client.request("POST", "/api/program/runs/3/motion-stop", body={})
+    finally:
+        raw.close()
+    for path in commands:
+        timeout = timeouts[("POST", path)]
+        assert timeout["read"] is None and timeout["write"] is None, path
+        assert timeout["connect"] == 7.0, path
+    for key in (("GET", "/api/cycle/status"),
+                ("POST", "/api/program/runs/3/node-correction-previews"),
+                ("POST", "/api/program/runs/3/motion-stop")):
+        assert timeouts[key]["read"] is not None, key
+
+
+def test_the_prepared_activation_is_read_by_its_digest() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"prepared_activation": {}}, request=request)
+
+    raw = httpx.Client(
+        base_url="http://headless.test", transport=httpx.MockTransport(handler)
+    )
+    client = HeadlessHttpClient("http://unused.test", client=raw)
+    digest = "sha256:" + "9" * 64
+    try:
+        assert client.prepared_activation(digest) == {"prepared_activation": {}}
+        with pytest.raises(ValueError):
+            client.prepared_activation("../api/runtime")
+    finally:
+        raw.close()
+    assert [(r.method, r.url.path) for r in requests] == [
+        ("GET", f"/api/activation-preparations/{digest}")
+    ]

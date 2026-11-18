@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from .state import ComposerState
 
 
-_PROJECTION_VERSION = "manyforge.assistant_mode_projection.v2"
+_PROJECTION_VERSION = "manyforge.assistant_mode_projection.v3"
 _CONTEXT_VERSION = "manyforge.assistant_mode_context.v1"
 _CATALOG_VERSION = "manyforge.assistant_mode_catalog.v1"
 _PROJECTION_FIELDS = {
@@ -67,16 +67,13 @@ _SOURCE_FIELDS = {
     "freshness",
     "known_gaps",
     "projection_generation",
-    "projection_owner_epoch",
     "receiver_age_ns",
     "selection_projection_generation",
     "selection_source_content_digest",
     "selection_source_generation",
-    "selection_source_owner_epoch",
     "selection_source_owner_id",
     "source_content_digest",
     "source_generation",
-    "source_owner_epoch",
     "source_owner_id",
     "source_owner_kind",
 }
@@ -177,10 +174,7 @@ def _source(value: Any, node_environment: VerifiedActiveNodeEnvironment) -> dict
             "the active assistant mode projection is incomplete",
         )
     for field in (
-        "projection_owner_epoch",
-        "selection_source_owner_epoch",
         "selection_source_owner_id",
-        "source_owner_epoch",
         "source_owner_id",
         "source_owner_kind",
     ):
@@ -206,7 +200,6 @@ def _source(value: Any, node_environment: VerifiedActiveNodeEnvironment) -> dict
         "selection_projection_generation",
         "selection_source_content_digest",
         "selection_source_generation",
-        "selection_source_owner_epoch",
         "selection_source_owner_id",
     ):
         if source[field] != node_source.get(field):
@@ -326,7 +319,7 @@ def _model_request_contract(value: Any) -> dict[str, Any]:
             "supports_response_tools",
             "tool_call_family",
         }
-        # EXPERIMENTAL optional `reasoning: on|off`; optional `sampling`.
+        # Optional `reasoning: on|off` (model reasoning switch); optional `sampling`.
         | ({"reasoning", "sampling"} & set(contract)),
         "model_endpoint.request_contract",
     )

@@ -950,7 +950,8 @@ describe('Program authoring panels', () => {
       operationalLimit: { maximumTcpLinearSpeedMps: 0.15 },
     };
     const deployment: DeploymentWorkspaceResponse = {
-      schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+      schemaVersion: 'manyforge.composer_deployment_workspace.v2',
+      applyCommands: { inProgress: null, ended: [] },
       authoringWorkspace: { workspaceEpoch: 'workspace', workspaceRevision: 1,
         programDraftId: 'program', programDraftRevision: 1,
         deploymentDraftId: 'deployment', deploymentDraftRevision: 1 },
@@ -1029,9 +1030,10 @@ describe('Program authoring panels', () => {
     expect(bound).toContain('Edge waits are not supported yet; only level waits run.');
     expect(bound).toContain('placeholder="Wait forever"');
     expect(bound).toContain('Empty waits forever. Otherwise the wait fails after 0.01–3600 s');
-    // Without qualified Draft facts no signal is offered; the stored one is kept as unavailable.
+    // Without qualified Draft facts no signal is offered; the stored one is kept, not checked yet.
     const unbound = render(null);
-    expect(unbound).toContain('unavailable in the current Draft candidate');
+    expect(unbound).toContain('not checked yet');
+    expect(unbound).not.toContain('aria-invalid="true"');
     expect(unbound).not.toContain('robot · DO1');
   });
 
@@ -1098,8 +1100,8 @@ describe('Program authoring panels', () => {
     expect(markup).not.toContain('Qualified Draft system signals are unavailable.');
     const unavailableMarkup = render(null);
     expect(unavailableMarkup).toContain('Qualified Draft system signals are unavailable.');
-    expect(unavailableMarkup).toContain('unavailable in the current Draft candidate');
-    expect(unavailableMarkup).toContain('aria-invalid="true"');
+    expect(unavailableMarkup).toContain('not checked yet');
+    expect(unavailableMarkup).not.toContain('aria-invalid="true"');
   });
 
   it('edits the interrupt node rule: structured condition, stage labels until qualified, literal-only fields', () => {
@@ -1617,6 +1619,7 @@ describe('Program authoring panels', () => {
       runnerAllows: vi.fn(() => false),
       runnerRefusal: vi.fn(() => null),
       composerRefusalReason: null,
+      runnerBusyReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),
@@ -1627,8 +1630,9 @@ describe('Program authoring panels', () => {
       groupRuntimeScales: {},
       setGroupRuntimeScale: vi.fn(),
       commitGroupRuntimeScale: vi.fn(),
-      fullStop: vi.fn(),
-      resumeFullStop: vi.fn(),
+      stopAll: vi.fn(),
+      halt: vi.fn(),
+      resumeHalt: vi.fn(),
       reset: vi.fn(),
       applyRecoveryAction: vi.fn(),
       writeRuntimeBlackboard: vi.fn(),
@@ -1636,6 +1640,7 @@ describe('Program authoring panels', () => {
       stageManualResult: vi.fn(),
       readiness: null,
       cellLatch: null,
+      applicationStartId: null,
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
       <ProgramWorkspace
@@ -1805,6 +1810,7 @@ describe('Program authoring panels', () => {
       runnerAllows: vi.fn(() => false),
       runnerRefusal: vi.fn(() => null),
       composerRefusalReason: null,
+      runnerBusyReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
       run: vi.fn(),
@@ -1815,8 +1821,9 @@ describe('Program authoring panels', () => {
       groupRuntimeScales: {},
       setGroupRuntimeScale: vi.fn(),
       commitGroupRuntimeScale: vi.fn(),
-      fullStop: vi.fn(),
-      resumeFullStop: vi.fn(),
+      stopAll: vi.fn(),
+      halt: vi.fn(),
+      resumeHalt: vi.fn(),
       reset: vi.fn(),
       applyRecoveryAction: vi.fn(),
       writeRuntimeBlackboard: vi.fn(),
@@ -1824,6 +1831,7 @@ describe('Program authoring panels', () => {
       stageManualResult: vi.fn(),
       readiness: null,
       cellLatch: null,
+      applicationStartId: null,
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
       <div>

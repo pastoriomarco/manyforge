@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -403,9 +404,10 @@ SimpleScheduler::SimpleScheduler(SimpleSchedulerConfig config) {
     }();
   }
   // A strict profile is an admission contract, not a best-effort hint. Lock
-  // the process memory, then start every requested worker now so a refused
-  // lock, policy or affinity aborts kernel construction before any
-  // controller or safety callback can be admitted.
+  // the process memory, then start every worker now: a refused lock, or a
+  // required worker's refused policy or affinity, aborts kernel construction
+  // before any controller or safety callback can be admitted, and
+  // `schedule()` never creates a thread or waits for one.
   if (config.lock_memory) {
     const auto error = lock_process_memory();
     std::cerr << "manyforge_scheduler_memory_lock accepted="
@@ -416,12 +418,7 @@ SimpleScheduler::SimpleScheduler(SimpleSchedulerConfig config) {
       throw std::runtime_error("native scheduler strict profile rejected its memory lock: " +
                                error);
   }
-  for (auto& worker : workers_) {
-    if (worker.os_config.required) {
-      std::lock_guard<std::mutex> lock(worker.mutex);
-      worker.ensure_started_locked(&worker);
-    }
-  }
+  for (auto& worker : workers_) worker.start(&worker);
 }
 
 SimpleScheduler::~SimpleScheduler() {
@@ -433,10 +430,7 @@ SimpleScheduler::~SimpleScheduler() {
   }
 }
 
-void SimpleScheduler::Worker::ensure_started_locked(Worker* self) {
-  if (thread.joinable()) {
-    return;
-  }
+void SimpleScheduler::Worker::start(Worker* self) {
   {
     std::lock_guard<std::mutex> startup_lock(startup_mutex);
     startup_complete = false;
@@ -451,7 +445,7 @@ void SimpleScheduler::Worker::ensure_started_locked(Worker* self) {
   }
   if (!error.empty()) {
     // On strict startup failure the worker returns before touching its task
-    // mutex, so joining while the caller retains that mutex is safe.
+    // mutex.
     thread.join();
     throw std::runtime_error("native scheduler role " +
                              std::string(core::scheduler_priority_name(priority)) +
@@ -471,15 +465,13 @@ core::ScheduleHandle SimpleScheduler::schedule(
   Worker& w = worker_for(priority);
   std::unique_lock<std::mutex> registry_lock(registry_mutex_);
   if (admission_closed_) throw std::runtime_error("scheduler admission is closed");
-  handle_to_priority_[handle] = priority;
+  handle_to_priority_[handle] = RegisteredTask{priority, deadline};
   try {
     std::lock_guard<std::mutex> lock(w.mutex);
-    w.ensure_started_locked(&w);
     ++w.queue_generation;
-    w.tasks.emplace(handle, ScheduledTask{deadline, std::move(callback)});
+    w.tasks.emplace(TaskKey{deadline, handle}, std::move(callback));
   } catch (...) {
-    // A strict worker can reject construction before accepting a callback, and
-    // allocation can fail while inserting the task. Neither path may leave a
+    // Allocation can fail while inserting the task; that must not leave a
     // phantom handle that cancel()/diagnostics still consider live.
     handle_to_priority_.erase(handle);
     throw;
@@ -490,8 +482,7 @@ core::ScheduleHandle SimpleScheduler::schedule(
 }
 
 void SimpleScheduler::close_admission_and_discard() {
-  std::array<std::map<core::ScheduleHandle, ScheduledTask>, core::kSchedulerPriorityCount>
-      discarded;
+  std::array<TaskMap, core::kSchedulerPriorityCount> discarded;
   {
     std::lock_guard<std::mutex> registry_lock(registry_mutex_);
     admission_closed_ = true;
@@ -512,24 +503,24 @@ void SimpleScheduler::cancel(core::ScheduleHandle handle) {
 }
 
 bool SimpleScheduler::cancel_before_dequeue(core::ScheduleHandle handle) {
-  core::SchedulerPriority priority;
+  RegisteredTask registered;
   {
     std::lock_guard<std::mutex> registry_lock(registry_mutex_);
     auto it = handle_to_priority_.find(handle);
     if (it == handle_to_priority_.end()) {
       return false;  // already fired or never scheduled
     }
-    priority = it->second;
+    registered = it->second;
     handle_to_priority_.erase(it);
   }
-  Worker& w = worker_for(priority);
+  Worker& w = worker_for(registered.priority);
   decltype(w.tasks)::node_type removed;
   {
     std::lock_guard<std::mutex> lock(w.mutex);
     ++w.queue_generation;
     // Zero when the worker already dequeued it (the registry entry is erased
     // only after the dequeue), so a running callback is never reported removed.
-    removed = w.tasks.extract(handle);
+    removed = w.tasks.extract(TaskKey{registered.deadline, handle});
   }
   w.cv.notify_all();
   return !removed.empty();
@@ -543,11 +534,36 @@ void SimpleScheduler::set_safety_path_fault_sink(
 
 void SimpleScheduler::contain_safety_path_fault(
     std::string_view reason_code) noexcept {
-  std::lock_guard<std::mutex> lock(safety_path_fault_sink_mutex_);
-  if (!safety_path_fault_sink_) {
-    std::terminate();
+  {
+    std::lock_guard<std::mutex> lock(safety_path_fault_sink_mutex_);
+    if (safety_path_fault_sink_) {
+      safety_path_fault_sink_(reason_code);
+      return;
+    }
   }
-  safety_path_fault_sink_(reason_code);
+  // No cell runtime holds the sink, so there is no Kernel to Halt: the fault
+  // is reported and the lane continues.
+  (void)std::fprintf(stderr, "manyforge_fault code=%.*s state=uncontained\n",
+                     static_cast<int>(reason_code.size()), reason_code.data());
+}
+
+std::shared_ptr<SimpleScheduler> make_runtime_collision_check_scheduler(
+    const SimpleSchedulerConfig &cell_config,
+    std::shared_ptr<SimpleScheduler> cell_scheduler) {
+  const auto lane = core::scheduler_priority_index(core::SchedulerPriority::RuntimeSafety);
+  SimpleSchedulerConfig config;
+  config.workers[lane] = cell_config.workers[lane];
+  // Required: a refused OS profile fails construction. With no OS profile
+  // (off) it inherits the composing thread's class, as every lane does.
+  config.workers[lane].required = true;
+  // The cell scheduler already locked the process memory (MCL_FUTURE).
+  config.lock_memory = false;
+  auto scheduler = std::make_shared<SimpleScheduler>(std::move(config));
+  scheduler->set_safety_path_fault_sink(
+      [cell = std::move(cell_scheduler)](std::string_view reason_code) {
+        cell->contain_safety_path_fault(reason_code);
+      });
+  return scheduler;
 }
 
 void SimpleScheduler::Worker::drain() {
@@ -646,27 +662,24 @@ void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
         return;
       }
 
-      const auto next_it = std::min_element(
-          tasks.begin(), tasks.end(),
-          [](const auto& lhs, const auto& rhs) {
-            return lhs.second.deadline < rhs.second.deadline;
-          });
+      const auto next_it = tasks.begin();
+      const auto deadline = next_it->first.first;
 
       const auto now = steady_now_ns();
-      if (next_it->second.deadline > now) {
+      if (deadline > now) {
         const auto observed_generation = queue_generation;
         (void)cv.wait_for(
             lock,
             st,
-            std::chrono::nanoseconds(next_it->second.deadline - now),
+            std::chrono::nanoseconds(deadline - now),
             [this, observed_generation]() {
               return queue_generation != observed_generation;
             });
         continue;
       }
 
-      callback = std::move(next_it->second.callback);
-      fired_handle = next_it->first;
+      callback = std::move(next_it->second);
+      fired_handle = next_it->first.second;
       tasks.erase(next_it);
       ++callbacks_in_flight;
     }
@@ -688,7 +701,7 @@ void SimpleScheduler::Worker::worker_loop(std::stop_token st) {
 
     if (callback) {
       // A throw on a Stop/safety-path lane is contained by the host (motion
-      // admission closed, Full Stop attempted); the lane keeps running.
+      // admission closed, Halt requested); the lane keeps running.
       // finish_callback() runs before the containment on purpose: draining
       // while holding the Kernel lock must not wait on this worker. So
       // "drained" means the callback returned, not that this worker is idle;

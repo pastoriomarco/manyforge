@@ -1,12 +1,11 @@
 {
-  "schema_version": "manyforge.program_run_status.v4",
+  "schema_version": "manyforge.program_run_status.v5",
   "owner_id": "program-runner.development-workbench",
-  "owner_epoch": "program-runner-06566edc14494853af0a54703d97e6b8",
   "run_revision": 3,
   "state": "running",
   "capture": {
-    "schema_version": "manyforge.program_run_capture.v2",
-    "program_run_id": "program-cycle.1",
+    "schema_version": "manyforge.program_run_capture.v3",
+    "program_run_id": 1,
     "applied_record_digest": "sha256:4b39f8dfc0979342d42ccc425c4e0a4a03df5e468b7579814dcfd0015f03a002",
     "scenario_id": "mock_lite6_motion_retry",
     "source_document_digest": "sha256:542f008bd464f6705d4e8210abfaa537072326fb0f8281cc792593b35d849215",
@@ -20,29 +19,24 @@
     "node_policy_digest": "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
     "owner_identities": [
       {
-        "owner_role": "headless_projection",
-        "owner_id": "headless-api.development-workbench",
-        "owner_epoch": "headless-api-effc85b4ac278195473cadb79f6dc709"
+        "role": "headless_projection",
+        "application_start_id": "3f9a00000000002a"
       },
       {
-        "owner_role": "manager",
-        "owner_id": "component-manager.c1_build_authority_cell",
-        "owner_epoch": "manager-5c61ab4c530848dfb1a3481dbcbeb4a7"
+        "role": "manager",
+        "application_start_id": "3f9a00000000002a"
       },
       {
-        "owner_role": "program_runner",
-        "owner_id": "program-runner.development-workbench",
-        "owner_epoch": "program-runner-06566edc14494853af0a54703d97e6b8"
+        "role": "program_runner",
+        "application_start_id": "3f9a00000000002a"
       },
       {
-        "owner_role": "scene_runtime",
-        "owner_id": "scene-runtime.c1_build_authority_cell",
-        "owner_epoch": "scene-runtime-4c51b67bc317194be8842bedf9cca4d3"
+        "role": "scene_runtime",
+        "application_start_id": "3f9a00000000002a"
       },
       {
-        "owner_role": "scene_transactions",
-        "owner_id": "logical-scene.c1_build_authority_cell",
-        "owner_epoch": "sha256:041aeec7ab733c39e2c894d8f75e011e9f20db226ce11c6eec32b52db4be686e"
+        "role": "scene_transactions",
+        "application_start_id": "3f9a00000000002a"
       }
     ]
   },
@@ -60,6 +54,7 @@
     "trial_a": "running"
   },
   "active_operation_count": null,
+  "halt": null,
   "reason_code": null,
   "message": "",
   "details": null,

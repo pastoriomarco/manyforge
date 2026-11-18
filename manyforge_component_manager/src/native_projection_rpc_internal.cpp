@@ -23,8 +23,10 @@ namespace scene = manyforge::scene;
 
 // Version 4 added the provider-freshness kinds (17), now retired. Both
 // endpoints compile this unit; a mixed-version peer fails closed on magic.
+// Version 5 carries the rebuild maintenance successor's Apply id as a
+// number.
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'P',
-                                              'R', 'P', 'C', '4'};
+                                              'R', 'P', 'C', '5'};
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
 
 [[noreturn]] void Fail(const std::string &detail) {
@@ -802,7 +804,7 @@ void WriteRebuild(Writer &writer,
   writer.String(scene::EncodeLogicalSceneSnapshot(*request.logical_scene));
   writer.Boolean(request.maintenance_successor.has_value());
   if (request.maintenance_successor.has_value()) {
-    WriteStrong(writer, request.maintenance_successor->first);
+    WriteGeneration(writer, request.maintenance_successor->first);
     WriteGeneration(writer, request.maintenance_successor->second);
     WriteProjectionRevision(writer, *request.maintenance_predecessor);
   }
@@ -815,7 +817,7 @@ void WriteRebuild(Writer &writer,
           scene::DecodeLogicalSceneSnapshot(reader.String()))};
   if (reader.Boolean()) {
     request.maintenance_successor = std::pair{
-        ReadStrong<core::ApplyId>(reader),
+        ReadGeneration<core::ApplyId>(reader),
         ReadGeneration<core::ApplyGeneration>(reader)};
     request.maintenance_predecessor = ReadProjectionRevision(reader);
   }

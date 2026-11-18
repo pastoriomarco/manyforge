@@ -376,7 +376,7 @@ parse_prepared_activation_input(const CanonicalValue &value) {
          " is unsupported; only " +
          std::string(kPreparedActivationInputSchemaVersion) +
          " opens (launch-time Program parameter overrides were removed); "
-         "prepare the Scenario again from a fresh stopped workbench");
+         "stop ManyForge, start it with fresh runtime state and prepare the Scenario again");
   }
   require_exact_fields(
       value,

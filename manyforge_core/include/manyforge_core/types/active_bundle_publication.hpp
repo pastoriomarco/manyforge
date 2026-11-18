@@ -12,7 +12,7 @@ struct NamedApplyPublicationTransactionDTO final {
   ApplyGeneration apply_generation;
 
   [[nodiscard]] bool valid() const noexcept {
-    return !apply_id.empty() && apply_generation.nonzero();
+    return apply_id.nonzero() && apply_generation.nonzero();
   }
 
   friend bool operator==(const NamedApplyPublicationTransactionDTO&,

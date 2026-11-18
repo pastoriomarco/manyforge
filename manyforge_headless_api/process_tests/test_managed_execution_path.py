@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 from contextlib import contextmanager
+import hashlib
 import json
 import math
 import socket
@@ -35,6 +36,7 @@ from manyforge_headless_api.execution import (
 from manyforge_headless_api.models import (
     OperationIntentRequest,
     ProgramRunStopIntentRequest,
+    RuntimeScaleControlRequest,
     TargetObservationQuery,
 )
 from manyforge_headless_api.native import HeadlessApiError
@@ -43,10 +45,30 @@ from manyforge_headless_api.program_runner_client import ProgramRunnerHttpClient
 from manyforge_headless_api.process_tests.test_process_stack import (
     ProcessStack,
     _assistant_stack,
+    _request_key as _process_request_key,
     _required_path,
+    _runner_command_end,
+    _runner_command_succeeded,
+    _started_run,
     keep_failure_evidence,
 )
+from manyforge_headless_api.process_tests.test_dual_robot_grouped_execution import (
+    _native_events,
+    _native_events_when,
+    _start_motion,
+)
+from manyforge_behavior.request_keys import Part, format_request_key, with_part
 from manyforge_headless_api.service import HeadlessService
+
+
+def _request_key(label: str) -> str:
+    """One request key per test label: 32 hex (contract 1.4)."""
+
+    return hashlib.sha256(label.encode("utf-8")).hexdigest()[:32]
+
+
+def _context(label: str, source_label: str) -> dict[str, Any]:
+    return {"request_key": _request_key(label), "source_label": source_label}
 
 
 TERMINAL_STATES = {
@@ -115,12 +137,17 @@ def _prepare_and_enable_all(run_root: Path) -> None:
 
 @contextmanager
 def _managed_cell(
-    monkeypatch: pytest.MonkeyPatch, *, fake_worker_marker: Path | None = None
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    fake_worker_marker: Path | None = None,
+    metadata_environment: str = "MANYFORGE_ASSISTANT_NATIVE_METADATA",
+    package_environment: str = "MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT",
 ) -> Iterator[ProcessStack]:
     """The Mock Lite 6 cell under Manager, every component enabled.
 
     With `fake_worker_marker`, Manager's host plans with the fake candidate
     worker, which blocks its first planning request until it is cancelled.
+    The environment names select the generated fixture package.
     """
 
     if fake_worker_marker is not None:
@@ -133,7 +160,11 @@ def _managed_cell(
     with TemporaryDirectory(prefix="mf-managed-") as temporary:
         root = Path(temporary)
         try:
-            with _assistant_stack(root) as stack:
+            with _assistant_stack(
+                root,
+                metadata_environment=metadata_environment,
+                package_environment=package_environment,
+            ) as stack:
                 _prepare_and_enable_all(stack.execution_run_root)
                 yield stack
         except BaseException:
@@ -168,17 +199,20 @@ def _in_process_api(stack: ProcessStack, execution: ExecutionCommandClient) -> T
                 UnusedManager(),  # type: ignore[arg-type]
                 execution,
                 ProgramRunnerHttpClient(stack.program_runner_url, timeout_seconds=8.0),
+                application_start_id=stack.application_start_id,
             ),
             trusted_principal_adapter=FixedTrustedPrincipalAdapter(),
         )
     )
 
 
-def _wait_terminal(headless: HeadlessHttpClient, operation_id: str) -> dict[str, Any]:
+def _wait_terminal(
+    headless: HeadlessHttpClient, operation_id: int, application_start_id: str
+) -> dict[str, Any]:
     deadline = time.monotonic() + 20.0
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        last = headless.operation(operation_id)
+        last = headless.operation(operation_id, application_start_id=application_start_id)
         operation = last.get("operation")
         if isinstance(operation, dict) and operation.get("state") in TERMINAL_STATES:
             return last
@@ -187,12 +221,15 @@ def _wait_terminal(headless: HeadlessHttpClient, operation_id: str) -> dict[str,
 
 
 def _wait_state(
-    headless: HeadlessHttpClient, operation_id: str, expected: set[str]
+    headless: HeadlessHttpClient,
+    operation_id: int,
+    expected: set[str],
+    application_start_id: str,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + 20.0
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        last = headless.operation(operation_id)
+        last = headless.operation(operation_id, application_start_id=application_start_id)
         operation = last.get("operation")
         if isinstance(operation, dict) and operation.get("state") in expected:
             return last
@@ -200,7 +237,7 @@ def _wait_state(
     raise RuntimeError(f"operation did not reach one of {sorted(expected)}: {last}")
 
 
-def _wait_retired(client: ExecutionCommandClient, operation_id: str) -> None:
+def _wait_retired(client: ExecutionCommandClient, operation_id: int) -> None:
     """Observe exact automatic settlement; never perform client-side cleanup."""
 
     deadline = time.monotonic() + 5.0
@@ -210,6 +247,38 @@ def _wait_retired(client: ExecutionCommandClient, operation_id: str) -> None:
             return
         assert time.monotonic() < deadline, projection
         time.sleep(0.005)
+
+
+def _wait_events_settled(client: ExecutionCommandClient) -> dict[str, Any]:
+    """The event page once the Kernel has journaled its interrupt-rule states.
+
+    Enabling the cell queues each global rule's first state; the Kernel's
+    projection worker journals it asynchronously, while the baseline already
+    carries it from memory: wait until each rule's latest row matches it.
+    """
+
+    def journaled(page: dict[str, Any]) -> bool:
+        baseline = page.get("interrupt_rule_state_baseline") or {}
+        if baseline.get("status") != "ready":
+            return False
+        latest: dict[str, str] = {}
+        after, more = 0, True
+        while more:
+            rows = client.events(after)
+            for event in rows["events"]:
+                if event["record_kind"] == "interrupt_rule_state_changed":
+                    latest[event["payload"]["rule_id"]] = event["payload"]["state"]
+            after, more = rows["next_after_sequence"], rows["has_more"]
+        return all(latest.get(row["rule_id"]) == row["state"]
+                   for row in baseline["snapshot"]["states"])
+
+    deadline = time.monotonic() + 10.0
+    page = client.events(0)
+    while not journaled(page):
+        assert time.monotonic() < deadline, page
+        time.sleep(0.01)
+        page = client.events(0)
+    return page
 
 
 def _wait_cell_latch_cleared(headless: HeadlessHttpClient) -> dict[str, Any]:
@@ -313,7 +382,7 @@ def _direct_control_joint_operation(
     identity: Mapping[str, Any],
     target: dict[str, Any],
     *,
-    request_id: str,
+    label: str,
     positions_rad: list[float],
 ) -> dict[str, Any]:
     command = target["command"]
@@ -321,16 +390,11 @@ def _direct_control_joint_operation(
     joint_names = [joint["source_joint_name"] for joint in command["joints"]]
     assert len(joint_names) == len(positions_rad)
     return {
-        "request_context": {
-            "request_id": request_id,
-            "request_owner_epoch": identity["owner_epoch"],
-            "source_label": "composer_ui",
-            "correlation_id": None,
-        },
+        "request_context": _context(label, "composer_ui"),
         "program_id": manual_control["program_id"],
         "program_revision": manual_control["program_revision"],
         "program_binding_id": manual_control["program_binding_id"],
-        "program_run_id": manual_control["program_run_id"],
+        "program_run_id": None,
         "expected_graph_revision": identity["graph_revision"],
         "expected_retained_bundle_id": identity["retained_bundle_id"],
         "expected_scene_revision": None,
@@ -340,7 +404,7 @@ def _direct_control_joint_operation(
                 "required_capability_id": target["operation_capability_id"],
                 "action_span": None,
                 "payload": _planning_motion(
-                    f"robot-control-{request_id}",
+                    f"robot-control-{label}",
                     {
                         "kind": "joint_goal",
                         "joint_names": joint_names,
@@ -367,7 +431,7 @@ def _direct_control_joint_operation(
 
 
 def _direct_control_gripper_operation(
-    status: dict[str, Any], *, request_id: str, position: float
+    status: dict[str, Any], *, label: str, position: float
 ) -> dict[str, Any]:
     identity = status["identity"]
     _, direct_target = _status_target(status, presentation="gripper")
@@ -379,16 +443,11 @@ def _direct_control_gripper_operation(
         else {"kind": "linear_m", "value_m": position}
     )
     return {
-        "request_context": {
-            "request_id": request_id,
-            "request_owner_epoch": identity["owner_epoch"],
-            "source_label": "composer_ui",
-            "correlation_id": None,
-        },
+        "request_context": _context(label, "composer_ui"),
         "program_id": manual_control["program_id"],
         "program_revision": manual_control["program_revision"],
         "program_binding_id": manual_control["program_binding_id"],
-        "program_run_id": manual_control["program_run_id"],
+        "program_run_id": None,
         "expected_graph_revision": identity["graph_revision"],
         "expected_retained_bundle_id": identity["retained_bundle_id"],
         "expected_scene_revision": None,
@@ -418,122 +477,188 @@ def _direct_control_gripper_operation(
 def _assert_delayed_first_packet(
     execution_run_root: Path, get: dict[str, Any], first: dict[str, Any],
 ) -> None:
-    # A connected private client may be descheduled before its first
-    # packet. A second request stays queued during the 300 ms delay.
+    # A connected private client may be descheduled before its request. It
+    # holds up no other connection of the lane, and its request is served
+    # whenever it arrives: there is no first-packet time limit.
+    pinned = PinnedRunRoot(execution_run_root)
     with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as delayed:
         delayed.settimeout(5.0)
-        pinned = PinnedRunRoot(execution_run_root)
         with pinned.socket_address("execution-command.sock") as address:
             delayed.connect(address)
         with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as queued:
+            queued.settimeout(5.0)
             with pinned.socket_address("execution-command.sock") as address:
                 queued.connect(address)
             queued.sendall(rfc8785.dumps(get))
-            queued.settimeout(0.3)
-            with pytest.raises(socket.timeout):
-                queued.recv(4 * 1024 * 1024)
-            delayed.sendall(rfc8785.dumps(get))
-            delayed_response = json.loads(delayed.recv(4 * 1024 * 1024))
-            queued.settimeout(5.0)
             queued_response = json.loads(queued.recv(4 * 1024 * 1024))
-    assert delayed_response == first
+        # The silent connection is still open and unanswered (a closed one
+        # would read end-of-file).
+        delayed.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            delayed.recv(4 * 1024 * 1024)
+        delayed.settimeout(5.0)
+        # A connection closed without a request is dropped; the lane goes on.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as closed:
+            with pinned.socket_address("execution-command.sock") as address:
+                closed.connect(address)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as after_close:
+            after_close.settimeout(5.0)
+            with pinned.socket_address("execution-command.sock") as address:
+                after_close.connect(address)
+            after_close.sendall(rfc8785.dumps(get))
+            after_close_response = json.loads(after_close.recv(4 * 1024 * 1024))
+        # The lateness under test: well beyond the former 1 s limit.
+        time.sleep(1.5)
+        delayed.sendall(rfc8785.dumps(get))
+        delayed_response = json.loads(delayed.recv(4 * 1024 * 1024))
     assert queued_response == first
+    assert after_close_response == first
+    assert delayed_response == first
+
+
+def _stoppable_motion_fixture() -> tuple[str, str]:
+    """Select the assistant-native cell whose one Program is a slow joint move.
+
+    The headless build generates it (manyforge_headless/CMakeLists.txt) and
+    scripts/test-all.sh exports its own environment names, so
+    ``_assistant_stack`` keeps its one-Program rule.
+    """
+
+    return ("MANYFORGE_ASSISTANT_STOPPABLE_MOTION_METADATA",
+            "MANYFORGE_ASSISTANT_STOPPABLE_MOTION_PACKAGE_ROOT")
 
 
 def test_internal_program_run_stop_uses_one_exact_priority_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with _managed_cell(monkeypatch) as stack:
+    # The Forced Program End of a Kernel-held run, sent by the Program runner
+    # as the first step of a Reset of the running cycle.
+    metadata_environment, package_environment = _stoppable_motion_fixture()
+    with _managed_cell(
+        monkeypatch,
+        metadata_environment=metadata_environment,
+        package_environment=package_environment,
+    ) as stack, HeadlessHttpClient(stack.base_url, timeout_seconds=20.0) as headless:
         run_root = stack.execution_run_root
         client = ExecutionCommandClient(
             run_root, timeout_seconds=5.0, attribution_transport="internal"
         )
-        identity = client.identity()["identity"]
-        component, direct = _execution_target(client.targets()["targets"], presentation="motion")
-        (observed,) = [
-            row for row in client.observation()["observation"]["targets"]
-            if (row["controllable_component_id"], row["command_target_id"])
-            == (component["controllable_component_id"], direct["command_target_id"])]
-        current = [float(value) for value in observed["positions_si"]]
-        goal = list(current)
-        first_joint = direct["command"]["joints"][0]
-        goal[0] = min(float(first_joint["max_position_rad"]),
-                      max(float(first_joint["min_position_rad"]), goal[0] + 0.2))
-        operation = _direct_control_joint_operation(
-            identity, direct, request_id="program-run-stop.operation", positions_rad=goal)
-        operation["program_run_id"] = "program-run.stop-process-test"
-        accepted = client.submit(
-            OperationIntentRequest.model_validate(operation), trusted_principal_id=None
-        )["accepted"]
-        request = ProgramRunStopIntentRequest.model_validate({
-            "request_context": {
-                "request_id": "program-run-stop.request",
-                "request_owner_epoch": identity["owner_epoch"],
-                "source_label": "manyforge_behavior",
-                "correlation_id": "program-run.stop-process-test",
-            },
-            "program_run_id": "program-run.stop-process-test",
-            "reason": "process-test Program scope Stop",
+        applied = headless.program_applied()
+        stack.wait_authoring_admission(expected_allowed=True)
+        reply = headless.program_run_start({
+            "request_key": _process_request_key(),
+            "source_label": "managed_execution_process_test",
+            "scenario_id": applied["scenario_id"],
+            "source_document_digest": applied["source_document_digest"],
+            "expected_applied_record_digest": applied["source"]["record_digest"],
+            "draft_program_revision": applied["program_revision"],
         })
+        started = _started_run(*_runner_command_end(headless, reply, timeout_seconds=20.0))
+        program_run_id = started["capture"]["program_run_id"]
+        _start_motion(headless, started, request_id="program-run-stop.motion-start")
 
-        stopped = client.stop_program_run(request)
-        replay = client.stop_program_run(request)
-        assert stopped["owner_epoch"] == identity["owner_epoch"]
-        assert stopped["accepted"]["request_id"] == request.request_context.request_id
-        assert replay["accepted"]["stop_id"] == stopped["accepted"]["stop_id"]
-        assert replay["accepted"]["replay_status"] == "replayed_exact"
+        # The run's one motion operation, executing.
+        deadline = time.monotonic() + 30.0
+        operation_id: int | None = None
+        while operation_id is None or client.read(operation_id)["operation"]["state"] != "executing":
+            assert time.monotonic() < deadline, (operation_id, _native_events(stack))
+            if operation_id is None:
+                accepted = [event["operation_id"] for event in _native_events(stack)
+                            if event["record_kind"] == "operation_accepted"
+                            and event["payload"]["intent"]["program_run_id"] == program_run_id]
+                assert len(accepted) <= 1, accepted
+                operation_id = accepted[0] if accepted else None
+            time.sleep(0.01)
+
+        # Reset the running cycle: the runner's Forced Program End, keyed as
+        # part 1 of the Reset's request key, is its first step.
+        cycle = headless.program_cycle_status()
+        assert cycle["state"] == "running" and cycle["program_run_id"] == program_run_id, cycle
+        reset_key = _process_request_key()
+        reset = headless.program_cycle_reset({
+            "request_key": reset_key,
+            "application_start_id": stack.application_start_id,
+            "source_label": "managed_execution_process_test",
+            "program_run_id": program_run_id,
+            "expected_cycle_generation": cycle["cycle_generation"],
+            "expected_claim_generation": cycle["cycle_claim_generation"],
+        })
+        assert reset["command"]["request_key"] == reset_key, reset
+        reset_row, _ = _runner_command_succeeded(headless, reset, timeout_seconds=60.0)
+        assert reset_row["kind"] == "reset", reset_row
+        assert headless.program_cycle_status()["state"] == "idle_after_reset"
+        stop_key = format_request_key(
+            with_part(bytes.fromhex(reset_key), Part.RESET_FORCED_END)
+        )
+
+        # Exactly one priority-lane request: one Program-end Stop event naming
+        # the run, with the exact key and the runner's internal attribution.
+        def program_end_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                event["payload"] for event in rows
+                if event["record_kind"] == "stop_event_accepted"
+                and event["payload"]["requested"] == "program_end"
+                and event["payload"]["program_run_id"] == program_run_id
+            ]
+
+        def stopped_states(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return [
+                event["payload"]["operation_state"] for event in rows
+                if event["record_kind"] == "state_observed"
+                and event["operation_id"] == operation_id
+                and event["payload"]["operation_state"]["state"] == "stopped"
+            ]
+
+        # The journal writer writes the rows shortly after the actions.
+        events = _native_events_when(
+            stack, lambda rows: bool(program_end_events(rows)) and bool(stopped_states(rows))
+        )
+        (stop_event,) = program_end_events(events)
+        assert stop_event["request_key"] == stop_key, stop_event
+        assert stop_event["attribution"]["transport"] == "internal", stop_event
+        assert stop_event["source_label"] == "manyforge_behavior", stop_event
+        assert operation_id in [row["operation_id"] for row in stop_event["covered"]], stop_event
+        event_id = stop_event["event_id"]
+        assert type(event_id) is int
+
+        # Replaying the same request returns the kept answer.
+        request = ProgramRunStopIntentRequest.model_validate({
+            "request_context": {"request_key": stop_key, "source_label": "manyforge_behavior"},
+            "program_run_id": program_run_id,
+        })
+        replay = client.stop_program_run(request)["accepted"]
+        assert replay["request_key"] == stop_key, replay
+        assert replay["event_id"] == event_id, replay
+        assert replay["replay_status"] == "replayed_exact", replay
+        assert replay["hold_revision"] == stop_event["hold_revision_after"], (replay, stop_event)
 
         deadline = time.monotonic() + 10.0
         stop_status: dict[str, Any] = {}
         while time.monotonic() < deadline:
-            stop_status = client.stop_status(stopped["accepted"]["stop_id"])
-            if stop_status["stop_status"]["state"] in {"succeeded", "partial", "failed"}:
+            stop_status = client.read_stop(event_id)
+            if stop_status["stop_status"]["state"] == "complete":
                 break
             time.sleep(0.01)
-        assert stop_status["stop_status"]["state"] == "succeeded"
-        assert client.read(accepted["operation_id"])["operation"]["state"] == "stopped"
+        assert stop_status["stop_status"]["state"] == "complete"
+        assert stop_status["stop_status"]["result"] == "stopped"
+        # The operation ended stopped by that event.
+        stopped_rows = stopped_states(events)
+        assert stopped_rows, [event for event in events if event["operation_id"] == operation_id]
+        assert stopped_rows[-1]["stop_event_id"] == event_id, stopped_rows[-1]
 
-        # Cross-lane fence: Stop and its status travel the control socket,
-        # the release travels the ordinary one and acts only on the exact
-        # Stop identity and generation it names, never on arrival order.
-        stale_release = client.release_program_run_stop_fence(
-            "program-run.stop-process-test", stopped["accepted"]["stop_id"],
-            stopped["accepted"]["stop_generation"] + 1)
-        assert stale_release["ok"] is False, stale_release
-        for _ in range(2):
-            released = client.release_program_run_stop_fence(
-                "program-run.stop-process-test", stopped["accepted"]["stop_id"],
-                stopped["accepted"]["stop_generation"])
-            assert released["ok"] is True, released
-
-        event_deadline = time.monotonic() + 5.0
-        stop_events: list[dict[str, Any]] = []
-        while not stop_events and time.monotonic() < event_deadline:
-            stop_events = [event for event in client.events(identity["owner_epoch"], 0)["events"]
-                           if event.get("request_id") == request.request_context.request_id]
-            time.sleep(0.01)
-        assert stop_events
-
-        # Releasing the Program-run hold lets the Kernel retire this clean,
-        # already-settled manual operation. Do not invent a second Reset.
-        _wait_retired(client, accepted["operation_id"])
+        # The Reset retired the stopped operation and the run's claim, and
+        # with it the Program-run hold; authoring is open again.
+        _wait_retired(client, operation_id)
+        # The events reply's Kernel Stop facts (the page keeps only some).
+        facts = client._exchange({
+            "api_version": EXECUTION_COMMAND_VERSION,
+            "after_sequence": 0,
+            "command": "events",
+            "limit": 1,
+        })
+        assert facts["ok"] is True and facts["program_run_hold"] is None, facts
         stack.wait_authoring_admission(expected_allowed=True)
         assert CellAdmissionClient(run_root).get()["authoring_allowed"] is True
-
-        next_operation = _direct_control_joint_operation(
-            identity, direct, request_id="program-run-stop.next-operation", positions_rad=current)
-        next_operation["program_run_id"] = "program-run.stop-process-test.next"
-        next_accepted = client.submit(
-            OperationIntentRequest.model_validate(next_operation), trusted_principal_id=None
-        )["accepted"]
-        deadline = time.monotonic() + 20.0
-        next_terminal: dict[str, Any] = {}
-        while time.monotonic() < deadline:
-            next_terminal = client.read(next_accepted["operation_id"])["operation"]
-            if next_terminal["state"] in TERMINAL_STATES:
-                break
-            time.sleep(0.01)
-        assert next_terminal["state"] == "completed", next_terminal
 
 
 def test_events_sample_live_progress_without_durable_progress_records(
@@ -542,7 +667,7 @@ def test_events_sample_live_progress_without_durable_progress_records(
     with _managed_cell(monkeypatch) as stack:
         execution = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=3.0)
         status = execution.diagnostics()["status"]
-        request = _direct_control_gripper_operation(status, request_id="progress-only",
+        request = _direct_control_gripper_operation(status, label="progress-only",
                                                     position=0.004)
         payload = request["participants"][0]["payload"]
         payload["caller_options"][0]["value_s"] = 3.0
@@ -551,12 +676,11 @@ def test_events_sample_live_progress_without_durable_progress_records(
                                     trusted_principal_id="test")
         assert accepted.get("ok") is True, accepted
         operation_id = accepted["accepted"]["operation_id"]
-        epoch = status["identity"]["owner_epoch"]
         cursor = 0
         previous = None
         deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline:
-            page = execution.events(epoch, cursor)
+            page = execution.events(cursor)
             cursor = page["next_after_sequence"]
             sample = next((row for row in page["operation_progress"]
                            if row["operation_id"] == operation_id), None)
@@ -586,9 +710,11 @@ def test_manual_motion_malformed_stop_recovers_with_durable_evidence(
             positions[0] = 0.55
             request = _direct_control_joint_operation(
                 status["identity"], _status_target(status, presentation="motion")[1],
-                request_id="manual-malformed-stop-operation", positions_rad=positions)
-            operation_id = headless.execute(request)["accepted"]["operation_id"]
-            _wait_state(headless, operation_id, {"executing"})
+                label="manual-malformed-stop-operation", positions_rad=positions)
+            operation_id = headless.execute(
+                {**request, "application_start_id": stack.application_start_id}
+            )["accepted"]["operation_id"]
+            _wait_state(headless, operation_id, {"executing"}, stack.application_start_id)
 
             malformed_response = raw_api.post(
                 "/api/execution/stops",
@@ -598,25 +724,35 @@ def test_manual_motion_malformed_stop_recovers_with_durable_evidence(
             )
             assert malformed_response.status_code == 200, malformed_response.text
             acceptance = malformed_response.json()["accepted"]
-            assert acceptance["request_id"] == "malformed-stop.managed-malformed-stop"
-            assert acceptance["resolution_disposition"] == "promoted_to_full"
-            assert acceptance["resolution_reason"] == "malformed_ordinary_intent"
-            terminal = _wait_terminal(headless, operation_id)["operation"]
+            # It acts with a fresh Headless key: class 1, minter 5.
+            assert acceptance["request_key"][:16] == "40" + "00000000000005"
+            # PD-1: an invalid operation Stop becomes Stop all.
+            assert acceptance["requested"] == "operation"
+            assert acceptance["applied"] == "stop_all"
+            assert acceptance["widen_reason"] == "malformed"
+            terminal = _wait_terminal(
+                headless, operation_id, stack.application_start_id
+            )["operation"]
             assert terminal["state"] == "stopped"
-            assert terminal["active_stop_id"] == acceptance["stop_id"]
+            assert terminal["stop_event_id"] == acceptance["event_id"]
 
-            with sqlite3.connect(stack.execution_state_root / "operation-journal.sqlite3") as db:
-                row = db.execute(
-                    "SELECT payload_json FROM journal_records WHERE request_id=? "
-                    "AND record_kind='stop_acceptance_projected'",
-                    ("malformed-stop.managed-malformed-stop",),
-                ).fetchone()
+            # The journal writer writes the row shortly after the Stop.
+            deadline = time.monotonic() + 5.0
+            row = None
+            while row is None and time.monotonic() < deadline:
+                with sqlite3.connect(stack.execution_state_root / "operation-journal.sqlite3") as db:
+                    row = db.execute(
+                        "SELECT payload_json FROM journal_records WHERE stop_event_id=? "
+                        "AND record_kind='stop_event_accepted'",
+                        (acceptance["event_id"],),
+                    ).fetchone()
+                if row is None:
+                    time.sleep(0.01)
             assert row is not None
             projected = json.loads(row[0])
-            assert projected["acceptance"]["malformed_ingress_reason"] == (
-                "recognized_stop_payload_invalid")
-            assert projected["acceptance"]["normalized_request_digest"] is None
-            assert projected["intent"] == {"intent_kind": "malformed_ingress", "value": None}
+            assert projected["request_key"] == acceptance["request_key"]
+            assert projected["reason"] == "recognized_stop_payload_invalid"
+            assert projected["widen_reason"] == "malformed"
 
             # No recovery request exists: the latch clears by itself once every
             # component is healthy and idle again.
@@ -642,11 +778,10 @@ def test_frame_transform_query_uses_cell_resolver_and_direct_frames(
                         key=lambda frame: frame["frame_id"])
         assert len(frames) >= 2, frames
         client = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=10.0)
-        identity = client.identity()["identity"]
+        client.identity()  # Ready before the read-only queries.
         probe = _pose(0.05, -0.02, 0.03)
         query = {
-            "schema_version": "manyforge.target_observation_query.v2",
-            "owner_epoch": identity["owner_epoch"],
+            "schema_version": "manyforge.target_observation_query.v3",
             "program_binding_id": binding["program_binding_id"],
             "kind": "frame_transform",
             "pose": probe,
@@ -658,14 +793,16 @@ def test_frame_transform_query_uses_cell_resolver_and_direct_frames(
             return client._exchange({"api_version": EXECUTION_COMMAND_VERSION,
                                      "command": "query_target", "query": {**query, **change}})
 
-        before = client.events(identity["owner_epoch"], 0)
+        # Read-only queries append nothing; the rule states enabling queued
+        # are journaled first.
+        before = _wait_events_settled(client)
         identity_transform = exchange({})
         assert identity_transform["ok"] is True, identity_transform
         typed = client.query_target(TargetObservationQuery.model_validate(query))
         assert typed["target_observation"]["value"] == (
             identity_transform["target_observation"]["value"])
         observation = identity_transform["target_observation"]
-        assert observation["schema_version"] == "manyforge.target_observation.v2"
+        assert observation["schema_version"] == "manyforge.target_observation.v3"
         for key, value in query.items():
             if key != "schema_version":
                 assert observation[key] == value
@@ -705,9 +842,7 @@ def test_frame_transform_query_uses_cell_resolver_and_direct_frames(
         malformed = exchange({"source_frame": {"type": "component_frame", "frame": {"frame_id": frames[0]["frame_id"]}}})
         assert malformed["ok"] is False
         assert malformed["error"]["code"] == "execution_command_invalid"
-        assert exchange({"owner_epoch": "old.owner"})["error"]["code"] == (
-            "execution_target_owner_stale")
-        assert client.events(identity["owner_epoch"], 0) == before
+        assert client.events(0) == before
 
 
 def test_program_operation_query_rejects_wrong_or_missing_context(
@@ -718,25 +853,23 @@ def test_program_operation_query_rejects_wrong_or_missing_context(
     with _managed_cell(monkeypatch) as stack:
         binding = _program_binding(stack)
         client = ProgramRunnerExecutionTransport(stack.execution_run_root, timeout_seconds=2.0)
-        identity = client.identity()["identity"]
+        client.identity()  # Ready before the read-only queries.
         query = {
-            "schema_version": "manyforge.program_operation_query.v2",
-            "owner_epoch": identity["owner_epoch"],
+            "schema_version": "manyforge.program_operation_query.v3",
             "program_binding_id": binding["program_binding_id"],
-            "program_run_id": "n3-program-run-1",
+            "program_run_id": 1,
             "target": _arm_binding(binding)["target"],
         }
-        before = client.events(identity["owner_epoch"], 0)
+        before = client.events(0)
         for change, code in [
             ({}, "execution_operation_context_unavailable"),
-            ({"owner_epoch": "old"}, "stale_request_owner_epoch"),
             ({"target": {**query["target"], "command_target_id": "foreign"}},
              "execution_operation_target_unavailable"),
         ]:
             with pytest.raises(HeadlessApiError) as error:
                 client.query_operation({**query, **change})
             assert error.value.code == code
-        assert client.events(identity["owner_epoch"], 0) == before
+        assert client.events(0) == before
 
 
 def test_cell_admission_crosses_real_execution_seqpacket_surface(
@@ -745,7 +878,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
     with _managed_cell(monkeypatch) as stack:
         run_root = stack.execution_run_root
         client = ExecutionCommandClient(run_root, timeout_seconds=5.0)
-        get = {"api_version": "manyforge.execution_command.v3", "command": "cell_admission_get"}
+        get = {"api_version": "manyforge.execution_command.v4", "command": "cell_admission_get"}
         first = client._exchange(get)
         assert client._exchange(get) == first
         _assert_delayed_first_packet(run_root, get, first)
@@ -756,7 +889,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
         motion_component, direct = _status_target(status, presentation="motion")
         observed = _status_observation(status, presentation="motion")
         operation = _direct_control_joint_operation(
-            status["identity"], direct, request_id="handover.query",
+            status["identity"], direct, label="handover.query",
             positions_rad=list(observed["positions_rad"]))
         proof = client.read_manual_handover(OperationIntentRequest.model_validate(operation),
                                             trusted_principal_id=None)
@@ -766,16 +899,15 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
         # A supplied context is only a precondition. Reading cannot acquire a
         # claim or invent a held parent, including the valid initial revision 0.
         operation["manual_handover"] = {
-            "program_runner_owner_epoch": "absent.runner",
-            "program_run_id": "absent.parent",
+            "program_run_id": 9_000,
             "claim_generation": 1,
-            "selection_revision": 0,
+            "hold_revision": 0,
         }
         proof = client.read_manual_handover(OperationIntentRequest.model_validate(operation),
                                             trusted_principal_id=None)
         assert proof["ok"] is True and proof["handover"] is None
-        for field, value in (("selection_revision", True), ("selection_revision", -1),
-                             ("selection_revision", float(2**53)), ("extra", 0)):
+        for field, value in (("hold_revision", True), ("hold_revision", -1),
+                             ("hold_revision", float(2**53)), ("extra", 0)):
             malformed_operation = copy.deepcopy(operation)
             malformed_operation["manual_handover"][field] = value
             invalid = client._exchange({
@@ -793,19 +925,35 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
         assert malformed["error"]["code"] == "execution_command_invalid"
 
         assert client._exchange_on(get, run_root / "execution-control.sock") == {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": "cell_admission_get",
             "error": {
                 "code": "execution_control_command_unsupported",
                 "details": {},
                 "message": ("the independent Stop control socket accepts only Stop, "
-                            "Stop status and operator-alarm attention"),
+                            "Stop status, carried-object-lost and speed changes; "
+                            "component actions, the component model and "
+                            "operator-alarm attention go to the independent "
+                            "component socket"),
+                "producer": "kernel",
+            },
+            "ok": False,
+        }
+        assert client._exchange_on(get, run_root / "execution-component.sock") == {
+            "api_version": "manyforge.execution_command_response.v6",
+            "command": "cell_admission_get",
+            "error": {
+                "code": "execution_component_command_unsupported",
+                "details": {},
+                "message": ("the independent component socket accepts only "
+                            "component actions, the component model and "
+                            "operator-alarm attention"),
                 "producer": "kernel",
             },
             "ok": False,
         }
         assert client._exchange_on(get, run_root / "execution-observation.sock") == {
-            "api_version": "manyforge.execution_command_response.v4",
+            "api_version": "manyforge.execution_command_response.v6",
             "command": "cell_admission_get",
             "error": {
                 "code": "execution_observation_command_unsupported",
@@ -816,7 +964,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
             "ok": False,
         }
         wrong_observation_command = client._exchange_on(
-            {"api_version": "manyforge.execution_command.v3", "command": "identity"},
+            {"api_version": "manyforge.execution_command.v4", "command": "identity"},
             run_root / "execution-observation.sock")
         assert wrong_observation_command["ok"] is False
         assert wrong_observation_command["error"]["code"] == (
@@ -832,7 +980,7 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
 
         def observed_motion_state() -> dict[str, Any]:
             control = client.control_state()["control_state"]
-            assert control["schema_version"] == "manyforge.execution_control_state.v7"
+            assert control["schema_version"] == "manyforge.execution_control_state.v8"
             matching = [row["observed"] for row in control["observed_targets"]
                         if (row["controllable_component_id"], row["command_target_id"],
                             row["operation_capability_id"]) == motion_target_key]
@@ -844,7 +992,9 @@ def test_cell_admission_crosses_real_execution_seqpacket_surface(
         with client.open_observation_session() as observation_session:
             first_frame = observation_session.next(None, threading.Event())["observation"]
             repeated_frame = observation_session.next(
-                {"owner_epoch": "retired-owner-epoch",
+                # A retired application start: answered at once, never held.
+                {"application_start_id": format(
+                    int(stack.application_start_id, 16) % 0xFFFF_FFFF_FFFF_FFFF + 1, "016x"),
                  "source_epoch": first_frame["source_epoch"],
                  "source_sequence": first_frame["source_sequence"]},
                 threading.Event(),
@@ -920,7 +1070,7 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(
             positions[0] = 0.03
             intent = _direct_control_joint_operation(
                 status["identity"], _status_target(status, presentation="motion")[1],
-                request_id="blocked-direct-preview", positions_rad=positions)
+                label="blocked-direct-preview", positions_rad=positions)
 
             def run_preview() -> None:
                 try:
@@ -940,22 +1090,20 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(
             assert not preview_done.is_set()
 
             stop_request = {
-                "request_context": {
-                    "request_id": "stop-while-preview-blocked",
-                    "request_owner_epoch": status["identity"]["owner_epoch"],
-                    "source_label": "headless_process_test",
-                    "correlation_id": "n6-c1-stop-isolation",
-                },
+                "application_start_id": stack.application_start_id,
+                "request_context": _context(
+                    "stop-while-preview-blocked", "headless_process_test"
+                ),
                 "operations": [{
-                    "operation_id": "non-resident-operation",
+                    "operation_id": 9_000_000,
                     "expected_operation_revision": 1,
-                    "expected_stop_generation": 0,
                 }],
                 "reason": "prove Stop transport is independent from preview",
             }
             stopped = headless.stop_operations(stop_request)
-            assert stopped["accepted"]["resolution_disposition"] == "promoted_to_full"
-            assert stopped["accepted"]["resolution_reason"] == "unknown_operation"
+            # PD-1: an operation Stop naming an unknown target is Stop all.
+            assert stopped["accepted"]["applied"] == "stop_all"
+            assert stopped["accepted"]["widen_reason"] == "unknown_target"
 
             # Stop preempted the blocked preview instead of waiting for it.
             preview_thread.join(timeout=3.0)
@@ -964,8 +1112,7 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(
             assert preview_response[0]["ok"] is False
             replay = headless.stop_operations(stop_request)["accepted"]
             assert replay["replay_status"] == "replayed_exact", replay
-            for field in ("stop_id", "stop_generation"):
-                assert replay[field] == stopped["accepted"][field]
+            assert replay["event_id"] == stopped["accepted"]["event_id"]
             deadline = time.monotonic() + 5.0
             records: list[Any] = []
             while not records and time.monotonic() < deadline:
@@ -975,24 +1122,27 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(
                 ) as journal:
                     records = journal.execute(
                         "SELECT sequence,payload_json FROM journal_records "
-                        "WHERE record_kind='stop_acceptance_projected' AND request_id=?",
-                        (stop_request["request_context"]["request_id"],),
+                        "WHERE record_kind='stop_event_accepted' AND stop_event_id=?",
+                        (stopped["accepted"]["event_id"],),
                     ).fetchall()
                 if not records:
                     time.sleep(0.01)
             assert len(records) == 1, records
             sequence, payload_json = records[0]
             payload = json.loads(payload_json)
-            assert payload["intent"]["value"]["request_attribution"] == {
+            # Headless forms the HTTP key: class 3, part 0 (contract 1.4).
+            assert payload["request_key"] == (
+                "c0" + stop_request["request_context"]["request_key"][2:]
+            )
+            assert payload["attribution"] == {
                 "assurance": "externally_authenticated",
                 "principal_id": "operator.process-test",
                 "transport": "http",
             }
-            events = execution.events(status["identity"]["owner_epoch"], sequence - 1,
-                                      limit=1)["events"]
+            events = execution.events(sequence - 1, limit=1)["events"]
             assert len(events) == 1
             assert events[0]["sequence"] == sequence
-            assert events[0]["record_kind"] == "stop_acceptance_projected"
+            assert events[0]["record_kind"] == "stop_event_accepted"
             assert events[0]["operation_id"] is None
             assert events[0]["operation_revision"] is None
             assert events[0]["payload"] == payload
@@ -1000,6 +1150,93 @@ def test_slow_preview_cannot_delay_the_standard_stop_path(
             if preview_thread is not None:
                 preview_thread.join(timeout=3.0)
             raw_api.close()
+
+
+def test_runtime_scale_is_answered_on_its_own_lane_while_a_preview_blocks_submission(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Speed changes from both sockets reach the scale lane, never the
+    submission lane that a blocked preview holds.
+
+    The full-lane refusal itself (`execution_runtime_scale_lane_busy` for the
+    ninth waiting request) needs the lane worker held, which only an Apply's
+    exclusive composition section does; a process test cannot hold it, so this
+    checks the routing.
+    """
+
+    marker = tmp_path / "blocked-preview-worker"
+    with _managed_cell(monkeypatch, fake_worker_marker=marker) as stack:
+        run_root = stack.execution_run_root
+        execution = ExecutionCommandClient(run_root, timeout_seconds=2.0)
+        internal = ExecutionCommandClient(run_root, timeout_seconds=2.0,
+                                          attribution_transport="internal")
+        planning = ExecutionCommandClient(run_root, timeout_seconds=30.0)
+        preview_thread: threading.Thread | None = None
+        try:
+            status = execution.diagnostics()["status"]
+            identity = status["identity"]
+            _, target = _status_target(status, presentation="motion")
+            positions = list(_status_observation(status, presentation="motion")["positions_rad"])
+            positions[0] = 0.03
+            motion = _direct_control_joint_operation(identity, target,
+                                                     label="scale-lane-preview",
+                                                     positions_rad=positions)
+            preview_thread = threading.Thread(
+                target=lambda: planning.preview_motion(
+                    OperationIntentRequest.model_validate(motion), trusted_principal_id=None),
+                daemon=True)
+            preview_thread.start()
+            deadline = time.monotonic() + 2.0
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.005)
+            assert marker.exists()
+
+            binding = _program_binding(stack)
+            selector = {"program_binding_id": binding["program_binding_id"],
+                        **_arm_binding(binding)["target"]}
+
+            def request(label: str, scale: float) -> dict[str, Any]:
+                return {
+                    "request_context": _context(label, "test"),
+                    "selector": selector,
+                    "expected_control_generation": 0,
+                    "scale": scale,
+                }
+
+            def reached_the_kernel(response: dict[str, Any]) -> bool:
+                # Accepted, or refused by the Kernel itself: never a lane or
+                # socket refusal, never a timeout behind the blocked preview.
+                return response["ok"] is True or response["error"]["code"] not in {
+                    "execution_submission_lane_busy",
+                    "execution_runtime_scale_lane_busy",
+                    "execution_control_command_unsupported",
+                    "execution_ordinary_command_unsupported",
+                }
+
+            # Control socket (the Headless route).
+            control = execution.set_runtime_scale_control(
+                RuntimeScaleControlRequest.model_validate(request("scale-lane-control", 0.5)),
+                trusted_principal_id=None)
+            assert reached_the_kernel(control), control
+            if control["ok"]:
+                assert control["accepted"]["active_operation_id"] is None
+            # Ordinary socket: the same lane, no new refusal.
+            ordinary = execution._exchange({
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": {"transport": "http", "assurance": "unverified",
+                                "principal_id": None},
+                "command": "set_runtime_scale_control",
+                "request": request("scale-lane-ordinary", 0.4),
+            })
+            assert reached_the_kernel(ordinary), ordinary
+            assert preview_thread.is_alive()
+            assert internal.stop_program_run(ProgramRunStopIntentRequest.model_validate({
+                "request_context": _context("scale-lane-stop", "test"),
+                "program_run_id": 43,
+            }))["ok"] is True
+        finally:
+            if preview_thread is not None:
+                preview_thread.join(timeout=3.0)
 
 
 def test_ordered_active_tcp_read_waits_for_queued_set_tcp(
@@ -1025,7 +1262,7 @@ def test_ordered_active_tcp_read_waits_for_queued_set_tcp(
             positions = list(_status_observation(status, presentation="motion")["positions_rad"])
             positions[0] = 0.03
             motion = _direct_control_joint_operation(identity, target,
-                                                     request_id="tcp-barrier-preview",
+                                                     label="tcp-barrier-preview",
                                                      positions_rad=positions)
             baseline = execution._exchange({"api_version": EXECUTION_COMMAND_VERSION,
                                             "command": "read_active_tcp"})
@@ -1051,7 +1288,7 @@ def test_ordered_active_tcp_read_waits_for_queued_set_tcp(
                 time.sleep(0.005)
             assert marker.exists()
             set_tcp = _direct_control_joint_operation(identity, target,
-                                                      request_id="tcp-barrier-set",
+                                                      label="tcp-barrier-set",
                                                       positions_rad=positions)
             set_tcp["participants"][0]["payload"] = {
                 "kind": "set_tcp", "tcp": {"kind": "entry", **chosen_entry}}
@@ -1078,11 +1315,8 @@ def test_ordered_active_tcp_read_waits_for_queued_set_tcp(
                 clients[1].recv(4 * 1024 * 1024)
             clients[1].settimeout(5.0)
             assert internal.stop_program_run(ProgramRunStopIntentRequest.model_validate({
-                "request_context": {"request_id": "tcp-barrier-stop",
-                                    "request_owner_epoch": identity["owner_epoch"],
-                                    "source_label": "test"},
-                "program_run_id": "program-run.tcp-barrier",
-                "reason": "release blocked preview",
+                "request_context": _context("tcp-barrier-stop", "test"),
+                "program_run_id": 44,
             }))["ok"] is True
             set_result = json.loads(clients[0].recv(4 * 1024 * 1024))
             read_result = json.loads(clients[1].recv(4 * 1024 * 1024))

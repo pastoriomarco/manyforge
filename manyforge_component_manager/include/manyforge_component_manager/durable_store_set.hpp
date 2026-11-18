@@ -74,12 +74,17 @@ struct ManagerDurableStoreStartupInventory final {
 /// successful initialization. It does not make the three SQLite databases
 /// one transaction, infer cross-store recovery, start the Manager process, or
 /// invoke any Manager state-machine operation.
+///
+/// The three stores write their files afterwards through `record_writer`,
+/// which its owner drains before closing them. With nullptr each store owns
+/// a writer of its own, drained by its Close.
 class ExternallyProvisionedManagerStores final {
  public:
   ExternallyProvisionedManagerStores(
       std::filesystem::path stable_state_directory,
       const manyforge::deployment::
-          CanonicalEmptyRetainedBundleAdmission& admission);
+          CanonicalEmptyRetainedBundleAdmission& admission,
+      manyforge::persistence::SqliteRecordWriter* record_writer = nullptr);
   ~ExternallyProvisionedManagerStores();
 
   ExternallyProvisionedManagerStores(

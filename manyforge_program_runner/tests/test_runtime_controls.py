@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 from types import MappingProxyType, SimpleNamespace
 import time
 
@@ -14,13 +16,25 @@ from manyforge_program_runner.runtime_controls import (
 )
 
 
+def _kb(*parts) -> bytes:
+    """A deterministic 16-byte request key named by text, for readable tests."""
+
+    return hashlib.md5("/".join(map(str, parts)).encode()).digest()
+
+
+def _key(*parts) -> str:
+    """The wire form (32 lowercase hex) of ``_kb``."""
+
+    return _kb(*parts).hex()
+
+
 _DIGEST_A = "sha256:" + "a" * 64
 _DIGEST_B = "sha256:" + "b" * 64
 
 
 def _capture() -> dict[str, object]:
     return {
-        "program_run_id": "program-run.1",
+        "program_run_id": 1,
         "program_id": "program.1",
         "program_revision": _DIGEST_A,
         "program_binding_id": _DIGEST_B,
@@ -53,19 +67,16 @@ def _intervention(
         "execution_id": 9,
         "observed_state_valid_until_ns": 0,
         "operation_revision": 10,
-        "participants": [{"operation_participant_id": "participant.1"}],
+        "participants": [{"operation_participant_id": {"operation_id": 1, "ordinal": 1}}],
         "recovery_class": "ordinary_operator_stop",
         "status": "action_required",
-        "stop_certificate_id": "certificate.1",
-        "stop_certificate_revision": 2,
-        "stop_generation": 3,
-        "stop_id": "stop.1",
+        "stop_event_id": 1,
     }
     return SimpleNamespace(
         identity=SimpleNamespace(
-            program_run_id="program-run.1",
+            program_run_id=1,
             node_instance_id="move.1",
-            node_attempt_id="attempt.1",
+            node_attempt_id=1,
         ),
         owner_assessment=assessment,
         owner_task_id="operation.1",
@@ -118,61 +129,15 @@ def test_recent_control_trace_rotates_without_a_lifetime_command_ceiling() -> No
     for value in range(10_000):
         controls.audit_value("runtime_blackboard_written", key="counter", value=value)
     snapshot = controls.snapshot()
-    assert snapshot["schema_version"] == "manyforge.program_runtime_controls.v3"
+    assert snapshot["schema_version"] == "manyforge.program_runtime_controls.v4"
     assert snapshot["runtime_control_revision"] == 10_001
     assert len(snapshot["audit"]) == 256
     assert snapshot["audit"][0]["event_revision"] == 9_745
-    restored = ProgramRuntimeControls.restore(_capture(), snapshot)
-    restored.audit_value("after_restart", value=10_000)
-    assert restored.snapshot()["audit"][-1]["event_revision"] == 10_001
+    controls.audit_value("after_rotation", value=10_000)
+    assert controls.snapshot()["audit"][-1]["event_revision"] == 10_001
 
 
-@pytest.mark.parametrize(
-    "schema_version",
-    [
-        "manyforge.program_runtime_controls.v2",
-        "manyforge.program_runtime_controls.v1",
-    ],
-)
-def test_superseded_control_snapshots_are_refused_not_converted(
-    schema_version: str,
-) -> None:
-    superseded = {
-        **ProgramRuntimeControls(_capture()).snapshot(),
-        "schema_version": schema_version,
-        "has_active_runtime_overrides": False,
-        "has_staged_runtime_overrides": False,
-        "has_stale_runtime_overrides": False,
-        "overrides": [],
-        "promotion_proposals": [],
-    }
-    with pytest.raises(ValueError, match="unsupported schema"):
-        ProgramRuntimeControls.restore(_capture(), superseded)
-    current = ProgramRuntimeControls(_capture()).snapshot()
-    current["overrides"] = []
-    with pytest.raises(ValueError, match="invalid shape"):
-        ProgramRuntimeControls.restore(_capture(), current)
-
-
-@pytest.mark.parametrize("damage", ["gap", "empty", "short", "bool_revision"])
-def test_recent_control_trace_rejects_gaps_and_false_revision_types(damage) -> None:
-    controls = ProgramRuntimeControls(_capture())
-    for _ in range(300):
-        controls.audit_value("event")
-    snapshot = controls.snapshot()
-    if damage == "gap":
-        snapshot["audit"][0]["event_revision"] += 1
-    elif damage == "empty":
-        snapshot["audit"] = []
-    elif damage == "short":
-        snapshot["audit"].pop(0)
-    else:
-        snapshot["audit"][0]["event_revision"] = True
-    with pytest.raises(ValueError):
-        ProgramRuntimeControls.restore(_capture(), snapshot)
-
-
-def test_retry_state_is_bounded_by_program_nodes_and_reopens_above_old_limit() -> None:
+def test_retry_state_is_bounded_by_program_nodes_above_old_limit() -> None:
     from manyforge_behavior.program import _MAX_TREE_NODES
     from manyforge_program_runner.runtime_controls import _MAX_RETRY_NODES
 
@@ -182,7 +147,6 @@ def test_retry_state_is_bounded_by_program_nodes_and_reopens_above_old_limit() -
         controls.note_retry(f"node.{index}")
     snapshot = controls.snapshot()
     assert len(snapshot["retry_counts"]) == 1_025
-    assert ProgramRuntimeControls.restore(_capture(), snapshot).snapshot() == snapshot
 
 
 def test_retry_preflight_does_not_evict_an_exhausted_policy_allowance(
@@ -214,7 +178,7 @@ def test_positive_budget_is_exhausted_explicitly_for_offer_and_command() -> None
         controls.require_retry_capacity("move.1", policy)
         offer = controls.recovery_offer(
             cycle_generation=6,
-            owner_epoch="runner.epoch.1",
+            application_start_id="3f9a000000000001",
             intervention=intervention,
             policy=policy,
         )
@@ -227,7 +191,7 @@ def test_positive_budget_is_exhausted_explicitly_for_offer_and_command() -> None
     assert error.value.code == "program_runtime_retry_limit_reached"
     exhausted = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy=policy,
     )
@@ -235,28 +199,24 @@ def test_positive_budget_is_exhausted_explicitly_for_offer_and_command() -> None
     assert all(
         action["action_id"] != "retry_runtime_step" for action in exhausted["actions"]
     )
-    # Exhaustion survives retained-state reopen; another node has its own count.
-    reopened = ProgramRuntimeControls.restore(_capture(), controls.snapshot())
-    assert reopened.retry_permitted("move.1", policy) is False
-    assert reopened.retry_permitted("move.2", policy) is True
+    # Another node has its own count.
+    assert controls.retry_permitted("move.2", policy) is True
 
 
-def test_zero_budget_is_unlimited_beyond_255_across_reopen() -> None:
+def test_zero_budget_is_unlimited_beyond_255() -> None:
     controls = ProgramRuntimeControls(_capture())
     unlimited = {"allow_intervention": True, "max_retries": 0}
     for _ in range(300):
         controls.require_retry_capacity("move.1", unlimited)
         controls.note_retry("move.1")
     assert controls.retry_count("move.1") == 300
-    reopened = ProgramRuntimeControls.restore(_capture(), controls.snapshot())
-    assert reopened.retry_count("move.1") == 300
-    reopened.require_retry_capacity("move.1", unlimited)
-    assert reopened.note_retry("move.1") == 301
+    controls.require_retry_capacity("move.1", unlimited)
+    assert controls.note_retry("move.1") == 301
     # Unlimited never enables a forbidden intervention.
     forbidden = {"allow_intervention": False, "max_retries": 0}
-    assert reopened.retry_permitted("move.1", forbidden) is False
+    assert controls.retry_permitted("move.1", forbidden) is False
     with pytest.raises(ProgramRuntimeControlError) as error:
-        reopened.require_retry_capacity("move.1", forbidden)
+        controls.require_retry_capacity("move.1", forbidden)
     assert error.value.code == "program_runtime_retry_forbidden_by_policy"
 
 
@@ -276,66 +236,60 @@ def test_retry_counter_exhaustion_is_explicit_never_wraparound(monkeypatch) -> N
     assert controls.snapshot() == before
 
 
-@pytest.mark.parametrize("count", [0, -1, True, 2**53, 1.0])
-def test_retained_retry_counts_are_exact_positive_integers(count) -> None:
-    snapshot = ProgramRuntimeControls(_capture()).snapshot()
-    snapshot["retry_counts"] = {"move.1": count}
-    with pytest.raises(ValueError, match="retry count is invalid"):
-        ProgramRuntimeControls.restore(_capture(), snapshot)
-
-
 def test_one_reset_owner_event_includes_attribution_and_deduplicates_phase_retry() -> (
     None
 ):
     controls = ProgramRuntimeControls(_capture())
+    # The runner passes the parsed 16-byte key; the audit keeps its wire form.
     request = {
-        "request_id": "reset.1",
+        "request_key": _kb("reset.1"),
         "source_label": "operator",
-        "correlation_id": "action.1",
     }
     controls.mark_reset(**request)
     snapshot = controls.snapshot()
     controls.mark_reset(**request)
     assert controls.snapshot() == snapshot
-    controls.mark_reset(**{**request, "request_id": "reset.retry.2"})
+    controls.mark_reset(**{**request, "request_key": _kb("reset.retry.2")})
     assert controls.snapshot() == snapshot
     assert snapshot["audit"][-1] == {
         "event_revision": 1,
         "kind": "program_runtime_controls_reset",
         "action_id": "reset_cycle",
-        **request,
+        "request_key": _key("reset.1"),
+        "source_label": "operator",
     }
 
 
 def test_checked_revision_exhaustion_precedes_effect_and_preserves_reset() -> None:
     controls = ProgramRuntimeControls(_capture())
     controls.note_retry("move.1")
-    snapshot = controls.snapshot()
     maximum = 9_007_199_254_740_991
-    snapshot["runtime_control_revision"] = maximum - 1
-    snapshot["audit"] = [
-        {"event_revision": index, "kind": "prior_event"}
-        for index in range(maximum - 257, maximum - 1)
-    ]
-    restored = ProgramRuntimeControls.restore(_capture(), snapshot)
+    # No public path reaches the revision limit in a test; seed the ledger.
+    with controls._lock:  # noqa: SLF001
+        controls._revision = maximum - 1  # noqa: SLF001
+        controls._audit = [  # noqa: SLF001
+            {"event_revision": index, "kind": "prior_event"}
+            for index in range(maximum - 257, maximum - 1)
+        ]
+    snapshot = controls.snapshot()
     with pytest.raises(ProgramRuntimeControlError) as error:
-        restored.note_retry("move.1")
+        controls.note_retry("move.1")
     assert error.value.code == "program_runtime_control_revision_exhausted"
-    assert restored.snapshot() == snapshot
-    restored.mark_reset(request_id="reset.1")
-    assert restored.revision == maximum
+    assert controls.snapshot() == snapshot
+    controls.mark_reset(request_key=_kb("reset.1"))
+    assert controls.revision == maximum
 
 
 def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> None:
     controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
     offer = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=_intervention(),
         policy=_policy(),
     )
     assert offer is not None
-    assert offer["schema_version"] == "manyforge.cycle_recovery_offer.v5"
+    assert offer["schema_version"] == "manyforge.cycle_recovery_offer.v6"
     assert offer["policy"] == _policy()
     assert offer["retries_used"] == 0
     # The held node's own failure is carried unchanged.
@@ -353,7 +307,7 @@ def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> Non
     assert (
         controls.recovery_offer(
             cycle_generation=6,
-            owner_epoch="runner.epoch.1",
+            application_start_id="3f9a000000000001",
             intervention=_intervention(),
             policy=_policy(),
         )
@@ -362,7 +316,7 @@ def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> Non
 
     forbidden = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=_intervention(),
         policy={**_policy(), "allow_intervention": False},
     )
@@ -373,7 +327,7 @@ def test_recovery_offer_is_stable_policy_filtered_and_generation_fenced() -> Non
 
     acknowledged = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=_intervention(acknowledged=True),
         policy=_policy(),
     )
@@ -389,13 +343,13 @@ def test_failure_retry_waits_for_confirmed_containment() -> None:
     controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
     confirmed = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=_intervention(acknowledged=True),
         policy=_policy(),
     )
     pending = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=_intervention(acknowledged=True),
         policy=_policy(),
         containment_pending=True,
@@ -434,12 +388,11 @@ def test_operator_stop_recovery_uses_owner_fence_not_failure_retry_policy() -> N
             "recovery_class": "ordinary_operator_stop",
             "retry_admissible": True,
             "status": "retry_ready",
-            "stop_owner_generation": 3,
         }
     )
     offer = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy={**_policy(), "allow_intervention": False, "max_retries": 0},
     )
@@ -465,12 +418,12 @@ def test_operator_stop_recovery_uses_owner_fence_not_failure_retry_policy() -> N
     # An operator Stop is not a failure: no details, no origin.
     assert offer["details"] is None and offer["origin"] is None
     selected = controls.recovery_offer(
-        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=intervention,
-        policy=_policy(), selection_revision=3,
+        cycle_generation=6, application_start_id="3f9a000000000001", intervention=intervention,
+        policy=_policy(), hold_revision=3,
     )
     newer = controls.recovery_offer(
-        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=intervention,
-        policy=_policy(), selection_revision=4,
+        cycle_generation=6, application_start_id="3f9a000000000001", intervention=intervention,
+        policy=_policy(), hold_revision=4,
     )
     assert newer["offer_id"] != selected["offer_id"]
     assert newer["offer_revision"] == selected["offer_revision"] + 1
@@ -486,7 +439,7 @@ def test_operator_stop_reset_waits_for_proven_non_moving_state() -> None:
 
     offer = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy={**_policy(), "allow_intervention": False, "max_retries": 0},
     )
@@ -503,7 +456,6 @@ def test_operator_stop_reset_waits_for_proven_non_moving_state() -> None:
             "recovery_class": "ordinary_operator_stop",
             "retry_admissible": True,
             "status": "retry_ready",
-            "stop_owner_generation": 3,
             # The Stop-time sample is already past the Kernel's freshness
             # budget when the offer is built (the live "born expired" case).
             "observed_state_valid_until_ns": time.monotonic_ns() - 1,
@@ -511,7 +463,7 @@ def test_operator_stop_reset_waits_for_proven_non_moving_state() -> None:
     )
     settled = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy={**_policy(), "allow_intervention": False, "max_retries": 0},
     )
@@ -532,17 +484,14 @@ def test_released_operator_stop_projects_no_stale_offer() -> None:
             "allowed_actions": [],
             "recovery_class": "none",
             "status": "unavailable",
-            "stop_id": "",
-            "stop_generation": 0,
-            "stop_certificate_id": "",
-            "stop_certificate_revision": 0,
+            "stop_event_id": 0,
         }
     )
 
     assert (
         controls.recovery_offer(
             cycle_generation=6,
-            owner_epoch="runner.epoch.1",
+            application_start_id="3f9a000000000001",
             intervention=intervention,
             policy={**_policy(), "allow_intervention": False, "max_retries": 0},
         )
@@ -550,30 +499,64 @@ def test_released_operator_stop_projects_no_stale_offer() -> None:
     )
 
 
-def test_recovery_offer_normalizes_absent_stop_identity_to_null() -> None:
+def test_recovery_offer_carries_no_stop_identity() -> None:
     controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
-    intervention = _intervention()
-    intervention.owner_assessment.update(
-        {
-            "stop_id": "",
-            "stop_generation": 0,
-            "stop_certificate_id": "",
-            "stop_certificate_revision": 0,
-        }
-    )
-
     offer = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
-        intervention=intervention,
+        application_start_id="3f9a000000000001",
+        intervention=_intervention(),
         policy=_policy(),
     )
 
     assert offer is not None
-    assert offer["stop_id"] is None
-    assert offer["stop_generation"] is None
-    assert offer["stop_certificate_id"] is None
-    assert offer["stop_certificate_revision"] is None
+    for removed in (
+        "stop_event_id",
+        "stop_id",
+        "stop_generation",
+        "stop_certificate_id",
+        "stop_certificate_revision",
+    ):
+        assert removed not in offer
+
+
+def test_operator_stop_reset_requires_the_operation_stop_event() -> None:
+    """Settled = every participant stopped (backend_stop_confirmed) and the
+    operation names its Stop event; no certificate or owner generation."""
+    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
+    intervention = _intervention(policy_parameter="operator_stop_policy")
+    intervention.owner_assessment["allowed_actions"] = [
+        "replan_from_stopped_state",
+        "reset_cycle",
+    ]
+    intervention.owner_assessment.update(
+        {
+            "backend_stop_confirmed": True,
+            "execution_state": "Stopped",
+            "recovery_class": "ordinary_operator_stop",
+            "retry_admissible": True,
+            "status": "retry_ready",
+            "stop_event_id": 0,
+        }
+    )
+    policy = {**_policy(), "allow_intervention": False, "max_retries": 0}
+
+    def reset_enabled() -> bool:
+        offer = controls.recovery_offer(
+            cycle_generation=6,
+            application_start_id="3f9a000000000001",
+            intervention=intervention,
+            policy=policy,
+        )
+        assert offer is not None
+        return next(
+            row for row in offer["actions"] if row["action_id"] == "reset_cycle"
+        )["enabled"]
+
+    assert reset_enabled() is False
+    intervention.owner_assessment["stop_event_id"] = 4
+    assert reset_enabled() is True
+    intervention.owner_assessment["backend_stop_confirmed"] = False
+    assert reset_enabled() is False
 
 
 def test_recovery_offer_projects_immutable_owner_facts_and_policy() -> None:
@@ -584,7 +567,7 @@ def test_recovery_offer_projects_immutable_owner_facts_and_policy() -> None:
             **intervention.owner_assessment,
             "allowed_actions": ("retry_motion_from_current_state",),
             "participants": (
-                MappingProxyType({"operation_participant_id": "participant.1"}),
+                MappingProxyType({"operation_participant_id": {"operation_id": 1, "ordinal": 1}}),
             ),
             "recovery_class": "ordinary_operator_stop",
             "status": "retry_ready",
@@ -594,15 +577,41 @@ def test_recovery_offer_projects_immutable_owner_facts_and_policy() -> None:
 
     offer = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy=policy,
     )
 
     assert offer is not None
-    assert offer["participants"] == [{"operation_participant_id": "participant.1"}]
+    assert offer["participants"] == [{"operation_participant_id": {"operation_id": 1, "ordinal": 1}}]
     assert offer["policy"] == {"allow_intervention": True, "max_retries": 2}
     assert _first_enabled(offer) == "retry_motion_from_current_state"
+
+
+def test_recovery_offer_names_only_a_kernel_operation_number() -> None:
+    def offer_for(owner_task_id):
+        intervention = _intervention()
+        intervention.owner_task_id = owner_task_id
+        return ProgramRuntimeControls(
+            _capture(), recovery_fences=_fences()
+        ).recovery_offer(
+            cycle_generation=6,
+            application_start_id="3f9a000000000001",
+            intervention=intervention,
+            policy=_policy(),
+        )
+
+    with_operation = offer_for(5)
+    # A task with no operation (e.g. a Pick that found no feasible candidate)
+    # is keyed by its text task id; the offer names no operation then.
+    without_operation = offer_for("0123456789abcdef0123456789abcdef")
+    assert with_operation is not None and without_operation is not None
+    assert with_operation["operation_id"] == 5
+    assert without_operation["operation_id"] is None
+    volatile = {"operation_id", "generated_at_ns"}
+    assert {
+        key: value for key, value in without_operation.items() if key not in volatile
+    } == {key: value for key, value in with_operation.items() if key not in volatile}
 
 
 def test_recovery_fence_shape_is_closed() -> None:
@@ -619,7 +628,7 @@ def test_owner_backed_retry_requires_confirmed_non_moving_state() -> None:
     intervention.owner_assessment = None
     offer = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy=_policy(),
     )
@@ -631,7 +640,7 @@ def test_owner_backed_retry_requires_confirmed_non_moving_state() -> None:
     intervention.owner_task_id = None
     ownerless = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy=_policy(),
     )
@@ -648,7 +657,7 @@ def test_manual_result_requires_policy_and_non_moving_owner_evidence() -> None:
 
     waiting = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy=_policy(),
     )
@@ -661,7 +670,7 @@ def test_manual_result_requires_policy_and_non_moving_owner_evidence() -> None:
     intervention.owner_assessment["acknowledged_non_moving"] = True
     ready = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy=_policy(),
     )
@@ -677,7 +686,7 @@ def test_manual_result_requires_policy_and_non_moving_owner_evidence() -> None:
     )
     held = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy=_policy(),
     )
@@ -696,7 +705,7 @@ def test_past_owner_observation_deadline_keeps_every_recovery_action() -> None:
     intervention = _intervention(acknowledged=True)
     fresh = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy=_policy(),
     )
@@ -706,7 +715,7 @@ def test_past_owner_observation_deadline_keeps_every_recovery_action() -> None:
 
     offer = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy=_policy(),
     )
@@ -744,7 +753,7 @@ def test_never_dispatched_owner_failure_offers_retry_under_captured_policy() -> 
         "execution_id": 22,
         "observed_state_valid_until_ns": 0,
         "operation_revision": 1,
-        "participants": [{"operation_participant_id": "participant.1"}],
+        "participants": [{"operation_participant_id": {"operation_id": 1, "ordinal": 1}}],
         "recovery_class": "failed_validation",
         "retry_admissible": True,
         "status": "retry_ready",
@@ -753,7 +762,7 @@ def test_never_dispatched_owner_failure_offers_retry_under_captured_policy() -> 
 
     offer = controls.recovery_offer(
         cycle_generation=5,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy={"allow_intervention": True, "max_retries": 0},
     )
@@ -772,7 +781,7 @@ def test_never_dispatched_owner_failure_offers_retry_under_captured_policy() -> 
 
     forbidden = controls.recovery_offer(
         cycle_generation=5,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=intervention,
         policy={"allow_intervention": False, "max_retries": 0},
     )
@@ -795,7 +804,7 @@ def test_continue_is_offered_for_failure_holds_with_confirmation_and_close_fact(
     controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
     held = _intervention()
     not_closable = controls.recovery_offer(
-        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=held, policy=_policy()
+        cycle_generation=6, application_start_id="3f9a000000000001", intervention=held, policy=_policy()
     )
     action = _continue_action(not_closable)
     assert action["requires_confirmation"] is True
@@ -806,13 +815,13 @@ def test_continue_is_offered_for_failure_holds_with_confirmation_and_close_fact(
     closable = _intervention()
     closable.owner_assessment = {**closable.owner_assessment, "eligible_close": True}
     offer = controls.recovery_offer(
-        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=closable, policy=_policy()
+        cycle_generation=6, application_start_id="3f9a000000000001", intervention=closable, policy=_policy()
     )
     assert _continue_action(offer)["enabled"] is True
     # Continue releases motion: it waits for confirmed containment like Retry.
     pending = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=closable,
         policy=_policy(),
         containment_pending=True,
@@ -827,12 +836,12 @@ def test_continue_is_offered_for_failure_holds_with_confirmation_and_close_fact(
     logic.owner_assessment = None
     assert _continue_action(
         controls.recovery_offer(
-            cycle_generation=6, owner_epoch="runner.epoch.1", intervention=logic, policy=_policy()
+            cycle_generation=6, application_start_id="3f9a000000000001", intervention=logic, policy=_policy()
         )
     )["enabled"] is True
     stop = controls.recovery_offer(
         cycle_generation=6,
-        owner_epoch="runner.epoch.1",
+        application_start_id="3f9a000000000001",
         intervention=_intervention(policy_parameter="operator_stop_policy"),
         policy=_policy(),
     )
@@ -856,7 +865,7 @@ def test_f6a_program_stop_failure_hold_offers_retry_continue_and_reset() -> None
     }
     policy = {"allow_intervention": True, "max_retries": 1}
     offer = controls.recovery_offer(
-        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=held, policy=policy
+        cycle_generation=6, application_start_id="3f9a000000000001", intervention=held, policy=policy
     )
     actions = {row["action_id"]: row for row in offer["actions"]}
     assert actions["replan_from_stopped_state"]["enabled"] is True
@@ -865,7 +874,7 @@ def test_f6a_program_stop_failure_hold_offers_retry_continue_and_reset() -> None
     assert offer["recovery_class"] == "ordinary_program_stop"
     controls.note_retry("move.1")  # The one allowed Retry is used.
     exhausted = controls.recovery_offer(
-        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=held, policy=policy
+        cycle_generation=6, application_start_id="3f9a000000000001", intervention=held, policy=policy
     )
     retry = next(
         row for row in exhausted["actions"] if row["action_id"] == "replan_from_stopped_state"
@@ -880,12 +889,12 @@ def test_each_held_node_keeps_its_own_stable_offer() -> None:
     first = _intervention()
     second = _intervention()
     second.identity = SimpleNamespace(
-        program_run_id="program-run.1", node_instance_id="move.2", node_attempt_id="attempt.2"
+        program_run_id=1, node_instance_id="move.2", node_attempt_id=2
     )
 
     def offer(intervention):
         return controls.recovery_offer(
-            cycle_generation=6, owner_epoch="runner.epoch.1", intervention=intervention, policy=_policy()
+            cycle_generation=6, application_start_id="3f9a000000000001", intervention=intervention, policy=_policy()
         )
 
     one, two = offer(first), offer(second)

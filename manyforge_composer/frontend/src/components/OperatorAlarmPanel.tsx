@@ -1,3 +1,4 @@
+import { ERROR_CATALOG } from '../api/errorCatalog.generated';
 import { KernelErrorPanel } from './KernelErrorPanel';
 import type { KernelErrorPresentation } from './KernelErrorPanel';
 
@@ -15,14 +16,30 @@ export interface OperatorAlarmView {
   details: Record<string, unknown>;
 }
 
+const PROGRAM_RUNNER_LOSS = 'manyforge.runtime.program_runner_loss';
+
+/**
+ * A Program Runner loss's cause: its typed `fault_code` (the Runner fault's
+ * own code, or `program_runner_contact_lost`, OD-296 (a)), shown as that
+ * code's catalog text; an unknown code keeps the alarm message.
+ */
+function programRunnerFaultCause(details: Record<string, unknown>): string | undefined {
+  const code = details.fault_code;
+  if (typeof code !== 'string') return undefined;
+  return Object.hasOwn(ERROR_CATALOG, code) ? ERROR_CATALOG[code][1] : undefined;
+}
+
 /**
  * What went wrong, for the headline: the owner's failure message when the
- * record carries one, else the alarm message. The definition title is the
- * category and goes into the status line.
+ * record carries one, a Program Runner fault's catalog text, else the alarm
+ * message. The definition title is the category and goes into the status line.
  */
 export function operatorAlarmCause(
-  alarm: { message: string; details: Record<string, unknown> },
+  alarm: { definitionId: string; message: string; details: Record<string, unknown> },
 ): string {
+  if (alarm.definitionId === PROGRAM_RUNNER_LOSS) {
+    return programRunnerFaultCause(alarm.details) ?? alarm.message;
+  }
   const failure = alarm.details.failure;
   const message = failure !== null && typeof failure === 'object' && !Array.isArray(failure)
     ? (failure as Record<string, unknown>).message

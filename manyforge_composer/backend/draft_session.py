@@ -31,6 +31,7 @@ from manyforge_behavior.program import (
     MAX_RECOVERY_POLICY_RETRIES,
     Program,
     ProgramValidationError,
+    _frame_ref_order,
     _program_direct_reference,
     merge_param_patch,
     motion_tcp_selection,
@@ -90,6 +91,7 @@ OPERATOR_DRAFT_MUTATIONS = (
     "program_draft_update_settings",
     "program_draft_update_node_policies",
     "program_draft_update_node_presentation",
+    "scene_draft_rename_object",
     "viewer_draft_replace",
 )
 _NODE_POLICY_MUTATION = "program_draft_update_node_policies"
@@ -607,6 +609,162 @@ def _scene_orientation(
         f"orientation source does not name a Draft scene resource: {scene_resource_id}",
         status_code=404,
     )
+
+
+# The Program identifier rule for scene_resource_id (program.py
+# `_program_identifier`): a portable lower-case identifier of at most 256 chars.
+_SCENE_RESOURCE_ID_MAX_CHARS = 256
+
+
+def _is_scene_resource_id(value: Any) -> bool:
+    return (
+        type(value) is str
+        and _PORTABLE_ID_PATTERN.fullmatch(value) is not None
+        and len(value) <= _SCENE_RESOURCE_ID_MAX_CHARS
+    )
+
+
+class _SceneRename:
+    """Rename one scene resource id at every place the Program types it.
+
+    The places come from the Program schema: the scene rows and their support
+    contacts, viewer visibility maps, scene_resource frame references of stored
+    poses (Program parameter defaults, blackboard initial values and
+    allowed_frames), scene_resource-typed Program parameters and blackboard
+    keys, and node parameters whose catalog schema (or key-typed value) is a
+    scene resource. Value sources carry no literal ids. ``paths`` lists every
+    changed place.
+    """
+
+    def __init__(self, previous: str, replacement: str, catalog: NodeCatalog) -> None:
+        self.previous = previous
+        self.replacement = replacement
+        self.catalog = catalog
+        self.paths: list[str] = []
+
+    def _id(self, value: Any, path: str) -> Any:
+        if value == self.previous:
+            self.paths.append(path)
+            return self.replacement
+        return value
+
+    def _frame_ref(self, frame: Any, path: str) -> None:
+        if type(frame) is dict and frame.get("kind") == "scene_resource":
+            frame["scene_resource_id"] = self._id(
+                frame.get("scene_resource_id"), f"{path}.scene_resource_id"
+            )
+
+    def _declared(self, declared_type: Any, value: Any, path: str) -> Any:
+        """A value of a Program declared type (`_validate_declared_type_value`)."""
+
+        if declared_type == "scene_resource":
+            return self._id(value, path)
+        if declared_type == "stored_pose" and type(value) is dict:
+            self._frame_ref(value.get("frame_ref"), f"{path}.frame_ref")
+        return value
+
+    def _schema_value(self, schema: Any, value: Any, path: str) -> Any:
+        """A value of a catalog schema (`_validate_semantic_value`)."""
+
+        registry = self.catalog.schema_registry
+        concrete = registry.resolve(schema)
+        if concrete.semantic_type == "scene_resource" and concrete.schema_type != "object":
+            return self._id(value, path)
+        if concrete.schema_type == "object" and type(value) is dict:
+            for name in list(value):
+                child = concrete.properties.get(name)
+                if child is None:
+                    child = concrete.additional_property_schema
+                if child is not None:
+                    value[name] = self._schema_value(child, value[name], f"{path}.{name}")
+        elif (
+            concrete.schema_type == "array"
+            and type(value) is list
+            and concrete.items is not None
+        ):
+            for index, item in enumerate(value):
+                value[index] = self._schema_value(
+                    concrete.items, item, f"{path}[{index}]"
+                )
+        return value
+
+    def apply(self, document: dict[str, Any]) -> None:
+        scene = document.get("scene") or []
+        for index, row in enumerate(scene):
+            row["scene_resource_id"] = self._id(
+                row.get("scene_resource_id"), f"scene[{index}].scene_resource_id"
+            )
+            contacts = (row.get("metadata") or {}).get("support_contacts")
+            if type(contacts) is list:
+                for contact_index, contact in enumerate(contacts):
+                    contact["support_object_id"] = self._id(
+                        contact.get("support_object_id"),
+                        f"scene[{index}].metadata.support_contacts[{contact_index}]"
+                        ".support_object_id",
+                    )
+                contacts.sort(key=lambda item: str(item.get("support_object_id")))
+        scene.sort(key=lambda item: str(item.get("scene_resource_id")))
+
+        viewer = document.get("viewer")
+        if type(viewer) is dict:
+            for field_name in ("scene_resource_visibility", "scene_resource_axes_visibility"):
+                visibility = viewer.get(field_name)
+                if type(visibility) is dict and self.previous in visibility:
+                    self.paths.append(f"viewer.{field_name}.{self.previous}")
+                    visibility[self.replacement] = visibility.pop(self.previous)
+                    viewer[field_name] = dict(sorted(visibility.items()))
+
+        for index, row in enumerate(document.get("parameters") or []):
+            if "default" in row:
+                row["default"] = self._declared(
+                    row.get("type"), row["default"], f"parameters[{index}].default"
+                )
+
+        key_types: dict[str, Any] = {}
+        blackboard = document.get("blackboard")
+        for index, row in enumerate(
+            (blackboard.get("keys") or []) if type(blackboard) is dict else []
+        ):
+            key_types[row.get("key")] = row.get("type")
+            path = f"blackboard.keys[{index}]"
+            if "initial" in row:
+                row["initial"] = self._declared(
+                    row.get("type"), row["initial"], f"{path}.initial"
+                )
+            frames = row.get("allowed_frames")
+            if type(frames) is list:
+                for frame_index, frame in enumerate(frames):
+                    self._frame_ref(frame, f"{path}.allowed_frames[{frame_index}]")
+                frames.sort(key=_frame_ref_order)
+
+        pending = [
+            (root, f"forest[{index}]")
+            for index, root in enumerate(document.get("forest") or [])
+        ]
+        while pending:
+            node, path = pending.pop()
+            parameters = node.get("parameters")
+            if type(parameters) is dict:
+                entry = self.catalog.get(node["node_id"])
+                for parameter in entry.parameters:
+                    if parameter.id not in parameters:
+                        continue
+                    parameter_path = f"{path}.parameters.{parameter.id}"
+                    key_parameter = parameter.schema.value_type_from_key
+                    if key_parameter is not None:
+                        parameters[parameter.id] = self._declared(
+                            key_types.get(parameters.get(key_parameter)),
+                            parameters[parameter.id],
+                            parameter_path,
+                        )
+                    else:
+                        parameters[parameter.id] = self._schema_value(
+                            parameter.schema, parameters[parameter.id], parameter_path
+                        )
+            pending.extend(
+                (child, f"{path}.children[{index}]")
+                for index, child in enumerate(node.get("children") or [])
+            )
 
 
 def _resolve_relative_orientation(
@@ -1892,6 +2050,7 @@ class ComposerDraftSession:
             "scene_draft_update_object": self._scene_update,
             "scene_draft_upsert_objects": self._scene_upsert,
             "scene_draft_remove_objects": self._scene_remove,
+            "scene_draft_rename_object": self._scene_rename,
             "viewer_draft_replace": self._viewer_replace,
             "tree_draft_insert_node": self._tree_insert,
             "tree_draft_update_node_params": self._tree_update,
@@ -3064,6 +3223,74 @@ class ComposerDraftSession:
             item for item in scene if item["scene_resource_id"] not in removed
         ]
         return {"removed": list(identities)}
+
+    def _scene_rename(
+        self, document: dict[str, Any], arguments: dict[str, Any], catalog: NodeCatalog
+    ) -> dict[str, Any]:
+        """Rename one initial-scene object and every Program reference to it.
+
+        Renaming to the same id is a validated no-op, like
+        ``tree_draft_rename_node``. When the Draft validated before the
+        rename, the renamed Draft must validate too.
+        """
+
+        if set(arguments) != {"scene_resource_id", "new_scene_resource_id"}:
+            _error(
+                "draft_arguments_invalid",
+                "scene_draft_rename_object requires exactly scene_resource_id and "
+                "new_scene_resource_id",
+            )
+        previous = arguments["scene_resource_id"]
+        replacement = arguments["new_scene_resource_id"]
+        scene = self._scene(document)
+        identities = {item.get("scene_resource_id") for item in scene}
+        if previous not in identities:
+            _error(
+                "draft_scene_resource_not_found",
+                f"Draft scene resource does not exist: {previous}",
+                status_code=404,
+            )
+        if not _is_scene_resource_id(replacement):
+            _error(
+                "draft_arguments_invalid",
+                "new_scene_resource_id must be a portable lower-case ID "
+                f"of at most {_SCENE_RESOURCE_ID_MAX_CHARS} characters",
+            )
+        if replacement == previous:
+            return {
+                "previous_scene_resource_id": previous,
+                "renamed_scene_resource_id": replacement,
+                "references": [],
+            }
+        if replacement in identities:
+            _error(
+                "draft_scene_resource_exists",
+                f"Draft scene resource already exists: {replacement}",
+                status_code=409,
+            )
+        try:
+            valid_before = not derive_candidate(document, catalog)[1]
+        except AuthoringForestError:
+            valid_before = False
+        rename = _SceneRename(previous, replacement, catalog)
+        rename.apply(document)
+        if valid_before:
+            try:
+                diagnostics = derive_candidate(document, catalog)[1]
+            except AuthoringForestError as error:
+                _error(error.code, str(error), detail=error.detail)
+            if diagnostics:
+                _error(
+                    "composer_draft_validation_failed",
+                    f"renaming {previous} to {replacement} leaves the Program "
+                    f"invalid: {diagnostics[0]['message']}",
+                    detail={"diagnostics": diagnostics},
+                )
+        return {
+            "previous_scene_resource_id": previous,
+            "renamed_scene_resource_id": replacement,
+            "references": rename.paths,
+        }
 
     @staticmethod
     def _tree(document: dict[str, Any]) -> list[dict[str, Any]]:

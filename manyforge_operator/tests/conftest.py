@@ -181,7 +181,7 @@ def make_readiness(state: ReadinessState = ReadinessState.READY) -> ReadinessObs
         state=state,
         source_schema="manyforge.readiness.v1",
         owner_id="headless",
-        owner_epoch="epoch-1",
+        application_start_id="3f9a0000000000a1",
         payload_sha256=SHA,
         observed_at_unix_ns=500,
         reason_code=None if state is ReadinessState.READY else "warming_up",
@@ -214,7 +214,7 @@ def make_status(
     ]
     readiness = [make_readiness()] if state is LaunchInstanceState.READY else []
     return LaunchInstanceStatus(
-        schema_version="manyforge.launch_instance_status.v1",
+        schema_version="manyforge.launch_instance_status.v2",
         launch_instance_id="launch-1",
         record_generation=1,
         configuration=configuration,
@@ -240,3 +240,13 @@ def configuration_factory() -> Callable[..., LaunchConfiguration]:
 @pytest.fixture
 def status_factory() -> Callable[..., object]:
     return make_status
+
+
+@pytest.fixture(autouse=True)
+def roomy_disk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A start checks the free-space floor first; tests supply the reading."""
+    from manyforge_operator import run_session
+
+    monkeypatch.setattr(
+        run_session, "read_disk", lambda _fd: run_session.DiskReading(10**15, 10**15, 10**6)
+    )

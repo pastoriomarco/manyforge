@@ -12,7 +12,7 @@ function request(): Record<string, unknown> {
     width: 640,
     height: 480,
     mime: 'image/jpeg',
-    requiredFrame: { ownerEpoch: 'headless.epoch.1', generation: 19 },
+    requiredFrame: { applicationStartId: '3f9a0000000000a1', generation: 19 },
     timeoutMs: 2_000,
   };
 }
@@ -20,7 +20,7 @@ function request(): Record<string, unknown> {
 describe('snapshot observer wire', () => {
   it('accepts only the exact bounded owner-frame request', () => {
     expect(parseSnapshotObserverRequest(request()).requiredFrame).toEqual({
-      ownerEpoch: 'headless.epoch.1',
+      applicationStartId: '3f9a0000000000a1',
       generation: 19,
     });
     for (const mutate of [
@@ -28,10 +28,16 @@ describe('snapshot observer wire', () => {
       (value: Record<string, unknown>) => { value.width = 63; },
       (value: Record<string, unknown>) => { value.timeoutMs = 2_001; },
       (value: Record<string, unknown>) => {
-        value.requiredFrame = { ownerEpoch: '', generation: 19 };
+        value.requiredFrame = { applicationStartId: '', generation: 19 };
       },
       (value: Record<string, unknown>) => {
-        value.requiredFrame = { ownerEpoch: 'headless.epoch.1', generation: -1 };
+        value.requiredFrame = { applicationStartId: 'headless.epoch.1', generation: 19 };
+      },
+      (value: Record<string, unknown>) => {
+        value.requiredFrame = { ownerEpoch: '3f9a0000000000a1', generation: 19 };
+      },
+      (value: Record<string, unknown>) => {
+        value.requiredFrame = { applicationStartId: '3f9a0000000000a1', generation: -1 };
       },
     ]) {
       const invalid = request();

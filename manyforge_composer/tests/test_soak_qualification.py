@@ -192,7 +192,7 @@ def test_glb_cache_remains_bounded_per_structural_model(
                 bytes=b"solid fixture",
             )
 
-    state = ComposerState(headless_client=FakeClient())
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=FakeClient())
     for index in range(12):
         logical_uri = f"package://fixture/mesh_{index}.stl"
         visual = routes_urdf._LinkVisual(

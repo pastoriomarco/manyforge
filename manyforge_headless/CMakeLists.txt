@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_headless VERSION 0.2.1 LANGUAGES CXX)
+project(manyforge_headless VERSION 0.3.0 LANGUAGES CXX)
 
 cmake_policy(SET CMP0077 NEW)
 
@@ -57,8 +57,7 @@ add_library(manyforge_headless
   src/operator_alarm_owner.cpp
   src/operator_alarm_reducer.cpp
   src/runtime_snapshot.cpp
-  src/scene_runtime_state_owner.cpp
-  src/source_snapshot.cpp)
+  src/scene_runtime_state_owner.cpp)
 add_library(manyforge::headless ALIAS manyforge_headless)
 target_include_directories(manyforge_headless PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -199,10 +198,26 @@ target_link_libraries(manyforge_headless_owner_publication PUBLIC
 set_target_properties(manyforge_headless_owner_publication PROPERTIES
   POSITION_INDEPENDENT_CODE ON)
 
-add_executable(manyforge_manager_daemon src/manager_daemon.cpp)
+set(
+  MANYFORGE_PRIVATE_STREAM_SOURCE_DIR
+  "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_private_stream"
+  CACHE PATH
+  "Path to the shared private stream server source tree")
+if(NOT TARGET manyforge::private_stream)
+  add_subdirectory(
+    "${MANYFORGE_PRIVATE_STREAM_SOURCE_DIR}"
+    "${CMAKE_CURRENT_BINARY_DIR}/manyforge_private_stream"
+    EXCLUDE_FROM_ALL)
+endif()
+
+add_executable(manyforge_manager_daemon src/manager_daemon.cpp
+  src/application_process_supervisor.cpp)
 target_link_libraries(manyforge_manager_daemon PRIVATE
+  manyforge::private_stream
   manyforge_headless_owner_publication
   manyforge::deployment_admission
+  # The one writer of the Manager's store files.
+  manyforge::persistence
   # Apply acceptance recompiles the stored prepared Program outcome.
   manyforge::deployment)
 
@@ -228,10 +243,22 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_manager_package_generation
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
-  add_executable(test_source_snapshot test/test_source_snapshot.cpp)
-  target_link_libraries(test_source_snapshot PRIVATE
-    manyforge_headless GTest::gtest_main)
-  gtest_discover_tests(test_source_snapshot
+  add_executable(test_application_process_supervisor
+    test/test_application_process_supervisor.cpp
+    src/application_process_supervisor.cpp)
+  target_include_directories(test_application_process_supervisor PRIVATE src)
+  target_link_libraries(test_application_process_supervisor PRIVATE
+    manyforge::deployment GTest::gtest_main)
+  gtest_discover_tests(test_application_process_supervisor
+    PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_manager_status_stream
+    test/test_manager_status_stream.cpp)
+  target_link_libraries(test_manager_status_stream PRIVATE
+    manyforge::private_stream
+    manyforge_headless_owner_publication
+    GTest::gtest_main)
+  gtest_discover_tests(test_manager_status_stream
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_runtime_snapshot test/test_runtime_snapshot.cpp)
@@ -259,6 +286,13 @@ if(BUILD_TESTING)
   target_link_libraries(test_manager_response_transport PRIVATE
     GTest::gtest_main)
   gtest_discover_tests(test_manager_response_transport
+    PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_manager_local_exchange
+    test/test_manager_local_exchange.cpp)
+  target_link_libraries(test_manager_local_exchange PRIVATE
+    GTest::gtest_main)
+  gtest_discover_tests(test_manager_local_exchange
     PROPERTIES TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_scene_runtime_pose_projector
@@ -307,8 +341,6 @@ if(BUILD_TESTING)
     PROPERTIES
       RUN_SERIAL TRUE
       TIMEOUT ${MANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS})
-  set_property(DIRECTORY APPEND PROPERTY TEST_INCLUDE_FILES
-    "${CMAKE_CURRENT_SOURCE_DIR}/test/event_historian_ctest_properties.cmake")
 
   set(
     MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT
@@ -514,6 +546,25 @@ if(BUILD_TESTING)
         "the compatible replacement execution host does not exist: "
         "${MANYFORGE_HEADLESS_TEST_ROS_REPLACEMENT_EXECUTION_HOST}")
     endif()
+    # The RoboPlan test-boundary build of the real host (its projection
+    # fixture), whose management status reply can be held by a file in its
+    # run root; the installed host never contains that hold.
+    # It is built into RoboPlan's own binary directory: beside the host in a
+    # stand-alone RoboPlan build, under `roboplan/` in the integration graph
+    # (the same two places scripts/ros/build-ros2-control-runtime.sh checks).
+    set(
+      MANYFORGE_HEADLESS_TEST_ROS_LATE_REPLY_EXECUTION_HOST
+      "${_MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_TARGET_ROOT}/ros_projection_host_fixture/manyforge_ros2_control_execution_host")
+    if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_ROS_LATE_REPLY_EXECUTION_HOST}")
+      set(
+        MANYFORGE_HEADLESS_TEST_ROS_LATE_REPLY_EXECUTION_HOST
+        "${_MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_TARGET_ROOT}/roboplan/ros_projection_host_fixture/manyforge_ros2_control_execution_host")
+    endif()
+    if(NOT EXISTS "${MANYFORGE_HEADLESS_TEST_ROS_LATE_REPLY_EXECUTION_HOST}")
+      message(FATAL_ERROR
+        "the test-boundary execution host does not exist: "
+        "${MANYFORGE_HEADLESS_TEST_ROS_LATE_REPLY_EXECUTION_HOST}")
+    endif()
     # Manager Apply packages are generated from example Scenarios through the
     # normal activation path. Each model component reads its prepared root as
     # a `generated/<asset>_structural` sibling of the combined Lite6 root.
@@ -642,6 +693,18 @@ if(BUILD_TESTING)
       "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"
       "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER}")
 
+    # The same cell whose one Program is a slow joint move that runs long
+    # enough to be stopped. scripts/test-all.sh names it to the Python process
+    # tests (MANYFORGE_ASSISTANT_STOPPABLE_MOTION_*).
+    set(MANYFORGE_HEADLESS_TEST_ASSISTANT_STOPPABLE_MOTION_FIXTURE_ROOT
+      "${CMAKE_CURRENT_BINARY_DIR}/assistant-native-stoppable-motion-test-fixture")
+    manyforge_headless_manager_apply_package(
+      manyforge_headless_test_assistant_stoppable_motion_package
+      "${MANYFORGE_HEADLESS_TEST_ASSISTANT_STOPPABLE_MOTION_FIXTURE_ROOT}"
+      assistant-ros2-control-stoppable-motion
+      "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"
+      "${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER}")
+
     # The Lite gripper alone: pneumatic, commanded output, with feedback.
     set(MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_FIXTURE_ROOT
       "${CMAKE_CURRENT_BINARY_DIR}/pneumatic-commanded-feedback-manager-test-fixture")
@@ -680,7 +743,8 @@ if(BUILD_TESTING)
         MANYFORGE_HEADLESS_TEST_ROS_SETUP)
       add_dependencies(manyforge_headless_py
         manyforge_manager_daemon manyforge_headless_test_canonical_empty_package
-        manyforge_headless_test_robotiq_position_package)
+        manyforge_headless_test_robotiq_position_package
+        manyforge_headless_test_assistant_stoppable_motion_package)
       add_test(NAME manager_robotiq_position_process
         COMMAND bash -c [=[set -e; source "$1"; shift; exec "$@"]=]
           manager-robotiq-position "${MANYFORGE_HEADLESS_TEST_ROS_SETUP}"
@@ -707,21 +771,6 @@ if(BUILD_TESTING)
       ros2-control
       "${MANYFORGE_HEADLESS_TEST_ROS_REPLACEMENT_EXECUTION_HOST}")
   endif()
-
-  add_executable(manyforge_publish_headless_assistant_test_source
-    test/publish_assistant_authoring_source.cpp)
-  add_dependencies(manyforge_publish_headless_assistant_test_source
-    manyforge_headless_test_assistant_package
-    manyforge_headless_test_canonical_empty_package)
-  target_compile_definitions(
-    manyforge_publish_headless_assistant_test_source PRIVATE
-    MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE="${MANYFORGE_HEADLESS_TEST_ASSISTANT_BUNDLE_ID_FILE}"
-    MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_ASSISTANT_PACKAGE_ROOT}"
-    MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT}")
-  target_link_libraries(
-    manyforge_publish_headless_assistant_test_source PRIVATE
-    manyforge_headless_owner_publication
-    manyforge::deployment_admission)
 
   add_executable(test_headless_api_core test/test_headless_api_core.cpp)
   add_dependencies(test_headless_api_core
@@ -844,6 +893,7 @@ if(BUILD_TESTING)
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT="${MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_PACKAGE_ROOT}"
       MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST}"
       MANYFORGE_HEADLESS_TEST_ROS_REPLACEMENT_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_ROS_REPLACEMENT_EXECUTION_HOST}"
+      MANYFORGE_HEADLESS_TEST_ROS_LATE_REPLY_EXECUTION_HOST="${MANYFORGE_HEADLESS_TEST_ROS_LATE_REPLY_EXECUTION_HOST}"
       MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER="${MANYFORGE_HEADLESS_TEST_ROS_EXECUTION_WORKER}")
     add_dependencies(test_manager_daemon_process
       manyforge_headless_test_manager_apply_replacement_package)

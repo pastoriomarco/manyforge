@@ -2,9 +2,8 @@
 --
 -- Version 4 owns durable scene transactions and version 5 owns execution-host
 -- recovery.  This overlay adds one bounded checkpoint/control row.  A
--- quiescent compaction retains the exact current immutable scene, advances an
--- opaque request-owner epoch, and removes only history already represented by
--- that checkpoint.  Native recovery compaction retains the current completed
+-- quiescent compaction retains the exact current immutable scene and removes
+-- only history already represented by that checkpoint.  Native recovery compaction retains the current completed
 -- runtime set plus at most one pending replacement while preserving a durable
 -- monotonic generation watermark.
 
@@ -35,15 +34,6 @@ CREATE TABLE IF NOT EXISTS logical_scene_history_state (
     compaction_generation INTEGER NOT NULL DEFAULT 0 CHECK (
         compaction_generation >= 0
         AND compaction_generation <= 9007199254740991
-    ),
-    request_epoch_generation INTEGER NOT NULL DEFAULT 0 CHECK (
-        request_epoch_generation >= 0
-        AND request_epoch_generation <= 9007199254740991
-    ),
-    request_owner_epoch TEXT CHECK (
-        request_owner_epoch IS NULL
-        OR (length(request_owner_epoch) > 0
-            AND length(request_owner_epoch) <= 256)
     ),
     compacted_through_transaction_sequence INTEGER NOT NULL DEFAULT 0 CHECK (
         compacted_through_transaction_sequence >= 0
@@ -79,14 +69,7 @@ CREATE TABLE IF NOT EXISTS logical_scene_history_state (
         compaction_in_progress IN (0, 1)
     ),
     CHECK (
-        (request_epoch_generation = 0 AND request_owner_epoch IS NULL)
-        OR
-        (request_epoch_generation > 0 AND request_owner_epoch IS NOT NULL)
-    ),
-    CHECK (
         (compaction_generation = 0
-         AND request_epoch_generation = 0
-         AND request_owner_epoch IS NULL
          AND compacted_through_transaction_sequence = 0
          AND compacted_through_owner_event_sequence = 0
          AND compacted_named_apply_stage_count = 0
@@ -100,7 +83,6 @@ CREATE TABLE IF NOT EXISTS logical_scene_history_state (
         (compaction_generation > 0
          AND compacted_through_transaction_sequence > 0
          AND compacted_through_owner_event_sequence > 0
-         AND request_epoch_generation > 1
          AND checkpoint_retained_bundle_id IS NOT NULL
          AND checkpoint_graph_revision IS NOT NULL
          AND checkpoint_scene_id IS NOT NULL

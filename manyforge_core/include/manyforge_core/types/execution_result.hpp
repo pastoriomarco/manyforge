@@ -40,13 +40,11 @@ struct ExecutionHandle {
   ExecutionHandle(std::function<bool(int64_t)> wait, std::function<ExecutionSnapshot()> snapshot,
                   std::uint64_t generation = 0,
                   std::optional<ControllerGoalId> goal_id = std::nullopt,
-                  std::optional<ControllerGoalGeneration> goal_generation = std::nullopt,
                   std::optional<ContentDigest> contract_digest = std::nullopt)
       : wait_for_completion(std::move(wait)),
         get_snapshot(std::move(snapshot)),
         execution_generation(generation),
         controller_goal_id(std::move(goal_id)),
-        controller_goal_generation(std::move(goal_generation)),
         prepared_contract_digest(std::move(contract_digest)) {}
 
   std::function<bool(int64_t timeout_ns)> wait_for_completion;
@@ -59,7 +57,6 @@ struct ExecutionHandle {
   /// All three fields are jointly present there and jointly absent on the
   /// historical trajectory-only path while that path is being removed.
   std::optional<ControllerGoalId> controller_goal_id;
-  std::optional<ControllerGoalGeneration> controller_goal_generation;
   std::optional<ContentDigest> prepared_contract_digest;
 };
 

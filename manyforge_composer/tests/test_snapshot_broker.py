@@ -15,14 +15,14 @@ from manyforge_composer.backend.routes_snapshot import (
 from manyforge_composer.backend.security import SecurityConfig
 
 
-OWNER_EPOCH = "headless.epoch.7"
+START_ID = "3f9a0000000000a7"
 OWNER_GENERATION = 41
 JPEG = b"\xff\xd8\xff\xd9"
 
 
 def _broker() -> SnapshotBroker:
     return SnapshotBroker(
-        prepare_capture=lambda _timeout_s: (OWNER_EPOCH, OWNER_GENERATION),
+        prepare_capture=lambda _timeout_s: (START_ID, OWNER_GENERATION),
     )
 
 
@@ -64,13 +64,13 @@ def test_snapshot_sender_receives_owner_bound_request_and_capture_identity() -> 
         assert request.width == 64
         assert request.height == 32
         assert request.media_type == "image/jpeg"
-        assert request.required_owner_epoch == OWNER_EPOCH
+        assert request.required_application_start_id == START_ID
         assert request.required_generation == OWNER_GENERATION
         assert request.deadline_ns > time.monotonic_ns()
         assert broker.deliver(
             request.request_id,
             JPEG,
-            observed_owner_epoch=OWNER_EPOCH,
+            observed_application_start_id=START_ID,
             observed_generation=OWNER_GENERATION + 1,
         ) is True
         assert broker.deliver(request.request_id, None) is False
@@ -80,7 +80,7 @@ def test_snapshot_sender_receives_owner_bound_request_and_capture_identity() -> 
     capture = broker.capture_sync(64, 32, "jpeg", timeout_s=0.1)
     assert capture is not None
     assert capture.image_bytes == JPEG
-    assert capture.observed_owner_epoch == OWNER_EPOCH
+    assert capture.observed_application_start_id == START_ID
     assert capture.observed_generation == OWNER_GENERATION + 1
     assert broker.status()["completed_total"] == 1
     assert broker.status()["deliveries_rejected_total"] == 1
@@ -114,7 +114,7 @@ def test_snapshot_broker_keeps_multiple_browsers_without_reconnect_churn() -> No
         assert broker.deliver(
             request.request_id,
             JPEG,
-            observed_owner_epoch=OWNER_EPOCH,
+            observed_application_start_id=START_ID,
             observed_generation=OWNER_GENERATION,
         )
         assert capture.result(timeout=0.2) is not None
@@ -131,13 +131,13 @@ def test_snapshot_rejects_cross_owner_or_regressed_frame_without_settling() -> N
         assert broker.deliver(
             request.request_id,
             JPEG,
-            observed_owner_epoch="replacement.epoch",
+            observed_application_start_id="3f9a0000000000a8",
             observed_generation=OWNER_GENERATION,
         ) is False
         assert broker.deliver(
             request.request_id,
             JPEG,
-            observed_owner_epoch=OWNER_EPOCH,
+            observed_application_start_id=START_ID,
             observed_generation=OWNER_GENERATION - 1,
         ) is False
         assert broker.deliver(request.request_id, None) is True
@@ -150,9 +150,9 @@ def test_snapshot_rejects_cross_owner_or_regressed_frame_without_settling() -> N
 class _HeadlessClient:
     def runtime(self) -> dict[str, object]:
         return {
-            "schema_version": "manyforge.headless_runtime_snapshot.v1",
+            "schema_version": "manyforge.headless_runtime_snapshot.v3",
             "complete": True,
-            "projection_owner_epoch": OWNER_EPOCH,
+            "application_start_id": START_ID,
             "projection_generation": OWNER_GENERATION,
         }
 
@@ -177,7 +177,7 @@ def test_snapshot_render_returns_the_observed_frame_headers() -> None:
         assert broker.deliver(
             request.request_id,
             JPEG,
-            observed_owner_epoch=OWNER_EPOCH,
+            observed_application_start_id=START_ID,
             observed_generation=OWNER_GENERATION,
         )
 
@@ -188,7 +188,7 @@ def test_snapshot_render_returns_the_observed_frame_headers() -> None:
     )
     assert response.status_code == 200
     assert response.content == JPEG
-    assert response.headers["x-manyforge-viewer-owner-epoch"] == OWNER_EPOCH
+    assert "x-manyforge-viewer-owner-epoch" not in response.headers
     assert response.headers["x-manyforge-viewer-generation"] == str(
         OWNER_GENERATION
     )
@@ -214,7 +214,7 @@ def test_snapshot_upload_settles_only_matching_pending_frame() -> None:
             f"/api/scene/snapshot/upload/{request_id}",
             content=JPEG,
             headers={
-                "X-ManyForge-Viewer-Owner-Epoch": "wrong.epoch",
+                "X-ManyForge-Viewer-Application-Start-Id": "3f9a0000000000a8",
                 "X-ManyForge-Viewer-Generation": str(OWNER_GENERATION),
             },
         )
@@ -223,7 +223,7 @@ def test_snapshot_upload_settles_only_matching_pending_frame() -> None:
             f"/api/scene/snapshot/upload/{request_id}",
             content=JPEG,
             headers={
-                "X-ManyForge-Viewer-Owner-Epoch": OWNER_EPOCH,
+                "X-ManyForge-Viewer-Application-Start-Id": START_ID,
                 "X-ManyForge-Viewer-Generation": str(OWNER_GENERATION),
             },
         )

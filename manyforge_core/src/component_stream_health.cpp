@@ -11,51 +11,6 @@
 
 namespace manyforge::core {
 
-std::string_view to_string(const StreamSeverityDTO value) noexcept {
-  switch (value) {
-    case StreamSeverityDTO::kFault:
-      return "fault";
-    case StreamSeverityDTO::kBlocking:
-      return "blocking";
-    case StreamSeverityDTO::kWarning:
-      return "warning";
-  }
-  return "fault";
-}
-
-std::string_view to_string(const StreamRecoveryDTO value) noexcept {
-  return value == StreamRecoveryDTO::kAuto ? "auto" : "ack";
-}
-
-std::string_view to_string(const StreamTimestampSourceDTO value) noexcept {
-  return value == StreamTimestampSourceDTO::kArrival ? "arrival" : "message_stamp";
-}
-
-std::string_view to_string(const StreamLivenessStateDTO value) noexcept {
-  switch (value) {
-    case StreamLivenessStateDTO::kLive:
-      return "live";
-    case StreamLivenessStateDTO::kStale:
-      return "stale";
-    case StreamLivenessStateDTO::kAbsent:
-      return "absent";
-  }
-  return "absent";
-}
-
-std::optional<StreamSeverityDTO> parse_stream_severity(const std::string_view value) noexcept {
-  if (value == "fault") return StreamSeverityDTO::kFault;
-  if (value == "blocking") return StreamSeverityDTO::kBlocking;
-  if (value == "warning") return StreamSeverityDTO::kWarning;
-  return std::nullopt;
-}
-
-std::optional<StreamRecoveryDTO> parse_stream_recovery(const std::string_view value) noexcept {
-  if (value == "ack") return StreamRecoveryDTO::kAck;
-  if (value == "auto") return StreamRecoveryDTO::kAuto;
-  return std::nullopt;
-}
-
 namespace {
 
 [[nodiscard]] bool Lower(const char c) noexcept { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); }
@@ -67,12 +22,6 @@ bool ValidStreamId(const std::string_view value) noexcept {
          std::all_of(value.begin(), value.end(), [](const char c) {
            return Lower(c) || c == '_' || c == '.' || c == '/' || c == '-';
          });
-}
-
-bool ValidStreamFaultCode(const std::string_view value) noexcept {
-  return !value.empty() && value.size() <= kMaxStreamFaultCodeBytes &&
-         std::all_of(value.begin(), value.end(),
-                     [](const char c) { return Lower(c) || c == '_' || c == '.'; });
 }
 
 namespace {
@@ -113,8 +62,6 @@ struct StreamRecorder::Slot final {
   std::int64_t declared_at_ns{};
   /// Absent past its start-up grace.
   bool absent_classified{};
-  bool latched{};
-  std::optional<ErrorDTO> fault_event;
 };
 
 struct ComponentStreamHealth::Shared final {
@@ -145,10 +92,8 @@ struct ComponentStreamHealth::Shared final {
   std::uint64_t next_serial{1U};
   std::function<void(const std::string&)> log;
 
-  /// Serializes listener calls with ClearListener.
-  std::mutex listener_mutex;
-  Listener listener;
-  std::uint64_t listener_token{};
+  /// Serializes log calls with SetLog.
+  std::mutex log_mutex;
 
   void ScheduleEvaluationLocked(const std::shared_ptr<Shared>& self) {
     if (detached.load()) return;
@@ -168,15 +113,11 @@ struct ComponentStreamHealth::Shared final {
     const auto found = overrides.find({slot.component, slot.defaults.stream_id});
     if (found == overrides.end()) return;
     if (found->second.budget_ns) slot.effective.budget_ns = *found->second.budget_ns;
-    if (found->second.severity) slot.effective.severity = *found->second.severity;
-    if (found->second.recovery) slot.effective.recovery = *found->second.recovery;
   }
 
   [[nodiscard]] static ErrorDTO Condition(const StreamRecorder::Slot& slot, const std::string_view code) {
     const auto& id = slot.defaults.stream_id;
-    const std::string what = code == kComponentStreamStaleCode    ? "is stale"
-                             : code == kComponentStreamAbsentCode ? "has no sample"
-                                                                  : "needs the operator's Recover";
+    const std::string what = code == kComponentStreamStaleCode ? "is stale" : "has no sample";
     return {std::string(code),
             "Component " + slot.component.value() + " stream " + id + " " + what + " (budget " +
                 std::to_string(slot.effective.budget_ns / 1'000'000) + " ms).",
@@ -188,7 +129,6 @@ struct ComponentStreamHealth::Shared final {
     if (slot.state == StreamLivenessStateDTO::kStale) return kComponentStreamStaleCode;
     if (slot.state == StreamLivenessStateDTO::kAbsent && slot.absent_classified)
       return kComponentStreamAbsentCode;
-    if (slot.latched) return kComponentStreamAcknowledgementRequiredCode;
     return std::nullopt;
   }
 
@@ -197,21 +137,10 @@ struct ComponentStreamHealth::Shared final {
     for (auto it = slots.lower_bound({component, std::string()});
          it != slots.end() && it->first.first == component; ++it) {
       const auto& slot = *it->second;
-      if (slot.fault_event && !verdict.fault_event) verdict.fault_event = slot.fault_event;
       const auto code = ConditionCode(slot);
       if (!code || slot.effective.severity == StreamSeverityDTO::kWarning) continue;
-      const bool lost = *code != kComponentStreamAcknowledgementRequiredCode;
-      if (slot.effective.severity == StreamSeverityDTO::kFault) {
-        if (!lost) continue;
-        if (!verdict.fault_loss) verdict.fault_loss = Condition(slot, *code);
-      }
-      if (!verdict.motion_hold) {
-        auto hold = Condition(slot, *code);
-        hold.code = std::string(to_string(ErrorCode::kInvalidStateTransition));
-        hold.details.emplace("reason", std::string(*code));
-        hold.details.emplace("controllable_component_id", component.value());
-        verdict.motion_hold = std::move(hold);
-      }
+      if (slot.effective.severity == StreamSeverityDTO::kFault && !verdict.fault_loss)
+        verdict.fault_loss = Condition(slot, *code);
     }
     return verdict;
   }
@@ -219,10 +148,6 @@ struct ComponentStreamHealth::Shared final {
   void MarkStaleLocked(StreamRecorder::Slot& slot) {
     slot.state = StreamLivenessStateDTO::kStale;
     slot.absent_classified = false;
-    // A `fault` stream never latches here: its latch is the incident.
-    if (slot.effective.recovery == StreamRecoveryDTO::kAck &&
-        slot.effective.severity != StreamSeverityDTO::kFault)
-      slot.latched = true;
     dirty.insert(slot.component);
   }
 
@@ -329,25 +254,17 @@ struct ComponentStreamHealth::Shared final {
       }
     }
     if (changes.empty()) return;
-    std::lock_guard listener_lock(self->listener_mutex);
+    std::lock_guard log_lock(self->log_mutex);
     if (self->detached.load()) return;
     for (const auto& [component, verdict] : changes) {
       if (self->log) {
         try {
           std::string line = "INFO manyforge component stream health: component=" + component.value();
-          const auto& shown = verdict.fault_event   ? verdict.fault_event
-                              : verdict.fault_loss  ? verdict.fault_loss
-                                                    : verdict.motion_hold;
+          const auto& shown = verdict.fault_loss;
           line += shown ? " condition=" + shown->message : std::string(" condition=none");
           self->log(line + "\n");
         } catch (...) {
         }
-      }
-      if (!self->listener) continue;
-      try {
-        self->listener(component, verdict);
-      } catch (...) {
-        // The next transition delivers the current verdict again.
       }
     }
   }
@@ -401,25 +318,6 @@ void RecordSample(const std::shared_ptr<StreamRecorder::Slot>& slot,
   Advance(slot);
 }
 
-void ReportSlotFault(const std::shared_ptr<StreamRecorder::Slot>& slot, const std::string_view code,
-                     const std::string_view detail) noexcept {
-  const auto owner = slot->owner.lock();
-  if (!owner) return;
-  try {
-    const bool valid = ValidStreamFaultCode(code);
-    ErrorDTO event{valid ? std::string(code) : std::string("component_stream_fault"),
-                   Truncated(detail, kMaxStreamFaultDetailBytes),
-                   {{"stream_id", slot->defaults.stream_id}}};
-    if (!valid) event.details.emplace("reported_code", Truncated(code, kMaxStreamFaultCodeBytes));
-    std::lock_guard lock(owner->mutex);
-    if (slot->fault_event) return;  // The first event stands until Recover.
-    slot->fault_event = std::move(event);
-    owner->dirty.insert(slot->component);
-    owner->ScheduleEvaluationLocked(owner);
-  } catch (...) {
-  }
-}
-
 }  // namespace
 
 void StreamRecorder::Record(const std::int64_t source_stamp_ns) noexcept {
@@ -427,10 +325,6 @@ void StreamRecorder::Record(const std::int64_t source_stamp_ns) noexcept {
 }
 
 void StreamRecorder::RecordArrival() noexcept { RecordSample(slot_, std::nullopt); }
-
-void StreamRecorder::ReportFault(const std::string_view code, const std::string_view detail) noexcept {
-  ReportSlotFault(slot_, code, detail);
-}
 
 ComponentStreamHealth::ComponentStreamHealth(std::shared_ptr<IClock> clock, IScheduler& scheduler)
     : shared_(std::make_shared<Shared>(std::move(clock), scheduler)) {
@@ -504,21 +398,6 @@ bool ComponentStreamHealth::RecordDeclared(const ControllableComponentId& compon
   return true;
 }
 
-bool ComponentStreamHealth::ReportDeclaredFault(const ControllableComponentId& component,
-                                                const std::string_view stream_id,
-                                                const std::string_view code,
-                                                const std::string_view detail) {
-  std::shared_ptr<StreamRecorder::Slot> slot;
-  {
-    std::lock_guard lock(shared_->mutex);
-    const auto found = shared_->slots.find({component, std::string(stream_id)});
-    if (found == shared_->slots.end()) return false;
-    slot = found->second;
-  }
-  ReportSlotFault(slot, code, detail);
-  return true;
-}
-
 Result<void> ComponentStreamHealth::SetOverrides(std::vector<StreamParameterOverrideDTO> overrides) {
   std::map<SlotKey, StreamParameterOverrideDTO> table;
   for (auto& row : overrides) {
@@ -540,9 +419,6 @@ Result<void> ComponentStreamHealth::SetOverrides(std::vector<StreamParameterOver
     const auto before = slot->effective;
     shared_->ApplyEffectiveLocked(*slot);
     if (before == slot->effective) continue;
-    if (slot->effective.recovery == StreamRecoveryDTO::kAuto ||
-        slot->effective.severity == StreamSeverityDTO::kFault)
-      slot->latched = false;
     // A changed budget takes effect at once; older entries are refreshed lazily.
     const auto advanced = slot->last_advance_ns.load();
     shared_->PushDeadlineLocked(
@@ -568,63 +444,15 @@ std::vector<StreamHealthDTO> ComponentStreamHealth::Read(const ControllableCompo
     if (advanced != kNever) row.age_ns = std::max<std::int64_t>(0, now - advanced);
     row.budget_ns = slot.effective.budget_ns;
     row.severity = slot.effective.severity;
-    row.recovery = slot.effective.recovery;
     row.timestamp_source = slot.defaults.timestamp_source;
-    row.acknowledgement_required = slot.latched;
-    if (slot.fault_event) {
-      row.error = slot.fault_event;
-    } else if (const auto code = Shared::ConditionCode(slot)) {
-      row.error = Shared::Condition(slot, *code);
-    }
+    if (const auto code = Shared::ConditionCode(slot)) row.error = Shared::Condition(slot, *code);
     result.push_back(std::move(row));
   }
   return result;
 }
 
-ComponentStreamVerdictDTO ComponentStreamHealth::Verdict(const ControllableComponentId& component) const {
-  std::lock_guard lock(shared_->mutex);
-  return shared_->VerdictLocked(component);
-}
-
-bool ComponentStreamHealth::Acknowledge(const ControllableComponentId& component) {
-  std::lock_guard lock(shared_->mutex);
-  bool changed = false;
-  bool latched = false;
-  for (auto it = shared_->slots.lower_bound({component, std::string()});
-       it != shared_->slots.end() && it->first.first == component; ++it) {
-    latched = latched || it->second->latched;
-    changed = changed || it->second->latched || it->second->fault_event;
-    it->second->latched = false;
-    it->second->fault_event.reset();
-  }
-  if (!changed) return false;
-  shared_->dirty.insert(component);
-  shared_->ScheduleEvaluationLocked(shared_);
-  return latched;
-}
-
-std::uint64_t ComponentStreamHealth::SetListener(Listener listener) {
-  std::uint64_t token{};
-  {
-    std::lock_guard listener_lock(shared_->listener_mutex);
-    shared_->listener = std::move(listener);
-    token = ++shared_->listener_token;
-  }
-  std::lock_guard lock(shared_->mutex);
-  // Replay: the new listener receives every current non-empty verdict.
-  shared_->published.clear();
-  for (const auto& [key, slot] : shared_->slots) shared_->dirty.insert(key.first);
-  shared_->ScheduleEvaluationLocked(shared_);
-  return token;
-}
-
-void ComponentStreamHealth::ClearListener(const std::uint64_t token) noexcept {
-  std::lock_guard listener_lock(shared_->listener_mutex);
-  if (shared_->listener_token == token) shared_->listener = nullptr;
-}
-
 void ComponentStreamHealth::SetLog(std::function<void(const std::string&)> log) {
-  std::lock_guard listener_lock(shared_->listener_mutex);
+  std::lock_guard log_lock(shared_->log_mutex);
   shared_->log = std::move(log);
 }
 

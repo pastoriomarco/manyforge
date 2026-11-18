@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_core VERSION 0.2.1 LANGUAGES CXX)
+project(manyforge_core VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,11 +35,9 @@ endif()
 
 # Core library
 add_library(manyforge_core
-  src/stuck_drain_wait.cpp
   src/addressed_observed_state_publication.cpp
   src/configured_robot_measured_state.cpp
   src/component_lifecycle.cpp
-  src/component_lifecycle_snapshot.cpp
   src/component_state.cpp
   src/component_coordinator.cpp
   src/runtime_route_configuration.cpp
@@ -54,7 +52,6 @@ add_library(manyforge_core
   src/coordinate_state.cpp
   src/state_machine.cpp
   src/error_code_mapping.cpp
-  src/emergency_stop_acceptance_reserve.cpp
   src/bounded_operation_control_executor.cpp
   src/bounded_stop_control_executor.cpp
   src/bounded_stop_stage_attempt_executor.cpp
@@ -125,9 +122,7 @@ add_library(manyforge_core
   src/scene_frame_resolution.cpp
   src/stop_intent.cpp
   src/stop_scope_resolver.cpp
-  src/stop_terminal_reducer.cpp
-  src/stop_terminal_state.cpp
-  src/stop_journal_projection_codec.cpp
+  src/stop_event_codec.cpp
   src/trajectory_cache.cpp
   src/trajectory_cache_intent.cpp
   src/trajectory_cache_compatibility.cpp
@@ -338,13 +333,6 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_resource_slot_table
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
-  add_executable(test_emergency_stop_acceptance_reserve
-    test/test_emergency_stop_acceptance_reserve.cpp)
-  target_link_libraries(test_emergency_stop_acceptance_reserve PRIVATE
-    manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_emergency_stop_acceptance_reserve
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
   add_executable(test_bounded_operation_control_executor
     test/test_bounded_operation_control_executor.cpp)
   target_link_libraries(test_bounded_operation_control_executor PRIVATE
@@ -373,6 +361,13 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_stop_intent
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_stop_state_core
+    test/test_stop_state_core.cpp)
+  target_link_libraries(test_stop_state_core PRIVATE
+    manyforge_core GTest::gtest_main)
+  gtest_discover_tests(test_stop_state_core
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_stop_scope_resolver
     test/test_stop_scope_resolver.cpp)
   target_link_libraries(test_stop_scope_resolver PRIVATE
@@ -385,13 +380,6 @@ if(BUILD_TESTING)
   target_link_libraries(test_participant_stop_stage PRIVATE
     manyforge_core manyforge::content_identity GTest::gtest_main)
   gtest_discover_tests(test_participant_stop_stage
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_stop_terminal_reducer
-    test/test_stop_terminal_reducer.cpp)
-  target_link_libraries(test_stop_terminal_reducer PRIVATE
-    manyforge_core manyforge::content_identity GTest::gtest_main)
-  gtest_discover_tests(test_stop_terminal_reducer
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_runtime_scale_governor test/test_runtime_scale_governor.cpp)
@@ -441,19 +429,11 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_io_condition_evaluator
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
-  add_executable(test_stop_terminal_state
-    test/test_stop_terminal_state.cpp)
-  target_link_libraries(test_stop_terminal_state PRIVATE
-    manyforge_core GTest::gtest_main)
-  gtest_discover_tests(test_stop_terminal_state
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_stop_journal_projection_codec
-    test/test_stop_journal_projection_codec.cpp
+  add_executable(test_io_rule_outcome_codec
     test/test_io_rule_outcome_codec.cpp)
-  target_link_libraries(test_stop_journal_projection_codec PRIVATE
+  target_link_libraries(test_io_rule_outcome_codec PRIVATE
     manyforge_core manyforge::content_identity GTest::gtest_main)
-  gtest_discover_tests(test_stop_journal_projection_codec
+  gtest_discover_tests(test_io_rule_outcome_codec
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_resolved_stop_base_plan_codec
@@ -928,9 +908,8 @@ if(BUILD_TESTING)
       test_resource_addressed_execution_kernel
       test_runtime_participant_stop_readiness
       test_sqlite_operation_journal
-      test_stop_journal_projection_codec
       test_stop_record_size
-      test_stop_terminal_reducer)
+      test_stop_state_core)
     if(TARGET ${_golden_test})
       target_compile_definitions(${_golden_test} PRIVATE
         MANYFORGE_CORE_TEST_GOLDEN_DIR="${CMAKE_CURRENT_SOURCE_DIR}/test/golden")

@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
-import os
 import re
 import time
 import uuid
@@ -21,10 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from manyforge_headless_api.execution_control import (
-    ExecutionControlBusyError,
-    ExecutionControlClient,
-)
+from manyforge_headless_api.execution_control import ExecutionControlClient
 from manyforge_headless_api.request_validation import request_validation_detail
 
 from .composer_settings import ComposerSettingsStore
@@ -43,7 +38,6 @@ from .routes_scenario_documents import create_scenario_document_router
 from .routes_urdf import create_urdf_router
 from .routes_viewer import create_viewer_router
 from .security import SecurityConfig
-from .workbench_session import previous_session_notice
 from .state import (
     RUNTIME_UNAVAILABLE_MESSAGE,
     RUNTIME_UNAVAILABLE_REASON_CODE,
@@ -110,15 +104,34 @@ _UNAVAILABLE_PAYLOAD = UnavailableResponse(
 ).detail.model_dump(by_alias=True)
 
 
+# The Stop routes Composer forwards without validation (D11): never refused,
+# an oversized or non-object body is forwarded as `{}` for Headless to promote.
+_RECOGNIZED_STOP_PATHS = frozenset({
+    "/api/execution/stops", "/api/execution/stop-all", "/api/execution/halt",
+})
+_RECOGNIZED_RUN_STOP_PATH = re.compile(r"/api/program/runs/[^/]+/motion-stop")
+
+
+def is_recognized_stop_path(path: str) -> bool:
+    return (
+        path in _RECOGNIZED_STOP_PATHS
+        or _RECOGNIZED_RUN_STOP_PATH.fullmatch(path) is not None
+    )
+
+
 class ComposerRequestBodyLimitMiddleware:
-    """Reject oversized bodies on one bounded callback path family."""
+    """Reject oversized bodies on one bounded callback path family.
+
+    With ``recognized_stop`` it covers exactly the recognized Stop paths and
+    never rejects: an oversized or non-object body becomes `{}`.
+    """
 
     def __init__(
         self,
         app: ASGIApp,
         *,
         maximum_bytes: int,
-        path_prefix: str,
+        path_prefix: str = "",
         recognized_stop: bool = False,
     ) -> None:
         self.app = app
@@ -129,9 +142,10 @@ class ComposerRequestBodyLimitMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         path = str(scope.get("path", ""))
         path_matches = (
-            path == self.path_prefix
+            is_recognized_stop_path(path)
             if self.recognized_stop
             else path.startswith(self.path_prefix)
+            and not is_recognized_stop_path(path)
         )
         if scope["type"] != "http" or not path_matches:
             await self.app(scope, receive, send)
@@ -282,7 +296,6 @@ def create_app(
     effect route is caught before it can create a process or mutate robot state.
     """
 
-    session_notice = previous_session_notice(os.environ.get("MANYFORGE_WORKBENCH_PREVIOUS_SESSION_REPORT"))
     security = security or SecurityConfig()
     state.allowed_fs_roots = list(security.allowed_fs_roots)
     state.allowed_program_write_roots = (
@@ -307,25 +320,12 @@ def create_app(
             state.headless_client,
             admission=state.authoring_admission,
             workspace=state.authoring_workspace,
+            apply_commands=state.apply_commands,
         )
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         try:
-            if state.authoring_admission is not None:
-                try:
-                    await asyncio.to_thread(state.authoring_admission.recover)
-                except HTTPException as error:
-                    if error.status_code != 503:
-                        raise
-                    # The authoring owner has already failed closed. Keep
-                    # read-only Composer projections available while its
-                    # required execution owner is absent; startup is not an
-                    # implicit recovery or a grant of edit authority.
-                    logger.warning(
-                        "Composer authoring remains unavailable at startup: %s",
-                        error.detail,
-                    )
             yield
         finally:
             if state.execution_observation_source is not None:
@@ -379,21 +379,16 @@ def create_app(
         allow_headers=[
             "Content-Type",
             "X-Request-ID",
-            "X-ManyForge-Viewer-Owner-Epoch",
+            "X-ManyForge-Viewer-Application-Start-Id",
             "X-ManyForge-Viewer-Generation",
         ],
     )
     if state.headless_client is not None:
-        for recognized_stop_path in (
-            "/api/execution/stops",
-            "/api/execution/full-stop",
-        ):
-            app.add_middleware(
-                ComposerRequestBodyLimitMiddleware,
-                maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
-                path_prefix=recognized_stop_path,
-                recognized_stop=True,
-            )
+        app.add_middleware(
+            ComposerRequestBodyLimitMiddleware,
+            maximum_bytes=_MAXIMUM_REQUEST_BODY_BYTES,
+            recognized_stop=True,
+        )
 
     # Request correlation and bounded access logging are shell infrastructure,
     # not runtime ownership. Keep HTTPException rendering inside this
@@ -502,7 +497,6 @@ def create_app(
                 headless = state.headless_client.health()
                 return {
                     "status": headless.get("status", "degraded"),
-                    "workbench_session_notice": session_notice,
                     "startup_scenario_notice": state.startup_scenario_notice,
                     "mode": "headless_client",
                     "components": {
@@ -525,7 +519,6 @@ def create_app(
             except HeadlessClientError as error:
                 return {
                     "status": "degraded",
-                    "workbench_session_notice": session_notice,
                     "startup_scenario_notice": state.startup_scenario_notice,
                     "mode": "headless_client",
                     "components": {
@@ -552,7 +545,6 @@ def create_app(
                 }
         return {
             "status": "degraded",
-            "workbench_session_notice": session_notice,
             "startup_scenario_notice": state.startup_scenario_notice,
             "mode": "structural_only",
             "components": {
@@ -654,51 +646,6 @@ def create_app(
             create_viewer_router(state, security),
             tags=["headless-viewer-observation-client"],
         )
-
-        @app.exception_handler(RequestValidationError)
-        async def recognized_stop_validation_handler(
-            request: Request,
-            error: RequestValidationError,
-        ) -> Response:
-            if request.method == "POST" and request.url.path in {
-                "/api/execution/stops",
-                "/api/execution/full-stop",
-            }:
-                from manyforge_headless_api.client import HeadlessClientError
-
-                try:
-                    payload = await execution_controls.stop(
-                        lambda: state.headless_client.recognized_malformed_stop(
-                            request.url.path
-                        )
-                    )
-                    response: Response = JSONResponse(content=payload)
-                except ExecutionControlBusyError as busy_error:
-                    response = JSONResponse(
-                        status_code=503,
-                        content={
-                            "detail": {
-                                "code": "execution_control_ingress_busy",
-                                "message": str(busy_error),
-                            }
-                        },
-                    )
-                except HeadlessClientError as client_error:
-                    response = JSONResponse(
-                        status_code=client_error.status_code or 503,
-                        content={
-                            "detail": {
-                                "code": client_error.code,
-                                "message": str(client_error),
-                            }
-                        },
-                    )
-                if getattr(
-                    request.state, "recognized_stop_close_connection", False
-                ):
-                    response.headers["Connection"] = "close"
-                return response
-            return await _request_validation_response(request, error)
 
         @app.websocket("/ws/control")
         async def headless_state_websocket(websocket: WebSocket) -> None:

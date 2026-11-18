@@ -40,9 +40,8 @@ CREATE TABLE IF NOT EXISTS logical_scene_store_metadata (
     maximum_wal_bytes INTEGER NOT NULL CHECK (
         maximum_wal_bytes = 16777216
     ),
-    maximum_named_apply_stages INTEGER NOT NULL CHECK (
-        maximum_named_apply_stages = 256
-    )
+    -- Set by the record writer when records of this start were not written.
+    records_lost INTEGER NOT NULL DEFAULT 0 CHECK (records_lost IN (0, 1))
 ) STRICT;
 
 CREATE TABLE IF NOT EXISTS canonical_empty_scene_acceptance (
@@ -288,8 +287,21 @@ CREATE TABLE IF NOT EXISTS logical_scene_named_apply_finalizations (
     )
 ) WITHOUT ROWID, STRICT;
 
+-- Every column but records_lost is immutable.
 CREATE TRIGGER IF NOT EXISTS logical_scene_store_metadata_no_update
-BEFORE UPDATE ON logical_scene_store_metadata
+BEFORE UPDATE OF
+    singleton,
+    schema_id,
+    schema_version,
+    schema_artifact_digest,
+    canonical_empty_admission_digest,
+    cell_id,
+    canonical_empty_retained_bundle_id,
+    canonical_empty_graph_revision,
+    maximum_identifier_bytes,
+    maximum_database_page_image_bytes,
+    maximum_wal_bytes
+ON logical_scene_store_metadata
 BEGIN
     SELECT RAISE(ABORT, 'logical_scene_store_metadata is immutable');
 END;

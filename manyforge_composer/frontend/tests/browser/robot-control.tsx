@@ -30,21 +30,21 @@ let previewCount = 0;
 let availabilityCount = 0;
 let manualReady = false;
 let cleanupRequired = false;
-let selectionRevision = 0;
+let holdRevision = 0;
 let holdPreviews = false;
 const heldPreviews: (() => void)[] = [];
 let rejectPreview = false;
 let previewFailureReason: string | null = null;
 const commands: { kind: string; payload: unknown; resolve: () => void; reject: () => void }[] = [];
 const source = {
-  sendExecutionCommand(kind: string, payload: Record<string, unknown>, requestId: string) {
+  sendExecutionCommand(kind: string, payload: Record<string, unknown>) {
     if (commands.length >= 32) throw new Error('Test command bound exceeded');
     return new Promise((resolve, reject) => commands.push({
       kind, payload,
       resolve: () => { if (kind === 'program_manual_handover') cleanupRequired = false; resolve(kind === 'runtime_scale' ? { result: {
         ok: true, api_version: 'v1', command: 'set_runtime_scale_control', accepted: {
         accepted_at_ns: '1234',
-        request_id: requestId, replay_status: 'accepted_new', selector: payload.selector,
+        replay_status: 'accepted_new', selector: payload.selector,
         control_generation: Number(payload.expected_control_generation) + 1,
         requested_scale: payload.scale, active_operation_id: null,
         active_operation_revision: null, active_operation_scale_generation: null,
@@ -58,12 +58,12 @@ api.execution.manualAvailability = async (intent) => {
   availabilityCount += 1;
   const available = manualReady && !currentStatus.manualOperations.some((operation) => operation.resident);
   return {
-    requestId: intent.request_context.request_id, requestOwnerEpoch: currentStatus.ownerEpoch,
+    requestKey: intent.request_context.request_key,
     intentDigest: `sha256:${'a'.repeat(64)}`, available,
     unavailableReason: available ? null : 'manual_handover_producer_not_held',
     cleanupRequired: available && cleanupRequired,
-    manualHandover: available ? { program_runner_owner_epoch: 'runner.1',
-      program_run_id: 'program.1', claim_generation: 1, selection_revision: selectionRevision } : null,
+    manualHandover: available ? {
+      program_run_id: 1, claim_generation: 1, hold_revision: holdRevision } : null,
   };
 };
 
@@ -81,13 +81,13 @@ api.execution.previewMotion = async (intent) => {
   const payload = intent.participants[0].payload;
   const positions = payload.kind === 'motion' && payload.motion.kind === 'joint_goal'
     ? payload.motion.positions_rad : controller.state.draftPositionsRad;
-  const receipt = receiptFixture(currentStatus, intent.request_context.request_id, positions);
+  const receipt = receiptFixture(currentStatus, intent.request_context.request_key, positions);
   if (holdPreviews) await new Promise<void>((resolve) => heldPreviews.push(resolve));
   return receipt;
 };
 api.execution.previewCapabilityCommand = async (intent) => {
   previewCount += 1;
-  return gripperReceiptFixture(currentStatus, intent.request_context.request_id,
+  return gripperReceiptFixture(currentStatus, intent.request_context.request_key,
     controller.state.draftGripperPosition!);
 };
 
@@ -99,13 +99,13 @@ function App() {
   const [groupsVisible, setGroupsVisible] = useState(false);
   const [nativeAvailable, updateNativeAvailable] = useState(true);
   const result = useRobotControl(true, programActive, false,
-    { executionControlStatus: nativeAvailable ? status : null,
+    { applicationStartId: '3f9a000000000001', executionControlStatus: nativeAvailable ? status : null,
       authoringAdmission: { authoringAllowed: !programActive, admissionGeneration: 1 },
       programCycle: {
-        programRunnerOwnerEpoch: 'runner.1', cycleGeneration: 1,
+        cycleGeneration: 1,
         state: programActive ? 'running' : 'idle_after_reset',
-        programRunId: programActive ? 'program.1' : null, runRevision: 1,
-        executionControlRevision: selectionRevision + 1,
+        programRunId: programActive ? 1 : null, runRevision: 1,
+        executionControlRevision: holdRevision + 1,
       },
     } as ComposerHeadlessState, source);
   useLayoutEffect(() => {
@@ -120,7 +120,7 @@ function App() {
   const program = {
     cycleState: programActive ? 'running' : 'idle_after_reset',
     state: { runnerAvailable: true, applied: null, pending: null, controlPending: null,
-      run: groupsVisible ? { state: 'running', capture: { programRunId: 'groups.1' } } : null,
+      run: groupsVisible ? { state: 'running', capture: { programRunId: 2 } } : null,
       controls: groupsVisible ? { executionSelections: { groups: ['all', 'arm', 'grippers'].map((groupId) => ({
         groupId, state: 'running', stopAllowed: true, resumeAllowed: false,
       })) } } : null },
@@ -175,9 +175,9 @@ const harness = {
   releaseOperation() { publish({ ...currentStatus, manualOperations: currentStatus.manualOperations
     .map((operation) => ({ ...operation, resident: false, operationRevision: operation.operationRevision + 1 })) }); },
   settled() { publish({ ...currentStatus, manualOperations: [{
-    programRunId: currentStatus.directControl.programRunId, operationId: 'settled',
+    programRunId: currentStatus.directControl.programRunId, operationId: 90,
     operationRevision: 2, resident: false, state: 'completed', progress: 1,
-    activeStopGeneration: null, activeStopId: null, terminalError: null,
+    stopEventId: null, terminalError: null,
   }] }); },
   measured(positions: number[]) { publish({ ...currentStatus, observedMotion: {
     ...currentStatus.observedMotion, positionsRad: positions,
@@ -188,7 +188,7 @@ const harness = {
   manualReady(ready: boolean, cleanup = false) {
     manualReady = ready;
     cleanupRequired = cleanup;
-    selectionRevision += 1;
+    holdRevision += 1;
     publish({ ...currentStatus });
   },
   setPreviewFailure(failed: boolean, reason: string | null = null) {
@@ -197,15 +197,15 @@ const harness = {
   },
   refresh() { publish({ ...currentStatus, observedMotion: { ...currentStatus.observedMotion,
     sequence: currentStatus.observedMotion.sequence + 1 } }); },
-  operation(id: string, state: OperationObservation['state'] = 'executing', error: string | null = null,
+  operation(id: number, state: OperationObservation['state'] = 'executing', error: string | null = null,
     target: 'motion' | 'gripper' = 'motion') {
     publish({ ...currentStatus, manualOperations: [{
       programRunId: (target === 'gripper' ? currentStatus.directControlGripper : currentStatus.directControl).programRunId,
       operationId: id, operationRevision: 1, resident: true, state,
-      progress: 0.5, activeStopGeneration: null, activeStopId: null, terminalError: error,
+      progress: 0.5, stopEventId: null, terminalError: error,
     }] });
   },
-  replaceOwner() { publish(statusFixture(`${currentStatus.ownerEpoch}-next`)); },
+  replaceOwner() { publish(statusFixture(`${currentStatus.applicationStartId}-next`)); },
   scale(value: number) { controller.setRuntimeScale(value); controller.commitRuntimeScale(); },
   freezeScale() { publish({ ...currentStatus, runtimeScaleControl: {
     ...currentStatus.runtimeScaleControl!, controlGeneration: 2,

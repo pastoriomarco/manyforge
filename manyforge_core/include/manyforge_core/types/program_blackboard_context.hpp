@@ -12,7 +12,6 @@ namespace manyforge::core {
 /// Installation retains the existing composition/admission guards throughout
 /// the exact Kernel service/configuration/current-owner recheck and commit.
 struct AppliedProgramBlackboardContextDTO final {
-  RequestOwnerEpoch request_owner_epoch;
   ActiveBundlePublicationGeneration active_publication_generation{0U};
   ProgramId program_id;
   ProgramRevision program_revision;

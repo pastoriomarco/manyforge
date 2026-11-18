@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_component_manager VERSION 0.2.1 LANGUAGES CXX)
+project(manyforge_component_manager VERSION 0.3.0 LANGUAGES CXX)
 
 cmake_policy(SET CMP0077 NEW)
 
@@ -210,12 +210,9 @@ add_library(manyforge_component_manager
   src/native_projection_transition_internal.cpp
   src/manager_bootstrap_journal.cpp
   src/execution_host_unit_admission.cpp
-  src/reference_runtime_unit_admission.cpp
   src/retained_execution_host_unit_adapter.cpp
-  src/retained_posix_runtime_unit_adapter.cpp
   src/runtime_convergence.cpp
   src/runtime_observation.cpp
-  src/runtime_unit_adapter_router.cpp
   src/selected_bundle_transition.cpp
   src/selected_runtime_composition_rpc_internal.cpp
   src/site_settings.cpp
@@ -317,21 +314,6 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_runtime_observation
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
-  # Test-only join: generate one real retained runtime product through the
-  # offline compiler, then admit it through the production focused reader.
-  # The Component Manager library itself remains free of the full compiler.
-  add_executable(test_reference_runtime_unit_admission
-    test/test_reference_runtime_unit_admission.cpp)
-  target_include_directories(test_reference_runtime_unit_admission PRIVATE
-    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
-    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
-  target_link_libraries(test_reference_runtime_unit_admission PRIVATE
-    manyforge_component_manager
-    manyforge::deployment
-    GTest::gtest_main)
-  gtest_discover_tests(test_reference_runtime_unit_admission
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
   add_executable(test_sqlite_store_startup_internal
     test/test_sqlite_store_startup_internal.cpp)
   target_include_directories(test_sqlite_store_startup_internal PRIVATE
@@ -351,6 +333,7 @@ if(BUILD_TESTING)
   target_link_libraries(test_manager_bootstrap_journal PRIVATE
     manyforge_component_manager
     manyforge::deployment_admission
+    manyforge::persistence
     GTest::gtest_main
     SQLite::SQLite3)
   set(
@@ -373,9 +356,9 @@ if(BUILD_TESTING)
   add_executable(test_active_bundle_publication_store
     test/test_active_bundle_publication_store.cpp)
   target_link_libraries(test_active_bundle_publication_store PRIVATE
-    manyforge_component_manager GTest::gtest_main)
-  # The receipt-bound test publishes past the 4096-receipt limit; every
-  # Publish fully re-verifies the retained receipts, so it needs minutes.
+    manyforge_component_manager manyforge::persistence GTest::gtest_main)
+  # The receipt-bound test publishes past the 4096-receipt limit and writes
+  # every receipt to the file.
   gtest_discover_tests(test_active_bundle_publication_store
     PROPERTIES TIMEOUT 300)
 
@@ -383,6 +366,7 @@ if(BUILD_TESTING)
     test/test_manager_apply_journal.cpp)
   target_link_libraries(test_manager_apply_journal PRIVATE
     manyforge_component_manager
+    manyforge::persistence
     GTest::gtest_main
     SQLite::SQLite3)
   gtest_discover_tests(test_manager_apply_journal
@@ -584,19 +568,6 @@ if(BUILD_TESTING)
     manyforge::deployment_verification_core
     GTest::gtest_main)
   gtest_discover_tests(test_manager_active_runtime_coordinator
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_executable(test_retained_posix_runtime_unit_adapter
-    test/test_retained_posix_runtime_unit_adapter.cpp)
-  target_include_directories(
-    test_retained_posix_runtime_unit_adapter PRIVATE
-    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/src"
-    "${MANYFORGE_DEPLOYMENT_SOURCE_DIR}/test")
-  target_link_libraries(test_retained_posix_runtime_unit_adapter PRIVATE
-    manyforge_component_manager
-    manyforge::deployment
-    GTest::gtest_main)
-  gtest_discover_tests(test_retained_posix_runtime_unit_adapter
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_canonical_empty_bootstrap_coordinator

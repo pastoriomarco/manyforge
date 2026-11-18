@@ -122,15 +122,18 @@ struct XArmIoComponentConfig final {
 ///   command timeout (the stream starts with the owner's driver), else
 ///   `fault_stream_stale`.
 /// - Health: a stale stream is `fault_stream_stale` while the owner is usable
-///   (prepared, connected, not deliberately offline); controller errors (C33,
+///   (prepared, connected, not deliberately offline) and its arming isn't
+///   running (that pauses the stream); controller errors (C33,
 ///   C19, the GPIO module's) are the owner's faults.
 class XArmIoComponent final : public core::IComponentAdapter,
                               public roboplan_backend::IIoOutputWriter {
 public:
   /// `owner_usable`: whether the owner is usable now (its stream is then
-  /// expected).
+  /// expected). `owner_arming`: whether the owner's arming runs now
+  /// (`XArmOwnerAdapter::Arming`; empty: never).
   XArmIoComponent(XArmIoComponentConfig config, std::shared_ptr<const IXArmDriver> driver,
-                  std::function<bool(std::int64_t now_ns)> owner_usable, core::IClock &clock);
+                  std::function<bool(std::int64_t now_ns)> owner_usable, core::IClock &clock,
+                  std::function<bool()> owner_arming = {});
 
   [[nodiscard]] core::ComponentState State(std::int64_t now_ns) const override;
   [[nodiscard]] core::ActionResult Run(core::ComponentAction action,
@@ -182,13 +185,14 @@ private:
   const std::shared_ptr<const IXArmDriver> driver_;
   const std::function<bool(std::int64_t)> owner_usable_;
   core::IClock &clock_;
+  const std::function<bool()> owner_arming_;
   mutable std::mutex mutex_;
   core::ComponentLifecycle lifecycle_{core::ComponentLifecycle::kNotPrepared};
   std::vector<Track> tracks_;
   std::optional<std::int64_t> last_sample_at_ns_;
   std::optional<XArmGpioModuleStatus> gpio_;
   int writes_in_flight_{0};
-  /// When the stream went stale while the owner was usable.
+  /// When the stream went stale while the owner was usable and not arming.
   mutable std::optional<std::int64_t> stale_since_;
 };
 

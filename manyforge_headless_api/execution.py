@@ -60,6 +60,8 @@ from .execution_event_stream import follow_execution_events, open_event_subscrip
 EXECUTION_SOCKET_FILE = "execution-command.sock"
 EXECUTION_CONTROL_SOCKET_FILE = "execution-control.sock"
 EXECUTION_OBSERVATION_SOCKET_FILE = "execution-observation.sock"
+# Component actions, the component model and operator-alarm attention.
+EXECUTION_COMPONENT_SOCKET_FILE = "execution-component.sock"
 ACTIVE_TCP_EVENT_KIND = "active_tcp_changed"
 # The host's component model facts in every ``events`` reply and stream
 # ``state``: a change of any wakes the control
@@ -71,20 +73,23 @@ COMPONENT_MODEL_STATE_FIELDS = (
     "rule_holds",
     "signal_samples",
 )
-EXECUTION_COMMAND_VERSION = "manyforge.execution_command.v3"
-EXECUTION_RESPONSE_VERSION = "manyforge.execution_command_response.v4"
-VOLATILE_MOTION_TRACE_VERSION = "manyforge.volatile_motion_trace.v1"
+EXECUTION_COMMAND_VERSION = "manyforge.execution_command.v4"
+EXECUTION_RESPONSE_VERSION = "manyforge.execution_command_response.v6"
+# The Kernel's selection-request schema, bumped with the removal of the
+# runner owner epoch and claim generation (contract 1.9).
+PROGRAM_EXECUTION_SELECTION_VERSION = "manyforge.program_execution_selection.v3"
+VOLATILE_MOTION_TRACE_VERSION = "manyforge.volatile_motion_trace.v2"
 MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
+_REQUEST_KEY_TEXT = re.compile(r"[0-9a-f]{32}")
 OPERATION_EVENT_KINDS = frozenset(
     {
         "operation_accepted",
         "control_accepted",
-        "stop_acceptance_projected",
-        "stop_terminal_projected",
+        "stop_event_accepted",
+        "stop_event_completed",
         "runtime_scale_accepted",
         "operation_prepared",
         "state_observed",
-        "host_replaced",
         # Kernel global rule state rows: folded by the global
         # rule status projection and ingested by the historian unchanged.
         STATE_EVENT_KIND,
@@ -95,35 +100,129 @@ OPERATION_EVENT_KINDS = frozenset(
 )
 
 
+# ``read_stop`` reply members (``manyforge.execution_stop_status.v2``).
+_STOP_STATUS_MEMBERS = frozenset(
+    {
+        "accepted_at_ns",
+        "applied",
+        "completed_at_ns",
+        "covered",
+        "event_id",
+        "request_key",
+        "requested",
+        "result",
+        "schema_version",
+        "state",
+        "widen_reason",
+    }
+)
+_STOP_EVENT_RESULTS = frozenset(
+    {"pending", "no_effect", "stopped", "stopped_escalated", "some_failed"}
+)
+
+
+def _is_request_key(value: Any) -> bool:
+    return isinstance(value, str) and _REQUEST_KEY_TEXT.fullmatch(value) is not None
+
+
+_PLANNING_JOB_MEMBERS = frozenset(
+    {"error", "job_id", "kind", "planning_result", "schema_version", "state"}
+)
+_PLANNING_JOB_STATES = frozenset({"accepted", "planning", "done", "failed", "cancelled"})
+# The host bounds a job name as it bounds a pick/place `sequence_id`.
+_MAXIMUM_PLANNING_JOB_ID_BYTES = 96
+
+
+def _require_planning_job_id(job_id: Any) -> str:
+    if (
+        not isinstance(job_id, str)
+        or not job_id
+        or len(job_id.encode("utf-8")) > _MAXIMUM_PLANNING_JOB_ID_BYTES
+    ):
+        raise ValueError("planning job id must be 1 to 96 bytes of text")
+    return job_id
+
+
+def _valid_planning_result(result: Any, expected_kind: str) -> bool:
+    """The `planning_result` a done pick/place planning job carries."""
+
+    return (
+        isinstance(result, dict)
+        and result.get("schema_version") == "manyforge.pick_place_planning_result.v1"
+        and result.get("kind") == expected_kind
+        and result.get("status") in {"planned", "no_feasible_candidate"}
+        and type(result.get("attempted_candidate_count")) is int
+        and 0 <= result["attempted_candidate_count"] <= 4096
+        and isinstance(result.get("reports"), list)
+        and len(result["reports"]) <= result["attempted_candidate_count"]
+        and not (
+            expected_kind == "pick"
+            and result["attempted_candidate_count"] > 0
+            and not isinstance(result.get("last_attempted_candidate"), dict)
+        )
+        and not (
+            expected_kind == "place"
+            and result.get("last_attempted_candidate") is not None
+        )
+        and not (result["status"] == "planned" and not isinstance(result.get("plan"), dict))
+        and not (result["status"] == "no_feasible_candidate" and result.get("plan") is not None)
+    )
+
+
+def _validated_planning_job(
+    response: dict[str, Any], command: str, job_id: str | None = None
+) -> dict[str, Any]:
+    """Check the `planning_job` of an accepted plan, read or cancel reply.
+
+    A job carries its `planning_result` only when `done` and its typed `error`
+    only when `failed`.
+    """
+
+    if response.get("ok") is not True:
+        return response
+    job = response.get("planning_job")
+    if (
+        response.get("command") != command
+        or not isinstance(job, dict)
+        or set(job) != _PLANNING_JOB_MEMBERS
+        or job.get("schema_version") != "manyforge.planning_job.v1"
+        or (job_id is not None and job.get("job_id") != job_id)
+        or job.get("kind") not in {"pick", "place"}
+        or job.get("state") not in _PLANNING_JOB_STATES
+        or (job["state"] == "done") != (job.get("planning_result") is not None)
+        or (job["state"] == "failed") != isinstance(job.get("error"), dict)
+        or (job["state"] != "failed" and job.get("error") is not None)
+        or (
+            job["state"] == "done"
+            and not _valid_planning_result(job["planning_result"], job["kind"])
+        )
+    ):
+        raise HeadlessApiError(
+            "execution_command_response_invalid",
+            "pick/place planning job has the wrong kind or shape",
+        )
+    return response
+
+
+def _is_counter(value: Any) -> bool:
+    return type(value) is int and 1 <= value <= MAXIMUM_SAFE_INTEGER
+
+
 def _valid_operation_event_identity(event: dict[str, Any]) -> bool:
     operation_id = event.get("operation_id")
     operation_revision = event.get("operation_revision")
     if event.get("record_kind") in {
-        "stop_acceptance_projected",
-    }:
-        request_id = event.get("request_id")
-        return (
-            operation_id is None
-            and operation_revision is None
-            and isinstance(request_id, str)
-            and bool(request_id)
-        )
-    if event.get("record_kind") in {
-        "stop_terminal_projected",
+        "stop_event_accepted",
+        "stop_event_completed",
         STATE_EVENT_KIND,
         ACTIVE_TCP_EVENT_KIND,
     }:
         return (
             operation_id is None
             and operation_revision is None
-            and event.get("request_id") is None
+            and event.get("request_key") is None
         )
-    return (
-        isinstance(operation_id, str)
-        and bool(operation_id)
-        and type(operation_revision) is int
-        and 1 <= operation_revision <= MAXIMUM_SAFE_INTEGER
-    )
+    return _is_counter(operation_id) and _is_counter(operation_revision)
 
 
 _RETRY_ELIGIBILITY_KEYS = frozenset({"eligible", "cause", "effect", "reason"})
@@ -172,21 +271,9 @@ def _valid_retry_eligibility(value: object) -> bool:
 
 MAX_EXECUTION_PACKET_BYTES = 1024 * 1024
 MAX_EXECUTION_RESPONSE_BYTES = 4 * 1024 * 1024
-# Mirrors the native operation journal's closed maximum. Released operations
-# are removed as their control event is ingested, so this is a concurrent
-# owner-state bound rather than lifetime retention.
+# Mirrors the native operation journal's closed maximum: the bound of the
+# resident operations' progress rows.
 MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS = 4096
-# Operation states in which the target no longer moves under this operation.
-_OPERATION_REST_STATES = frozenset(
-    {
-        "completed",
-        "stopped",
-        "failed",
-        "interrupted",
-        "intervention_required",
-        "cancelled_pre_dispatch",
-    }
-)
 MOTION_PREVIEW_RESPONSE_KEYS = frozenset(
     {"api_version", "command", "ok", "preview_receipt"}
 )
@@ -203,8 +290,7 @@ MOTION_PREVIEW_RECEIPT_KEYS = frozenset(
         "program_revision",
         "program_run_id",
         "receipt_digest",
-        "request_id",
-        "request_owner_epoch",
+        "request_key",
         "required_capability_id",
         "retained_bundle_id",
         "scene_revision",
@@ -328,8 +414,7 @@ CAPABILITY_COMMAND_PREVIEW_RECEIPT_KEYS = frozenset(
         "program_revision",
         "program_run_id",
         "receipt_digest",
-        "request_id",
-        "request_owner_epoch",
+        "request_key",
         "required_capability_id",
         "retained_bundle_id",
         "schema_version",
@@ -359,7 +444,7 @@ class ExecutionPort(Protocol):
 
     def open_observation_session(self) -> "ExecutionObservationSession": ...
 
-    def subscribe_events(self, after_cursor: int, owner_epoch: str | None) -> Any: ...
+    def subscribe_events(self, after_cursor: int) -> Any: ...
 
     def submit(
         self,
@@ -389,7 +474,7 @@ class ExecutionPort(Protocol):
         trusted_principal_id: str | None,
     ) -> dict[str, Any]: ...
 
-    def read(self, operation_id: str) -> dict[str, Any]: ...
+    def read(self, operation_id: int) -> dict[str, Any]: ...
 
     def plan_pick(
         self,
@@ -404,6 +489,12 @@ class ExecutionPort(Protocol):
         *,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]: ...
+
+    def read_planning_job(self, job_id: str) -> dict[str, Any]: ...
+
+    def cancel_planning_job(self, job_id: str) -> dict[str, Any]: ...
+
+    def release_planning_job(self, job_id: str) -> dict[str, Any]: ...
 
     def reset(
         self,
@@ -426,19 +517,27 @@ class ExecutionPort(Protocol):
         trusted_principal_id: str | None,
     ) -> dict[str, Any]: ...
 
-    def full_stop(
+    def stop_all(
         self,
         request: FullStopIntentRequest,
         *,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]: ...
 
-    def recognized_malformed_stop(
+    def halt(
+        self,
+        request: FullStopIntentRequest,
+        *,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]: ...
+
+    def recognized_stop(
         self,
         *,
-        request_id: str,
+        request_key: str,
         recognized_route: str,
         reason: str,
+        source_label: str | None,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]: ...
 
@@ -467,7 +566,6 @@ class ExecutionPort(Protocol):
 
     def events(
         self,
-        owner_epoch: str,
         after_sequence: int,
         *,
         limit: int = 16,
@@ -600,9 +698,9 @@ class ExecutionObservationSession(
         cancelled: threading.Event,
     ) -> dict[str, Any]:
         if cursor is not None and (
-            set(cursor) != {"owner_epoch", "source_epoch", "source_sequence"}
-            or not isinstance(cursor.get("owner_epoch"), str)
-            or not cursor["owner_epoch"]
+            set(cursor) != {"application_start_id", "source_epoch", "source_sequence"}
+            or not isinstance(cursor.get("application_start_id"), str)
+            or not cursor["application_start_id"]
             or not isinstance(cursor.get("source_epoch"), str)
             or not cursor["source_epoch"]
             or type(cursor.get("source_sequence")) is not int
@@ -614,7 +712,9 @@ class ExecutionObservationSession(
             )
         command = {
             "api_version": EXECUTION_COMMAND_VERSION,
-            "after_owner_epoch": None if cursor is None else cursor["owner_epoch"],
+            "after_application_start_id": (
+                None if cursor is None else cursor["application_start_id"]
+            ),
             "after_source_epoch": None if cursor is None else cursor["source_epoch"],
             "after_source_sequence": (
                 None if cursor is None else cursor["source_sequence"]
@@ -680,20 +780,15 @@ def _sparse_request_with_complete_context(request: Any) -> dict[str, Any]:
     """Project the public request context accepted by the native owner.
 
     Stop selectors deliberately omit unused selector kinds and an absent
-    reason.  Session/client sequence is Program-cycle audit metadata and is
-    consumed before this native boundary; the native request context remains
-    the closed four-field DTO, including a nullable correlation identity.
+    reason. The native request context is ``{request_key, source_label}``
+    with the key Headless formed; ``A`` was checked at the edge and is not
+    forwarded.
     """
 
     payload = request.model_dump(mode="json", exclude_none=True)
     payload["request_context"] = request.request_context.model_dump(
         mode="json",
-        include={
-            "request_id",
-            "request_owner_epoch",
-            "source_label",
-            "correlation_id",
-        },
+        include={"request_key", "source_label"},
     )
     return payload
 
@@ -708,6 +803,7 @@ class ExecutionCommandClient:
         timeout_seconds: float = 10.0,
         attribution_transport: str = "http",
     ) -> None:
+        # ``timeout_seconds`` limits the connection only; see `_exchange_on`.
         if timeout_seconds <= 0 or timeout_seconds > 30:
             raise ValueError("execution timeout must be in (0, 30] seconds")
         if attribution_transport not in {"http", "internal"}:
@@ -724,8 +820,18 @@ class ExecutionCommandClient:
         self._observation_socket_path = (
             self._run_root.path / EXECUTION_OBSERVATION_SOCKET_FILE
         )
+        self._component_socket_path = (
+            self._run_root.path / EXECUTION_COMPONENT_SOCKET_FILE
+        )
         self._timeout_seconds = timeout_seconds
         self._attribution_transport = attribution_transport
+
+    def _receive_timeout(self, command: dict[str, Any]) -> float | None:
+        """The limit on sending and receiving once connected: none, the
+        request waits for its answer (OD-214)."""
+
+        del command
+        return None
 
     def _exchange_on(
         self, command: dict[str, Any], socket_path: Path
@@ -751,6 +857,11 @@ class ExecutionCommandClient:
                     client.settimeout(self._timeout_seconds)
                     operation = "connect"
                     client.connect(socket_address)
+                    # Only the connection is limited (OD-214): the request
+                    # then waits for its answer. A host exit closes the
+                    # socket; a late host is the Manager's status probe's.
+                    operation = "settimeout"
+                    client.settimeout(self._receive_timeout(command))
                     operation = "send"
                     sent = client.send(encoded)
                     if sent != len(encoded):
@@ -789,7 +900,11 @@ class ExecutionCommandClient:
         self,
         request: ProgramRunStopIntentRequest,
     ) -> dict[str, Any]:
-        """Submit the private Program-owner selector on the Stop lane."""
+        """Submit the private Program-owner selector on the Stop lane.
+
+        Only the Program runner calls it (Forced Program End); the Kernel
+        accepts the program-run selector only from internal callers.
+        """
 
         if self._attribution_transport != "internal":
             raise HeadlessApiError(
@@ -814,59 +929,89 @@ class ExecutionCommandClient:
             )
         return response
 
-    def release_program_run_stop_fence(
+    def stop_program_selection(
         self,
-        program_run_id: str,
-        stop_id: str,
-        stop_generation: int,
+        request: Any,
+        *,
+        trusted_principal_id: str | None,
     ) -> dict[str, Any]:
-        """Reopen one exact internally owned Program-run Stop boundary."""
+        """Stop (level 1) of named groups of one Program run, on the Stop lane.
+
+        Headless sends it straight to the Kernel with the operator's
+        attribution (contract 1.8; K-10 accepts non-internal callers).
+        """
+
+        response = self._exchange_control(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": self._request_attribution(trusted_principal_id),
+                "command": "stop_program_selection",
+                "request": {
+                    "schema_version": PROGRAM_EXECUTION_SELECTION_VERSION,
+                    "request_context": {
+                        "request_key": request.request_key,
+                        "source_label": request.source_label,
+                    },
+                    "program_run_id": request.program_run_id,
+                    "group_ids": list(request.group_ids),
+                },
+            }
+        )
+        if response.get("ok") is True and (
+            response.get("command") != "stop_program_selection"
+            or not isinstance(response.get("accepted"), dict)
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "Program selection Stop acceptance has the wrong kind or shape",
+            )
+        return response
+
+    def release_halt(
+        self,
+        program_run_id: int,
+        expected_hold_revision: int,
+    ) -> dict[str, Any]:
+        """Execute after Halt: lower the run's freeze at one hold revision."""
 
         if self._attribution_transport != "internal":
             raise HeadlessApiError(
                 "execution_request_attribution_invalid",
-                "Program-run Stop release is available only to the internal owner transport",
+                "Halt release is available only to the internal owner transport",
             )
-        for label, value in (
-            ("Program-run identity", program_run_id),
-            ("Stop identity", stop_id),
-        ):
-            if (
-                not isinstance(value, str)
-                or not value
-                or unicodedata.normalize("NFC", value) != value
-                or len(value.encode("utf-8")) > 2_048
-            ):
-                raise ValueError(f"{label} must be bounded non-empty NFC text")
+        if not _is_counter(program_run_id):
+            raise ValueError("Program-run number is outside its safe bound")
         if (
-            type(stop_generation) is not int
-            or not 1 <= stop_generation <= MAXIMUM_SAFE_INTEGER
+            type(expected_hold_revision) is not int
+            or not 0 <= expected_hold_revision <= MAXIMUM_SAFE_INTEGER
         ):
-            raise ValueError("Stop generation is outside its safe bound")
+            raise ValueError("hold revision is outside its safe bound")
         response = self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "attribution": self._request_attribution(None),
-                "command": "release_program_run_stop_fence",
+                "command": "release_halt",
+                "expected_hold_revision": expected_hold_revision,
                 "program_run_id": program_run_id,
-                "stop_generation": stop_generation,
-                "stop_id": stop_id,
             }
         )
-        if response.get("ok") is True and response.get("command") != (
-            "release_program_run_stop_fence"
+        if response.get("ok") is True and (
+            response.get("command") != "release_halt"
+            # scope is null when the run is not the Kernel's current run (no effect).
+            or "scope" not in response
+            or not isinstance(response["scope"], (dict, type(None)))
         ):
             raise HeadlessApiError(
                 "execution_command_response_invalid",
-                "Program-run Stop release response has the wrong command kind",
+                "Halt release response has the wrong command kind or shape",
             )
         return response
 
-    def stop_status(self, stop_id: str) -> dict[str, Any]:
-        """Read one exact aggregate Stop result for the internal Program owner.
+    def read_stop(self, event_id: int) -> dict[str, Any]:
+        """Read one Stop event's record for the internal Program owner.
 
-        Served beside Stop on the independent control socket, so Stop
-        settlement never waits behind ordinary or planning traffic.
+        Served beside Stop on the independent control socket, so waiting on
+        a Stop never queues behind ordinary or planning traffic.
         """
 
         if self._attribution_transport != "internal":
@@ -874,18 +1019,14 @@ class ExecutionCommandClient:
                 "execution_request_attribution_invalid",
                 "Stop-status read is available only to the internal owner transport",
             )
-        if (
-            not stop_id
-            or unicodedata.normalize("NFC", stop_id) != stop_id
-            or len(stop_id.encode("utf-8")) > 2_048
-        ):
-            raise ValueError("Stop identity must be bounded non-empty NFC text")
+        if not _is_counter(event_id):
+            raise ValueError("Stop event id is outside its safe bound")
         response = self._exchange_control(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "attribution": self._request_attribution(None),
                 "command": "read_stop",
-                "stop_id": stop_id,
+                "event_id": event_id,
             }
         )
         if response.get("ok") is not True:
@@ -894,50 +1035,36 @@ class ExecutionCommandClient:
         if (
             response.get("command") != "read_stop"
             or not isinstance(status, dict)
-            or set(status) - {"terminal_projection"}
-            != {
-                "request_id",
-                "schema_version",
-                "state",
-                "stop_generation",
-                "stop_id",
-            }
-            # The additive forensic projection state: one string.
-            or status.get("terminal_projection", "pending")
-            not in ("pending", "recorded", "failed")
-            or status.get("schema_version") != "manyforge.execution_stop_status.v1"
-            or not isinstance(status.get("stop_id"), str)
-            or not isinstance(status.get("request_id"), str)
-            or not status["request_id"]
-            or status.get("state")
-            not in {
-                "accepted",
-                "stopping",
-                "certifying",
-                "succeeded",
-                "partial",
-                "failed",
-            }
-            or type(status.get("stop_generation")) is not int
-            or not 1 <= status["stop_generation"] <= MAXIMUM_SAFE_INTEGER
+            or set(status) != _STOP_STATUS_MEMBERS
+            or status.get("schema_version") != "manyforge.execution_stop_status.v2"
+            or status.get("event_id") != event_id
+            or not _is_request_key(status.get("request_key"))
+            or status.get("state") not in {"pending", "complete"}
+            or status.get("result") not in _STOP_EVENT_RESULTS
+            or not isinstance(status.get("covered"), list)
+            or (status["state"] == "complete")
+            != (status.get("completed_at_ns") is not None)
         ):
             raise HeadlessApiError(
                 "execution_command_response_invalid",
-                "native aggregate Stop status has an invalid envelope",
+                "native Stop event status has an invalid envelope",
             )
         return response
 
-    def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
+    def subscribe_events(self, after_cursor: int):
         """Open the event subscription stream strictly after ``after_cursor``;
         a context manager yielding the subscription."""
 
-        return open_event_subscription(self._run_root, after_cursor, owner_epoch)
+        return open_event_subscription(self._run_root, after_cursor)
 
     def _exchange(self, command: dict[str, Any]) -> dict[str, Any]:
         return self._exchange_on(command, self._socket_path)
 
     def _exchange_control(self, command: dict[str, Any]) -> dict[str, Any]:
         return self._exchange_on(command, self._control_socket_path)
+
+    def _exchange_component(self, command: dict[str, Any]) -> dict[str, Any]:
+        return self._exchange_on(command, self._component_socket_path)
 
     def _request_attribution(self, trusted_principal_id: str | None) -> dict[str, Any]:
         if trusted_principal_id is not None and (
@@ -1030,9 +1157,7 @@ class ExecutionCommandClient:
         if (
             response.get("command") != "query_operation"
             or not isinstance(operation, dict)
-            or not isinstance(operation.get("operation_id"), str)
-            or not operation["operation_id"]
-            or len(operation["operation_id"].encode("utf-8")) > MAX_IDENTITY_BYTES
+            or not _is_counter(operation.get("operation_id"))
             or type(operation.get("operation_revision")) is not int
             or not 1 <= operation["operation_revision"] <= MAXIMUM_SAFE_INTEGER
             or not isinstance(operation.get("participants"), list)
@@ -1057,7 +1182,7 @@ class ExecutionCommandClient:
         )
         observation = response.get("target_observation")
         expected = request.model_dump(mode="json", exclude_none=True)
-        expected["schema_version"] = "manyforge.target_observation.v2"
+        expected["schema_version"] = "manyforge.target_observation.v3"
         if request.kind == "frame_transform":
             self._require_frame_transform(response, observation, expected)
             return response
@@ -1135,8 +1260,7 @@ class ExecutionCommandClient:
             )
         )
         expected = {
-            "schema_version": "manyforge.target_observation.v2",
-            "owner_epoch": request.owner_epoch,
+            "schema_version": "manyforge.target_observation.v3",
             "program_binding_id": request.program_binding_id,
             "kind": "io_signal",
             "signal": request.signal.model_dump(mode="json"),
@@ -1164,8 +1288,6 @@ class ExecutionCommandClient:
             cursor = response["published_cursor"]
             if cursor is not None:
                 cursor = IoSourceCursor.model_validate(cursor)
-                if cursor.owner_epoch != request.owner_epoch:
-                    raise ValueError("Mock receipt cursor names another owner epoch")
                 source_id = response["target_observation"]["value"]["source_id"]
                 if source_id is not None and cursor.source_id != source_id:
                     raise ValueError("Mock receipt cursor names another source")
@@ -1303,32 +1425,21 @@ class ExecutionCommandClient:
         return response
 
     @staticmethod
-    def _event_runtime_fault_snapshot(
-        response: dict[str, Any], expected_owner_epoch: str
-    ) -> dict[str, Any]:
+    def _event_runtime_fault_snapshot(response: dict[str, Any]) -> dict[str, Any]:
         """Validate common provenance before interpreting page success/failure.
 
         The Headless owner validates the complete closed A/B fact schema before
         mutation. This transport never infers a condition from diagnostic text.
         """
-        owner_epoch = response.get("owner_epoch")
         faults = response.get("runtime_faults")
         if (
             response.get("command") != "events"
-            or not isinstance(owner_epoch, str)
-            or not 0 < len(owner_epoch.encode("utf-8")) <= 2_048
-            or unicodedata.normalize("NFC", owner_epoch) != owner_epoch
-            or owner_epoch != expected_owner_epoch
             or type(response.get("execution_owner_ready")) is not bool
             or not isinstance(faults, dict)
             or set(faults)
             != {"operation_journal_write_fault", "program_runner_loss", "kernel_internal_fault"}
             or any(
-                fact is not None
-                and (
-                    not isinstance(fact, dict)
-                    or fact.get("request_owner_epoch") != owner_epoch
-                )
+                fact is not None and not isinstance(fact, dict)
                 for fact in faults.values()
             )
         ):
@@ -1336,20 +1447,17 @@ class ExecutionCommandClient:
                 "execution_command_response_invalid",
                 "execution host fault snapshot has invalid provenance",
             )
-        return {"owner_epoch": owner_epoch, "runtime_faults": faults,
+        return {"runtime_faults": faults,
                 "execution_owner_ready": response["execution_owner_ready"]}
 
     def events(
         self,
-        owner_epoch: str,
         after_sequence: int,
         *,
         limit: int = 16,
     ) -> dict[str, Any]:
         if (
-            not owner_epoch
-            or len(owner_epoch.encode("utf-8")) > 2_048
-            or type(after_sequence) is not int
+            type(after_sequence) is not int
             or not 0 <= after_sequence <= MAXIMUM_SAFE_INTEGER
             or type(limit) is not int
             or not 1 <= limit <= 16
@@ -1361,23 +1469,21 @@ class ExecutionCommandClient:
                 "after_sequence": after_sequence,
                 "command": "events",
                 "limit": limit,
-                "owner_epoch": owner_epoch,
             }
         )
-        return self.parse_events_reply(response, owner_epoch, after_sequence, limit)
+        return self.parse_events_reply(response, after_sequence, limit)
 
     @classmethod
     def parse_events_reply(
         cls,
         response: dict[str, Any],
-        owner_epoch: str,
         after_sequence: int,
         limit: int,
     ) -> dict[str, Any]:
         """Validate one ``events`` reply (also one the event stream rebuilt)
         and return its page with the reply's facts."""
 
-        runtime_snapshot = cls._event_runtime_fault_snapshot(response, owner_epoch)
+        runtime_snapshot = cls._event_runtime_fault_snapshot(response)
         try:
             if response.get("ok") is not True:
                 cls._raise_error_response(response)
@@ -1388,8 +1494,7 @@ class ExecutionCommandClient:
                 or type(admission_generation) is not int
                 or not 1 <= admission_generation <= MAXIMUM_SAFE_INTEGER
                 or not isinstance(page, dict)
-                or page.get("schema_version") != "manyforge.execution_event_page.v2"
-                or page.get("owner_epoch") != owner_epoch
+                or page.get("schema_version") != "manyforge.execution_event_page.v3"
                 or type(page.get("next_after_sequence")) is not int
                 or not after_sequence <= page["next_after_sequence"] <= MAXIMUM_SAFE_INTEGER
                 or type(page.get("has_more")) is not bool
@@ -1414,17 +1519,12 @@ class ExecutionCommandClient:
                     ) from error
                 if (
                     not isinstance(event, dict)
-                    or event.get("owner_epoch") != owner_epoch
                     or type(event.get("sequence")) is not int
                     or not previous < event["sequence"] <= MAXIMUM_SAFE_INTEGER
                     or event.get("record_kind") not in OPERATION_EVENT_KINDS
                     or (
-                        event.get("request_id") is not None
-                        and (
-                            not isinstance(event.get("request_id"), str)
-                            or not event["request_id"]
-                            or len(event["request_id"].encode("utf-8")) > 2_048
-                        )
+                        event.get("request_key") is not None
+                        and not _is_request_key(event["request_key"])
                     )
                     or not _valid_operation_event_identity(event)
                     or not isinstance(event.get("occurred_at_wall"), str)
@@ -1432,7 +1532,6 @@ class ExecutionCommandClient:
                     or len(event["occurred_at_wall"].encode("utf-8")) > 128
                     or unicodedata.normalize("NFC", event["occurred_at_wall"])
                     != event["occurred_at_wall"]
-                    or type(event.get("effect_pending")) is not bool
                     or not isinstance(event.get("payload"), dict)
                     or not isinstance(event.get("payload_digest"), str)
                 ):
@@ -1449,14 +1548,12 @@ class ExecutionCommandClient:
             progress = response.get("operation_progress")
             if not isinstance(progress, list) or len(progress) > MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS:
                 raise HeadlessApiError("execution_command_response_invalid", "native operation progress exceeds its bound")
-            seen: set[str] = set()
+            seen: set[int] = set()
             for row in progress:
                 if (
                     not isinstance(row, dict)
-                    or set(row) != {"owner_epoch", "operation_id", "operation_revision", "progress"}
-                    or row["owner_epoch"] != owner_epoch
-                    or not isinstance(row["operation_id"], str)
-                    or not 0 < len(row["operation_id"].encode("utf-8")) <= 2_048
+                    or set(row) != {"operation_id", "operation_revision", "progress"}
+                    or not _is_counter(row["operation_id"])
                     or row["operation_id"] in seen
                     or type(row["operation_revision"]) is not int
                     or not 1 <= row["operation_revision"] <= MAXIMUM_SAFE_INTEGER
@@ -1476,6 +1573,27 @@ class ExecutionCommandClient:
                 "interrupt_rule_state_baseline"
             )
             page["active_tcp_baseline"] = response.get("active_tcp_baseline")
+            # Stream `state` only (OD-205 (b)): the Kernel's operations table
+            # and Stop facts from memory; absent from an `events` reply.
+            operations = response.get("operations")
+            if operations is not None and (
+                not isinstance(operations, dict)
+                or type(operations.get("change")) is not int
+                or not 0 <= operations["change"] <= MAXIMUM_SAFE_INTEGER
+                or not isinstance(operations.get("faulted"), list)
+                or not isinstance(operations.get("resident"), list)
+                or type(operations.get("resident_total")) is not int
+                or not len(operations["resident"])
+                <= operations["resident_total"]
+                <= MAXIMUM_SAFE_INTEGER
+            ):
+                raise HeadlessApiError(
+                    "execution_command_response_invalid",
+                    "native operations table is invalid",
+                )
+            page["operations"] = operations
+            page["last_stop_event_id"] = response.get("last_stop_event_id")
+            page["stop_progress_sequence"] = response.get("stop_progress_sequence")
             page["component_model"] = {
                 name: response.get(name) for name in COMPONENT_MODEL_STATE_FIELDS
             }
@@ -1541,8 +1659,7 @@ class ExecutionCommandClient:
                 "handover",
                 "availability",
                 "intent_digest",
-                "request_id",
-                "request_owner_epoch",
+                "request_key",
             }
             or response.get("command") != "read_manual_handover"
         ):
@@ -1626,7 +1743,7 @@ class ExecutionCommandClient:
         if (
             response.get("command") != "preview_motion"
             or receipt.get("target") != participant["target"]
-            or version != "manyforge.direct_control_motion_preview.v4"
+            or version != "manyforge.direct_control_motion_preview.v5"
             or receipt.get("commit_eligible") is not True
         ):
             raise HeadlessApiError(
@@ -1643,8 +1760,7 @@ class ExecutionCommandClient:
             ) from exc
         tcp_selector = participant["payload"].get("tcp_endpoint")
         if (
-            resolved_tcp.owner_epoch != receipt.get("request_owner_epoch")
-            or (resolved_tcp.source == "active_tcp" and tcp_selector != {"kind": "current"})
+            (resolved_tcp.source == "active_tcp" and tcp_selector != {"kind": "current"})
             or (resolved_tcp.source == "joint_flange_fallback" and
                 (not isinstance(submitted_motion, dict) or submitted_motion.get("kind") != "joint_goal"
                  or tcp_selector != {"kind": "current"}))
@@ -1758,7 +1874,7 @@ class ExecutionCommandClient:
             response.get("command") != "preview_capability_command"
             or receipt.get("target") != participant["target"]
             or receipt.get("schema_version")
-            != "manyforge.direct_control_capability_command_preview.v2"
+            != "manyforge.direct_control_capability_command_preview.v3"
             or receipt.get("commit_eligible") is not True
         ):
             raise HeadlessApiError(
@@ -1818,9 +1934,9 @@ class ExecutionCommandClient:
             )
         return response
 
-    def read(self, operation_id: str) -> dict[str, Any]:
-        if not operation_id or len(operation_id.encode("utf-8")) > 256:
-            raise ValueError("operation_id must be bounded non-empty text")
+    def read(self, operation_id: int) -> dict[str, Any]:
+        if not _is_counter(operation_id):
+            raise ValueError("operation_id must be an operation number")
         response = self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
@@ -1881,15 +1997,13 @@ class ExecutionCommandClient:
     def _read_motion_trace_file(self, metadata: Any, allowance_bytes: int) -> dict[str, Any]:
         directory = os.environ.get("MANYFORGE_MOTION_TRACE_DIR", "")
         if (not directory or not isinstance(metadata, dict)
-                or set(metadata) != {"schema_version", "file", "bytes", "sha256", "request_owner_epoch", "status"}
-                or metadata.get("schema_version") != "manyforge.motion_trace_file.v1"
+                or set(metadata) != {"schema_version", "file", "bytes", "sha256", "status"}
+                or metadata.get("schema_version") != "manyforge.motion_trace_file.v2"
                 or not isinstance(metadata.get("file"), str)
                 or re.fullmatch(r"trace-[0-9a-f]{64}\.json", metadata["file"]) is None
                 or type(metadata.get("bytes")) is not int
                 or not 0 < metadata["bytes"] <= min(allowance_bytes, 3 * 1024 * 1024)
                 or metadata.get("sha256") != "sha256:" + metadata["file"][6:-5]
-                or not isinstance(metadata.get("request_owner_epoch"), str)
-                or not 0 < len(metadata["request_owner_epoch"].encode("utf-8")) <= 2048
                 or not isinstance(metadata.get("status"), str)
                 or metadata.get("status") not in {"complete", "partial"}):
             raise HeadlessApiError("motion_trace_file_invalid", "native trace file metadata is invalid or disk traces are unconfigured")
@@ -1903,16 +2017,15 @@ class ExecutionCommandClient:
         try:
             trace = strict_json_object(payload.decode("utf-8", errors="strict"), label="motion trace file")
             if (rfc8785.dumps(trace) != payload
-                    or trace.get("schema_version") != VOLATILE_MOTION_TRACE_VERSION
-                    or trace.get("request_owner_epoch") != metadata["request_owner_epoch"]):
-                raise ValueError("trace schema, owner or canonical bytes differ")
+                    or trace.get("schema_version") != VOLATILE_MOTION_TRACE_VERSION):
+                raise ValueError("trace schema or canonical bytes differ")
         except (HeadlessApiError, ValueError, UnicodeError, rfc8785.CanonicalizationError) as error:
             raise HeadlessApiError("motion_trace_file_invalid", "trace file content is invalid") from error
         return trace
 
-    def operation_recovery(self, operation_id: str) -> dict[str, Any]:
-        if not operation_id or len(operation_id.encode("utf-8")) > 256:
-            raise ValueError("operation_id must be bounded non-empty text")
+    def operation_recovery(self, operation_id: int) -> dict[str, Any]:
+        if not _is_counter(operation_id):
+            raise ValueError("operation_id must be an operation number")
         response = self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
@@ -1926,7 +2039,7 @@ class ExecutionCommandClient:
             response.get("command") != "get_operation_recovery"
             or not isinstance(assessment, dict)
             or assessment.get("schema_version")
-            != "manyforge.kernel_recovery_assessment.v1"
+            != "manyforge.kernel_recovery_assessment.v2"
             or type(assessment.get("assessment_revision")) is not int
             or assessment["assessment_revision"] < 1
             or type(assessment.get("control_command_epoch")) is not int
@@ -1941,17 +2054,8 @@ class ExecutionCommandClient:
             or not isinstance(participants, list)
             or not participants
             or (
-                response.get("stop_id") is None
-                and response.get("stop_generation") is not None
-            )
-            or (
-                response.get("stop_id") is not None
-                and (
-                    not isinstance(response.get("stop_id"), str)
-                    or not response["stop_id"]
-                    or type(response.get("stop_generation")) is not int
-                    or response["stop_generation"] < 1
-                )
+                response.get("stop_event_id") is not None
+                and not _is_counter(response.get("stop_event_id"))
             )
         ):
             raise HeadlessApiError(
@@ -1962,12 +2066,12 @@ class ExecutionCommandClient:
 
     def apply_operation_recovery(
         self,
-        operation_id: str,
+        operation_id: int,
         expected_operation_revision: int,
         request: OperationRecoveryActionRequest,
     ) -> dict[str, Any]:
-        if not operation_id or len(operation_id.encode("utf-8")) > 256:
-            raise ValueError("operation_id must be bounded non-empty text")
+        if not _is_counter(operation_id):
+            raise ValueError("operation_id must be an operation number")
         if (
             type(expected_operation_revision) is not int
             or not 1 <= expected_operation_revision <= MAXIMUM_SAFE_INTEGER
@@ -2010,42 +2114,18 @@ class ExecutionCommandClient:
                 "intent": request.model_dump(mode="json"),
             }
         )
-        result = response.get("planning_result")
-        expected_kind = "pick" if command.endswith("pick") else "place"
-        if response.get("ok") is True:
-            if (
-                response.get("command") != command
-                or not isinstance(result, dict)
-                or result.get("schema_version")
-                != "manyforge.pick_place_planning_result.v1"
-                or result.get("kind") != expected_kind
-                or result.get("status") not in {"planned", "no_feasible_candidate"}
-                or type(result.get("attempted_candidate_count")) is not int
-                or not 0 <= result["attempted_candidate_count"] <= 4096
-                or not isinstance(result.get("reports"), list)
-                or len(result["reports"]) > result["attempted_candidate_count"]
-                or (
-                    expected_kind == "pick"
-                    and result["attempted_candidate_count"] > 0
-                    and not isinstance(result.get("last_attempted_candidate"), dict)
-                )
-                or (
-                    expected_kind == "place"
-                    and result.get("last_attempted_candidate") is not None
-                )
-                or (
-                    result["status"] == "planned"
-                    and not isinstance(result.get("plan"), dict)
-                )
-                or (
-                    result["status"] == "no_feasible_candidate"
-                    and result.get("plan") is not None
-                )
-            ):
-                raise HeadlessApiError(
-                    "execution_command_response_invalid",
-                    "pick/place planning result has the wrong kind or shape",
-                )
+        # Answered at acceptance (OD-213 (1)): the job is read, cancelled and
+        # released by name; its result arrives with a read once it is done.
+        _validated_planning_job(response, command, request.sequence_id)
+        if response.get("ok") is True and (
+            response["planning_job"]["state"] != "accepted"
+            or response["planning_job"]["kind"]
+            != ("pick" if command.endswith("pick") else "place")
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "pick/place planning was not answered with an accepted job",
+            )
         return response
 
     def plan_pick(
@@ -2071,6 +2151,48 @@ class ExecutionCommandClient:
             request,
             trusted_principal_id=trusted_principal_id,
         )
+
+    def _planning_job_command(self, command: str, job_id: str) -> dict[str, Any]:
+        # Served on the control socket, memory only: never behind planning.
+        return self._exchange_control(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": command,
+                "job_id": _require_planning_job_id(job_id),
+            }
+        )
+
+    def read_planning_job(self, job_id: str) -> dict[str, Any]:
+        """One pick/place planning job's state, and its result once done."""
+
+        return _validated_planning_job(
+            self._planning_job_command("read_planning_job", job_id),
+            "read_planning_job",
+            job_id,
+        )
+
+    def cancel_planning_job(self, job_id: str) -> dict[str, Any]:
+        """Cancel this planning job only; returns its state after the cancel."""
+
+        return _validated_planning_job(
+            self._planning_job_command("cancel_planning_job", job_id),
+            "cancel_planning_job",
+            job_id,
+        )
+
+    def release_planning_job(self, job_id: str) -> dict[str, Any]:
+        """Drop a finished planning job (done, failed or cancelled)."""
+
+        response = self._planning_job_command("release_planning_job", job_id)
+        if response.get("ok") is True and (
+            response.get("command") != "release_planning_job"
+            or set(response) != {"api_version", "command", "ok"}
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "planning job release response has the wrong command kind or shape",
+            )
+        return response
 
     def _control(
         self,
@@ -2143,59 +2265,92 @@ class ExecutionCommandClient:
             )
         return response
 
-    def full_stop(
+    def _cell_wide_stop(
+        self,
+        command: str,
+        request: FullStopIntentRequest,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        response = self._exchange_control(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "attribution": self._request_attribution(trusted_principal_id),
+                "command": command,
+                "request": request.model_dump(mode="json"),
+            }
+        )
+        if response.get("ok") is True and (
+            response.get("command") != command
+            or not isinstance(response.get("accepted"), dict)
+        ):
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                f"{command} acceptance has the wrong kind or shape",
+            )
+        return response
+
+    def stop_all(
         self,
         request: FullStopIntentRequest,
         *,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]:
-        response = self._exchange_control(
-            {
-                "api_version": EXECUTION_COMMAND_VERSION,
-                "attribution": self._request_attribution(trusted_principal_id),
-                "command": "full_stop",
-                "request": request.model_dump(mode="json"),
-            }
-        )
-        accepted = response.get("accepted")
-        if response.get("ok") is True and (
-            response.get("command") != "full_stop"
-            or not isinstance(accepted, dict)
-            or accepted.get("resolution_reason") != "explicit_full_stop"
-        ):
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "Full Stop acceptance has the wrong kind or shape",
-            )
-        return response
+        """Stop all: every operation in the cell; holds every group."""
 
-    def recognized_malformed_stop(
+        return self._cell_wide_stop("stop_all", request, trusted_principal_id)
+
+    def halt(
         self,
+        request: FullStopIntentRequest,
         *,
-        request_id: str,
-        recognized_route: str,
-        reason: str,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]:
+        """Halt: Stop all plus the Program frozen; names no run."""
+
+        return self._cell_wide_stop("halt", request, trusted_principal_id)
+
+    def cell_stop(self, request: FullStopIntentRequest) -> dict[str, Any]:
+        """The Program node's cell Stop (``kernel.cell_stop``): internal only."""
+
+        if self._attribution_transport != "internal":
+            raise HeadlessApiError(
+                "execution_request_attribution_invalid",
+                "cell Stop is available only to the internal owner transport",
+            )
+        return self._cell_wide_stop("cell_stop", request, None)
+
+    def recognized_stop(
+        self,
+        *,
+        request_key: str,
+        recognized_route: str,
+        reason: str,
+        source_label: str | None,
+        trusted_principal_id: str | None,
+    ) -> dict[str, Any]:
+        """A Stop recognized on its route but not forwarded as asked (its
+        body cannot be read, or it names another application start or none):
+        the Kernel widens it by the route. ``source_label`` is the caller's
+        validated label, or None."""
+
         response = self._exchange_control(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "attribution": self._request_attribution(trusted_principal_id),
-                "command": "malformed_stop",
+                "command": "recognized_stop",
                 "reason": reason,
                 "recognized_route": recognized_route,
-                "request_id": request_id,
+                "request_key": request_key,
+                "source_label": source_label,
             }
         )
-        accepted = response.get("accepted")
         if response.get("ok") is True and (
-            response.get("command") != "stop"
-            or not isinstance(accepted, dict)
-            or accepted.get("resolution_disposition") != "promoted_to_full"
+            response.get("command") != "recognized_stop"
+            or not isinstance(response.get("accepted"), dict)
         ):
             raise HeadlessApiError(
                 "execution_command_response_invalid",
-                "recognized malformed Stop acceptance has the wrong kind or shape",
+                "recognized Stop acceptance has the wrong kind or shape",
             )
         return response
 
@@ -2204,7 +2359,7 @@ class ExecutionCommandClient:
         SignalSample, the rule holds and the required signal ids, as the
         execution host publishes them (an in-memory read)."""
         return self._read_projection_on(
-            "read_component_model", self._control_socket_path
+            "read_component_model", self._component_socket_path
         )
 
     def component_action(self, component_id: str, action: str) -> dict[str, Any]:
@@ -2214,7 +2369,7 @@ class ExecutionCommandClient:
         `component_action_unsupported`, `component_not_found`); the result
         arrives in the component's `last_action`.
         """
-        response = self._exchange_control(
+        response = self._exchange_component(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "command": "component_action",
@@ -2224,7 +2379,7 @@ class ExecutionCommandClient:
         return self._validate_projection_response("component_action", response)
 
     def component_recovery_preflight(self, component_id: str) -> dict[str, Any]:
-        response = self._exchange_control({
+        response = self._exchange_component({
             "api_version": EXECUTION_COMMAND_VERSION,
             "command": "component_recovery_preflight",
             "request": {"component_id": component_id},
@@ -2240,7 +2395,7 @@ class ExecutionCommandClient:
         return response
 
     def component_recover_enable(self, component_id: str, confirmation: dict[str, Any]) -> dict[str, Any]:
-        response = self._exchange_control({
+        response = self._exchange_component({
             "api_version": EXECUTION_COMMAND_VERSION,
             "command": "component_action",
             "request": {"component_id": component_id, "action": "enable", "recovery_preflight": confirmation},
@@ -2277,7 +2432,9 @@ class ExecutionCommandClient:
         *,
         trusted_principal_id: str | None,
     ) -> dict[str, Any]:
-        response = self._exchange(
+        # Beside Stop on the control socket: the execution host queues it on
+        # its speed-scaling lane, never behind planning or Submit.
+        response = self._exchange_control(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
                 "attribution": self._request_attribution(trusted_principal_id),
@@ -2333,11 +2490,18 @@ class StreamedExecutionEvents:
 
     MAX_BUFFERED_EVENTS = 4_096
 
-    def __init__(self, subscribe: Callable[[int, str | None], Any], stop: threading.Event) -> None:
+    def __init__(
+        self,
+        subscribe: Callable[[int], Any],
+        stop: threading.Event,
+        application_start_id: str,
+    ) -> None:
         self._subscribe = subscribe
         self._stop = stop
         self._changed = threading.Condition()
-        self._owner_epoch: str | None = None
+        # One Kernel and one journal per application start: the stream names
+        # no owner, so this start is the event source's identity.
+        self._application_start_id = application_start_id
         self._state: dict[str, Any] | None = None
         self._progress: list[Any] = []
         self._events: deque[dict[str, Any]] = deque()
@@ -2368,9 +2532,6 @@ class StreamedExecutionEvents:
         with self._changed:
             kind = message["type"]
             if kind == "snapshot":
-                if message["owner_epoch"] != self._owner_epoch:
-                    self._events.clear()
-                self._owner_epoch = message["owner_epoch"]
                 self._state = message["state"]
                 self._progress = []
                 self._connected = True
@@ -2393,40 +2554,39 @@ class StreamedExecutionEvents:
             self._version += 1
             self._changed.notify_all()
 
-    def _require_connected(self) -> tuple[str, dict[str, Any]]:
-        if not self._connected or self._owner_epoch is None or self._state is None:
+    def _require_connected(self) -> dict[str, Any]:
+        if not self._connected or self._state is None:
             raise HeadlessApiError(
                 "execution_owner_unavailable", "execution event stream is not connected"
             )
-        return self._owner_epoch, self._state
+        return self._state
 
     def identity(self) -> dict[str, Any]:
-        """The stream's owner in the ``identity`` reply shapes the pump reads
+        """The start in the ``identity`` reply shapes the pump reads
         (ready: the identity; no product: ``execution_owner_not_ready``)."""
 
         with self._changed:
-            owner_epoch, state = self._require_connected()
+            state = self._require_connected()
             if state.get("execution_owner_ready") is True:
-                return {"ok": True, "identity": {"owner_epoch": owner_epoch}}
+                return {
+                    "ok": True,
+                    "identity": {"application_start_id": self._application_start_id},
+                }
             return {
                 "ok": False,
                 "error": {
                     "code": "execution_owner_not_ready",
                     "message": "the managed execution owner has no active physical product",
-                    "details": {"owner_epoch": owner_epoch},
+                    "details": {"application_start_id": self._application_start_id},
                 },
             }
 
-    def events(self, owner_epoch: str, after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
+    def events(self, after_sequence: int, *, limit: int = 16) -> dict[str, Any]:
         """The buffered rows strictly after ``after_sequence`` as one validated
         ``events`` page with the latest stream facts."""
 
         with self._changed:
-            current_epoch, state = self._require_connected()
-            if current_epoch != owner_epoch:
-                raise HeadlessApiError(
-                    "execution_owner_unavailable", "execution event stream changed its owner"
-                )
+            state = self._require_connected()
             while self._events and self._events[0]["sequence"] <= after_sequence:
                 self._events.popleft()
             self._changed.notify_all()  # Room for a held follower.
@@ -2440,14 +2600,12 @@ class StreamedExecutionEvents:
                     "events": rows,
                     "has_more": has_more,
                     "next_after_sequence": rows[-1]["sequence"] if rows else after_sequence,
-                    "owner_epoch": owner_epoch,
-                    "schema_version": "manyforge.execution_event_page.v2",
+                    "schema_version": "manyforge.execution_event_page.v3",
                 },
                 "ok": True,
                 "operation_progress": list(self._progress),
-                "owner_epoch": owner_epoch,
             }
-        return ExecutionCommandClient.parse_events_reply(response, owner_epoch, after_sequence, limit)
+        return ExecutionCommandClient.parse_events_reply(response, after_sequence, limit)
 
     def wait(self, timeout: float) -> None:
         """Until a new stream message, ``stop`` or ``timeout``."""
@@ -2468,6 +2626,7 @@ class ExecutionEventPump:
         core: HeadlessCorePort,
         execution: ExecutionPort,
         *,
+        application_start_id: str,
         poll_seconds: float = 0.1,
         page_limit: int = 16,
     ) -> None:
@@ -2481,7 +2640,9 @@ class ExecutionEventPump:
         self._stop = threading.Event()
         # Identity, pages and wake-ups come from the event
         # subscription; the request/reply `events` command is never polled.
-        self._stream = StreamedExecutionEvents(execution.subscribe_events, self._stop)
+        self._stream = StreamedExecutionEvents(
+            execution.subscribe_events, self._stop, application_start_id
+        )
         self._page_limit = page_limit
         self._thread: threading.Thread | None = None
         self._last_error: str | None = None
@@ -2503,6 +2664,10 @@ class ExecutionEventPump:
         # Each component's last recorded `last_action`; None until the first
         # model of this Headless (a baseline, not recorded again).
         self._recorded_actions: dict[str, Any] | None = None
+        # OD-215: the Kernel journal's (queue full, storage failure) levels
+        # from the latest runtime faults, for the disk check's own thread
+        # (one tuple assignment; no lock).
+        self.journal_disk_signals: tuple[bool, bool] = (False, False)
 
     def set_progress_observer(
         self, observer: Callable[[list[dict[str, Any]]], None] | None,
@@ -2535,15 +2700,13 @@ class ExecutionEventPump:
     ) -> None:
         self._global_rules_observer = observer
 
-    def _observe_global_rules(self, owner_epoch: str, page: dict[str, Any]) -> None:
+    def _observe_global_rules(self, page: dict[str, Any]) -> None:
         # A malformed rule wire makes only this projection unknown; the
         # historian feed continues (the Runner mirror's own recapture rule).
         try:
             self._global_rules.observe(
-                owner_epoch,
                 page.get("interrupt_rule_catalog"),
                 page.get("interrupt_rule_state_baseline"),
-                page["events"],
             )
             if self._global_rules_failing:
                 self._global_rules_failing = False
@@ -2669,80 +2832,6 @@ class ExecutionEventPump:
             logger.info("Execution event pump recovered")
         return True
 
-    @staticmethod
-    def _control_projection_key(event: dict[str, Any]) -> tuple[Any, ...]:
-        """Return only operation facts that can change the control shell.
-
-        Native journal rows record lifecycle transitions, not progress-only
-        samples. The events response carries a separate in-memory progress
-        projection without rebuilding the cold control projection. Lifecycle,
-        Stop, runtime-scale, and fault meaning remain in this small key.
-        """
-
-        record_kind = event["record_kind"]
-        if record_kind in {
-            "stop_acceptance_projected",
-            "stop_terminal_projected",
-            }:
-            # Stop projections are sparse, globally scoped owner facts.  Their
-            # exact digest is the simplest complete change identity.
-            return (record_kind, event["payload_digest"])
-
-        payload = event["payload"]
-        operation = payload["operation_state"]
-
-        def selected(row: dict[str, Any], *names: str) -> tuple[Any, ...]:
-            return tuple(row.get(name) for name in names)
-
-        scale = payload.get("runtime_scale_status")
-        scale_key = (
-            None
-            if not isinstance(scale, dict)
-            else (
-                *selected(
-                    scale,
-                    "runtime_scale_generation",
-                    "state",
-                    "requested_scale",
-                    "effective_scale",
-                ),
-                tuple(
-                    (
-                        *selected(
-                            participant,
-                            "participant_id",
-                            "state",
-                            "accepted_generation",
-                            "commanded_scale",
-                            "applied_scale",
-                            "supported",
-                        ),
-                        rfc8785.dumps(participant.get("error")),
-                    )
-                    for participant in scale.get("participants", ())
-                ),
-            )
-        )
-        return (
-            record_kind,
-            *selected(
-                operation,
-                "operation_id",
-                "operation_revision",
-                "state",
-                "active_stop_id",
-                "active_stop_generation",
-            ),
-            tuple(
-                (
-                    *selected(participant, "participant_id", "state"),
-                    rfc8785.dumps(participant.get("terminal_error")),
-                )
-                for participant in operation.get("participants", ())
-            ),
-            scale_key,
-        )
-
     def _record_finished_actions(self, model: dict[str, Any] | None) -> None:
         """One History event per component action the host finished.
 
@@ -2770,63 +2859,40 @@ class ExecutionEventPump:
                 )
 
     @staticmethod
-    def _operation_is_settled(event: dict[str, Any]) -> bool:
-        """Whether this event leaves its operation's robot at rest.
-
-        The control projection ignores joint samples, so the rest pose after a
-        motion would otherwise stay at whatever sample the last unrelated
-        control change captured (for example another robot's operation end).
-        """
-
-        if event["record_kind"] == "stop_terminal_projected":
-            return True
-        payload = event.get("payload")
-        operation = payload.get("operation_state") if isinstance(payload, dict) else None
-        return isinstance(operation, dict) and operation.get("state") in _OPERATION_REST_STATES
-
-    @staticmethod
-    def _operation_is_released(event: dict[str, Any]) -> bool:
-        if event["record_kind"] != "control_accepted":
-            return False
-        result = event["payload"].get("result")
-        return isinstance(result, dict) and result.get("control") in {
-            "acknowledge_completed",
-            "reset",
-        }
-
-    @staticmethod
-    def _idle_owner_epoch(response: dict[str, Any]) -> str | None:
-        """Return the typed epoch of an idle owner, if the response proves it."""
+    def _idle_application_start_id(response: dict[str, Any]) -> str | None:
+        """Return the start of an idle owner, if the response proves it."""
         if response.get("ok") is not False:
             return None
         error = response.get("error")
         details = error.get("details") if isinstance(error, dict) else None
-        owner_epoch = details.get("owner_epoch") if isinstance(details, dict) else None
+        start_id = details.get("application_start_id") if isinstance(details, dict) else None
         if (
             not isinstance(error, dict)
             or error.get("code") != "execution_owner_not_ready"
             or not isinstance(error.get("message"), str)
             or not error["message"]
             or not isinstance(details, dict)
-            or set(details) != {"owner_epoch"}
-            or not isinstance(owner_epoch, str)
-            or not owner_epoch
-            or len(owner_epoch.encode("utf-8")) > 2_048
-            or unicodedata.normalize("NFC", owner_epoch) != owner_epoch
+            or set(details) != {"application_start_id"}
+            or not isinstance(start_id, str)
+            or not start_id
+            or len(start_id.encode("utf-8")) > 2_048
+            or unicodedata.normalize("NFC", start_id) != start_id
         ):
             return None
-        return owner_epoch
+        return start_id
 
-    def _observe_runtime_fault_snapshot(
-        self, snapshot: dict[str, Any], expected_owner_epoch: str
-    ) -> None:
-        if snapshot["owner_epoch"] != expected_owner_epoch:
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "runtime fault observation changed the current native owner",
+    def _observe_runtime_fault_snapshot(self, snapshot: dict[str, Any]) -> None:
+        fault = snapshot["runtime_faults"].get("operation_journal_write_fault")
+        if isinstance(fault, dict):
+            error = fault.get("error")
+            self.journal_disk_signals = (
+                fault.get("queue_full") is True,
+                isinstance(error, dict)
+                and error.get("code") == "operation_journal_storage_failure",
             )
+        else:
+            self.journal_disk_signals = (False, False)
         result = self._core.observe_runtime_fault_conditions(
-            source_owner_epoch=expected_owner_epoch,
             current_runtime_faults_json=_canonical_json(
                 snapshot["runtime_faults"]
             ).decode("utf-8"),
@@ -2839,13 +2905,71 @@ class ExecutionEventPump:
         if result["changed"]:
             self._notify_change()
 
+    def _observe_component_faults(self, model: dict[str, Any]) -> None:
+        """OD-247: one operator alarm per component in fault.
+
+        Passes every component whose published state shows a fault, except
+        the simulators (`sim_reset`), as they are left out of the cell latch
+        too. The core raises and returns the alarms on edges only. A model
+        without component states (no host) is not observed.
+        """
+
+        states = model.get("component_states")
+        if not isinstance(states, list):
+            return
+        faults = [
+            {
+                "component_id": state["component_id"],
+                "fault": {
+                    key: value
+                    for key, value in state["fault"].items()
+                    if key != "since_ns"
+                },
+            }
+            for state in states
+            if isinstance(state.get("fault"), dict)
+            and "sim_reset" not in state.get("capabilities", ())
+        ]
+        result = self._core.observe_component_faults(
+            faults_json=_canonical_json(faults).decode("utf-8"),
+        )
+        if not isinstance(result, dict) or type(result.get("changed")) is not bool:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "component fault observer returned no changed decision",
+            )
+        if result["changed"]:
+            self._notify_change()
+
+    def _observe_operation_table(self, operations: dict[str, Any]) -> None:
+        # OD-205 (b): the operation alarms follow the Kernel's memory table:
+        # its counter and faulted list (the resident list is the runner's).
+        alarm_table = {
+            name: operations[name]
+            for name in ("change", "faulted", "faulted_total")
+            if name in operations
+        }
+        result = self._core.observe_operation_table(
+            operations_json=_canonical_json(alarm_table).decode("utf-8"),
+        )
+        if not isinstance(result, dict) or type(result.get("changed")) is not bool:
+            raise HeadlessApiError(
+                "execution_command_response_invalid",
+                "operations table observer returned no changed decision",
+            )
+        if result["changed"]:
+            self._notify_change()
+
     def _run(self) -> None:
-        owner_epoch: str | None = None
+        application_start_id: str | None = None
         after_sequence = 0
-        source_high_water_epoch: str | None = None
+        source_read = False
         source_high_water = 0
         last_source_identity: tuple[str, str] | None = None
-        operation_control_keys: dict[str, tuple[Any, ...]] = {}
+        # The panel's wake key from the stream `state` (Kernel memory, OD-205
+        # (b)): the operations change counter, the Stop facts and the robots'
+        # Active TCP. Rows are History only.
+        stream_facts: tuple[Any, ...] | None = None
         control_projection_changed = False
         admission_generation: int | None = None
         component_model: dict[str, Any] | None = None
@@ -2853,11 +2977,11 @@ class ExecutionEventPump:
         source = self._stream
 
         def publish_if_changed(
-            source_owner_epoch: str,
+            source_start_id: str,
             source_mode: str,
         ) -> None:
             nonlocal control_projection_changed, last_source_identity
-            identity = (source_owner_epoch, source_mode)
+            identity = (source_start_id, source_mode)
             if identity != last_source_identity or control_projection_changed:
                 last_source_identity = identity
                 control_projection_changed = False
@@ -2866,11 +2990,11 @@ class ExecutionEventPump:
         while not self._stop.is_set():
             self._refresh_alarm_sources()
             try:
-                if owner_epoch is None:
+                if application_start_id is None:
                     identity_response = source.identity()
                     if identity_response.get("ok") is not True:
-                        next_epoch = self._idle_owner_epoch(identity_response)
-                        if next_epoch is None:
+                        next_start_id = self._idle_application_start_id(identity_response)
+                        if next_start_id is None:
                             ExecutionCommandClient._raise_error_response(identity_response)
                         # An empty product still has the stable Kernel/journal.
                         # Keep the existing idle identity poll, then use events.
@@ -2878,38 +3002,32 @@ class ExecutionEventPump:
                     else:
                         source_mode = "active"
                         status = identity_response.get("identity")
-                        next_epoch = (
-                            status.get("owner_epoch") if isinstance(status, dict) else None
+                        next_start_id = (
+                            status.get("application_start_id")
+                            if isinstance(status, dict) else None
                         )
-                        if not isinstance(next_epoch, str) or not next_epoch:
+                        if not isinstance(next_start_id, str) or not next_start_id:
                             raise HeadlessApiError(
                                 "execution_command_response_invalid",
-                                "execution status has no owner epoch",
+                                "execution status has no application start id",
                             )
-                    if source_high_water_epoch != next_epoch:
-                        if source_high_water_epoch is not None:
-                            # A new host starts without results: record each.
-                            self._recorded_actions = {}
-                        source_high_water_epoch = next_epoch
+                    # One host per start: the first identity read starts the
+                    # event series; a later one resumes at the high water.
+                    if not source_read:
+                        source_read = True
                         source_high_water = 0
                         after_sequence = 0
                         self._global_rules.reset()
-                        operation_control_keys.clear()
+                        stream_facts = None
                         self._progress_rows.clear()
                         self._progress_dirty = True
                     else:
                         after_sequence = source_high_water
-                    owner_epoch = next_epoch
-                page = source.events(
-                    owner_epoch,
-                    after_sequence,
-                    limit=self._page_limit,
-                )
+                    application_start_id = next_start_id
+                page = source.events(after_sequence, limit=self._page_limit)
                 source_mode = "active" if page["execution_owner_ready"] else "idle"
                 self._observe_runtime_fault_snapshot(
-                    {"owner_epoch": page["owner_epoch"],
-                     "runtime_faults": page["runtime_faults"]},
-                    owner_epoch,
+                    {"runtime_faults": page["runtime_faults"]}
                 )
                 next_admission_generation = page["admission_generation"]
                 if admission_generation != next_admission_generation:
@@ -2921,58 +3039,41 @@ class ExecutionEventPump:
                     component_model = page["component_model"]
                     control_projection_changed = True
                     self._record_finished_actions(component_model)
+                    self._observe_component_faults(component_model)
                 page_had_events = bool(page["events"])
-                self._observe_global_rules(owner_epoch, page)
+                self._observe_global_rules(page)
+                operations = page["operations"]
+                if operations is not None:
+                    self._observe_operation_table(operations)
+                next_stream_facts = (
+                    operations["change"] if operations is not None else None,
+                    page["last_stop_event_id"],
+                    page["stop_progress_sequence"],
+                    _canonical_json(page["active_tcp_baseline"]),
+                )
+                if next_stream_facts != stream_facts:
+                    previous, stream_facts = stream_facts, next_stream_facts
+                    control_projection_changed = True
+                    # An operation changed or a participant ended its Stop:
+                    # refresh the rest pose (idempotent).
+                    if previous is None or previous[0] != next_stream_facts[0] or (
+                        previous[2] != next_stream_facts[2]
+                    ):
+                        self._notify_motion_settled()
                 for event in page["events"]:
                     self._core.ingest_operation_event(
-                        source_owner_epoch=owner_epoch,
                         source_sequence=event["sequence"],
                         record_kind=event["record_kind"],
-                        request_id=event["request_id"],
+                        request_key=event["request_key"],
                         operation_id=event["operation_id"],
                         operation_revision=event["operation_revision"],
                         occurred_at_ns=nonnegative_int64(event["occurred_at_ns"]),
                         occurred_at_wall=event["occurred_at_wall"],
-                        effect_pending=event["effect_pending"],
                         payload_json=_canonical_json(event["payload"]).decode("utf-8"),
                         payload_digest=event["payload_digest"],
                     )
                     after_sequence = event["sequence"]
                     source_high_water = after_sequence
-                    if event["record_kind"] == ACTIVE_TCP_EVENT_KIND:
-                        # A changed robot TCP is part of the control projection.
-                        control_projection_changed = True
-                        continue
-                    if event["record_kind"] == STATE_EVENT_KIND:
-                        # The global rule status model already folded rule state.
-                        continue
-                    operation_id = event.get("operation_id")
-                    if isinstance(operation_id, str):
-                        key = self._control_projection_key(event)
-                        if (
-                            operation_id not in operation_control_keys
-                            and len(operation_control_keys)
-                            >= MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS
-                        ):
-                            # Change-detection memo only, bounded by eviction:
-                            # operations retired without an ack/reset record
-                            # (closed in recovery, failed pre-dispatch) never
-                            # release their key. Dropping the oldest costs at
-                            # most one extra change notification.
-                            operation_control_keys.pop(next(iter(operation_control_keys)))
-                            control_projection_changed = True
-                        if operation_control_keys.get(operation_id) != key:
-                            operation_control_keys[operation_id] = key
-                            control_projection_changed = True
-                            if self._operation_is_settled(event):
-                                self._notify_motion_settled()
-                        if self._operation_is_released(event):
-                            operation_control_keys.pop(operation_id, None)
-                    else:
-                        # The only operation-less events are sparse Stop facts.
-                        control_projection_changed = True
-                        if self._operation_is_settled(event):
-                            self._notify_motion_settled()
                 if page["next_after_sequence"] != after_sequence:
                     raise HeadlessApiError(
                         "execution_command_response_invalid",
@@ -2982,14 +3083,13 @@ class ExecutionEventPump:
                 self._publish_progress(time.monotonic())
                 if not page["has_more"]:
                     self._core.complete_operation_event_snapshot(
-                        source_owner_epoch=owner_epoch,
                         through_source_sequence=after_sequence,
                     )
-                    publish_if_changed(owner_epoch, source_mode)
+                    publish_if_changed(application_start_id, source_mode)
                     if self._record_error(None):
                         self._notify_change()
                     if source_mode == "idle":
-                        owner_epoch = None
+                        application_start_id = None
                     # Wakes on the next stream message; the other sources
                     # this loop observes keep the period.
                     self._stream.wait(self._poll_seconds)
@@ -2997,12 +3097,12 @@ class ExecutionEventPump:
                     # Do not delay a sparse lifecycle/Stop/fault transition
                     # behind a larger History catch-up.  The downstream cold
                     # combiner still retains only the newest requested value.
-                    publish_if_changed(owner_epoch, source_mode)
+                    publish_if_changed(application_start_id, source_mode)
             except Exception as error:
                 runtime_snapshot = getattr(error, "runtime_fault_snapshot", None)
-                if runtime_snapshot is not None and owner_epoch is not None:
+                if runtime_snapshot is not None and application_start_id is not None:
                     try:
-                        self._observe_runtime_fault_snapshot(runtime_snapshot, owner_epoch)
+                        self._observe_runtime_fault_snapshot(runtime_snapshot)
                     except Exception as fault_error:
                         error = RuntimeError(
                             f"{type(error).__name__}: {error}; "
@@ -3014,11 +3114,9 @@ class ExecutionEventPump:
                 self._publish_progress(time.monotonic())
                 self._global_rules.unknown()
                 self._publish_global_rules()
-                if owner_epoch is not None:
+                if application_start_id is not None:
                     try:
-                        quality = self._core.mark_operation_event_source_unknown(
-                            source_owner_epoch=owner_epoch,
-                        )
+                        quality = self._core.mark_operation_event_source_unknown()
                         if quality.get("status") == "marked_unknown":
                             self._notify_change()
                     except Exception as quality_error:
@@ -3029,7 +3127,7 @@ class ExecutionEventPump:
                         )
                 if self._record_error(error):
                     self._notify_change()
-                owner_epoch = None
+                application_start_id = None
                 after_sequence = source_high_water
                 self._stop.wait(self._poll_seconds)
 

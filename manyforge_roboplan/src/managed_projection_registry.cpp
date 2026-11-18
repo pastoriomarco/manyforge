@@ -113,25 +113,39 @@ public:
             candidate.planning_collision_model.product_id});
     Require(planning_model.has_value(),
             "native projection retained planning model is absent or invalid");
-    return ManagedProjectionCandidateInputs{std::move(bundle),
-                                            std::move(*model_map),
-                                            std::move(*planning_model)};
+    const auto started = std::chrono::steady_clock::now();
+    auto stage = RetainedPlanningModelStage::create_verified(
+        *planning_model, config_.execution_run_root);
+    // Scene meshes resolve only below the approved scene-asset root; the
+    // retained package root is never a scene-mesh search path.
+    auto collision_model =
+        collision::ManyForgeCollisionEngine::load_shared_model(
+            "manyforge_managed_native_projection", stage.loader_urdf_path(),
+            stage.srdf_path(), stage.package_paths(), std::string{},
+            config_.scene_asset_root_fd);
+    std::cerr << "native projection collision model loaded: retained_bundle="
+              << candidate.retained_bundle_id.value() << " load_ms="
+              << std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - started)
+                     .count()
+              << " (shared by every planning group)\n";
+    return ManagedProjectionCandidateInputs{
+        std::move(bundle),
+        std::move(*model_map),
+        std::move(*planning_model),
+        std::move(collision_model),
+        std::string(stage.loader_urdf_bytes()),
+        std::string(stage.srdf_bytes())};
   }
 
   [[nodiscard]] RetainedCollisionWorldProjector
   ConstructGroupProjector(const ManagedProjectionCandidateInputs &inputs,
                           const std::string &group) const override {
-    auto stage = RetainedPlanningModelStage::create_verified(
-        inputs.planning_model, config_.execution_run_root);
-    // Scene meshes resolve only below the approved scene-asset root; the
-    // retained package root is never a scene-mesh search path.
-    auto shared_model = collision::ManyForgeCollisionEngine::load_shared_model(
-        "manyforge_managed_native_projection", stage.loader_urdf_path(),
-        stage.srdf_path(), stage.package_paths(), group,
-        config_.scene_asset_root_fd);
     return RetainedCollisionWorldProjector::create_verified(
-        std::move(shared_model), *inputs.bundle, inputs.model_map,
-        inputs.planning_model);
+        collision::ManyForgeCollisionEngine::bind_shared_model_group(
+            inputs.collision_model, inputs.loader_urdf_bytes,
+            inputs.srdf_bytes, group),
+        *inputs.bundle, inputs.model_map, inputs.planning_model);
   }
 
 private:
@@ -416,69 +430,6 @@ public:
     return projection;
   }
 
-  [[nodiscard]] bool AllRequiredProjectionsHealthy(
-      const deployment::RetainedBundle &bundle,
-      const core::ProjectionRevisionDTO &expected) const {
-    // Handles and pending-job identity are resolved with a short lock, and
-    // every ProjectionHealth read happens after that lock is released. A
-    // provider whose worker is constructing a candidate therefore cannot hold
-    // up this readiness hint, nor any other provider's assessment.
-    bool found = false;
-    for (const auto &provider : bundle.value().capability_provider_bindings) {
-      if (!core::RequiresNativeSceneProjection(
-              provider.capability_id,
-              provider.capability_definition_revision)) {
-        continue;
-      }
-      std::set<core::RuntimeUnitId> runtime_sources;
-      for (const auto &endpoint : provider.endpoint_bindings) {
-        if (endpoint.source_kind !=
-            core::CapabilityEndpointSourceKind::kRuntimeUnit) {
-          continue;
-        }
-        const auto *runtime_unit =
-            std::get_if<core::RuntimeUnitId>(&endpoint.source_id);
-        if (runtime_unit == nullptr || runtime_unit->empty()) {
-          return false;
-        }
-        runtime_sources.insert(*runtime_unit);
-      }
-      if (runtime_sources.size() != 1U ||
-          runtime_sources.begin()->value() != config_.runtime_unit_id) {
-        continue;
-      }
-      const ManagedProjectionKey key{
-          provider.capability_provider_binding_id,
-          provider.capability_provider_binding_revision};
-      const core::ProjectionExecutionHostBindingDTO binding{
-          provider.capability_provider_binding_id,
-          provider.capability_provider_binding_revision,
-          core::RuntimeUnitId(config_.runtime_unit_id),
-          core::RuntimeEpoch(config_.runtime_epoch)};
-      const auto projection = FindRevision(binding, expected);
-      if (projection == nullptr) {
-        ReportProjectionReadiness("missing " + key.first.value());
-        return false;
-      }
-      if (WorkPendingFor(key, projection)) {
-        ReportProjectionReadiness("waiting for " + key.first.value());
-        return false;
-      }
-      const auto health = projection->ProjectionHealth();
-      if (health.execution_host_binding != binding ||
-          !health.healthy_for_identity(expected)) {
-        ReportProjectionReadiness("not healthy " + key.first.value());
-        return false;
-      }
-      found = true;
-    }
-    // A component-local controller can have no planning/collision provider.
-    // There is then no projection lease to wait for; Scene authority and
-    // command admission are still verified at their own boundaries.
-    ReportProjectionReadiness(found ? "ready" : "no required projection");
-    return true;
-  }
-
   void InstallActiveFrameResolverSet(
       const deployment::RetainedBundle &bundle,
       const core::ProjectionRevisionDTO &expected,
@@ -567,14 +518,18 @@ private:
     JobProgress(std::string operation_value,
                 core::ProjectionExecutionHostBindingDTO binding_value,
                 std::string initial_milestone,
-                RetainedPlannerSceneProjection::Clock clock_value)
+                RetainedPlannerSceneProjection::Clock clock_value,
+                std::string *initial_line)
         : operation(std::move(operation_value)),
           binding(std::move(binding_value)), clock(std::move(clock_value)),
           started_at_ns(clock()), last_progress_at_ns(started_at_ns) {
-      Advance(std::move(initial_milestone));
+      Advance(std::move(initial_milestone), initial_line);
     }
 
-    void Advance(std::string next_milestone) {
+    // With `deferred_line`, the line is returned there for the caller to
+    // print after its own lock instead of being printed here.
+    void Advance(std::string next_milestone,
+                 std::string *deferred_line = nullptr) {
       std::lock_guard lock(mutex);
       const auto now = clock();
       const auto since_start = (now - started_at_ns) / 1'000'000;
@@ -582,11 +537,22 @@ private:
       milestone = std::move(next_milestone);
       ++sequence;
       last_progress_at_ns = now;
-      std::cerr << "native projection job progress: operation=" << operation
-                << " provider=" << binding.provider_binding_id.value()
-                << " milestone=" << milestone << " sequence=" << sequence
-                << " elapsed_ms=" << since_start
-                << " since_last_progress_ms=" << since_last << '\n';
+      if (deferred_line != nullptr) {
+        *deferred_line = "native projection job progress: operation=" +
+                         operation + " provider=" +
+                         binding.provider_binding_id.value() +
+                         " milestone=" + milestone +
+                         " sequence=" + std::to_string(sequence) +
+                         " elapsed_ms=" + std::to_string(since_start) +
+                         " since_last_progress_ms=" +
+                         std::to_string(since_last) + '\n';
+      } else {
+        std::cerr << "native projection job progress: operation=" << operation
+                  << " provider=" << binding.provider_binding_id.value()
+                  << " milestone=" << milestone << " sequence=" << sequence
+                  << " elapsed_ms=" << since_start
+                  << " since_last_progress_ms=" << since_last << '\n';
+      }
 #if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
       AppendNativeProjectionTestTrace(
           "progress " + operation + " " +
@@ -794,19 +760,6 @@ private:
       registered.emplace_back(key, entry);
     }
     return registered;
-  }
-
-  void ReportProjectionReadiness(std::string detail) const {
-    // Readiness lines are emitted from the request strand and the composition
-    // builders, so this deduplication has its own lock instead of borrowing the
-    // registry mutex that callers deliberately release early.
-    std::lock_guard lock(readiness_report_mutex_);
-    if (detail == last_projection_readiness_detail_) {
-      return;
-    }
-    last_projection_readiness_detail_ = std::move(detail);
-    std::cerr << "native projection readiness: "
-              << last_projection_readiness_detail_ << '\n';
   }
 
   [[nodiscard]] static ManagedProjectionKey
@@ -1151,29 +1104,37 @@ private:
     const auto accepted = AcceptedRebuild(request, accepted_health);
     auto retained_lease_ids = projection->scene_snapshot_lease_retention_stats()
                                   .retained_ids_oldest_first;
-    {
+    // The job's first progress line, printed after mutex_ is released (also
+    // when starting the worker fails after the line was made).
+    std::string input_ready_line;
+    try {
       std::lock_guard lock(mutex_);
       StartRebuildLocked(key, request, accepted.resulting_health, projection,
-                         std::move(retained_lease_ids));
+                         std::move(retained_lease_ids), input_ready_line);
+    } catch (...) {
+      std::cerr << input_ready_line;
+      throw;
     }
+    std::cerr << input_ready_line;
     return accepted;
   }
 
   /// Registers one Rebuild job and starts its single worker. Callers hold
-  /// mutex_.
+  /// mutex_ and print `input_ready_line` after releasing it.
   void StartRebuildLocked(
       const ManagedProjectionKey &key,
       const core::NativeProjectionRebuildDTO &request,
       const core::ProjectionHealthDTO &accepted_health,
       const std::shared_ptr<RetainedPlannerSceneProjection> &projection,
-      std::vector<core::ProjectionLeaseId> retained_lease_ids) {
+      std::vector<core::ProjectionLeaseId> retained_lease_ids,
+      std::string &input_ready_line) {
     auto job = std::make_shared<
         std::promise<core::ProjectionCommitResultDTO>>();
     auto result = job->get_future().share();
     const auto binding = request.expected_execution_host_binding;
     auto progress =
         std::make_shared<JobProgress>("rebuild", binding, "input_ready",
-                                      clock_);
+                                      clock_, &input_ready_line);
     const auto [inserted, unique] = pending_rebuilds_.emplace(
         key, PendingRebuild{request, accepted_health, result, progress, projection,
                             std::move(retained_lease_ids),
@@ -1509,8 +1470,6 @@ private:
   // a later submission or a confirmed discard/retirement supersedes it; it is
   // never a second history database.
   std::map<ManagedProjectionKey, PendingRebuild> pending_rebuilds_;
-  mutable std::string last_projection_readiness_detail_;
-  mutable std::mutex readiness_report_mutex_;
   mutable std::mutex mutex_;
   // Independent of `mutex_`: candidate verification and model construction
   // never block registry reads. Never held together with `mutex_`.
@@ -1560,12 +1519,6 @@ ManagedProjectionRegistry::FindCurrentProjectionRevision(
     const core::ProjectionRevisionDTO &expected,
     const core::ProjectionExecutionHostBindingDTO &binding) const {
   return impl_->FindCurrentProjectionRevision(expected, binding);
-}
-
-bool ManagedProjectionRegistry::AllRequiredProjectionsHealthy(
-    const deployment::RetainedBundle &bundle,
-    const core::ProjectionRevisionDTO &expected) const {
-  return impl_->AllRequiredProjectionsHealthy(bundle, expected);
 }
 
 void ManagedProjectionRegistry::InstallActiveFrameResolverSet(

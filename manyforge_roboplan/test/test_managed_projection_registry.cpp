@@ -349,8 +349,8 @@ TEST(ManagedProjectionRegistry,
 
 TEST(NativeProjectionRpcCodec, HealthSelectorPreservesLegacyAndHasOneEncoding) {
   namespace detail = component_manager::detail;
-  // Frozen original MFNPRPC4/tag-2 request, independent of codec writers.
-  static constexpr char legacy_bytes[] = "MFNPRPC4\x02"
+  // Frozen MFNPRPC5/tag-2 request, independent of codec writers.
+  static constexpr char legacy_bytes[] = "MFNPRPC5\x02"
                                          "\x00\x00\x00\x05"
                                          "arm-a"
                                          "\x00\x00\x00\x0e"
@@ -368,6 +368,12 @@ TEST(NativeProjectionRpcCodec, HealthSelectorPreservesLegacyAndHasOneEncoding) {
       std::get<detail::NativeProjectionHealthQuery>(ordinary_decoded);
   EXPECT_EQ(plain.execution_host_binding, ordinary.execution_host_binding);
   EXPECT_FALSE(plain.selected_projection_revision.has_value());
+  // The string-Apply-id version 4 is refused like an unknown magic.
+  auto old_version = legacy;
+  old_version[7] = '4';
+  EXPECT_THROW(static_cast<void>(
+                   detail::DecodeNativeProjectionRpcRequest(old_version)),
+               std::invalid_argument);
 
   static constexpr char selector_bytes[] =
       "\x01"

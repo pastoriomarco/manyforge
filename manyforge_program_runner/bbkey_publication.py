@@ -40,7 +40,7 @@ from manyforge_behavior.orchestration_values import (
 )
 
 
-SCHEMA_VERSION: Final = "manyforge.program_bbkey_publication.v1"
+SCHEMA_VERSION: Final = "manyforge.program_bbkey_publication.v2"
 COMMAND: Final = "publish_program_bbkeys"
 FAULT_CODE: Final = "program_bbkey_publication_failed"
 # The matching current Apply is still installing the source, or
@@ -59,16 +59,14 @@ class ProgramBlackboardPublicationScope:
     """The exact identities every frame repeats.
 
     A Run source names its captured claim and Run. The cell-level source
-    between Runs has neither (both None): it is identified by the Runner
-    owner epoch, the Applied binding and publication (the host's existing
+    between Runs has neither (both None): it is identified by the Applied
+    binding and publication (the host's existing
     ``active_publication_generation``) and the Program-cycle generation, which
     the existing Reset advances. Every new Applied publication is a new source.
     """
 
-    owner_epoch: str
-    program_runner_owner_epoch: str
     claim_generation: int | None
-    program_run_id: str | None
+    program_run_id: int | None
     program_binding_id: str
     active_publication_generation: int
     cycle_generation: int
@@ -126,7 +124,7 @@ class ProgramBlackboardKeyPublisher:
         *,
         publish: Callable[[Mapping[str, Any]], Mapping[str, Any]],
         submit: Callable[[Callable[[], None]], Any],
-        stop_run: Callable[[str], None],
+        stop_run: Callable[[int], None],
         on_fault: Callable[[Mapping[str, Any], str], None],
         fault_reference: Callable[[Mapping[str, Any]], str],
         on_baseline_accepted: Callable[[], None] | None = None,
@@ -254,8 +252,6 @@ class ProgramBlackboardKeyPublisher:
         scope = self._scope
         return {
             "schema_version": SCHEMA_VERSION,
-            "owner_epoch": scope.owner_epoch,
-            "program_runner_owner_epoch": scope.program_runner_owner_epoch,
             "claim_generation": scope.claim_generation,
             "program_run_id": scope.program_run_id,
             "program_binding_id": scope.program_binding_id,

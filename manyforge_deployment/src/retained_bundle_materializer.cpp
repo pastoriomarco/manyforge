@@ -39,7 +39,6 @@
 #include "manyforge_deployment/runtime_profile_codec.hpp"
 #include "manyforge_deployment/stop_evidence_policy_codec.hpp"
 #include "planning_resource_map_internal.hpp"
-#include "reference_runtime_unit_internal.hpp"
 #include "retained_bundle_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"
@@ -111,23 +110,6 @@ require_control_domain_control_contract() {
       contract->placement() != ProductPlacement::kControlDomain) {
     throw std::logic_error(
         "build-qualified control-domain product contract is absent or "
-        "incoherent");
-  }
-  return *contract;
-}
-
-[[nodiscard]] const BuildQualifiedProductContract &
-require_reference_runtime_contract() {
-  const auto *contract = build_qualified_product_contract_registry().find(
-      core::ProductContractId(
-          std::string(detail::reference_runtime_product_contract_id())),
-      detail::reference_runtime_product_contract_revision());
-  if (contract == nullptr ||
-      contract->product_kind() !=
-          core::RetainedProductKind::kRuntimeUnitConfiguration ||
-      contract->placement() != ProductPlacement::kRuntimeUnit) {
-    throw std::logic_error(
-        "build-qualified reference runtime product contract is absent or "
         "incoherent");
   }
   return *contract;
@@ -1048,12 +1030,6 @@ void require_qualified_structural_subset_before_store(
     }
   } else {
     const auto &unit = graph.runtime_units.front();
-    const bool exact_reference =
-        unit.runtime_unit_id.value() == detail::kReferenceRuntimeUnitId &&
-        unit.runtime_profile_id.value() == detail::kReferenceRuntimeProfileId &&
-        unit.runtime_profile_revision.value() ==
-            detail::reference_runtime_profile_revision() &&
-        unit.configuration.empty();
     const bool exact_ros2_control_host =
         unit.runtime_profile_id.value() ==
             detail::kRos2ControlExecutionRuntimeProfileId &&
@@ -1061,7 +1037,7 @@ void require_qualified_structural_subset_before_store(
             detail::ros2_control_execution_runtime_profile_revision() &&
         detail::ros2_control_execution_runtime_configuration_is_qualified(
             unit.configuration);
-    if ((!exact_reference && !exact_ros2_control_host) ||
+    if (!exact_ros2_control_host ||
         !unit.dependency_runtime_unit_ids.empty() ||
         applicability.runtime_profiles().size() != 1U ||
         !composition.component_types().empty() ||
@@ -1080,13 +1056,8 @@ void require_qualified_structural_subset_before_store(
       detail::fail_retained_bundle(
           "runtime retention is outside an exact infrastructure process row");
     }
-    if (exact_reference) {
-      static_cast<void>(detail::emit_reference_runtime_manifest(
-          qualified.compiler_ir(), unit.runtime_unit_id));
-    } else {
-      static_cast<void>(detail::emit_ros2_control_execution_runtime_manifest(
-          qualified.compiler_ir(), unit.runtime_unit_id));
-    }
+    static_cast<void>(detail::emit_ros2_control_execution_runtime_manifest(
+        qualified.compiler_ir(), unit.runtime_unit_id));
   }
 
   const auto &cell_frame = composition.cell_frame();
@@ -1572,7 +1543,6 @@ prepare_planning_collision_product_before_store(
   std::vector<detail::PreparedRuntimeUnitArtifact> runtime_unit_artifacts;
   runtime_unit_artifacts.reserve(composition.graph().runtime_units.size());
   for (const auto &unit : composition.graph().runtime_units) {
-    detail::PreparedRuntimeUnitKind kind;
     const BuildQualifiedProductContract *qualified_runtime_contract = nullptr;
     std::string manifest;
     std::string launchable;
@@ -1581,32 +1551,10 @@ prepare_planning_collision_product_before_store(
     std::string_view launchable_role;
     std::string_view launchable_media_type;
     core::ProductId product_id(std::string{});
-    if (unit.runtime_profile_id.value() == detail::kReferenceRuntimeProfileId &&
-        unit.runtime_profile_revision.value() ==
-            detail::reference_runtime_profile_revision()) {
-      kind = detail::PreparedRuntimeUnitKind::kReference;
-      qualified_runtime_contract = &require_reference_runtime_contract();
-      manifest = detail::emit_reference_runtime_manifest(
-          qualified.compiler_ir(), unit.runtime_unit_id);
-      detail::require_reference_runtime_manifest_matches(
-          manifest, qualified.compiler_ir(), unit.runtime_unit_id);
-      launchable = std::string(detail::reference_runtime_launchable_script());
-      if (launchable.empty() ||
-          launchable.size() > detail::kMaxReferenceRuntimeLaunchableBytes) {
-        throw std::logic_error(
-            "build-owned reference runtime launchable exceeds its bound");
-      }
-      manifest_role = detail::kReferenceRuntimeManifestArtifactRole;
-      manifest_media_type = detail::kReferenceRuntimeManifestMediaType;
-      launchable_role = detail::kReferenceRuntimeLaunchableArtifactRole;
-      launchable_media_type = detail::kReferenceRuntimeLaunchableMediaType;
-      product_id = core::ProductId(
-          detail::reference_runtime_product_id(unit.runtime_unit_id));
-    } else if (unit.runtime_profile_id.value() ==
+    if (unit.runtime_profile_id.value() ==
                    detail::kRos2ControlExecutionRuntimeProfileId &&
                unit.runtime_profile_revision.value() ==
                    detail::ros2_control_execution_runtime_profile_revision()) {
-      kind = detail::PreparedRuntimeUnitKind::kRos2ControlExecution;
       qualified_runtime_contract =
           &require_ros2_control_execution_runtime_contract();
       manifest = detail::emit_ros2_control_execution_runtime_manifest(
@@ -1652,7 +1600,7 @@ prepare_planning_collision_product_before_store(
         qualified_runtime_contract->product_contract_revision(),
         runtime_inputs);
     runtime_unit_artifacts.push_back(detail::PreparedRuntimeUnitArtifact{
-        unit.runtime_unit_id, std::move(manifest), std::move(launchable), kind,
+        unit.runtime_unit_id, std::move(manifest), std::move(launchable),
         qualified_runtime_contract});
   }
   std::vector<core::RetainedSchemaArtifactRefDTO> schema_artifacts;
@@ -1970,13 +1918,9 @@ void require_verified_current_bundle_artifacts(
     const auto &product = group.products.front();
     require_verified_product_artifact_readback(product, artifact_store);
     const std::string_view manifest_role =
-        expected.kind == detail::PreparedRuntimeUnitKind::kReference
-            ? detail::kReferenceRuntimeManifestArtifactRole
-            : detail::kRos2ControlExecutionRuntimeManifestArtifactRole;
+        detail::kRos2ControlExecutionRuntimeManifestArtifactRole;
     const std::string_view launchable_role =
-        expected.kind == detail::PreparedRuntimeUnitKind::kReference
-            ? detail::kReferenceRuntimeLaunchableArtifactRole
-            : detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole;
+        detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole;
     std::optional<std::string> manifest;
     std::optional<std::string> launchable;
     for (const auto &artifact : product.artifact_refs) {
@@ -1999,14 +1943,9 @@ void require_verified_current_bundle_artifacts(
       throw std::runtime_error(
           "reloaded runtime-unit product differs from its prepared bytes");
     }
-    if (expected.kind == detail::PreparedRuntimeUnitKind::kReference) {
-      detail::require_reference_runtime_product_matches_retained_bundle(
-          *manifest, *launchable, value, group.runtime_unit_id);
-    } else {
-      detail::
-          require_ros2_control_execution_runtime_product_matches_retained_bundle(
-              *manifest, *launchable, value, group.runtime_unit_id);
-    }
+    detail::
+        require_ros2_control_execution_runtime_product_matches_retained_bundle(
+            *manifest, *launchable, value, group.runtime_unit_id);
   }
 }
 
@@ -2255,48 +2194,25 @@ detail::RetainedBundleMaterializer::materialize_prepared(
       throw std::logic_error(
           "prepared runtime-unit product has no qualified contract");
     }
-    std::string_view manifest_role;
-    std::string_view manifest_media_type;
-    std::string_view launchable_role;
-    std::string_view launchable_media_type;
-    core::ProductId product_id(std::string{});
-    switch (input.kind) {
-    case detail::PreparedRuntimeUnitKind::kReference:
-      detail::require_reference_runtime_manifest_matches(
-          input.manifest_bytes, qualified.compiler_ir(), input.runtime_unit_id);
-      if (input.launchable_bytes !=
-          detail::reference_runtime_launchable_script()) {
-        throw std::logic_error(
-            "prepared reference runtime launchable changed before retention");
-      }
-      manifest_role = detail::kReferenceRuntimeManifestArtifactRole;
-      manifest_media_type = detail::kReferenceRuntimeManifestMediaType;
-      launchable_role = detail::kReferenceRuntimeLaunchableArtifactRole;
-      launchable_media_type = detail::kReferenceRuntimeLaunchableMediaType;
-      product_id = core::ProductId(
-          detail::reference_runtime_product_id(input.runtime_unit_id));
-      break;
-    case detail::PreparedRuntimeUnitKind::kRos2ControlExecution:
-      detail::require_ros2_control_execution_runtime_manifest_matches(
-          input.manifest_bytes, qualified.compiler_ir(), input.runtime_unit_id);
-      if (input.launchable_bytes !=
-          detail::ros2_control_execution_runtime_launch_descriptor()) {
-        throw std::logic_error(
-            "prepared ros2_control execution launch descriptor changed before "
-            "retention");
-      }
-      manifest_role = detail::kRos2ControlExecutionRuntimeManifestArtifactRole;
-      manifest_media_type =
-          detail::kRos2ControlExecutionRuntimeManifestMediaType;
-      launchable_role =
-          detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole;
-      launchable_media_type =
-          detail::kRos2ControlExecutionRuntimeLaunchDescriptorMediaType;
-      product_id =
-          core::ProductId(detail::ros2_control_execution_runtime_product_id(
-              input.runtime_unit_id));
-      break;
+    detail::require_ros2_control_execution_runtime_manifest_matches(
+        input.manifest_bytes, qualified.compiler_ir(), input.runtime_unit_id);
+    if (input.launchable_bytes !=
+        detail::ros2_control_execution_runtime_launch_descriptor()) {
+      throw std::logic_error(
+          "prepared ros2_control execution launch descriptor changed before "
+          "retention");
     }
+    const std::string_view manifest_role =
+        detail::kRos2ControlExecutionRuntimeManifestArtifactRole;
+    const std::string_view manifest_media_type =
+        detail::kRos2ControlExecutionRuntimeManifestMediaType;
+    const std::string_view launchable_role =
+        detail::kRos2ControlExecutionRuntimeLaunchDescriptorArtifactRole;
+    const std::string_view launchable_media_type =
+        detail::kRos2ControlExecutionRuntimeLaunchDescriptorMediaType;
+    const core::ProductId product_id(
+        detail::ros2_control_execution_runtime_product_id(
+            input.runtime_unit_id));
     std::vector<detail::RetainedArtifactInput> runtime_artifacts{
         {core::ArtifactRoleId(std::string(launchable_role)),
          std::string(launchable_media_type), input.launchable_bytes},

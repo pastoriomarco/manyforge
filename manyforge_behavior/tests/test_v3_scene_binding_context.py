@@ -19,7 +19,7 @@ def test_scene_binding_keeps_component_observations_and_target_authority_distinc
                              "frame_references": [{"component_id": "tool", "frame_id": "tcp"}],
                              "collision_body_references": [{"component_id": "tool", "collision_body_id": "jaw"}]}],
     }
-    capture = ProgramRunPortContext("run", digest, "scenario", digest, "program", digest,
+    capture = ProgramRunPortContext(1, digest, "scenario", digest, "program", digest,
                                     digest, digest, digest, digest, binding)
     context = HeadlessSceneProgramPort._parse_context(capture)
     target = context.targets[("tool", "grip")]
@@ -97,9 +97,9 @@ def test_runtime_context_uses_exact_direct_target_and_derived_signal_rows():
                "retained_bundle_id": digest, "graph_revision": digest,
                "target_bindings": [{"target": target, "capability_bindings": []}],
                "signal_bindings": [row(output, "output"), row(derived, "input")]}
-    capture = ProgramRunPortContext("run", digest, "scenario", digest, "program", digest,
+    capture = ProgramRunPortContext(1, digest, "scenario", digest, "program", digest,
                                     digest, digest, digest, digest, binding)
-    context = NativeKernelProgramPort._parse_context(capture, request_owner_epoch="epoch")
+    context = NativeKernelProgramPort._parse_context(capture)
     assert context.targets[("io", "bank")].reference() == target
     assert _io_signal(context.signals, output, output=True).signal_name == "DO0"
     assert _io_signal(context.signals, derived).signal_name == "DO0.changed_outside"
@@ -117,15 +117,15 @@ def test_io_read_sends_signal_pair_and_checks_returned_scope():
     binding = _SignalBinding("io", "CI0", {"component_id": "io", "command_target_id": "bank"},
                              "bool", "input", "sampled_only", "sha256:" + "0" * 64)
     capture = SimpleNamespace(program_binding_id="binding")
-    context = SimpleNamespace(signals={("io", "CI0"): binding}, request_owner_epoch="epoch", capture=capture)
+    context = SimpleNamespace(signals={("io", "CI0"): binding}, capture=capture)
     requests = []
     def query(request):
         requests.append(request)
-        return {"target_observation": {**request, "schema_version": "manyforge.target_observation.v2",
+        return {"target_observation": {**request, "schema_version": "manyforge.target_observation.v3",
                 "value": {"value": True, "quality": "fresh"}}}
     owner = SimpleNamespace(_context=lambda run: context, _kernel=SimpleNamespace(query_target=query))
     port = _NativeTargetQueryPort(owner)
-    result = port._read_io_input("io.get_input", NodeAttemptIdentity("run", "node", "attempt"),
+    result = port._read_io_input("io.get_input", NodeAttemptIdentity(1, "node", 1),
                                  OwnerNodeInputs({"signal": reference}))
     assert result.succeeded and result.output is True
     assert requests[0]["signal"] == reference
@@ -133,11 +133,11 @@ def test_io_read_sends_signal_pair_and_checks_returned_scope():
     from manyforge_behavior.production_ports import ProductionPortError
     import pytest
     owner._kernel.query_target = lambda request: {"target_observation": {
-        **request, "schema_version": "manyforge.target_observation.v2",
+        **request, "schema_version": "manyforge.target_observation.v3",
         "signal": {**reference, "signal_name": "CI1"},
         "value": {"value": True, "quality": "fresh"}}}
     with pytest.raises(ProductionPortError, match="crossed the captured query"):
-        port._read_io_input("io.get_input", NodeAttemptIdentity("run", "node", "attempt"),
+        port._read_io_input("io.get_input", NodeAttemptIdentity(1, "node", 1),
                             OwnerNodeInputs({"signal": reference}))
 
 
@@ -179,7 +179,7 @@ def test_io_watch_registers_exact_signal_reference():
         _node_attribution=lambda identity: {}, _lock=RLock(), _io_watches={},
         _kernel=SimpleNamespace(register_io_watch=register))
     port = _NativeIoWatchTaskPort(owner)
-    port.start("io.wait_for_input", NodeAttemptIdentity("run", "node", "attempt"),
+    port.start("io.wait_for_input", NodeAttemptIdentity(1, "node", 1),
                OwnerNodeInputs({"signal": reference, "expected_value": True}))
     assert requests[0]["signal"] == reference
     assert requests[0]["condition"] == {"kind": "level", "expected_value": True}
@@ -200,16 +200,16 @@ def test_pneumatic_plan_preserves_signal_pairs_and_output_order():
                          {"signal": b, "open_value": True, "close_value": False}],
              "inputs": [{"input": "workpiece_grasped", "signal": part}]}
     target = SimpleNamespace(pneumatic_io=route)
-    context = SimpleNamespace(signals={("io", "A"): signal("A", "output"),
+    context = SimpleNamespace(capture=SimpleNamespace(), signals={("io", "A"): signal("A", "output"),
         ("io", "B"): signal("B", "output"), ("io", "Part"): signal("Part", "input")})
     descriptor = {"min_position": 0.0, "max_position": 0.5, "command_duration_s": 1.0}
     def preset(_descriptor, selector):
         return {"kind": "linear_m", "value_m": 0.5 if selector["name"] == "open" else 0.0}
     owner = SimpleNamespace(_context=lambda _: context, _require_scope_open=lambda _: None,
-        _target=lambda *_: target, _owner_status=lambda _: "epoch",
+        _target=lambda *_: target, _require_captured_deployment=lambda _: None,
         _gripper_descriptor=lambda *_, **__: descriptor, _named_gripper_position=preset)
     plan = _NativeKernelOperationTaskPort(owner).pneumatic_plan(
-        NodeAttemptIdentity("run", "node", "attempt"), OwnerNodeInputs({
+        NodeAttemptIdentity(1, "node", 1), OwnerNodeInputs({
             "target": {"component_id": "tool", "command_target_id": "gripper"},
             "position": {"kind": "named_preset", "name": "closed"},
             "required_inputs": [{"input": "workpiece_grasped", "value": True}]}))

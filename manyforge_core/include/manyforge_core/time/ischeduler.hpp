@@ -160,8 +160,8 @@ class IScheduler {
   /// RuntimeSafety or StopControl callback, or a runtime-collision lookahead
   /// authority/observer callback). A production scheduler hands the typed
   /// reason to the containment its host installed: motion admission closes
-  /// for the rest of the runtime and a Full Stop is attempted. Without an
-  /// installed containment the process terminates, as before.
+  /// for the rest of the runtime and a Halt is requested; without one it
+  /// writes one typed line. This default is used only by test schedulers.
   virtual void contain_safety_path_fault(std::string_view /*reason_code*/) noexcept {
     std::terminate();
   }

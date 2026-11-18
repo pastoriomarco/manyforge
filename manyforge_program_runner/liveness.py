@@ -1,11 +1,11 @@
-"""Private Manager-presence receiver for the separately hosted Program Runner."""
+"""Private receiver of the Manager's identity reports for the Program Runner.
+
+Reports never expire: a quiet Manager closes, fences and stops nothing here.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-import errno
-import hashlib
 import json
 import logging
 import os
@@ -15,45 +15,43 @@ import socket
 import stat
 import struct
 from threading import Event, RLock, Thread
-import time
 from typing import Any, Final
 import unicodedata
 
 from manyforge_headless_api.program_cycle import AcceptedProgramResetDTO
 
 
-API_VERSION: Final = "manyforge.program_runner_liveness.v1"
+API_VERSION: Final = "manyforge.program_runner_liveness.v2"
 POLICY_ID: Final = "manyforge.program-runner.manager-presence.v1"
 POLICY_REVISION: Final = "1"
-LOCAL_SAFE_STATE_CONTRACT_ID: Final = (
-    "manyforge.program-runner.manager-loss-containment.v1"
-)
-LOCAL_SAFE_STATE_CONTRACT_REVISION: Final = "1"
-RENEWAL_INTERVAL_NS: Final = 250_000_000
-EXPIRY_TIMEOUT_NS: Final = 1_000_000_000
+# Cadence at which pending BB key sources are started.
+PUBLICATION_CHECK_INTERVAL_S: Final = 0.0625
 MAXIMUM_PACKET_BYTES: Final = 16_384
 MAXIMUM_SEQUENCE: Final = 9_007_199_254_740_991
+# A Runner fault (OD-267): the closed set of codes that fence the cell.
 PUBLISHER_FAULT_CODE: Final = "program_bbkey_publication_failed"
-_MAXIMUM_PUBLISHER_FAULT_MESSAGE_BYTES: Final = 1_024
+TICK_WORKER_FAULT_CODE: Final = "program_tick_worker_failed"
+RUNNER_FAULT_CODES: Final = frozenset({PUBLISHER_FAULT_CODE, TICK_WORKER_FAULT_CODE})
+_MAXIMUM_RUNNER_FAULT_MESSAGE_BYTES: Final = 1_024
 
 
 _LOGGER = logging.getLogger(__name__)
 
 
 class ProgramRunnerLivenessError(RuntimeError):
-    """A malformed, foreign, or stale private liveness packet."""
+    """A malformed, foreign, or stale private liveness packet.
 
+    ``code`` is the typed cause of a fence that has one (a failed tick
+    worker), else None.
+    """
 
-@dataclass(frozen=True, slots=True)
-class RetainedLiveness:
-    manager_runtime_epoch: str | None
-    manager_owner_epoch: str | None
-    expired: bool
-    fault_reference: str | None
+    def __init__(self, message: str, *, code: str | None = None) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class ProgramRunnerLivenessReceiver:
-    """Mode-0600 seqpacket listener plus receiver-local monotonic watchdog."""
+    """Mode-0600 seqpacket listener plus the pending BB key-source check."""
 
     def __init__(
         self,
@@ -62,11 +60,7 @@ class ProgramRunnerLivenessReceiver:
         cell_id: str,
         receiver_runtime_unit_id: str,
         receiver_runtime_epoch: str,
-        retained: RetainedLiveness,
-        on_expiry: Callable[[str], str],
-        on_reconciliation: Callable[[str, str, str], None],
         cycle_status: Callable[[], Mapping[str, Any]],
-        monotonic_ns: Callable[[], int] = time.monotonic_ns,
         publication_check: Callable[[], None] | None = None,
     ) -> None:
         if not path.is_absolute() or path.name in {"", ".", ".."}:
@@ -75,13 +69,9 @@ class ProgramRunnerLivenessReceiver:
         self._cell_id = cell_id
         self._runtime_unit_id = receiver_runtime_unit_id
         self._runtime_epoch = receiver_runtime_epoch
-        self._on_expiry = on_expiry
-        self._on_reconciliation = on_reconciliation
         self._cycle_status = cycle_status
-        self._clock = monotonic_ns
-        # Starts pending BB key sources, run on the watchdog.
+        # Starts pending BB key sources, run on the publication thread.
         self._publication_check = publication_check
-        self._started_ns = self._clock()
         self._lock = RLock()
         self._stop = Event()
         self._listener: socket.socket | None = None
@@ -89,22 +79,19 @@ class ProgramRunnerLivenessReceiver:
         self._run_root_fd: int | None = None
         self._run_root_identity: tuple[int, int] | None = None
         self._server_thread: Thread | None = None
-        self._watchdog_thread: Thread | None = None
-        self._manager_runtime_epoch = retained.manager_runtime_epoch
-        self._manager_owner_epoch = retained.manager_owner_epoch
-        self._manager_runtime_unit_id: str | None = None
-        self._last_sequence: int | None = None
-        self._last_accepted_ns: int | None = None
+        self._publication_thread: Thread | None = None
+        # The serving thread's stop event (OD-296 (a)): close() writes it, so
+        # the thread waits for a connection or a request without a time limit.
+        self._stop_read_fd: int | None = None
+        self._stop_write_fd: int | None = None
         self._receiver_status_sequence = 1
         self._state = "unreconciled"
         self._fenced = True
-        self._fault_reference = retained.fault_reference
-        self._predecessor_expired = retained.expired
         self._last_rejection: str | None = None
         # Independent of Manager presence: no heartbeat or reconciliation
         # clears it, and it keeps commands fenced while Manager stays current.
-        self._publisher_fault: dict[str, Any] | None = None
-        self._publisher_fault_reference: str | None = None
+        self._runner_fault: dict[str, Any] | None = None
+        self._runner_fault_reference: str | None = None
 
     @staticmethod
     def _safe_run_root(metadata: os.stat_result) -> bool:
@@ -216,57 +203,6 @@ class ProgramRunnerLivenessReceiver:
         listener: socket.socket | None = None
         bound_identity: tuple[int, int] | None = None
         try:
-            try:
-                existing = self._endpoint_status(descriptor)
-            except FileNotFoundError:
-                existing = None
-            if existing is not None:
-                if (
-                    not stat.S_ISSOCK(existing.st_mode)
-                    or existing.st_uid != os.geteuid()
-                    or existing.st_nlink != 1
-                    or stat.S_IMODE(existing.st_mode) != 0o600
-                ):
-                    raise ProgramRunnerLivenessError(
-                        "liveness path exists and is not the exact owned socket"
-                    )
-                identity = (existing.st_dev, existing.st_ino)
-                probe = socket.socket(
-                    socket.AF_UNIX,
-                    socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC,
-                )
-                probe.settimeout(0.2)
-                try:
-                    probe.connect(socket_address)
-                except OSError as error:
-                    if error.errno != errno.ECONNREFUSED:
-                        raise ProgramRunnerLivenessError(
-                            "liveness socket state is ambiguous"
-                        ) from error
-                else:
-                    raise ProgramRunnerLivenessError(
-                        "liveness socket already has an active listener"
-                    )
-                finally:
-                    probe.close()
-                try:
-                    current = self._endpoint_status(descriptor)
-                except FileNotFoundError as error:
-                    raise ProgramRunnerLivenessError(
-                        "liveness socket changed during stale-path recovery"
-                    ) from error
-                if (
-                    (current.st_dev, current.st_ino) != identity
-                    or not stat.S_ISSOCK(current.st_mode)
-                    or current.st_uid != os.geteuid()
-                    or current.st_nlink != 1
-                    or stat.S_IMODE(current.st_mode) != 0o600
-                ):
-                    raise ProgramRunnerLivenessError(
-                        "liveness socket changed during stale-path recovery"
-                    )
-                os.unlink(self._path.name, dir_fd=descriptor)
-
             listener = socket.socket(
                 socket.AF_UNIX,
                 socket.SOCK_SEQPACKET | socket.SOCK_CLOEXEC,
@@ -290,47 +226,31 @@ class ProgramRunnerLivenessReceiver:
             self._listener_identity = bound_identity
             listener.listen(8)
             listener.setblocking(False)
-            # Reserve the unique listener identity before retrying retained
-            # containment, but do not accept reconciliation until that retry
-            # has completed.
-            if self._predecessor_expired:
-                reference = self._fault_reference
-                if reference is None:
-                    material = (
-                        "manyforge.program-runner.manager-loss.v1\0"
-                        + (self._manager_runtime_epoch or "unknown")
-                        + "\0"
-                        + self._runtime_epoch
-                    )
-                    reference = (
-                        "sha256:" + hashlib.sha256(material.encode()).hexdigest()
-                    )
-                try:
-                    reference = self._on_expiry(reference)
-                except Exception:
-                    pass
-                with self._lock:
-                    self._fault_reference = reference
+            self._stop_read_fd, self._stop_write_fd = os.pipe2(
+                os.O_CLOEXEC | os.O_NONBLOCK
+            )
             self._listener = listener
             self._server_thread = Thread(
                 target=self._serve,
                 name="program-runner-liveness",
                 daemon=True,
             )
-            self._watchdog_thread = Thread(
-                target=self._watchdog,
-                name="program-runner-watchdog",
+            self._publication_thread = Thread(
+                target=self._publication_loop,
+                name="program-runner-bbkey-publication",
                 daemon=True,
             )
             self._server_thread.start()
-            self._watchdog_thread.start()
+            self._publication_thread.start()
         except BaseException:
             self._stop.set()
+            self._signal_stop()
             if listener is not None:
                 listener.close()
-            for thread in (self._server_thread, self._watchdog_thread):
+            for thread in (self._server_thread, self._publication_thread):
                 if thread is not None and thread.is_alive():
-                    thread.join(timeout=2.0)
+                    thread.join()
+            self._close_stop_pipe()
             self._remove_endpoint(descriptor, bound_identity)
             os.close(descriptor)
             self._run_root_fd = None
@@ -338,14 +258,30 @@ class ProgramRunnerLivenessReceiver:
             self._listener = None
             raise
 
+    def _signal_stop(self) -> None:
+        if self._stop_write_fd is not None:
+            try:
+                os.write(self._stop_write_fd, b"\0")
+            except BlockingIOError:
+                pass  # Already signalled.
+
+    def _close_stop_pipe(self) -> None:
+        for descriptor in (self._stop_read_fd, self._stop_write_fd):
+            if descriptor is not None:
+                os.close(descriptor)
+        self._stop_read_fd = None
+        self._stop_write_fd = None
+
     def close(self) -> None:
         self._stop.set()
+        self._signal_stop()
         listener = self._listener
+        for thread in (self._server_thread, self._publication_thread):
+            if thread is not None:
+                thread.join()
         if listener is not None:
             listener.close()
-        for thread in (self._server_thread, self._watchdog_thread):
-            if thread is not None:
-                thread.join(timeout=2.0)
+        self._close_stop_pipe()
         descriptor = self._run_root_fd
         if descriptor is not None:
             try:
@@ -358,69 +294,70 @@ class ProgramRunnerLivenessReceiver:
 
     def require_current(self) -> None:
         with self._lock:
-            if self._publisher_fault is not None:
+            if self._runner_fault is not None:
+                code = self._runner_fault["code"]
                 raise ProgramRunnerLivenessError(
-                    "Program Runner is fenced by a BB key publication fault"
+                    f"Program Runner is fenced by a Runner fault: {code}",
+                    code=code if code == TICK_WORKER_FAULT_CODE else None,
                 )
             if self._state != "current" or self._fenced:
                 raise ProgramRunnerLivenessError(
-                    "Program Runner is fenced by Manager-presence liveness"
+                    "Program Runner awaits the Manager's reconciliation"
                 )
 
-    @property
-    def manager_fault_reference(self) -> str | None:
-        """The Manager-loss reference only, never a publisher fault."""
-
-        with self._lock:
-            return self._fault_reference
-
-    def latch_publisher_fault(
+    def latch_runner_fault(
         self, fault: Mapping[str, Any], reference: str
     ) -> bool:
-        """Latch the first BB publication fault for this receiver's lifetime,
-        unless its owner clears it (`clear_publisher_fault`). True when
-        this call latched it."""
+        """Latch a Runner fault. A BB publication fault is latched while no
+        fault is, until its owner clears it (`clear_runner_fault`). A tick
+        worker fault replaces a BB publication fault and never clears.
+        True when this call latched it."""
 
+        code = fault.get("code")
         message = fault.get("message")
         if (
             set(fault) != {"code", "message", "details"}
-            or fault.get("code") != PUBLISHER_FAULT_CODE
+            or code not in RUNNER_FAULT_CODES
             or fault.get("details") != {}
             or not isinstance(message, str)
             or not message
-            or len(message.encode("utf-8")) > _MAXIMUM_PUBLISHER_FAULT_MESSAGE_BYTES
+            or len(message.encode("utf-8")) > _MAXIMUM_RUNNER_FAULT_MESSAGE_BYTES
             or unicodedata.normalize("NFC", message) != message
             or not isinstance(reference, str)
             or len(reference) != 71
             or not reference.startswith("sha256:")
         ):
-            raise ProgramRunnerLivenessError("malformed BB publication fault")
+            raise ProgramRunnerLivenessError("malformed Runner fault")
         with self._lock:
-            if self._publisher_fault is not None:
+            if self._runner_fault is not None and (
+                code == PUBLISHER_FAULT_CODE
+                or self._runner_fault["code"] == TICK_WORKER_FAULT_CODE
+            ):
                 return False
-            self._publisher_fault = {
-                "code": PUBLISHER_FAULT_CODE,
+            self._runner_fault = {
+                "code": code,
                 "message": message,
                 "details": {},
             }
-            self._publisher_fault_reference = reference
+            self._runner_fault_reference = reference
             if self._receiver_status_sequence < MAXIMUM_SEQUENCE:
                 self._receiver_status_sequence += 1
         return True
 
-    def clear_publisher_fault(self, reference: str) -> bool:
-        """Clear exactly the latched fault with this reference (a
-        between-Runs source whose loss the Kernel confirmed, or that a newer
-        source superseded). True when it was cleared."""
+    def clear_runner_fault(self, reference: str) -> bool:
+        """Clear exactly the latched BB publication fault with this reference
+        (a source whose loss the Kernel confirmed, or that a newer source
+        superseded). True when it was cleared."""
 
         with self._lock:
             if (
-                self._publisher_fault is None
-                or self._publisher_fault_reference != reference
+                self._runner_fault is None
+                or self._runner_fault["code"] != PUBLISHER_FAULT_CODE
+                or self._runner_fault_reference != reference
             ):
                 return False
-            self._publisher_fault = None
-            self._publisher_fault_reference = None
+            self._runner_fault = None
+            self._runner_fault_reference = None
             if self._receiver_status_sequence < MAXIMUM_SEQUENCE:
                 self._receiver_status_sequence += 1
         return True
@@ -438,62 +375,47 @@ class ProgramRunnerLivenessReceiver:
             _LOGGER.exception("pending BB key source start failed")
 
     def status(self) -> dict[str, Any]:
-        now = self._clock()
         with self._lock:
-            age = (
-                None
-                if self._last_accepted_ns is None
-                else max(0, now - self._last_accepted_ns)
-            )
-            publisher_fault = (
-                None if self._publisher_fault is None else dict(self._publisher_fault)
+            runner_fault = (
+                None if self._runner_fault is None else dict(self._runner_fault)
             )
             return {
-                "schema_version": "manyforge.program_runner_liveness_status.v1",
-                "cell_id": self._cell_id,
-                "receiver_runtime_unit_id": self._runtime_unit_id,
-                "receiver_runtime_epoch": self._runtime_epoch,
-                "manager_runtime_unit_id": self._manager_runtime_unit_id,
-                "manager_runtime_epoch": self._manager_runtime_epoch,
-                "manager_owner_epoch": self._manager_owner_epoch,
-                "last_accepted_heartbeat_sequence": self._last_sequence,
+                "schema_version": "manyforge.program_runner_liveness_status.v2",
                 "receiver_status_sequence": self._receiver_status_sequence,
-                "local_heartbeat_age_ns": age,
                 "state": self._state,
-                # A publisher fault reuses the digested fence; its reference
-                # is the digest of the emitted publisher ErrorDTO.
-                # A Manager-loss reference stays in manager_fault_reference.
-                "command_fenced": self._fenced or publisher_fault is not None,
+                # A Runner fault reuses the digested fence; its reference
+                # is the digest of the emitted Runner-fault ErrorDTO.
+                "command_fenced": self._fenced or runner_fault is not None,
                 "fault_reference": (
-                    self._fault_reference
-                    if publisher_fault is None
-                    else self._publisher_fault_reference
+                    None if runner_fault is None else self._runner_fault_reference
                 ),
-                "publisher_fault": publisher_fault,
-                "runtime_policy_id": POLICY_ID,
-                "runtime_policy_revision": POLICY_REVISION,
-                "local_safe_state_contract_id": LOCAL_SAFE_STATE_CONTRACT_ID,
-                "local_safe_state_contract_revision": (
-                    LOCAL_SAFE_STATE_CONTRACT_REVISION
-                ),
+                "runner_fault": runner_fault,
             }
 
     def _serve(self) -> None:
+        """Serve the Manager's liveness exchanges (OD-296 (a)): each wait ends
+        on its event, never on a time limit. Waiting for a connection or a
+        request ends on its arrival, on the Manager closing the connection
+        or on close(); a Runner that is slow to answer is never lost."""
+
+        stop_fd = self._stop_read_fd
         while not self._stop.is_set():
             listener = self._listener
-            if listener is None:
+            if listener is None or stop_fd is None:
                 return
             try:
-                readable, _, _ = select.select([listener], [], [], 0.05)
-                if not readable:
-                    continue
+                readable, _, _ = select.select([listener, stop_fd], [], [])
+                if stop_fd in readable:
+                    return
                 connection, _ = listener.accept()
+            except BlockingIOError:
+                continue  # The connection went before it was accepted.
             except (OSError, ValueError):
                 if self._stop.is_set():
                     return
                 continue
             with connection:
-                connection.settimeout(0.2)
+                connection.setblocking(True)
                 try:
                     credentials = connection.getsockopt(
                         socket.SOL_SOCKET, socket.SO_PEERCRED, 12
@@ -501,6 +423,11 @@ class ProgramRunnerLivenessReceiver:
                     _peer_pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
                     if peer_uid != os.geteuid():
                         raise ProgramRunnerLivenessError("foreign peer uid")
+                    # The request, the Manager closing the connection (an
+                    # empty read below) or close().
+                    readable, _, _ = select.select([connection, stop_fd], [], [])
+                    if stop_fd in readable:
+                        return
                     packet, _ancillary, flags, _address = connection.recvmsg(
                         MAXIMUM_PACKET_BYTES + 1
                     )
@@ -563,12 +490,10 @@ class ProgramRunnerLivenessReceiver:
             {
                 "allowed_commands",
                 "accepted_reset",
-                "causal_client_sequence",
-                "causal_correlation_id",
-                "causal_session_id",
-                "program_runner_owner_epoch",
+                "causal_request_key",
                 "cycle_generation",
                 "current_command_kind",
+                "runner_commands",
                 "execution_control_revision",
                 "failure",
                 "state",
@@ -583,7 +508,6 @@ class ProgramRunnerLivenessReceiver:
         projected = {
             key: status[key]
             for key in (
-                "program_runner_owner_epoch",
                 "cycle_generation",
                 "state",
                 "program_run_id",
@@ -592,7 +516,6 @@ class ProgramRunnerLivenessReceiver:
                 "accepted_reset",
             )
         }
-        owner = projected["program_runner_owner_epoch"]
         generation = projected["cycle_generation"]
         state = projected["state"]
         run_id = projected["program_run_id"]
@@ -613,17 +536,13 @@ class ProgramRunnerLivenessReceiver:
             and (accepted_reset["reload_initial_scene"] or accepted_reset["reset_robot_position"])
         )
         if (
-            not isinstance(owner, str)
-            or not owner
-            or len(owner.encode("utf-8")) > 256
-            or type(generation) is not int
+            type(generation) is not int
             or not 1 <= generation <= MAXIMUM_SEQUENCE
             or state
             not in {
                 "idle_after_reset",
                 "starting",
                 "running",
-                "stopping",
                 "resetting",
                 "terminal_awaiting_reset",
                 "recovery_required",
@@ -640,20 +559,21 @@ class ProgramRunnerLivenessReceiver:
             not idle
             and not recovery
             and not idle_reset
+            # A start announces its run only after the Kernel claim (1.15.5).
+            and not (state == "starting" and run_id is None and claim_generation is None)
             and (
-                not isinstance(run_id, str)
-                or not run_id
-                or len(run_id.encode("utf-8")) > 256
+                type(run_id) is not int
+                or not 1 <= run_id <= MAXIMUM_SEQUENCE
             )
         ):
             raise ProgramRunnerLivenessError("malformed Program-cycle run identity")
-        if claim_generation is not None and not isinstance(run_id, str):
+        if claim_generation is not None and type(run_id) is not int:
             raise ProgramRunnerLivenessError("malformed Program-cycle run identity")
         claimless_terminal = state == "terminal_awaiting_reset" and terminal is not None
         if (
             not idle
             and claim_generation is None
-            and state not in {"starting", "stopping", "resetting", "recovery_required"}
+            and state not in {"starting", "resetting", "recovery_required"}
             and not claimless_terminal
         ):
             raise ProgramRunnerLivenessError("malformed unacquired Program cycle")
@@ -673,44 +593,12 @@ class ProgramRunnerLivenessReceiver:
             raise ProgramRunnerLivenessError("terminal Program cycle lacks evidence")
         return projected
 
-    @staticmethod
-    def _status_digest(status: Mapping[str, Any]) -> str:
-        material = bytearray(b"manyforge.manager-liveness.status.v1|")
-
-        def append(value: str | int) -> None:
-            encoded = str(value).encode("utf-8")
-            material.extend(str(len(encoded)).encode("ascii"))
-            material.extend(b":")
-            material.extend(encoded)
-            material.extend(b"|")
-
-        for value in (
-            status["cell_id"],
-            status["receiver_runtime_unit_id"],
-            status["receiver_runtime_epoch"],
-            status["manager_runtime_unit_id"],
-            status["manager_runtime_epoch"],
-            status["manager_owner_epoch"],
-            status["runtime_policy_id"],
-            status["runtime_policy_revision"],
-            status["last_accepted_heartbeat_sequence"],
-            status["receiver_status_sequence"],
-            status["local_heartbeat_age_ns"],
-            status["state"],
-            "true" if status["command_fenced"] else "false",
-            status["fault_reference"] or "",
-        ):
-            append(value)
-        return "sha256:" + hashlib.sha256(material).hexdigest()
-
     def _handle(self, request: Mapping[str, Any]) -> dict[str, Any]:
         if request.get("api_version") != API_VERSION:
             raise ProgramRunnerLivenessError("unsupported liveness API")
         kind = request.get("kind")
         if kind == "probe":
             self._exact(request, {"api_version", "cell_id", "kind"})
-            if request["cell_id"] != self._cell_id:
-                raise ProgramRunnerLivenessError("foreign cell")
             return {
                 "api_version": API_VERSION,
                 "cell_id": self._cell_id,
@@ -720,10 +608,6 @@ class ProgramRunnerLivenessReceiver:
                 "receiver_runtime_unit_id": self._runtime_unit_id,
                 "runtime_policy_id": POLICY_ID,
                 "runtime_policy_revision": POLICY_REVISION,
-                "local_safe_state_contract_id": LOCAL_SAFE_STATE_CONTRACT_ID,
-                "local_safe_state_contract_revision": (
-                    LOCAL_SAFE_STATE_CONTRACT_REVISION
-                ),
             }
         if kind != "heartbeat":
             raise ProgramRunnerLivenessError("unsupported liveness packet kind")
@@ -735,8 +619,6 @@ class ProgramRunnerLivenessReceiver:
                 "cell_id",
                 "heartbeat_sequence",
                 "kind",
-                "manager_owner_epoch",
-                "manager_runtime_epoch",
                 "manager_runtime_unit_id",
                 "receiver_runtime_epoch",
                 "receiver_runtime_unit_id",
@@ -748,23 +630,13 @@ class ProgramRunnerLivenessReceiver:
         )
         for key in (
             "active_bundle_id",
-            "manager_owner_epoch",
-            "manager_runtime_epoch",
             "manager_runtime_unit_id",
             "required_runtime_set_digest",
         ):
             if not isinstance(request[key], str) or not request[key]:
                 raise ProgramRunnerLivenessError(f"invalid {key}")
         sequence = request["heartbeat_sequence"]
-        if (
-            type(sequence) is not int
-            or not 1 <= sequence <= MAXIMUM_SEQUENCE
-            or request["cell_id"] != self._cell_id
-            or request["receiver_runtime_unit_id"] != self._runtime_unit_id
-            or request["receiver_runtime_epoch"] != self._runtime_epoch
-            or request["runtime_policy_id"] != POLICY_ID
-            or request["runtime_policy_revision"] != POLICY_REVISION
-        ):
+        if type(sequence) is not int or not 1 <= sequence <= MAXIMUM_SEQUENCE:
             raise ProgramRunnerLivenessError("foreign heartbeat identity")
         reconciliation = request["reconciliation_digest"]
         if reconciliation is not None and (
@@ -774,52 +646,18 @@ class ProgramRunnerLivenessReceiver:
         ):
             raise ProgramRunnerLivenessError("invalid reconciliation digest")
 
+        # Heartbeats are served one at a time on this receiver's single
+        # serving thread; this lock is held for memory-only work.
         with self._lock:
-            incoming_manager = request["manager_runtime_epoch"]
             needs_reconciliation = self._state != "current"
-            if self._manager_runtime_epoch is not None:
-                if incoming_manager != self._manager_runtime_epoch:
-                    if not self._predecessor_expired or (
-                        self._last_accepted_ns is not None and self._state != "expired"
-                    ):
-                        raise ProgramRunnerLivenessError(
-                            "predecessor Manager has not expired"
-                        )
-                    self._last_sequence = None
-                    needs_reconciliation = True
-                else:
-                    if (
-                        self._manager_owner_epoch is not None
-                        and request["manager_owner_epoch"] != self._manager_owner_epoch
-                    ):
-                        raise ProgramRunnerLivenessError(
-                            "Manager owner epoch changed without runtime expiry"
-                        )
-                    if (
-                        self._last_sequence is not None
-                        and sequence <= self._last_sequence
-                    ):
-                        raise ProgramRunnerLivenessError("stale heartbeat sequence")
             if self._receiver_status_sequence >= MAXIMUM_SEQUENCE:
                 raise ProgramRunnerLivenessError(
                     "receiver status sequence is exhausted"
                 )
-            if needs_reconciliation and reconciliation is not None:
-                self._on_reconciliation(
-                    reconciliation,
-                    incoming_manager,
-                    request["manager_owner_epoch"],
-                )
-            self._manager_runtime_epoch = incoming_manager
-            self._manager_owner_epoch = request["manager_owner_epoch"]
-            self._manager_runtime_unit_id = request["manager_runtime_unit_id"]
-            self._last_sequence = sequence
-            self._last_accepted_ns = self._clock()
             self._receiver_status_sequence += 1
             # Receipt proves peer liveness, not runtime readiness. During Apply
             # a healthy Manager may have no reconciled native projection yet.
             if reconciliation is not None:
-                self._predecessor_expired = False
                 self._state = "current"
                 self._fenced = False
             elif needs_reconciliation:
@@ -828,80 +666,24 @@ class ProgramRunnerLivenessReceiver:
         status = self.status()
         return {
             **status,
-            "active_bundle_id": request["active_bundle_id"],
             "api_version": API_VERSION,
             "kind": "heartbeat_ack",
             "program_cycle_status": self._project_cycle_status(),
-            "required_runtime_set_digest": request["required_runtime_set_digest"],
-            "receiver_status_digest": self._status_digest(status),
         }
 
-    def _watchdog(self) -> None:
-        while not self._stop.wait(RENEWAL_INTERVAL_NS / 1_000_000_000 / 4):
-            self.check_expiry()
+    def _publication_loop(self) -> None:
+        while not self._stop.wait(PUBLICATION_CHECK_INTERVAL_S):
             self.check_publication()
-
-    def check_expiry(self) -> bool:
-        """Perform one deterministic watchdog check (also used by tests)."""
-        with self._lock:
-            accepted = self._last_accepted_ns
-            if (
-                self._state == "expired"
-                or (
-                    accepted is None
-                    and (
-                        self._manager_runtime_epoch is None
-                        or self._predecessor_expired
-                        or self._clock() - self._started_ns <= EXPIRY_TIMEOUT_NS
-                    )
-                )
-                or (
-                    accepted is not None
-                    and (self._clock() - accepted <= EXPIRY_TIMEOUT_NS)
-                )
-            ):
-                return False
-            manager_epoch = self._manager_runtime_epoch or "unknown"
-            self._state = "expired"
-            self._fenced = True
-            self._predecessor_expired = True
-            if self._receiver_status_sequence < MAXIMUM_SEQUENCE:
-                self._receiver_status_sequence += 1
-            expired_sequence = self._last_sequence
-            expired_age = None if accepted is None else self._clock() - accepted
-        material = (
-            "manyforge.program-runner.manager-loss.v1\0"
-            + manager_epoch
-            + "\0"
-            + self._runtime_epoch
-        )
-        fallback = "sha256:" + hashlib.sha256(material.encode()).hexdigest()
-        try:
-            reference = self._on_expiry(fallback)
-        except Exception:
-            reference = fallback
-        with self._lock:
-            self._fault_reference = reference
-        # Containment and durable fault publication precede best-effort logs.
-        logging.getLogger(__name__).error(
-            "Manager heartbeat expired: epoch=%s sequence=%s age_ns=%s",
-            manager_epoch,
-            expired_sequence,
-            expired_age,
-        )
-        return True
 
 
 __all__ = [
     "API_VERSION",
-    "EXPIRY_TIMEOUT_NS",
-    "LOCAL_SAFE_STATE_CONTRACT_ID",
-    "LOCAL_SAFE_STATE_CONTRACT_REVISION",
     "POLICY_ID",
     "POLICY_REVISION",
+    "PUBLICATION_CHECK_INTERVAL_S",
     "PUBLISHER_FAULT_CODE",
+    "RUNNER_FAULT_CODES",
+    "TICK_WORKER_FAULT_CODE",
     "ProgramRunnerLivenessError",
     "ProgramRunnerLivenessReceiver",
-    "RENEWAL_INTERVAL_NS",
-    "RetainedLiveness",
 ]

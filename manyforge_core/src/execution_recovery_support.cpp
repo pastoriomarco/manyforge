@@ -503,17 +503,14 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
   assessment.stronger_authority_active = capture.stronger_authority_active;
 
   // Containment evidence and the execution's failure are independent facts.
+  // The addressed Stop event that settled this execution (K20); the Kernel
+  // adds the operation's participant phases and containing stage.
   const auto& addressed = capture.addressed_motion_stop_evidence;
   const bool addressed_contained = addressed && addressed->backend_stop_confirmed &&
-      addressed->execution_id == capture.execution_id &&
-      addressed->stop_owner_generation == capture.operator_stop_owner_generation &&
-      addressed->aggregate_stop_certificate.locally_valid();
+      addressed->execution_id == capture.execution_id && addressed->stop_event_id.nonzero();
   if (addressed_contained) {
     assessment.backend_stop_confirmed = true;
-    assessment.stop_owner_generation = addressed->stop_owner_generation;
-    assessment.stop_certificate_id = addressed->aggregate_stop_certificate.stop_certificate_id.value();
-    assessment.stop_certificate_revision =
-        addressed->aggregate_stop_certificate.stop_certificate_revision.value();
+    assessment.stop_event_id = addressed->stop_event_id.value();
   }
 
   const bool any_stop_owner_active =
@@ -523,6 +520,19 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
 
   const auto add_reset_action = [&]() {
     assessment.allowed_actions.push_back(RecoveryAction::kResetCycle);
+  };
+
+  // One rule for a terminal execution (Failed or Stopped): while its execute
+  // worker's terminal cleanup still runs it is not yet decided (waiting,
+  // `terminal_cleanup_pending`), after its branch's own stronger waits. The
+  // cleanup's completion republishes (retry_ready, reset_required, close).
+  const bool terminal_cleanup_pending =
+      (capture.execution_state == ExecutionState::kFailed ||
+       capture.execution_state == ExecutionState::kStopped) &&
+      !capture.terminal_cleanup_complete;
+  const auto await_terminal_cleanup = [&]() {
+    assessment.status = RecoveryAssessmentStatus::kWaiting;
+    assessment.reason_code = reason_codes::kRecoveryTerminalCleanupPending;
   };
 
   switch (capture.execution_state) {
@@ -546,20 +556,24 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
       break;
     }
     case ExecutionState::kFailed: {
-      if (!capture.failed_validation_retryable) {
-        assessment.recovery_class = RecoveryClass::kUnknownFault;
-        assessment.status = RecoveryAssessmentStatus::kResetRequired;
-        assessment.reason_code = reason_codes::kRecoveryFailedNotRetryable;
-        add_reset_action();
-        break;
-      }
-      assessment.recovery_class = RecoveryClass::kFailedValidation;
+      const bool retryable = capture.failed_validation_retryable;
+      assessment.recovery_class =
+          retryable ? RecoveryClass::kFailedValidation : RecoveryClass::kUnknownFault;
       add_reset_action();
-      if (any_stop_owner_active || capture.stronger_authority_active) {
+      if (retryable && (any_stop_owner_active || capture.stronger_authority_active)) {
         assessment.status = RecoveryAssessmentStatus::kWaiting;
         assessment.reason_code = any_stop_owner_active
                                      ? reason_codes::kRecoveryStopOwnerActive
                                      : reason_codes::kRecoveryStrongerAuthorityActive;
+        break;
+      }
+      if (terminal_cleanup_pending) {
+        await_terminal_cleanup();
+        break;
+      }
+      if (!retryable) {
+        assessment.status = RecoveryAssessmentStatus::kResetRequired;
+        assessment.reason_code = reason_codes::kRecoveryFailedNotRetryable;
         break;
       }
       assessment.status = RecoveryAssessmentStatus::kRetryReady;
@@ -571,10 +585,7 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
     }
     case ExecutionState::kStopped: {
       assessment.recovery_class = RecoveryClass::kOrdinaryOperatorStop;
-      assessment.stop_owner_generation = capture.operator_stop_owner_generation;
       add_reset_action();
-      const auto& certificate = capture.operator_stop_certificate;
-      const auto& addressed = capture.addressed_motion_stop_evidence;
       if (any_stop_owner_active || capture.stronger_authority_active) {
         assessment.status = RecoveryAssessmentStatus::kWaiting;
         assessment.reason_code = any_stop_owner_active
@@ -582,39 +593,16 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
                                      : reason_codes::kRecoveryStrongerAuthorityActive;
         break;
       }
-      const bool local_certificate_valid =
-          certificate.has_value() &&
-          certificate->completion_result == StopCertificateOutcome::kSucceeded &&
-          certificate->backend_stop_confirmed &&
-          certificate->execution_id == capture.execution_id &&
-          certificate->stop_owner_generation == capture.operator_stop_owner_generation;
-      const bool addressed_settlement_valid =
-          addressed.has_value() && addressed->backend_stop_confirmed &&
-          addressed->execution_id == capture.execution_id &&
-          addressed->stop_owner_generation == capture.operator_stop_owner_generation &&
-          addressed->aggregate_stop_certificate.locally_valid();
-      if (!local_certificate_valid && !addressed_settlement_valid) {
+      // Settled only by the addressed Stop event that contained this
+      // execution (`addressed_contained` above).
+      if (!addressed_contained) {
         assessment.status = RecoveryAssessmentStatus::kWaiting;
         assessment.reason_code = reason_codes::kRecoveryStopNotCertified;
         break;
       }
-      if (addressed_settlement_valid) {
-        assessment.stop_certificate_id =
-            addressed->aggregate_stop_certificate.stop_certificate_id.value();
-        assessment.stop_certificate_revision =
-            addressed->aggregate_stop_certificate.stop_certificate_revision.value();
-        assessment.backend_stop_confirmed = addressed->backend_stop_confirmed;
-      } else {
-        assessment.stop_certificate_id = certificate->certificate_id;
-        assessment.stop_certificate_revision = certificate->certificate_revision;
-        assessment.backend_stop_confirmed = certificate->backend_stop_confirmed;
-      }
-      if (!capture.terminal_cleanup_complete) {
-        // Certified, but the execute worker's terminal cleanup still runs:
-        // not yet decided. Its completion republishes (retry_ready, close).
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = reason_codes::kRecoveryTerminalCleanupPending;
-        assessment.evidence_refs.push_back(assessment.stop_certificate_id);
+      if (terminal_cleanup_pending) {
+        await_terminal_cleanup();
+        assessment.evidence_refs.push_back(std::to_string(assessment.stop_event_id));
         break;
       }
       assessment.status = RecoveryAssessmentStatus::kRetryReady;
@@ -622,7 +610,7 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
       assessment.allowed_actions.insert(assessment.allowed_actions.begin(),
                                         RecoveryAction::kReplanFromStoppedState);
       assessment.reason_code = reason_codes::kRecoveryStopCertified;
-      assessment.evidence_refs.push_back(assessment.stop_certificate_id);
+      assessment.evidence_refs.push_back(std::to_string(assessment.stop_event_id));
       break;
     }
     default: {
@@ -642,8 +630,7 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
   const bool terminal = capture.execution_state == ExecutionState::kCompleted ||
                         capture.execution_state == ExecutionState::kFailed ||
                         (capture.execution_state == ExecutionState::kStopped &&
-                         assessment.backend_stop_confirmed &&
-                         !assessment.stop_certificate_id.empty());
+                         assessment.backend_stop_confirmed && assessment.stop_event_id != 0U);
   const bool rebuilt_unknown = capture.owner_rebuild_pending && capture.owner_rebuild_rest_qualified &&
                                capture.execution_state == ExecutionState::kInterventionRequired &&
                                capture.terminal_effect == ParticipantEffectKnowledge::kEffectUncertain;
@@ -665,7 +652,13 @@ bool stopped_awaiting_terminal_cleanup(const KernelRecoveryAssessmentDTO& assess
   return assessment.execution_state == ExecutionState::kStopped &&
          assessment.status == RecoveryAssessmentStatus::kWaiting &&
          assessment.reason_code == reason_codes::kRecoveryTerminalCleanupPending &&
-         assessment.backend_stop_confirmed && !assessment.stop_certificate_id.empty();
+         assessment.backend_stop_confirmed && assessment.stop_event_id != 0U;
+}
+
+bool failed_not_retry_admissible(const KernelRecoveryAssessmentDTO& assessment) noexcept {
+  return assessment.execution_state == ExecutionState::kFailed && !assessment.retry_admissible &&
+         !(assessment.recovery_class == RecoveryClass::kFailedValidation &&
+           assessment.reason_code == reason_codes::kRecoveryTerminalCleanupPending);
 }
 
 bool recovery_assessment_semantically_differs(const KernelRecoveryAssessmentDTO& previous,
@@ -678,10 +671,10 @@ bool recovery_assessment_semantically_differs(const KernelRecoveryAssessmentDTO&
          previous.policy_id != next.policy_id ||
          previous.preemption_result != next.preemption_result ||
          previous.stop_owner_active != next.stop_owner_active ||
-         previous.stop_owner_generation != next.stop_owner_generation ||
          previous.backend_stop_confirmed != next.backend_stop_confirmed ||
-         previous.stop_certificate_id != next.stop_certificate_id ||
-         previous.stop_certificate_revision != next.stop_certificate_revision ||
+         previous.stop_event_id != next.stop_event_id ||
+         previous.stop_phase != next.stop_phase ||
+         previous.containing_stage_id != next.containing_stage_id ||
          previous.observed_state_available != next.observed_state_available ||
          previous.observed_state_fresh != next.observed_state_fresh ||
          previous.observed_state_at_rest != next.observed_state_at_rest ||
@@ -718,8 +711,8 @@ RecoveryAssessmentPublication prepare_recovery_assessment_publication(
       {"automatic_retry_effect", motion_retry_effect_name(next.retry_eligibility.effect)},
       {"automatic_retry_reason",
        motion_retry_ineligibility_reason_name(next.retry_eligibility.reason)},
-      {"stop_certificate_id", next.stop_certificate_id},
-      {"stop_certificate_revision", std::to_string(next.stop_certificate_revision)},
+      {"stop_event_id", std::to_string(next.stop_event_id)},
+      {"stop_phase", next.stop_phase},
       {"source_id", next.source_id},
       {"policy_id", next.policy_id},
       {"stronger_authority_active", next.stronger_authority_active ? "true" : "false"},
@@ -732,10 +725,6 @@ RecoveryAdmissionDecision evaluate_recovery_admission(
     const KernelRecoveryActionRequestDTO& request, const RecoveryAuthorityCapture& capture,
     const KernelRecoveryAssessmentDTO& assessment) {
   RecoveryAdmissionDecision decision;
-  if (request.request_id.empty()) {
-    decision.rejection_reason = reason_codes::kRecoveryRequestIdMissing;
-    return decision;
-  }
   if (request.principal_id.empty()) {
     decision.rejection_reason = reason_codes::kRecoveryPrincipalMissing;
     return decision;
@@ -784,14 +773,6 @@ RecoveryAdmissionDecision evaluate_recovery_admission(
     decision.rejection_reason = reason_codes::kRecoveryExecutionChanged;
     return decision;
   }
-  if (request.expected_stop_certificate_id != assessment.stop_certificate_id) {
-    decision.rejection_reason = reason_codes::kRecoveryStopCertificateChanged;
-    return decision;
-  }
-  if (request.expected_stop_owner_generation != assessment.stop_owner_generation) {
-    decision.rejection_reason = reason_codes::kRecoveryStopOwnerGenerationChanged;
-    return decision;
-  }
   decision.admitted = true;
   return decision;
 }
@@ -805,7 +786,7 @@ ErrorDTO recovery_action_rejection_error(const KernelRecoveryActionRequestDTO& r
   error.details = {
       {"reason",
        rejection_reason.empty() ? "recovery_action_rejected" : std::string(rejection_reason)},
-      {"request_id", request.request_id},
+      {"request_key", RequestKeyText(request.request_key)},
       {"action", recovery_action_name(request.action)},
       {"principal_id", request.principal_id},
       {"expected_assessment_revision", std::to_string(request.expected_assessment_revision)},
@@ -815,8 +796,8 @@ ErrorDTO recovery_action_rejection_error(const KernelRecoveryActionRequestDTO& r
       {"recovery_class", recovery_class_name(assessment.recovery_class)},
       {"execution_state", to_string(assessment.execution_state)},
   };
-  if (!assessment.stop_certificate_id.empty()) {
-    error.details["stop_certificate_id"] = assessment.stop_certificate_id;
+  if (assessment.stop_event_id != 0U) {
+    error.details["stop_event_id"] = std::to_string(assessment.stop_event_id);
   }
   error.details["execution_id"] = std::to_string(assessment.execution_id);
   if (assessment.recovery_class == RecoveryClass::kRuntimeCollision) {

@@ -68,7 +68,6 @@ TEST(IoSourceIngressSenderTest, EveryMessageIsAnArrivalAlsoWhilePaused) {
   ComponentStreamHealth health(clock, scheduler);
   const ControllableComponentId device("io");
   auto declared = health.Declare(device, {"inputs", 100'000'000, StreamSeverityDTO::kFault,
-                                          StreamRecoveryDTO::kAuto,
                                           StreamTimestampSourceDTO::kArrival});
   ASSERT_TRUE(declared.ok());
   const std::shared_ptr<StreamRecorder> arrivals = std::move(declared.value());

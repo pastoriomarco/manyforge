@@ -7,8 +7,10 @@
 #include <future>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <functional>
+#include <optional>
 #include <rclcpp/executors/single_threaded_executor.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_srvs/srv/set_bool.hpp>
@@ -60,8 +62,7 @@ protected:
                                             30'000'000'000LL};
     core::ResolvedLifecycleControlDomainScopeDTO scope{
         kDomain, core::ControlDomainRevision(kDigest.value()),
-        core::ResolvedProviderDomainScopeDTO{provider, core::RuntimeEpoch("runtime.1"),
-                                             std::nullopt, {}}};
+        core::ResolvedProviderDomainScopeDTO{provider, core::RuntimeEpoch("runtime.1"), {}}};
     core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
         kDomain, scope.control_domain_revision, provider.provider_instance_id,
         manifest_id, manifest_revision, kUnit, core::RuntimeEpoch("runtime.1"), kDigest};
@@ -180,7 +181,145 @@ TEST_F(IoProviderComponentAdapterTest, ExitedProcessIsAProcessExitedFault) {
   ASSERT_TRUE(state.fault.has_value());
   EXPECT_EQ(state.fault->code, core::FaultCode::kProcessExited);
   EXPECT_EQ(state.fault->message, "The simulated PLC exited");
+  // Without the host's restart entry nothing can start it again.
+  EXPECT_EQ(state.fault->operator_action, core::FaultOperatorAction::kNone);
   EXPECT_EQ(Run(ComponentAction::kPrepare).outcome, ActionOutcome::kFailed);
+}
+
+/// The supervised process of an I/O device (a simulated PLC) and the host's
+/// driver-restart entry, scripted: the process exits on demand; a restart
+/// installs the new process's exit source (as the host does) or fails.
+struct ScriptedProcess final {
+  std::shared_ptr<std::atomic<bool>> exited = std::make_shared<std::atomic<bool>>(false);
+  int restarts = 0;
+  std::optional<core::ErrorDTO> refusal;
+
+  std::function<std::optional<core::ErrorDTO>()> Source() const {
+    return [exited = exited]() -> std::optional<core::ErrorDTO> {
+      if (!exited->load()) return std::nullopt;
+      return core::ErrorDTO{"simulated_plc_exited", "controller_launch_exited: pid=7", {}};
+    };
+  }
+  void Attach(IoProviderDriverRecord &driver) {
+    driver.SetSupervisedProcessFaultSource(Source());
+    driver.SetSupervisedProcessRestart([this, &driver](std::stop_token) {
+      ++restarts;
+      if (refusal) return core::Result<void>::Err(*refusal);
+      // Called without the delivery barrier: the host installs the
+      // restarted process's source on the driver.
+      exited = std::make_shared<std::atomic<bool>>(false);
+      driver.SetSupervisedProcessFaultSource(Source());
+      return core::Result<void>::Ok();
+    });
+  }
+};
+
+// Decided (OD-211 a): an exited process's fault offers Recover; Prepare
+// starts it again and the device ends prepared.
+TEST_F(IoProviderComponentAdapterTest, PrepareStartsAnExitedProcessAgain) {
+  InstallMockInput();
+  ScriptedProcess process;
+  process.Attach(*driver);
+  ASSERT_EQ(Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  *process.exited = true;
+  const auto faulted = driver->State(clock->now());
+  ASSERT_EQ(faulted.lifecycle, ComponentLifecycle::kFault);
+  ASSERT_TRUE(faulted.fault.has_value());
+  EXPECT_EQ(faulted.fault->code, core::FaultCode::kProcessExited);
+  EXPECT_EQ(faulted.fault->operator_action, core::FaultOperatorAction::kRecover);
+  EXPECT_TRUE(faulted.fault->clearable);
+
+  EXPECT_EQ(Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  EXPECT_EQ(process.restarts, 1);
+  const auto after = driver->State(clock->now());
+  EXPECT_EQ(after.lifecycle, ComponentLifecycle::kPrepared);
+  EXPECT_FALSE(after.fault.has_value());
+  // A running process is never restarted.
+  EXPECT_EQ(Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  EXPECT_EQ(process.restarts, 1);
+}
+
+// Recover of a device whose process exited while it was enabled starts it
+// again and leaves it prepared, never enabled: its inputs are paused and the
+// runtime is told so.
+TEST_F(IoProviderComponentAdapterTest, RecoverStartsAnExitedProcessAgainAndLeavesItPrepared) {
+  std::vector<bool> lifecycle_calls;
+  InstallMockInput([&](bool planned_disabled) {
+    lifecycle_calls.push_back(planned_disabled);
+    return core::Result<void>::Ok();
+  });
+  ScriptedProcess process;
+  process.Attach(*driver);
+  ASSERT_EQ(Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  ASSERT_EQ(Run(ComponentAction::kEnable).outcome, ActionOutcome::kSucceeded);
+  lifecycle_calls.clear();
+  *process.exited = true;
+  ASSERT_EQ(driver->State(clock->now()).lifecycle, ComponentLifecycle::kFault);
+
+  const auto recovered = Run(ComponentAction::kRecover);
+  EXPECT_EQ(recovered.outcome, ActionOutcome::kSucceeded);
+  EXPECT_EQ(process.restarts, 1);
+  EXPECT_EQ(lifecycle_calls, (std::vector<bool>{true}));
+  EXPECT_EQ(driver->State(clock->now()).lifecycle, ComponentLifecycle::kPrepared);
+}
+
+// Prepare of a formerly enabled device after the restart tells the runtime
+// its inputs are paused, as Recover does.
+TEST_F(IoProviderComponentAdapterTest, PrepareAfterARestartTellsTheRuntimeItsInputsArePaused) {
+  std::vector<bool> lifecycle_calls;
+  InstallMockInput([&](bool planned_disabled) {
+    lifecycle_calls.push_back(planned_disabled);
+    return core::Result<void>::Ok();
+  });
+  ScriptedProcess process;
+  process.Attach(*driver);
+  ASSERT_EQ(Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  ASSERT_EQ(Run(ComponentAction::kEnable).outcome, ActionOutcome::kSucceeded);
+  lifecycle_calls.clear();
+  *process.exited = true;
+  EXPECT_EQ(Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  EXPECT_EQ(lifecycle_calls, (std::vector<bool>{true}));
+  EXPECT_EQ(driver->State(clock->now()).lifecycle, ComponentLifecycle::kPrepared);
+}
+
+// A failed restart is the action's failure with its typed code; the fault
+// stays, still offering Recover, and the next attempt can succeed.
+TEST_F(IoProviderComponentAdapterTest, AFailedRestartLeavesTheFaultAndCanBeTriedAgain) {
+  InstallMockInput();
+  ScriptedProcess process;
+  process.Attach(*driver);
+  *process.exited = true;
+  process.refusal = core::ErrorDTO{"component_driver_restart_failed",
+                                   "The simulated PLC ended again", {}};
+  const auto failed = Run(ComponentAction::kRecover);
+  EXPECT_EQ(failed.outcome, ActionOutcome::kFailed);
+  ASSERT_TRUE(failed.error.has_value());
+  EXPECT_EQ(failed.error->code, "component_driver_restart_failed");
+  const auto still = driver->State(clock->now());
+  ASSERT_EQ(still.lifecycle, ComponentLifecycle::kFault);
+  EXPECT_EQ(still.fault->operator_action, core::FaultOperatorAction::kRecover);
+
+  process.refusal.reset();
+  EXPECT_EQ(Run(ComponentAction::kRecover).outcome, ActionOutcome::kSucceeded);
+  EXPECT_EQ(process.restarts, 2);
+  EXPECT_EQ(driver->State(clock->now()).lifecycle, ComponentLifecycle::kPrepared);
+}
+
+// Only Prepare and Recover start the process again: Enable stays refused,
+// Disable never restarts it.
+TEST_F(IoProviderComponentAdapterTest, EnableAndDisableNeverRestartTheProcess) {
+  InstallMockInput();
+  ScriptedProcess process;
+  process.Attach(*driver);
+  ASSERT_EQ(Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  *process.exited = true;
+  const auto enable = Run(ComponentAction::kEnable);
+  EXPECT_EQ(enable.outcome, ActionOutcome::kFailed);
+  ASSERT_TRUE(enable.error.has_value());
+  EXPECT_EQ(enable.error->code, "io_provider_lifecycle_unavailable");
+  static_cast<void>(Run(ComponentAction::kDisable));
+  EXPECT_EQ(process.restarts, 0);
+  EXPECT_EQ(driver->State(clock->now()).lifecycle, ComponentLifecycle::kFault);
 }
 
 core::StreamLivenessStateDTO StreamState(const std::string &stream_id) {
@@ -199,8 +338,7 @@ std::unique_ptr<core::StreamRecorder> StaleStream(const std::string &stream_id,
   const auto health = host_component_stream_health();
   auto declared = health->Declare(
       kSignal.controllable_component_id,
-      {stream_id, 1'000'000, severity, core::StreamRecoveryDTO::kAuto,
-       core::StreamTimestampSourceDTO::kArrival});
+      {stream_id, 1'000'000, severity, core::StreamTimestampSourceDTO::kArrival});
   EXPECT_TRUE(declared.ok());
   auto recorder = std::move(declared.value());
   const auto give_up = std::chrono::steady_clock::now() + std::chrono::seconds(10);
@@ -414,7 +552,7 @@ TEST_F(IoDeviceSendersTest,
   core::ResolvedLifecycleControlDomainScopeDTO scope{
       kDomain, core::ControlDomainRevision(kDigest.value()),
       core::ResolvedProviderDomainScopeDTO{
-          provider, core::RuntimeEpoch("runtime.1"), std::nullopt, {resource}}};
+          provider, core::RuntimeEpoch("runtime.1"), {resource}}};
   core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
       kDomain,
       scope.control_domain_revision,

@@ -30,7 +30,7 @@ def _fixture(monkeypatch, *, kind="tcp_pose", selector=None):
     }
     monkeypatch.setattr(routes_draft, "_applied_context", lambda _state: (
         SimpleNamespace(binding_document=binding, program_revision=None), None))
-    identity = {"owner_epoch": "owner-1", "graph_revision": "graph-1", "retained_bundle_id": "bundle-1"}
+    identity = {"application_start_id": "owner-1", "graph_revision": "graph-1", "retained_bundle_id": "bundle-1"}
     descriptor = {"frames": [deepcopy(base_row)], "tcps": [
         {"entry": entry, "frame": deepcopy(tcp_row), "mounted_here": True}]}
     targets = {"ok": True, "identity": identity, "targets": {"components": [{
@@ -88,7 +88,7 @@ def test_observed_capture_refuses_mismatched_or_stale_identity(monkeypatch, chan
     elif change == "unmounted":
         targets["targets"]["components"][0]["targets"][0]["command"]["target_descriptor"]["tcps"][0]["mounted_here"] = False
     else:
-        control["identity"] = {**control["identity"], "owner_epoch": "old"}
+        control["identity"] = {**control["identity"], "application_start_id": "old"}
     with pytest.raises(DraftSessionError):
         routes_draft._observed_move_arguments(state, {"instance_id": "move", "observed_kind": "tcp_pose"})
 

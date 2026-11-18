@@ -34,14 +34,13 @@ MockBooleanInputSource source() {
       kSource, kIncarnation, {{descriptor("off")}, {descriptor("on"), true}}};
 }
 core::IoLevelWatchRequestDTO watch() {
-  return {{core::RequestOwnerEpoch("runner"),
-           core::ProgramRunId("run"),
-           {core::ProgramNodeInstanceId("wait"), "attempt"}},
+  return {{core::ProgramRunNumber(107U),
+           {core::ProgramNodeInstanceId("wait"), core::NodeAttemptNumber(1U)}},
           id("on"),
           true};
 }
 core::IoSourceCursorDTO origin() {
-  return {core::RequestOwnerEpoch("host"), 1, kSource, 0};
+  return {1, kSource, 0};
 }
 
 class MockBooleanInputProviderTest : public ::testing::Test {
@@ -49,8 +48,7 @@ protected:
   void Build(std::size_t capacity = 8,
              std::optional<std::uint64_t> prepared = std::nullopt) {
     auto created =
-        core::IoSignalSubsystem::Create({core::RequestOwnerEpoch("host"),
-                                         1,
+        core::IoSignalSubsystem::Create({1,
                                          {descriptor("off"), descriptor("on")},
                                          {kSource}},
                                         {1, 2, capacity, 4, 128, 1024}, clock);
@@ -71,8 +69,7 @@ protected:
                  std::shared_ptr<core::IoSignalSubsystem> &next_signals,
                  std::shared_ptr<core::IoSignalIngress> &next_ingress) {
     auto created =
-        core::IoSignalSubsystem::Create({core::RequestOwnerEpoch("host"),
-                                         2,
+        core::IoSignalSubsystem::Create({2,
                                          {descriptor("off"), descriptor("on")},
                                          {kSource}},
                                         {1, 2, 8, 4, 128, 1024}, clock);

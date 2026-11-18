@@ -7,7 +7,8 @@
 
 namespace manyforge::core {
 
-/// Hard bound: 64 correlation slots plus one non-evictable Full-Stop slot.
+/// Hard bound on the Stop lane indexes (`N_max`, stop state model §2.2): one
+/// work slot per index. Production uses 64.
 inline constexpr std::size_t kMaximumStopControlWorkSlots = 65U;
 
 /// One fixed-capacity StopControl worker. Construction performs every dynamic

@@ -7,27 +7,11 @@
 
 namespace manyforge::core {
 
-/// Exact original-Manager product-adoption input. Durable values and
-/// remote status readback do not recreate the original operation lifetime or
-/// an owner-local HeldStatusView. Scene independently checks its local state.
-struct QualifiedSceneProductAdoptionRequestDTO final {
-  ApplyComponentBringUpAuthorityDTO parent_authority;
-  ActiveBundlePublicationReceiptDTO expected_predecessor_publication;
-  ProjectionRevisionDTO expected_active_projection_revision;
-  LogicalSceneSnapshotIdentityDTO expected_snapshot_identity;
-  RetainedBundleDTO candidate_retained_bundle;
-  std::vector<ProjectionExecutionHostBindingDTO> execution_host_bindings;
-
-  friend bool operator==(const QualifiedSceneProductAdoptionRequestDTO&,
-                         const QualifiedSceneProductAdoptionRequestDTO&) = default;
-};
-
 /// Configuration-only original Manager seal. The producer joins these exact
 /// values to its persisted full intent and original live operation. Remote
 /// readback never creates that lifetime or authorizes replacement continuation.
 struct ManagerConfigurationSceneAuthorityDTO final {
   ApplyFenceOwnerDTO owner;
-  ContentDigest persisted_manager_intent_digest;
   CellAdmissionClaimDTO held_cell_claim;
   ConfigurationFenceStatusQueryDTO held_fence_query;
 
@@ -81,41 +65,13 @@ class IManagerSceneProjectionMaintenancePort {
   ReadMaintenanceInitialization(
       const ProjectionMaintenanceInitializationQueryDTO &query) const = 0;
 
-  /// Original snapshot-bound native staging. Invoked once; an Accepted
-  /// rebuild is observed through the separate read without repeating effects.
-  /// The exact original acquire-attempt query is observation-only held proof
-  /// before installation; it does not permit Acquire retry or rehydration.
-  [[nodiscard]] virtual std::vector<ProjectionHealthDTO>
-  StageOriginalManagerProductAdoption(
-      const QualifiedSceneProductAdoptionRequestDTO&,
-      const ApplyFenceAcquireAttemptQueryDTO&) {
-    throw std::runtime_error("original Manager Scene product staging is unavailable");
-  }
-
-  [[nodiscard]] virtual std::vector<ProjectionHealthDTO>
-  ReadOriginalManagerProductAdoptionProjectionHealth(
-      const QualifiedSceneProductAdoptionRequestDTO&,
-      const ApplyFenceAcquireAttemptQueryDTO&) {
-    throw std::runtime_error("original Manager Scene product staging read is unavailable");
-  }
-
-  /// Distinct original captured Manager entry, never resumed from journal
-  /// evidence. Uncomposed implementations refuse rather than fake readiness.
-  [[nodiscard]] virtual ProjectionMaintenanceInitializationStatusDTO
-  BeginOriginalManagerProductAdoption(const QualifiedSceneProductAdoptionRequestDTO&) {
-    throw std::runtime_error("original Manager Scene product adoption is unavailable");
-  }
-
-  [[nodiscard]] virtual ProjectionMaintenanceInitializationStatusDTO
-  CompleteOriginalManagerProductAdoption(
-      const QualifiedSceneProductAdoptionRequestDTO&,
-      const ActiveBundlePublicationReceiptDTO&) {
-    throw std::runtime_error("original Manager Scene product adoption is unavailable");
-  }
-
-  /// Configuration-only preservation; no linked lifecycle plan or child
-  /// authorization. The original producer retains its actual claim/fence,
+  /// Configuration preservation: snapshot-bound native staging, invoked
+  /// once; an Accepted rebuild is observed through the separate read without
+  /// repeating effects. The exact original acquire-attempt query is
+  /// observation-only held proof before installation; it does not permit
+  /// Acquire retry. The original producer retains its actual claim/fence,
   /// candidate owners and operation lifetime through uncertainty and release.
+  /// Uncomposed implementations refuse rather than fake readiness.
   [[nodiscard]] virtual std::vector<ProjectionHealthDTO>
   StageOriginalManagerConfigurationAdoption(
       const QualifiedSceneConfigurationAdoptionRequestDTO&,
@@ -137,6 +93,14 @@ class IManagerSceneProjectionMaintenancePort {
       const QualifiedSceneConfigurationAdoptionRequestDTO&,
       const ActiveBundlePublicationReceiptDTO&) {
     throw std::runtime_error("original Manager Scene configuration adoption is unavailable");
+  }
+  /// Ends the configuration adoption of an Apply that ended failed: completes
+  /// it with the Apply's recorded publication, or ends it without one. Local
+  /// to the Scene owner; an absent or completed adoption is left as it is.
+  virtual void EndOriginalManagerConfigurationAdoption(
+      const ApplyId&, ApplyGeneration,
+      const std::optional<ActiveBundlePublicationReceiptDTO>&) {
+    throw std::runtime_error("original Manager Scene configuration adoption end is unavailable");
   }
 
   /// Observes the exact current native set. It never creates or replaces a

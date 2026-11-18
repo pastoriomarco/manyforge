@@ -30,7 +30,7 @@ function snapshot(
     ));
     if (matches.length !== 1) continue;
     const active = matches[0].activeTcp;
-    if (active === null || active.ownerEpoch !== status.ownerEpoch) continue;
+    if (active === null) continue;
     result.set(row.target.component_id, { robot: row.target.component_id,
       active: { ...active, entry: active.entry === null ? null : { ...active.entry } } });
   }
@@ -43,7 +43,7 @@ function entryKey(active: ActiveTcp): string | null {
 
 /** Browser-memory only: the first observation of a run is never a hold edge. */
 export class ActiveTcpHoldHistory {
-  private runId: string | null = null;
+  private runId: number | null = null;
   private held = new Set<string>();
   private snapshots = new Map<string, TcpSnapshot>();
   private tainted = new Set<string>();
@@ -55,7 +55,7 @@ export class ActiveTcpHoldHistory {
     this.tainted.clear();
   }
 
-  observe(runId: string | null, held: readonly string[], current: TcpSnapshot,
+  observe(runId: number | null, held: readonly string[], current: TcpSnapshot,
     unknown: readonly string[] = [], locallyStarted = false): void {
     const next = new Set(held);
     if (runId !== this.runId) {
@@ -80,7 +80,7 @@ export class ActiveTcpHoldHistory {
     for (const baseline of this.snapshots.values()) {
       for (const [robot, old] of baseline) {
         const now = current.get(robot);
-        if (now !== undefined && old.active.ownerEpoch !== now.active.ownerEpoch) baseline.delete(robot);
+        if (now !== undefined && old.active.applicationStartId !== now.active.applicationStartId) baseline.delete(robot);
       }
     }
     this.invalidateOverlaps(this.held);
@@ -108,7 +108,7 @@ export class ActiveTcpHoldHistory {
     const changes: ResumeTcpChange[] = [];
     for (const [robot, old] of previous) {
       const now = current.get(robot);
-      if (now === undefined || old.active.ownerEpoch !== now.active.ownerEpoch) continue;
+      if (now === undefined || old.active.applicationStartId !== now.active.applicationStartId) continue;
       if (entryKey(old.active) !== entryKey(now.active)) {
         changes.push({ robot, oldDisplay: old.active.display ?? 'No TCP',
           newDisplay: now.active.display ?? 'No TCP' });

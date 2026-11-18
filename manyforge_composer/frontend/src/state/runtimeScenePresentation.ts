@@ -128,7 +128,7 @@ export function candidateObservationEpoch(
   frame: ExecutionObservationFrame | null,
   status: ExecutionOwnerStatus | null,
 ): string | null {
-  if (frame === null || status === null || frame.ownerEpoch !== status.ownerEpoch
+  if (frame === null || status === null || frame.applicationStartId !== status.applicationStartId
     || frame.cellId !== status.cellId || frame.retainedBundleId !== status.retainedBundleId
     || frame.graphRevision !== status.graphRevision) return null;
   // A selection may have no motion target (gripper-only).
@@ -143,7 +143,7 @@ export function candidateObservationEpoch(
     && target.sourceJointNames.includes(gripper.sourceCoordinateName)
   ));
   if (arm === undefined || tool === undefined) return null;
-  return JSON.stringify([frame.ownerEpoch, frame.sourceEpoch, arm?.sourceEpoch, tool?.sourceEpoch]);
+  return JSON.stringify([frame.applicationStartId, frame.sourceEpoch, arm?.sourceEpoch, tool?.sourceEpoch]);
 }
 
 export interface MeasuredRobotPresentation {
@@ -451,7 +451,7 @@ export function executionObservationRobotPresentation(
   return linkTransforms === null ? null : {
     objectId: motion.controllableComponentId,
     sourceId: `execution:${motion.commandTargetId}`,
-    sourceEpoch: `${frame.ownerEpoch}:${frame.sourceEpoch}`,
+    sourceEpoch: `${frame.applicationStartId}:${frame.sourceEpoch}`,
     sourceSequence: frame.sourceSequence,
     observedAtNs,
     linkTransforms,

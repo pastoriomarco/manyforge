@@ -388,6 +388,14 @@ TEST(IoSignalCatalogTest, OptionalAbsenceIsInertAndMalformedRowsFailClosed) {
   provider(row)["ingress_depth"] = JsonValueDTO{1.5};
   EXPECT_FALSE(
       ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{row}})).ok());
+  // The product maximum: 1024 is accepted, 1025 refused with the same code.
+  row = input_row();
+  provider(row)["ingress_depth"] = JsonValueDTO{1024.0};
+  EXPECT_TRUE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{row}})).ok());
+  provider(row)["ingress_depth"] = JsonValueDTO{1025.0};
+  const auto above = ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{row}}));
+  ASSERT_FALSE(above.ok());
+  EXPECT_EQ(above.error().details.at("reason"), "io_signal_configuration_invalid");
   row = input_row();
   row["unknown"] = JsonValueDTO{true};
   EXPECT_FALSE(

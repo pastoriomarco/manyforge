@@ -60,7 +60,11 @@ struct ResolvedTargetObservation final {
 /// Exact point resolver used by the native execution owner.
 ///
 /// Programs and generated Program Bindings are loaded by the identities in
-/// each bounded operation request. The resolved semantic binding must remain
+/// each bounded operation request, except that work of the held Program run
+/// uses the copy verified when that run was captured: the Kernel hands back
+/// the held capture's resolution context, and the copy is used only when it
+/// is exactly the request's Binding, Program and product (OD-234).
+/// The resolved semantic binding must remain
 /// inside an already-composed physical participant;
 /// this object performs no repository enumeration, latest selection, or backend
 /// discovery.
@@ -92,11 +96,13 @@ public:
   Resolve(const core::OperationIntentDTO &operation,
           std::size_t participant_index,
           const RobotTcpReader &robot_tcps = {},
-          std::optional<core::PreviewTcpCapture> *preview_tcp_capture = nullptr) const;
+          std::optional<core::PreviewTcpCapture> *preview_tcp_capture = nullptr,
+          const core::ProgramRunResolutionContext &held_run = {}) const;
 
   [[nodiscard]] core::Result<RetainedResolvedParticipant>
   ResolveExecutionParticipant(const core::OperationIntentDTO &operation,
                               std::size_t participant_index,
+                              const core::ProgramRunResolutionContext &held_run = {},
                               const RobotTcpReader &robot_tcps = {}) const;
 
   /// Effect-only ingress check. Preview/query resolution does not acquire
@@ -108,6 +114,10 @@ public:
   /// Resolve identity-only Run registration to a const, sealed Program table.
   /// This does not acquire a claim or authorize effects; Kernel installation
   /// checks the actual held Program-cycle claim after this cold product read.
+  /// The capture carries the Program and Binding read here as its
+  /// resolution context; the run's work resolves from them, so a file altered
+  /// on disk during the run is noticed by the next capture, not by the run's
+  /// next operation or query.
   [[nodiscard]] core::Result<core::ProgramRunExecutionCaptureDTO>
   ResolveProgramCapture(core::ProgramRunExecutionCaptureDTO capture) const;
 
@@ -154,10 +164,12 @@ public:
       const core::RuntimeParticipantBinding &observed_binding) const;
 
   /// Resolve portable control scope from the verified Program Binding only.
-  /// Operation identity and eligibility still come from the Kernel.
+  /// Operation identity and eligibility still come from the Kernel. A query
+  /// of the held run passes that run's resolution context (OD-234).
   [[nodiscard]] core::Result<core::ProgramTargetBindingDTO>
   ResolveOperationTarget(const core::ProgramBindingId &program_binding_id,
-                         const core::ProgramTargetReferenceDTO &target) const;
+                         const core::ProgramTargetReferenceDTO &target,
+                         const core::ProgramRunResolutionContext &held_run = {}) const;
 
   /// Declarative qualified retained stages for the exact Applied bound route.
   /// No current readiness, preparation or execution authority is asserted.
@@ -194,7 +206,7 @@ private:
   [[nodiscard]] std::shared_ptr<const deployment::ProgramBinding>
   LoadProgramBinding(const core::ProgramBindingId &program_binding_id) const;
   /// Active TCP: the selector's row of `rows`, the `carries` check and
-  /// the endpoint (labelled with `role`, the owner's contact bodies).
+  /// the endpoint: the row's frame and its owner's contact bodies.
   [[nodiscard]] core::Result<core::RuntimeMotionEndpointBindingDTO>
   ResolveRobotTcp(const core::TcpSelectorDTO &selector,
                   const core::ControllableComponentId &robot,
@@ -202,8 +214,6 @@ private:
                   const std::optional<core::TcpEntryReferenceDTO> &active,
                   const std::function<std::optional<core::TcpEntryReferenceDTO>(
                       const core::ProgramTargetReferenceDTO &)> &default_tcp_of_target,
-                  const std::function<std::optional<std::vector<core::CollisionBodyRoleId>>(
-                      const core::TcpEntryReferenceDTO &)> &contact_roles_of,
                   bool joint_goal = false) const;
   [[nodiscard]] std::shared_ptr<const deployment::ProgramBindingContract>
   LoadProgram(const core::ProgramId &program_id,

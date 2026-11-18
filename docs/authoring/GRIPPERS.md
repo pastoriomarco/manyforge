@@ -224,6 +224,23 @@ controller holds the fingers where they are and accepts the cancel, and that
 acceptance ends the command (or the goal's own result, if it comes first; a
 later one is ignored). The next gripper command can then start.
 
+## Checking the gripper's status
+
+**Check gripper status** (`gripper.check_status`) and **Wait for gripper
+status** (`gripper.wait_for_status`) read the **command state** of the
+gripper's last command: idle, moving, reached or failed. The command state
+is never proof that a part is held; only grasp confirmation (above) is.
+
+| Gripper | Reached means | Finger position in the status |
+|---|---|---|
+| Position gripper on a controller | the controller reported the goal reached | the reported position |
+| Pneumatic gripper with a valve output (the Mock and Isaac Lite gripper) | the output was delivered and the `command_duration_s` dwell elapsed | none |
+| Pneumatic gripper whose valves are mapped I/O (`pneumatic_io`) | not available: Apply refuses the node (`gripper_status_unavailable`) | none |
+| Pneumatic gripper without output (`output_mode: none`, display-only) | not available: Apply refuses the node (`gripper_status_unavailable`) | none |
+
+For a gripper with mapped I/O, read its inputs with the I/O nodes, or let
+the command's required inputs confirm it.
+
 ## Stop near the target
 
 One case where a Stop does not cancel a controlled gripper's goal (above) is

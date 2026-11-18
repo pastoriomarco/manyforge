@@ -29,9 +29,10 @@ def _normal_trace():
         goals.append({
             "action": "/arm/follow_joint_trajectory",
             "binding_epoch": 7,
-            "controller_goal_id": "ordinary.goal",
-            "controller_goal_generation": generation,
+            "controller_goal_id": {"generation": generation, "operation_id": 4, "ordinal": 1},
             "installation": "unknown",
+            "operation_id": 4,
+            "participant_id": {"operation_id": 4, "ordinal": 1},
             "trajectory": {
                 "header": {"sec": 1792744684, "nanosec": 1234, "frame_id": ""},
                 "joint_names": ["j1", "j2"],
@@ -39,8 +40,8 @@ def _normal_trace():
             },
         })
     return {
-        "schema_version": "manyforge.volatile_motion_trace.v1",
-        "request_owner_epoch": "owner.current",
+        "schema_version": "manyforge.volatile_motion_trace.v2",
+        "application_start_id": "3f9a00000000ffff",
         "volatile": True,
         "coverage": {"truncated": False, "evicted_goals": 0},
         "goals": goals,
@@ -50,20 +51,20 @@ def _normal_trace():
     }
 
 
-def _write_payload(directory: Path, payload: bytes, *, owner="owner.current", status="complete"):
+def _write_payload(directory: Path, payload: bytes, *, status="complete"):
     digest = hashlib.sha256(payload).hexdigest()
     filename = f"trace-{digest}.json"
     path = directory / filename
     path.write_bytes(payload)
     path.chmod(0o600)
-    metadata = {"schema_version": "manyforge.motion_trace_file.v1", "file": filename,
+    metadata = {"schema_version": "manyforge.motion_trace_file.v2", "file": filename,
                 "bytes": len(payload), "sha256": f"sha256:{digest}",
-                "request_owner_epoch": owner, "status": status}
+                "status": status}
     return metadata, path
 
 
 def _client(metadata, *, inline=None):
-    response = {"api_version": "manyforge.execution_command_response.v4", "ok": True,
+    response = {"api_version": "manyforge.execution_command_response.v6", "ok": True,
                 "command": "read_volatile_motion_trace"}
     if metadata is not ...:
         response["trace_file"] = metadata
@@ -109,7 +110,7 @@ def test_inline_trace_above_default_send_buffer_crosses_real_seqpacket(monkeypat
     monkeypatch.delenv("MANYFORGE_MOTION_TRACE_DIR", raising=False)
     trace = _normal_trace()
     trace["goals"][1]["trajectory"]["points"] *= 3000
-    response = rfc8785.dumps({"api_version": "manyforge.execution_command_response.v4",
+    response = rfc8785.dumps({"api_version": "manyforge.execution_command_response.v6",
                               "command": "read_volatile_motion_trace", "ok": True,
                               "trace": trace})
     assert 212_992 < len(response) < 400_000
@@ -134,7 +135,7 @@ def test_inline_trace_above_default_send_buffer_crosses_real_seqpacket(monkeypat
             client = ExecutionCommandClient(tmp_path, timeout_seconds=2, attribution_transport="internal")
             assert client.read_volatile_motion_trace(_MAX_BYTES) == trace
             command = answered.result(timeout=3)
-    assert command == {"api_version": "manyforge.execution_command.v3",
+    assert command == {"api_version": "manyforge.execution_command.v4",
                        "attribution": {"transport": "internal", "assurance": "unverified",
                                        "principal_id": None},
                        "command": "read_volatile_motion_trace",
@@ -148,7 +149,7 @@ def test_large_trace_crosses_real_small_seqpacket_only_as_file_metadata(monkeypa
     payload = rfc8785.dumps(trace)
     assert 212_992 < len(payload) < _MAX_BYTES
     metadata, path = _write_payload(tmp_path, payload)
-    response = rfc8785.dumps({"api_version": "manyforge.execution_command_response.v4",
+    response = rfc8785.dumps({"api_version": "manyforge.execution_command_response.v6",
                               "ok": True, "command": "read_volatile_motion_trace",
                               "trace_file": metadata})
     assert len(response) < 1024
@@ -187,8 +188,8 @@ def test_large_trace_crosses_real_small_seqpacket_only_as_file_metadata(monkeypa
     ("bytes", True), ("bytes", 0), ("bytes", -1), ("bytes", 1.5),
     ("bytes", _MAX_BYTES + 1), ("bytes", 4097),
     ("sha256", "sha256:" + "0" * 64),
-    ("request_owner_epoch", ""), ("request_owner_epoch", None),
-    ("request_owner_epoch", "é" * 1025),
+    # The metadata no longer names an owner epoch (host response v5).
+    ("request_owner_epoch", "owner.current"),
     ("status", "installed"), ("status", None), ("status", []),
     ("unexpected", "field"),
 ])
@@ -224,10 +225,9 @@ def test_global_trace_cap_applies_even_when_caller_allows_more(monkeypatch, tmp_
 
 @pytest.mark.parametrize("payload", [
     b"[]", b"{", b"\xff", b'{"a":1,"a":2}',
-    b'{ "schema_version": "manyforge.volatile_motion_trace.v1" }',
-    b'{"schema_version":"manyforge.volatile_motion_trace.v2"}',
-    rfc8785.dumps({**_normal_trace(), "request_owner_epoch": "owner.old"}),
-    b'{"request_owner_epoch":"owner.current","schema_version":"manyforge.volatile_motion_trace.v1","x":-0}',
+    b'{ "schema_version": "manyforge.volatile_motion_trace.v2" }',
+    b'{"schema_version":"manyforge.volatile_motion_trace.v1"}',
+    b'{"schema_version":"manyforge.volatile_motion_trace.v2","x":-0}',
 ])
 def test_valid_size_and_digest_do_not_hide_invalid_file_content(monkeypatch, tmp_path, payload):
     monkeypatch.setenv("MANYFORGE_MOTION_TRACE_DIR", str(tmp_path))

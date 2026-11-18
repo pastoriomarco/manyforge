@@ -31,7 +31,6 @@ const attachment: CarriedObjectAttachment = {
 };
 
 const facts = {
-  sourceOwnerEpoch: 'scene.owner.1',
   logicalScene: {
     access: { active_projection: revision, scene_writes_open: true, projection_leases_open: true },
     snapshot: { carried_object_attachments: [attachment] },
@@ -44,7 +43,7 @@ const currentControl = {
   transportError: null,
 };
 
-function snapshot(state: ComposerHeadlessState['programCycle']['state'], runId: string | null,
+function snapshot(state: ComposerHeadlessState['programCycle']['state'], runId: number | null,
   motionHeld: boolean | null): ComposerHeadlessState {
   return {
     programCycle: {
@@ -60,15 +59,15 @@ function snapshot(state: ComposerHeadlessState['programCycle']['state'], runId: 
 describe('live carried-object detach', () => {
   it('uses the owner Program motion-held projection without Robot Control readiness gates', () => {
     expect(sceneDetachUnavailableReason(snapshot('idle_after_reset', null, null), facts, attachment, currentControl)).toBeNull();
-    expect(sceneDetachUnavailableReason(snapshot('running', 'run.1', true), facts, attachment, currentControl)).toBeNull();
-    expect(sceneDetachUnavailableReason(snapshot('running', 'run.1', false), facts, attachment, currentControl))
+    expect(sceneDetachUnavailableReason(snapshot('running', 1,true), facts, attachment, currentControl)).toBeNull();
+    expect(sceneDetachUnavailableReason(snapshot('running', 1,false), facts, attachment, currentControl))
       .toBe('Not available while the Program is moving.');
-    expect(sceneDetachUnavailableReason(snapshot('running', 'run.1', null), facts, attachment, currentControl))
+    expect(sceneDetachUnavailableReason(snapshot('running', 1,null), facts, attachment, currentControl))
       .toBe('Not available while the Program is moving.');
   });
 
   it('requires connected transport, current semantics, and no transport error even with a cached held snapshot', () => {
-    const cachedHeld = snapshot('running', 'run.1', true);
+    const cachedHeld = snapshot('running', 1,true);
     expect(sceneDetachUnavailableReason(cachedHeld, facts, attachment, {
       ...currentControl,
       transportStatus: 'disconnected',
@@ -91,13 +90,14 @@ describe('live carried-object detach', () => {
     })).toBe('Program motion transport reports an error; wait before detaching.');
   });
 
+  const DETACH_KEY = `0f${'d'.repeat(30)}`;
+
   it('builds the direct Headless transaction from the current attachment and projection', () => {
-    expect(sceneDetachRequest(attachment, facts, 'request.detach.1')).toEqual({
+    expect(sceneDetachRequest(attachment, facts, '3f9a0000000000a1', DETACH_KEY)).toEqual({
+      application_start_id: '3f9a0000000000a1',
       request_context: {
-        request_id: 'request.detach.1',
-        request_owner_epoch: 'scene.owner.1',
+        request_key: DETACH_KEY,
         source_label: 'composer_ui',
-        correlation_id: 'request.detach.1',
       },
       expected_projection_revision: revision,
       operation: {
@@ -112,19 +112,19 @@ describe('live carried-object detach', () => {
   });
 
   it('accepts only the matching direct postcommit receipt for a successor Scene revision', () => {
+    // Headless sets the key's first byte (class 3, part 0) and keeps bytes 1-15.
     const response = {
-      request_id: 'request.detach.1',
-      request_owner_epoch: 'scene.owner.1',
+      request_key: `c0${DETACH_KEY.slice(2)}`,
       committed_projection_revision: {
         ...revision,
         scene_revision: { scene_id: 'scene.1', revision_id: 8, content_hash: 'scene.hash.8' },
       },
     } as Parameters<typeof sceneDetachReceiptAccepted>[0];
-    expect(sceneDetachReceiptAccepted(response, 'request.detach.1', 'scene.owner.1', revision)).toBe(true);
-    expect(sceneDetachReceiptAccepted(response, 'request.other', 'scene.owner.1', revision)).toBe(false);
+    expect(sceneDetachReceiptAccepted(response, DETACH_KEY, revision)).toBe(true);
+    expect(sceneDetachReceiptAccepted(response, `0f${'e'.repeat(30)}`, revision)).toBe(false);
     expect(sceneDetachReceiptAccepted({
       ...response,
       committed_projection_revision: revision,
-    }, 'request.detach.1', 'scene.owner.1', revision)).toBe(false);
+    }, DETACH_KEY, revision)).toBe(false);
   });
 });

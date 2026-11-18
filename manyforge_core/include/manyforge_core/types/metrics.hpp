@@ -35,6 +35,7 @@ struct MetricsSnapshot {
   uint64_t runtime_collision_tick_late_periods = 0;
   uint64_t runtime_collision_tick_missed_periods = 0;
   uint64_t runtime_collision_tick_max_consecutive_late_periods = 0;
+  uint64_t runtime_collision_tick_late_episodes = 0;
   uint64_t runtime_collision_stop_windows_started = 0;
   uint64_t runtime_collision_stop_windows_completed = 0;
   uint64_t runtime_collision_stop_ticks_attempted = 0;

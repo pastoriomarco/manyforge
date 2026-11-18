@@ -13,6 +13,8 @@ from manyforge_behavior.scene_client import (
     SceneTransactionRejectedError,
 )
 
+_KEY = "40" + "00" * 6 + "04" + "00" * 7 + "01"
+
 
 class FakeTransport:
     def __init__(self) -> None:
@@ -20,7 +22,7 @@ class FakeTransport:
 
     def scene(self) -> dict[str, Any]:
         return {
-            "schema_version": "manyforge.scene_projection.v1",
+            "schema_version": "manyforge.scene_projection.v2",
             "logical_scene": {},
         }
 
@@ -29,9 +31,8 @@ class FakeTransport:
     ) -> dict[str, Any]:
         self.request = body
         return {
-            "api_version": "manyforge.manager_command_response.v2",
-            "request_id": body["request_context"]["request_id"],
-            "request_owner_epoch": body["request_context"]["request_owner_epoch"],
+            "api_version": "manyforge.manager_command_response.v3",
+            "request_key": body["request_context"]["request_key"],
             "ok": True,
             "projection_status": "committed",
             "committed_projection_revision": {"scene_revision": {}},
@@ -42,7 +43,7 @@ def test_scene_client_forwards_without_owning_scene_state() -> None:
     transport = FakeTransport()
     client = SceneClient(transport)
     assert client.snapshot()["logical_scene"] == {}
-    request = {"request_context": {"request_id": "request.1", "request_owner_epoch": "scene.1"}}
+    request = {"request_context": {"request_key": _KEY, "source_label": "scene"}}
     assert client.commit(request)["projection_status"] == "committed"
     assert transport.request is request
 
@@ -74,12 +75,12 @@ def test_lost_commit_response_uses_only_exact_result_lookup():
 
         def scene_transaction_status(self, body):
             assert body == self.request
-            return {"api_version": "manyforge.manager_command_response.v2", "ok": True,
+            return {"api_version": "manyforge.manager_command_response.v3", "ok": True,
                     "result": self.result}
 
     transport = LostResponse()
     client = SceneClient(transport)
-    request = {"request_context": {"request_id": "request.1", "request_owner_epoch": "scene.1"}}
+    request = {"request_context": {"request_key": _KEY, "source_label": "scene"}}
     with pytest.raises(SceneOutcomeUnknownError):
         client.commit(request)
     assert client.receipt(request)["ok"]
@@ -116,11 +117,10 @@ def test_typed_transport_error_preserves_cause_without_claiming_scene_outcome(re
 
 def test_owner_rejection_still_preserves_exact_manager_receipt():
     receipt = {
-        "api_version": "manyforge.manager_command_response.v2",
+        "api_version": "manyforge.manager_command_response.v3",
         "ok": False,
         "projection_status": "not_attempted",
-        "request_id": "request.1",
-        "request_owner_epoch": "scene.1",
+        "request_key": _KEY,
         "error": {"code": "scene_refused", "message": "refused"},
     }
 
@@ -168,7 +168,7 @@ def test_uncertain_manager_reply_retains_typed_cause_without_becoming_refusal():
     class UncertainTransport(FakeTransport):
         def commit_scene_transaction(self, body):
             return {
-                "api_version": "manyforge.manager_command_response.v2",
+                "api_version": "manyforge.manager_command_response.v3",
                 "ok": False, "projection_status": "failed_projection_uncertain",
                 "error": {"code": "authoring_not_ready", "message": "uncertain",
                           "details": {"reason": "projection_unknown"}},

@@ -26,10 +26,10 @@ import {
   parseManagerStatusProjection,
   parseOperatorAlarmSnapshot,
   parseOperationObservation,
-  parsePersistentKeyEdit,
   parseExpressionCheckResult,
   parsePersistentKeyValues,
-  parsePersistentKeyValuesCleared,
+  parseProgramCommandReply,
+  parseApplyCommandReply,
   parseRuntimeScaleControlAccepted,
   parseRuntimeScaleControlStatus,
   parseMotionPreviewResponse,
@@ -39,7 +39,6 @@ import {
   parseManagerApplyStatus,
   parseManagerDeploymentCandidatePreviewResponse,
   parseProgramWorkspaceResponse,
-  parseProgramWorkspaceTransitionResponse,
   parseProgramRunStatus,
   parseApiErrorDto,
   parseKnownProgramRunOutcome,
@@ -289,7 +288,8 @@ function deploymentWorkspaceFixture(): Record<string, unknown> {
   const digestB = `sha256:${'b'.repeat(64)}`;
   const digestC = `sha256:${'c'.repeat(64)}`;
   return {
-    schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+    schemaVersion: 'manyforge.composer_deployment_workspace.v2',
+    apply_commands: { in_progress: null, ended: [] },
     authoringWorkspace: {
       workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
       programDraftId: 'draft-1', programDraftRevision: 2,
@@ -393,7 +393,6 @@ function sourceSectionFixture(): Record<string, unknown> {
     known_gaps: [],
     payload: { schema_version: 'fixture.v1' },
     source_generation: 1,
-    source_owner_epoch: 'source-epoch-1',
     source_owner_id: 'source-owner',
     receiver_age_ns: 100,
   };
@@ -401,10 +400,10 @@ function sourceSectionFixture(): Record<string, unknown> {
 
 function runtimeSnapshotFixture(): Record<string, unknown> {
   return {
-    schema_version: 'manyforge.headless_runtime_snapshot.v1',
+    schema_version: 'manyforge.headless_runtime_snapshot.v3',
+    application_start_id: '3f9a0000000000a1',
     complete: true,
     projection_generation: 4,
-    projection_owner_epoch: 'projection-epoch-1',
     projection_owner_id: 'headless-api',
     reasons: [],
     unavailable_sections: [],
@@ -443,9 +442,8 @@ function alarmSnapshotFixture(): Record<string, unknown> {
     details: { source: 'fixture' },
   };
   return {
-    schema_version: 'manyforge.operator_alarm_snapshot.v2',
+    schema_version: 'manyforge.operator_alarm_snapshot.v3',
     owner_id: 'alarm-owner',
-    owner_epoch: 'alarm-epoch-1',
     generation: 2,
     state_revision: 3,
     reconciled: true,
@@ -503,7 +501,7 @@ function structuralManifestFixture(): Record<string, unknown> {
 
 function sourceModelFixture(): Record<string, unknown> {
   return {
-    schema_version: 'manyforge.source_model_projection.v3',
+    schema_version: 'manyforge.source_model_projection.v4',
     cell_id: 'cell-a',
     retained_bundle_id: 'bundle-1',
     graph_revision: 'graph-1',
@@ -520,16 +518,13 @@ function sourceModelFixture(): Record<string, unknown> {
       freshness: 'fresh',
       known_gaps: [],
       projection_generation: 1,
-      projection_owner_epoch: 'source-projection-1',
       receiver_age_ns: 10,
       selection_projection_generation: 2,
       selection_source_content_digest: `sha256:${'a'.repeat(64)}`,
       selection_source_generation: 3,
-      selection_source_owner_epoch: 'manager-epoch-1',
       selection_source_owner_id: 'component-manager.cell-a',
       source_content_digest: `sha256:${'b'.repeat(64)}`,
       source_generation: 4,
-      source_owner_epoch: 'source-owner-epoch-1',
       source_owner_id: 'headless-api.source-model',
       source_owner_kind: 'source_model_projection',
     },
@@ -551,7 +546,7 @@ function projectionRevisionFixture(revision = 1): Record<string, unknown> {
 function managerApplyRecordFixture(): Record<string, unknown> {
   return {
     apply_generation: 3,
-    apply_id: 'apply-3',
+    apply_id: 3,
     candidate_graph_revision: 'graph-2',
     candidate_retained_bundle_id: 'bundle-2',
     committed: false,
@@ -584,9 +579,7 @@ function managerApplyRecordFixture(): Record<string, unknown> {
       assistant_mode: 'forbidden',
     },
     request: {
-      correlation_id: null,
-      request_id: 'request-3',
-      request_owner_epoch: 'browser-epoch-3',
+      request_key: `c0${'3'.repeat(30)}`,
       source_label: 'composer_ui',
     },
     terminal_state: null,
@@ -780,14 +773,13 @@ describe('Program product projections', () => {
 
   function runStatus(state = 'running'): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_run_status.v4',
+      schema_version: 'manyforge.program_run_status.v5',
       owner_id: 'program-runner.cell-a',
-      owner_epoch: 'program-runner.epoch.1',
       run_revision: 3,
       state,
       capture: {
-        schema_version: 'manyforge.program_run_capture.v2',
-        program_run_id: 'program-run.1',
+        schema_version: 'manyforge.program_run_capture.v3',
+        program_run_id: 1,
         applied_record_digest: digestC,
         scenario_id: 'cell-pick',
         source_document_digest: digestA,
@@ -800,9 +792,8 @@ describe('Program product projections', () => {
         node_policy_digest: digestA,
         node_policies: [],
         owner_identities: [{
-          owner_role: 'program_runner',
-          owner_id: 'program-runner.cell-a',
-          owner_epoch: 'program-runner.epoch.1',
+          role: 'program_runner',
+          application_start_id: '3f9a00000000002a',
         }],
       },
       tree_status: 'running',
@@ -814,6 +805,7 @@ describe('Program product projections', () => {
       message: '',
       details: null,
       origin: null,
+      halt: null,
     };
   }
 
@@ -834,7 +826,7 @@ describe('Program product projections', () => {
 
   function recoveryOffer(): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.cycle_recovery_offer.v5',
+      schema_version: 'manyforge.cycle_recovery_offer.v6',
       offer_id: digestA,
       offer_revision: 1,
       generated_at_ns: 10,
@@ -842,10 +834,10 @@ describe('Program product projections', () => {
       control_command_epoch: 0,
       operation_id: null,
       operation_revision: null,
-      program_run_id: 'program-run.1',
+      program_run_id: 1,
       program_binding_id: digestC,
       node_instance_id: 'move',
-      node_attempt_id: 'move.attempt.1',
+      node_attempt_id: 1,
       participants: [],
       graph_revision: digestB,
       retained_bundle_id: digestA,
@@ -854,10 +846,6 @@ describe('Program product projections', () => {
       deployment_generation: 1,
       scene_admission_epoch: 1,
       pose_source_apply_generation: 0,
-      stop_id: null,
-      stop_generation: null,
-      stop_certificate_id: null,
-      stop_certificate_revision: null,
       status: 'action_required',
       recovery_class: 'node_failure_pause',
       actions: [{
@@ -885,14 +873,13 @@ describe('Program product projections', () => {
 
   function runtimeControlsProjection(): Record<string, unknown> {
     return {
-      schema_version: 'manyforge.program_runtime_control_projection.v9',
+      schema_version: 'manyforge.program_runtime_control_projection.v10',
       owner_id: 'program-runner.cell-a',
-      owner_epoch: 'program-runner.epoch.1',
-      program_run_id: 'program-run.1',
+      program_run_id: 1,
       run_revision: 3,
       runtime_controls: {
-        schema_version: 'manyforge.program_runtime_controls.v3',
-        program_run_id: 'program-run.1',
+        schema_version: 'manyforge.program_runtime_controls.v4',
+        program_run_id: 1,
         runtime_control_revision: 1,
         recovery_fences: {
           program_generation: 1,
@@ -906,7 +893,7 @@ describe('Program product projections', () => {
       recovery_offer: null,
       recovery_offers: [],
       execution_selections: {
-        selection_revision: 0,
+        hold_revision: 0,
         motion_held: false,
         groups: [{ group_id: 'all', node_count: 1, held_node_count: 0,
           state: 'running', stop_allowed: true,
@@ -935,9 +922,8 @@ describe('Program product projections', () => {
       graph_revision: digestC,
       node_environment_digest: digestA,
       owner_identities: [{
-        owner_role: 'headless_projection',
-        owner_id: 'headless.program-apply',
-        owner_epoch: 'headless.epoch.1',
+        application_start_id: '3f9a00000000002a',
+        role: 'headless_projection',
       }],
       preparation_digest: digestB,
       program: programFixture(),
@@ -958,12 +944,11 @@ describe('Program product projections', () => {
       source_document_digest: digestA,
       scenario_id: 'cell-pick',
       project_path: '/projects/cell-pick.scenario',
-      schema_version: 'manyforge.applied_program_selection.v4',
+      schema_version: 'manyforge.applied_program_selection.v5',
       source: {
         record_digest: digestC,
         semantic_content_digest: digestB,
         source_generation: 1,
-        source_owner_epoch: 'headless.epoch.1',
         source_owner_id: 'headless.program-apply',
       },
     };
@@ -993,15 +978,15 @@ describe('Program product projections', () => {
       unavailable_reasons: [],
     })).toThrow(/unavailable reasons exactly when no current Scenario exists/);
     expect(applied.recordDigest).toBe(digestC);
-    expect(applied.sourceOwnerEpoch).toBe('headless.epoch.1');
+    expect(applied).not.toHaveProperty('sourceOwnerEpoch');
     expect(applied.program.program_id).toBe('fixture');
     expect(applied.programBinding.program_binding_id).toBe(digestC);
     expect(applied.programBinding.component_bindings[0].component_id).toBe('fixture_robot');
     expect(applied.programFrameFacts.frames[0]).toEqual({
       reference: { componentId: 'fixture_robot', frameId: 'base' }, matchCount: 1,
     });
-    expect(() => parseAppliedProgramSelection({ ...appliedInput, schema_version: 'manyforge.applied_program_selection.v3' }))
-      .toThrow(/applied_program_selection\.v4/);
+    expect(() => parseAppliedProgramSelection({ ...appliedInput, schema_version: 'manyforge.applied_program_selection.v4' }))
+      .toThrow(/applied_program_selection\.v5/);
     expect(() => parseAppliedProgramSelection({
       ...appliedInput,
       program_frame_facts: { ...appliedInput.program_frame_facts, program_binding_id: digestB },
@@ -1077,9 +1062,9 @@ describe('Program product projections', () => {
 
   // Same eight-field provenance row as the actual Runner/Headless contract.
   function operationFailureRow() {
-    return { node_instance_id: 'retry_move', node_attempt_id: 'retry_move.attempt.1',
+    return { node_instance_id: 'retry_move', node_attempt_id: 1,
       operator_facing_run_revision: 3,
-      operation: { source_owner_epoch: 'kernel.1', operation_id: 'operation.1', operation_revision: 2 },
+      operation: { operation_id: 5, operation_revision: 2 },
       resource_ids: ['lite6_robot.arm.coordinate.000000'],
       failure: { code: 'planning_failed', message: 'original failure' },
       recovery_class: 'failed_validation', terminal_facts: [{ kind: 'local_failure', effect: 'no_effect' }] };
@@ -1087,7 +1072,7 @@ describe('Program product projections', () => {
 
   it('accepts an actual held Run with its required empty operation failures', () => {
     const run = parseProgramRunStatus(actualHeldRun);
-    expect(run.capture.programRunId).toBe('program-cycle.1');
+    expect(run.capture.programRunId).toBe(1);
     expect(run.state).toBe('running');
     expect(run.nodeStatuses.start_rest).toBe('held');
     expect(run.operationFailures).toEqual([]);
@@ -1098,9 +1083,9 @@ describe('Program product projections', () => {
 
   it('retains exact nonempty operation failure provenance without inferring new authority', () => {
     const run = parseProgramRunStatus({ ...actualHeldRun, operation_failures: [operationFailureRow()] });
-    expect(run.operationFailures).toEqual([{ nodeInstanceId: 'retry_move', nodeAttemptId: 'retry_move.attempt.1',
+    expect(run.operationFailures).toEqual([{ nodeInstanceId: 'retry_move', nodeAttemptId: 1,
       operatorFacingRunRevision: 3,
-      operation: { sourceOwnerEpoch: 'kernel.1', operationId: 'operation.1', operationRevision: 2 },
+      operation: { operationId: 5, operationRevision: 2 },
       resourceIds: ['lite6_robot.arm.coordinate.000000'],
       failure: { code: 'planning_failed', message: 'original failure' },
       recoveryClass: 'failed_validation', terminalFacts: [{ kind: 'local_failure', effect: 'no_effect' }] }]);
@@ -1127,14 +1112,21 @@ describe('Program product projections', () => {
   it.each([
     null,
     { ...operationFailureRow(), extra: true },
-    { ...operationFailureRow(), node_attempt_id: '' },
+    { ...operationFailureRow(), node_attempt_id: 0 },
+    { ...operationFailureRow(), node_attempt_id: 'move.attempt.1' },
+    { ...operationFailureRow(), operation: { ...operationFailureRow().operation, operation_id: 'operation.1' } },
     { ...operationFailureRow(), node_instance_id: 'é'.repeat(65) },
     { ...operationFailureRow(), node_instance_id: 'e\u0301' },
     { ...operationFailureRow(), operator_facing_run_revision: 0 },
     { ...operationFailureRow(), operator_facing_run_revision: true },
     { ...operationFailureRow(), operation: { ...operationFailureRow().operation, operation_revision: 2 ** 53 } },
     { ...operationFailureRow(), operation: { ...operationFailureRow().operation, extra: true } },
-    { ...operationFailureRow(), operation: { ...operationFailureRow().operation, source_owner_epoch: 'é'.repeat(1025) } },
+    // The operation is exactly {operation_id, operation_revision}: the
+    // retired owner epoch is refused and neither member may be missing.
+    { ...operationFailureRow(), operation: { ...operationFailureRow().operation, source_owner_epoch: 'kernel.1' } },
+    { ...operationFailureRow(), operation: { operation_id: 5 } },
+    { ...operationFailureRow(), operation: { operation_revision: 2 } },
+    Object.fromEntries(Object.entries(operationFailureRow()).filter(([name]) => name !== 'recovery_class')),
     { ...operationFailureRow(), resource_ids: [] },
     { ...operationFailureRow(), resource_ids: ['b', 'a'] },
     { ...operationFailureRow(), resource_ids: ['a', 'a'] },
@@ -1154,7 +1146,27 @@ describe('Program product projections', () => {
   it('keeps run status tied to one exact runner owner', () => {
     const status = parseProgramRunStatus(runStatus());
 
-    expect(status.capture.programRunId).toBe('program-run.1');
+    expect(status.capture.programRunId).toBe(1);
+  });
+
+  it('carries the Stop that froze a halted run, kinds kept as text', () => {
+    expect(parseProgramRunStatus(runStatus()).halt).toBeNull();
+    expect(parseProgramRunStatus({ ...runStatus('halted'), halt: {
+      kind: 'halt', source_label: 'manager.carried_object_lost',
+    } }).halt).toEqual({ kind: 'halt', sourceLabel: 'manager.carried_object_lost' });
+    // An unknown kind is accepted as text (it maps to no cause line).
+    expect(parseProgramRunStatus({ ...runStatus('halted'), halt: {
+      kind: 'some_future_kind', source_label: null,
+    } }).halt).toEqual({ kind: 'some_future_kind', sourceLabel: null });
+    for (const halt of [
+      { kind: 'halt' }, { kind: '', source_label: null },
+      { kind: 'halt', source_label: null, event_id: 3 }, 'halt',
+    ]) {
+      expect(() => parseProgramRunStatus({ ...runStatus('halted'), halt })).toThrow(/halt/);
+    }
+    const missing = runStatus();
+    delete missing.halt;
+    expect(() => parseProgramRunStatus(missing)).toThrow();
   });
 
   it('carries the run end reason once the run has ended', () => {
@@ -1165,9 +1177,9 @@ describe('Program product projections', () => {
     } }).runEnd).toEqual({ end_reason: 'stopped', details: { stopped_by: 'rule', rule_id: 'door' } });
     expect(parseProgramRunStatus({ ...runStatus(), run_end: {
       end_reason: 'cell_fault',
-      details: { component_id: 'lite6_robot', error: { code: 'fault_estop', message: 'e-stop' } },
+      details: { component_id: 'lite6_robot', error: { code: 'fault_protective_stop', message: 'protective stop' } },
     } }).runEnd).toEqual({ end_reason: 'cell_fault',
-      details: { component_id: 'lite6_robot', error: { code: 'fault_estop', message: 'e-stop' } } });
+      details: { component_id: 'lite6_robot', error: { code: 'fault_protective_stop', message: 'protective stop' } } });
     expect(() => parseProgramRunStatus({ ...runStatus(), run_end: { end_reason: 'aborted', details: {} } }))
       .toThrow(/end_reason/);
   });
@@ -1280,7 +1292,7 @@ describe('Program product projections', () => {
       ...recoveryOffer(),
       offer_id: offerId,
       node_instance_id: node,
-      node_attempt_id: `${node}.attempt.1`,
+      node_attempt_id: 1,
       actions: [{
         action_id: 'retry_motion_from_current_state',
         requires_confirmation: false,
@@ -1340,7 +1352,7 @@ describe('Program product projections', () => {
     expect(refuses([hold('a', digestA, ['left']), hold('a', digestB, ['right'])]))
       .toThrow(/one offer per held node/);
     expect(refuses([{ ...hold('a', digestA, ['left']),
-      offer: { ...offer('a', digestA), program_run_id: 'program-run.2' } }]))
+      offer: { ...offer('a', digestA), program_run_id: 2 } }]))
       .toThrow(/one exact Program-run identity/);
     expect(refuses([{ ...hold('a', digestA, ['left']),
       offer: { ...offer('a', digestA), actions: [{ ...offer('a', digestA).actions[1], action_id: 'continue' }] } }]))
@@ -1411,8 +1423,8 @@ describe('Program product projections', () => {
     }).recoveryOffer?.reason.message).toBe('é'.repeat(2048));
     expect(() => parseProgramRuntimeControlProjection({
       ...runtimeControlsProjection(),
-      recovery_offer: { ...recoveryOffer(), schema_version: 'manyforge.cycle_recovery_offer.v4' },
-    })).toThrow(/cycle_recovery_offer.v5/);
+      recovery_offer: { ...recoveryOffer(), schema_version: 'manyforge.cycle_recovery_offer.v5' },
+    })).toThrow(/cycle_recovery_offer.v6/);
     // Omitted stop scope stays omitted: zero is Unlimited and the used count
     // may exceed the finite configured range.
     expect(offer?.policy).toEqual({ allowIntervention: true, maxRetries: 0 });
@@ -1470,7 +1482,7 @@ describe('Program product projections', () => {
     );
 
     expect(projection.recoveryOffer).toBeNull();
-    expect(projection.programRunId).toBe('program-run.1');
+    expect(projection.programRunId).toBe(1);
   });
 
   it.each([true, false])('retains the owner\'s motion-held fact unchanged when %s', (motionHeld) => {
@@ -1666,7 +1678,7 @@ describe('Program product projections', () => {
     controls.runtime_control_revision = 4;
     const fallback = {
       event_revision: 1, kind: 'program_node_takeover_fallback', node_instance_id: 'move',
-      incumbent_operation_id: 'op.1', path: 'spring_back_hold',
+      incumbent_operation_id: 3, path: 'spring_back_hold',
       code: 'takeover_preparation_late', message: 'late', preparation_ms: 40.5, budget_ms: 30,
       planning_cap_ms: 24,
     };
@@ -1680,7 +1692,7 @@ describe('Program product projections', () => {
         eventRevision: 1,
         kind: 'program_node_takeover_fallback',
         facts: {
-          nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'spring_back_hold',
+          nodeInstanceId: 'move', incumbentOperationId: 3, path: 'spring_back_hold',
           code: 'takeover_preparation_late', message: 'late', failureStage: null,
           preparationMs: 40.5, budgetMs: 30, planningCapMs: 24,
         },
@@ -1689,7 +1701,7 @@ describe('Program product projections', () => {
         eventRevision: 2,
         kind: 'program_node_takeover_fallback',
         facts: {
-          nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'ordinary_containment',
+          nodeInstanceId: 'move', incumbentOperationId: 3, path: 'ordinary_containment',
           code: null, message: null, failureStage: null, preparationMs: 40.5, budgetMs: 30,
           planningCapMs: 24,
         },
@@ -1698,7 +1710,7 @@ describe('Program product projections', () => {
         eventRevision: 3,
         kind: 'program_node_takeover_fallback',
         facts: {
-          nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'spring_back_hold',
+          nodeInstanceId: 'move', incumbentOperationId: 3, path: 'spring_back_hold',
           code: 'takeover_preparation_late', message: 'late', failureStage: 'spring_back_planning',
           preparationMs: 40.5, budgetMs: 30, planningCapMs: 24,
         },
@@ -1709,7 +1721,7 @@ describe('Program product projections', () => {
   it('refuses a malformed takeover fallback audit event', () => {
     const valid = {
       event_revision: 1, kind: 'program_node_takeover_fallback', node_instance_id: 'move',
-      incumbent_operation_id: 'op.1', path: 'spring_back_hold',
+      incumbent_operation_id: 3, path: 'spring_back_hold',
       code: null, message: null, preparation_ms: 40.5, budget_ms: 30, planning_cap_ms: 24,
     };
     const refuses = (patch: Record<string, unknown>) => {
@@ -1722,6 +1734,7 @@ describe('Program product projections', () => {
     expect(refuses({})).not.toThrow();
     expect(refuses({ node_instance_id: undefined })).toThrow(/node_instance_id/);
     expect(refuses({ incumbent_operation_id: '' })).toThrow(/incumbent_operation_id/);
+    expect(refuses({ incumbent_operation_id: 'op.1' })).toThrow(/incumbent_operation_id/);
     expect(refuses({ path: 'moving_replacement' })).toThrow(/path/);
     expect(refuses({ path: undefined })).toThrow(/path/);
     expect(refuses({ code: undefined })).toThrow(/code/);
@@ -1757,17 +1770,15 @@ describe('Program product projections', () => {
 
   it('parses one coherent cycle, run, and runtime-control observation', () => {
     const input = {
-      program_runner_owner_epoch: 'program-runner.epoch.1',
       cycle_generation: 8,
       state: 'running',
-      program_run_id: 'program-run.1',
+      program_run_id: 1,
       cycle_claim_generation: 2,
       terminal_or_settlement_reference: null,
       execution_control_revision: 4,
-      causal_correlation_id: null,
-      causal_session_id: null,
-      causal_client_sequence: null,
+      causal_request_key: null,
       current_command_kind: null,
+      runner_commands: { in_progress: null, ended: [] },
       failure: null,
       reset_phase: null, reset_options: null,
       reset_robot_position: { available: false, reason: 'unsupported' },
@@ -1781,6 +1792,22 @@ describe('Program product projections', () => {
     };
     const cycle = parseProgramCycleStatus(input);
 
+    // OD-144 / OD-214: the runner command in progress and the last ended ones.
+    expect(cycle.runnerCommands).toEqual({ inProgress: null, ended: [] });
+    const inProgress = {
+      kind: 'resume_motion', request_key: 'a'.repeat(32), step: 'admitting',
+      accepted_at_ns: '1763112345678901234', end: null,
+    };
+    expect(parseProgramCycleStatus({ ...input, runner_commands: { in_progress: inProgress, ended: [] } })
+      .runnerCommands.inProgress).toMatchObject({ kind: 'resume_motion', step: 'admitting', end: null });
+    const withoutCommands: Record<string, unknown> = { ...input };
+    delete withoutCommands.runner_commands;
+    expect(() => parseProgramCycleStatus(withoutCommands)).toThrow();
+    for (const value of [null, '', 1, {}, { in_progress: null }]) {
+      expect(() => parseProgramCycleStatus({ ...input, runner_commands: value })).toThrow();
+    }
+    // The removed member is refused.
+    expect(() => parseProgramCycleStatus({ ...input, command_in_progress: null })).toThrow();
     expect(cycle.resetRobotPosition).toEqual({ available: false, reason: 'unsupported' });
     expect(parseProgramCycleStatus({ ...input,
       reset_robot_position: { available: true, reason: null },
@@ -1798,69 +1825,30 @@ describe('Program product projections', () => {
     })).toThrow(/exact advertised run projection/);
     expect(() => parseProgramCycleStatus({
       ...input,
-      causal_client_sequence: '0',
-    })).toThrow(/canonical positive uint64/);
+      causal_request_key: 'request.start.1',
+    })).toThrow(/32 lowercase hex/);
     expect(parseProgramCycleStatus({
       ...input,
-      causal_client_sequence: '18446744073709551615',
-    }).causalClientSequence).toBe('18446744073709551615');
-  });
-
-  it('retains an immutable predecessor run after terminal owner recovery', () => {
-    const run = runStatus('failed');
-    run.tree_status = 'failure';
-    run.node_statuses = { root: 'failure' };
-    const controls = runtimeControlsProjection();
-    controls.owner_epoch = 'program-runner.epoch.2';
-    const input = {
-      program_runner_owner_epoch: 'program-runner.epoch.2',
-      cycle_generation: 8,
-      state: 'terminal_awaiting_reset',
-      program_run_id: 'program-run.1',
-      cycle_claim_generation: 2,
-      terminal_or_settlement_reference: digestA,
-      execution_control_revision: 5,
-      causal_correlation_id: 'run.1',
-      causal_session_id: null,
-      causal_client_sequence: null,
-      current_command_kind: 'program_run',
-      failure: null,
-      reset_phase: null, reset_options: null,
-      reset_robot_position: { available: false, reason: 'unsupported' },
-      allowed_commands: [],
-      run_revision: 3,
-      node_status_revision: 2,
-      runtime_control_revision: 1,
-      recovery_offer: null,
-      run,
-      runtime_controls: controls,
-    };
-    const cycle = parseProgramCycleStatus(input);
-
-    expect(cycle.programRunnerOwnerEpoch).toBe('program-runner.epoch.2');
-    expect(cycle.run?.ownerEpoch).toBe('program-runner.epoch.1');
+      causal_request_key: '00000000000000040000000000000076',
+    }).causalRequestKey).toBe('00000000000000040000000000000076');
+    // Headless's cycle-status route adds the display of the key (1.16.2).
     expect(parseProgramCycleStatus({
       ...input,
-      state: 'resetting',
-      reset_phase: 'stopping',
-      reset_options: { reload_initial_scene: false, reset_robot_position: false },
-      current_command_kind: 'program_reset',
-    }).run?.ownerEpoch).toBe('program-runner.epoch.1');
-    expect(() => parseProgramCycleStatus({
-      ...input,
-      state: 'running',
-    })).toThrow(/exact advertised run projection/);
+      causal_request_key: '00000000000000040000000000000076',
+      causal_display: '3f9a/s4.118',
+    }).causalDisplay).toBe('3f9a/s4.118');
+    expect(parseProgramCycleStatus(input).causalDisplay).toBeNull();
   });
 
   it('strictly retains selected no-run Reset progress and recovery', () => {
     const input = {
-      program_runner_owner_epoch: 'runner.1', cycle_generation: 3,
+      cycle_generation: 3,
       state: 'resetting', program_run_id: null, cycle_claim_generation: null,
       terminal_or_settlement_reference: null, run_revision: null,
       node_status_revision: null, runtime_control_revision: null,
-      execution_control_revision: 4, causal_correlation_id: 'reset.1',
-      causal_session_id: null, causal_client_sequence: null,
-      current_command_kind: 'program_reset', failure: null,
+      execution_control_revision: 4,
+      causal_request_key: null,
+      current_command_kind: 'program_reset', runner_commands: { in_progress: null, ended: [] }, failure: null,
       reset_phase: 'restoring_scene',
       reset_robot_position: { available: false, reason: 'unsupported' },
       reset_options: { reload_initial_scene: true, reset_robot_position: true },
@@ -1911,66 +1899,22 @@ describe('Program product projections', () => {
     }).resetOptions).toBeNull();
   });
 
-  it('parses accepted Program Apply and rejects a mismatched Manager identity', () => {
-    const digestA = `sha256:${'a'.repeat(64)}`;
-    const digestB = `sha256:${'b'.repeat(64)}`;
-    const digestC = `sha256:${'c'.repeat(64)}`;
-    const headless = {
-      status: 'accepted',
-      confirmation_token: null,
-      prepared_activation: {
-        schema_version: 'manyforge.prepared_activation_input.v7',
-        prepared_activation_id: digestC,
-        origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA, project_path: '/projects/fixture.scenario' },
-        captured_input_digest: digestB,
-        deployment_artifact_id: 'deployment.fixture',
-        deployment_revision: digestA,
-        retained_bundle_id: digestB,
-        graph_revision: digestC,
-        program_id: 'fixture-program',
-        program_revision: digestB,
-        program_outcome: { kind: 'bound', program_binding_id: digestA },
-        node_environment_digest: digestC,
-        assistant_mode: 'forbidden',
-      },
-      candidate_preview: null,
-      manager_apply: {
-        api_version: 'manyforge.manager_command_response.v2',
-        apply_generation: 1, apply_id: 'apply-1',
-        candidate_projection_revision: null,
-        error: null, ok: true, replay_status: 'accepted_new',
-        request_id: 'request-1', request_owner_epoch: 'owner.1', state: 'pending',
-      },
-      preparation: null,
-      phases_ms: { preparation_ms: 1 },
-      apply_id: 'apply-1',
-      apply_generation: 1,
+  it('parses an ended Program Apply row naming its Manager Apply (OD-214)', () => {
+    const row = {
+      kind: 'program_apply', request_key: '1'.repeat(32), step: 'applying',
+      step_source: { status: 'manager_apply', apply_id: 1, apply_generation: 1 },
+      accepted_at_ns: '10',
+      end: { outcome: 'succeeded', code: null, details: null, finished_at_ns: '20' },
     };
-    const response = parseProgramWorkspaceTransitionResponse({
-      status: 'accepted',
-      headless,
-      workspace: workspaceFixture(),
-    });
-
-    expect(response.status).toBe('accepted');
-    expect(response.workspace.draft.programLoaded).toBe(true);
-    expect(parseProgramWorkspaceTransitionResponse({
-      status: 'reverted',
-      headless: null,
-      workspace: workspaceFixture(),
-    }).status).toBe('reverted');
-    expect(() => parseProgramWorkspaceTransitionResponse({
-      status: 'accepted',
-      headless: null,
-      workspace: workspaceFixture(),
-    })).toThrow(/owner response/);
-    const malformed = structuredClone(headless);
-    malformed.apply_id = 'another-apply';
-    expect(() => parseProgramWorkspaceTransitionResponse({
-      status: 'accepted',
-      headless: malformed,
-      workspace: workspaceFixture(),
-    })).toThrow(/exact accepted Manager operation/);
+    const reply = { schema_version: 'manyforge.apply_command_reply.v1', command: row };
+    expect(parseApplyCommandReply(reply).stepSource)
+      .toEqual({ status: 'manager_apply', applyId: 1, applyGeneration: 1 });
+    // The Manager Apply names the `applying` step only.
+    expect(() => parseApplyCommandReply({ ...reply, command: { ...row, step: 'previewing' } }))
+      .toThrow(/step_source/);
+    // The former `{status, headless, workspace}` reply is refused.
+    expect(() => parseApplyCommandReply({ status: 'accepted', headless: null, workspace: {} }))
+      .toThrow(/exactly|required/);
   });
 });
 
@@ -2093,9 +2037,9 @@ describe('Deployment workspace parser', () => {
     const digestA = `sha256:${'a'.repeat(64)}`;
     const digestB = `sha256:${'b'.repeat(64)}`;
     const preview = {
-      api_version: 'manyforge.manager_command_response.v2',
+      api_version: 'manyforge.manager_command_response.v3',
       candidate_receipt: {
-        schema_version: 'manyforge.manager_deployment_candidate_receipt.v2',
+        schema_version: 'manyforge.manager_deployment_candidate_receipt.v3',
         deployment_artifact_id: 'deployment.fixture',
         deployment_revision: digestA,
         prepared_activation_id: digestB,
@@ -2106,7 +2050,6 @@ describe('Deployment workspace parser', () => {
           retained_bundle_id: 'bundle.current',
         },
         expected_admission_generation: 7,
-        manager_owner_epoch: 'manager.epoch.1',
         impact_digest: digestB,
         destructive_impact: true,
         receipt_digest: digestA,
@@ -2911,7 +2854,7 @@ describe('headless projection parsers', () => {
     const captured = structuredClone(isaacSceneOwnerSections) as Record<string, unknown>;
     const runtimeWire = runtimeSnapshotFixture();
     runtimeWire.projection_generation = captured.projection_generation;
-    runtimeWire.projection_owner_epoch = captured.projection_owner_epoch;
+    runtimeWire.application_start_id = captured.application_start_id;
     runtimeWire.projection_owner_id = captured.projection_owner_id;
     const runtimeSections = runtimeWire.sections as Record<string, unknown>;
     const capturedSections = captured.sections as Record<string, unknown>;
@@ -3516,8 +3459,8 @@ describe('headless projection parsers', () => {
     ]);
 
     const v2 = sourceModelFixture();
-    v2.schema_version = 'manyforge.source_model_projection.v2';
-    expect(() => parseSourceModelProjection(v2)).toThrow('manyforge.source_model_projection.v3');
+    v2.schema_version = 'manyforge.source_model_projection.v3';
+    expect(() => parseSourceModelProjection(v2)).toThrow('manyforge.source_model_projection.v4');
 
     const withoutComponents = sourceModelFixture();
     delete withoutComponents.components;
@@ -3555,77 +3498,97 @@ describe('headless projection parsers', () => {
 
   it('accepts only an exact successful scene transaction receipt', () => {
     const parsed = parseSceneTransactionResponse({
-      api_version: 'manyforge.manager_command_response.v2',
+      api_version: 'manyforge.manager_command_response.v3',
       committed_projection_revision: projectionRevisionFixture(2),
       error: null,
       ok: true,
       projection_status: 'committed',
       replay_status: 'accepted_new',
-      request_id: 'request-1',
-      request_owner_epoch: 'scene-owner-epoch-7',
+      request_key: 'a'.repeat(32),
       transaction_sequence: 1,
       update_status: 'pose_changed',
     });
     expect(parsed.committed_projection_revision.scene_revision.revision_id).toBe(2);
+    expect(parsed.request_key).toBe('a'.repeat(32));
   });
 
   it('parses exact pending and succeeded Manager Apply receipts', () => {
     const pending = parseManagerApplyResponse({
-      api_version: 'manyforge.manager_command_response.v2',
+      api_version: 'manyforge.manager_command_response.v3',
       apply_generation: 1,
-      apply_id: 'apply-1',
+      apply_id: 1,
       candidate_projection_revision: null,
       error: null,
       ok: true,
       replay_status: 'accepted_new',
-      request_id: 'request-1',
-      request_owner_epoch: 'manager-owner-1',
+      request_key: '1'.repeat(32),
       state: 'pending',
     });
     expect(pending.state).toBe('pending');
     expect(pending.candidateProjectionRevision).toBeNull();
 
     const succeeded = parseManagerApplyResponse({
-      api_version: 'manyforge.manager_command_response.v2',
+      api_version: 'manyforge.manager_command_response.v3',
       apply_generation: 1,
-      apply_id: 'apply-1',
+      apply_id: 1,
       candidate_projection_revision: projectionRevisionFixture(2),
       error: null,
       ok: true,
       replay_status: 'replayed_exact',
-      request_id: 'request-1',
-      request_owner_epoch: 'manager-owner-1',
+      request_key: '1'.repeat(32),
       state: 'succeeded',
     });
     expect(succeeded.state).toBe('succeeded');
-    expect(succeeded.applyId).toBe('apply-1');
+    expect(succeeded.applyId).toBe(1);
     if (succeeded.state !== 'succeeded') {
       throw new Error('expected a succeeded Manager Apply receipt');
     }
     expect(succeeded.candidateProjectionRevision.scene_revision.revision_id)
       .toBe(2);
+    expect(succeeded.requestKey).toBe('1'.repeat(32));
+    // The request is named by its 32-hex key; the v1 request id and owner
+    // epoch are refused.
+    expect(() => parseManagerApplyResponse({
+      ...succeededFixtureWithout(),
+      request_key: 'request-1',
+    })).toThrow(/request_key/);
+    expect(() => parseManagerApplyResponse({
+      ...succeededFixtureWithout(),
+      request_id: 'request-1',
+      request_owner_epoch: 'manager-owner-1',
+    })).toThrow(/exactly/);
+    function succeededFixtureWithout() {
+      return {
+        api_version: 'manyforge.manager_command_response.v3',
+        apply_generation: 1,
+        apply_id: 1,
+        candidate_projection_revision: null,
+        error: null,
+        ok: true,
+        replay_status: 'accepted_new',
+        state: 'pending',
+      };
+    }
   });
 
   it('rejects obsolete, extra-field, and inconsistent Manager Apply receipts', () => {
     const obsolete = {
-      api_version: 'manyforge.manager_command_response.v2',
+      api_version: 'manyforge.manager_command_response.v3',
       error: null,
       ok: true,
-      request_id: 'request-1',
-      request_owner_epoch: 'manager-owner-1',
+      request_key: '1'.repeat(32),
     };
     expect(() => parseManagerApplyResponse(obsolete)).toThrow(/exactly/);
 
     const extra = {
-      api_version: 'manyforge.manager_command_response.v2',
+      api_version: 'manyforge.manager_command_response.v3',
       apply_generation: 1,
-      apply_id: 'apply-1',
+      apply_id: 1,
       candidate_projection_revision: null,
       error: null,
       ok: true,
       replay_status: 'accepted_new',
-      request_id: 'request-1',
-      request_owner_epoch: 'manager-owner-1',
+      request_key: '1'.repeat(32),
       state: 'pending',
       projection_status: 'pending',
     };
@@ -3664,9 +3627,9 @@ describe('headless projection parsers', () => {
 
   it('parses durable Manager Apply progress and terminal failure exactly', () => {
     const base = {
-      api_version: 'manyforge.manager_command_response.v2',
+      api_version: 'manyforge.manager_command_response.v3',
       apply_generation: 4,
-      apply_id: 'apply-4',
+      apply_id: 4,
       candidate_projection_revision: null,
       failure_acknowledgement: 'unavailable',
       error: null,
@@ -3685,8 +3648,7 @@ describe('headless projection parsers', () => {
         program_binding_id: `sha256:${'4'.repeat(64)}`,
         prepared_activation_id: `sha256:${'5'.repeat(64)}`,
       },
-      request_id: 'request-4',
-      request_owner_epoch: 'owner-4',
+      request_key: '4'.repeat(32),
       state: 'pending',
     };
     expect(parseManagerApplyStatus(base).phase).toBe('runtime_converged');
@@ -3748,6 +3710,26 @@ describe('headless projection parsers', () => {
       state: 'unknown_effect',
     });
     expect(failed.state).toBe('unknown_effect');
+    // OD-188: the Manager ends an Apply with its own code in the existing
+    // terminal state; no new state value.
+    for (const code of ['apply_progression_failed']) {
+      const ended = parseManagerApplyStatus({
+        ...base,
+        failure: {
+          cause_code: code,
+          cause_details: {},
+          code,
+          effect_boundary: 'unknown',
+          effect_disposition: 'unknown',
+          message: 'the Apply ended',
+          phase: 'runtime_converged',
+          producer: 'component_manager',
+        },
+        state: 'unknown_effect',
+      });
+      expect(ended.state).toBe('unknown_effect');
+      expect(ended.failure).toMatchObject({ code, causeCode: code, effectDisposition: 'unknown' });
+    }
     expect(failed.failure?.effectDisposition).toBe('unknown');
     expect(failed.failure).toMatchObject({
       causeCode: 'stale_generation',
@@ -3872,53 +3854,6 @@ describe('headless projection parsers', () => {
     expect(structural.headless).toBeNull();
     expect(headless.mode).toBe('headless_client');
     expect(headless.runtimeAvailability).toBeNull();
-    expect(structural.workbenchSessionNotice).toBeNull();
-  });
-
-  it('parses the optional projected previous-session notice without classifying it', () => {
-    const notice = {
-      schema_version: 'manyforge.workbench_previous_session.v1',
-      session_id: 'a'.repeat(32),
-      archive_relative_path: `previous-sessions/${'a'.repeat(32)}`,
-      shutdown: 'clean',
-      effects: 'unknown',
-      history_coverage: 'not_imported',
-      journal_families: ['program_cycle', 'scene', 'manager', 'kernel_operation'],
-      message: 'Previous session journals retained; effects are unknown.',
-    };
-    const health = {
-      status: 'ok', mode: 'headless_client', components: {},
-      runtimeAvailability: null, timestamp: 1,
-      workbench_session_notice: notice,
-    };
-    const parsed = parseHealthResponse(health).workbenchSessionNotice;
-    expect(parsed).toEqual({
-      schemaVersion: notice.schema_version,
-      sessionId: notice.session_id,
-      archiveRelativePath: notice.archive_relative_path,
-      shutdown: 'clean', effects: 'unknown', historyCoverage: 'not_imported',
-      journalFamilies: notice.journal_families, message: notice.message,
-    });
-    expect(parseHealthResponse({ ...health, workbench_session_notice: null })
-      .workbenchSessionNotice).toBeNull();
-
-    for (const invalid of [
-      { ...notice, schema_version: 'other' },
-      { ...notice, session_id: 'A'.repeat(32) },
-      { ...notice, archive_relative_path: `previous-sessions/${'b'.repeat(32)}` },
-      { ...notice, shutdown: 'verified' },
-      { ...notice, effects: 'safe' },
-      { ...notice, history_coverage: 'imported' },
-      { ...notice, journal_families: notice.journal_families.slice(1) },
-      { ...notice, journal_families: [...notice.journal_families].reverse() },
-      { ...notice, message: '\u00e9'.repeat(513) },
-      { ...notice, message: 'e\u0301' },
-      { ...notice, message: '\ud800' },
-      { ...notice, extra: true },
-    ]) {
-      expect(() => parseHealthResponse({ ...health, workbench_session_notice: invalid }))
-        .toThrow('health.workbench_session_notice');
-    }
   });
 
   it('parses the optional startup-project notice', () => {
@@ -3938,18 +3873,16 @@ describe('headless projection parsers', () => {
       freshness: 'fresh',
       known_gaps: [],
       projection_generation: 4,
-      projection_owner_epoch: 'projection.epoch.1',
       receiver_age_ns: 10,
       source_content_digest: 'sha256:' + 'a'.repeat(64),
       source_generation: 2,
-      source_owner_epoch: 'manager.epoch.1',
       source_owner_id: 'component-manager.cell-a',
     };
     const statusWire = {
-      schema_version: 'manyforge.manager_status_projection.v1',
+      schema_version: 'manyforge.manager_status_projection.v2',
       source,
       status: {
-        api_version: 'manyforge.manager_source.v1',
+        api_version: 'manyforge.manager_source.v2',
         active: { canonical_empty: false,
           cell_graph: { cell_id: 'cell-a', components: [] },
           graph_revision: 'graph.1',
@@ -3972,14 +3905,14 @@ describe('headless projection parsers', () => {
     };
     const status = parseManagerStatusProjection(statusWire);
     const graph = parseManagerGraphProjection({
-      schema_version: 'manyforge.manager_graph_projection.v1',
+      schema_version: 'manyforge.manager_graph_projection.v2',
       source,
       graph_revision: 'graph.1',
       retained_bundle_id: 'bundle.1',
       cell_graph: { cell_id: 'cell-a', components: [] },
     });
     const diff = parseManagerDiffProjection({
-      schema_version: 'manyforge.manager_diff_projection.v1',
+      schema_version: 'manyforge.manager_diff_projection.v2',
       source,
       converged: true,
       desired_units: [],
@@ -3987,12 +3920,34 @@ describe('headless projection parsers', () => {
     });
 
     expect(status.status.active.graphRevision).toBe('graph.1');
-    expect(status.status.apply.records[0]?.request.requestId).toBe('request-3');
+    expect(status.status.apply.records[0]?.request.requestKey).toBe(`c0${'3'.repeat(30)}`);
     expect(status.status.apply.records[0]?.phase).toBe('fence_held');
     expect(graph.retainedBundleId).toBe('bundle.1');
     expect(diff.converged).toBe(true);
+    expect(status.status.runtime.outstandingExchanges).toBeUndefined();
 
-    for (const receipt of [undefined, null, {}, {
+    // OD-296 (a), OD-298 (a): what the Manager waits for, information only.
+    const waiting = structuredClone(statusWire);
+    (waiting.status.runtime as Record<string, unknown>).outstanding_exchanges = [
+      { channel: 'management', exchange: 'scene_frame', peer: 'execution_host', since_ns: 1200 },
+    ];
+    expect(parseManagerStatusProjection(waiting).status.runtime.outstandingExchanges).toEqual([
+      { peer: 'execution_host', channel: 'management', exchange: 'scene_frame', sinceNs: 1200 },
+    ]);
+    (waiting.status.runtime as Record<string, unknown>).outstanding_exchanges = [
+      { channel: 'liveness', exchange: 'probe', peer: 'kernel', since_ns: 1 },
+    ];
+    expect(() => parseManagerStatusProjection(waiting)).toThrow();
+
+    // OD-281: only the active configuration's record carries the receipt;
+    // every other record carries null.
+    const withoutReceipt = managerApplyRecordFixture();
+    withoutReceipt.prepared_activation = null;
+    statusWire.status.apply.records = [withoutReceipt];
+    expect(parseManagerStatusProjection(statusWire).status.apply.records[0]?.phase)
+      .toBe('fence_held');
+
+    for (const receipt of [undefined, {}, {
       ...(managerApplyRecordFixture().prepared_activation as Record<string, unknown>),
       unexpected_field: true,
     }]) {
@@ -4027,11 +3982,9 @@ describe('headless projection parsers', () => {
       freshness: 'fresh',
       known_gaps: [],
       projection_generation: 4,
-      projection_owner_epoch: 'projection.epoch.1',
       receiver_age_ns: 10,
       source_content_digest: 'sha256:' + 'a'.repeat(64),
       source_generation: 2,
-      source_owner_epoch: 'manager.epoch.1',
       source_owner_id: 'component-manager.cell-a',
     };
     const rows = [{ controllable_component_id: 'arm', simulator: 'none' }];
@@ -4043,10 +3996,10 @@ describe('headless projection parsers', () => {
       publication: {},
     };
     const status = (activeWire: Record<string, unknown>) => ({
-      schema_version: 'manyforge.manager_status_projection.v1',
+      schema_version: 'manyforge.manager_status_projection.v2',
       source,
       status: {
-        api_version: 'manyforge.manager_source.v1',
+        api_version: 'manyforge.manager_source.v2',
         active: activeWire,
         apply: { mutation_available: true, records: [], unavailable_reason_code: null },
         cell_id: 'cell-a',
@@ -4055,7 +4008,7 @@ describe('headless projection parsers', () => {
       },
     });
     const graph = {
-      schema_version: 'manyforge.manager_graph_projection.v1',
+      schema_version: 'manyforge.manager_graph_projection.v2',
       source,
       graph_revision: 'graph.1',
       retained_bundle_id: 'bundle.1',
@@ -4079,7 +4032,7 @@ describe('headless projection parsers', () => {
     const runtime = parseHeadlessRuntimeSnapshot(runtimeSnapshotFixture());
     const alarms = parseOperatorAlarmSnapshot(alarmSnapshotFixture());
 
-    expect(runtime.sections.logicalScene.sourceOwnerEpoch).toBe('source-epoch-1');
+    expect(runtime.sections.logicalScene.sourceOwnerId).toBe('source-owner');
     expect(alarms.alarms[0]?.lifecycleState).toBe('active_unacknowledged');
     expect(alarms.unacknowledgedMembership[0]?.recordRevision).toBe(3);
     expect(alarms.motionAttentionMembership).toEqual([]);
@@ -4128,13 +4081,14 @@ describe('headless projection parsers', () => {
 
   it('accepts the bounded historian page and validates event schema identity', () => {
     const wire = {
-      schema_version: 'manyforge.historian_summary_page.v2',
+      schema_version: 'manyforge.historian_summary_page.v3',
       time_window: { start_utc_ns: null, end_utc_ns: null },
       retention: null,
       events: [{
         sequence: 7,
+        application_start_id: '3f9a0000000000a1',
         event: {
-          schema_version: 'manyforge.historian_event_summary.v2',
+          schema_version: 'manyforge.historian_event_summary.v3',
           condition_severity: 'ERROR',
           occurred_at_utc_ns: '1785931200000000000',
           clock_owner: 'headless:test-epoch',
@@ -4158,6 +4112,13 @@ describe('headless projection parsers', () => {
 
     expect(page.events[0]?.event.eventType).toBe('operator_alarm_activated');
     expect(page.events[0]?.sequence).toBe(7);
+    // Each row names the start it belongs to.
+    expect(page.events[0]?.applicationStartId).toBe('3f9a0000000000a1');
+    for (const start of [undefined, 'start.1', '0000000000000000']) {
+      const row = structuredClone(wire);
+      (row.events[0] as Record<string, unknown>).application_start_id = start;
+      expect(() => parseHistorianPage(row)).toThrow();
+    }
     expect(() => parseHistorianPage({ ...wire, payload: {} })).toThrow();
     const eventWithPayload = structuredClone(wire);
     (eventWithPayload.events[0]!.event as Record<string, unknown>).payload = {};
@@ -4173,14 +4134,22 @@ describe('headless projection parsers', () => {
     expect(() => parseHistorianPage(noncanonicalTimestamp)).toThrow(
       'a canonical nonnegative int64 decimal string',
     );
+    const operationEvent = structuredClone(wire);
+    Object.assign(operationEvent.events[0]!.event, { program_run_id: 3, operation_id: 7 });
+    expect(parseHistorianPage(operationEvent).events[0]?.event).toMatchObject({
+      programRunId: 3, operationId: 7,
+    });
+    const textIds = structuredClone(wire);
+    Object.assign(textIds.events[0]!.event, { operation_id: 'operation.1.7' });
+    expect(() => parseHistorianPage(textIds)).toThrow();
   });
 
   it('accepts typed exact historian detail availability unions', () => {
     const detail = parseHistorianDetail({
-      schema_version: 'manyforge.historian_detail.v2',
+      schema_version: 'manyforge.historian_detail.v3',
       sequence: 7,
       event: {
-        schema_version: 'manyforge.historian_event.v2',
+        schema_version: 'manyforge.historian_event.v3',
         event_id: 'event-1',
         component: 'manyforge.execution',
         event_type: 'operation_updated',
@@ -4200,7 +4169,7 @@ describe('headless projection parsers', () => {
     expect(detail.sections.executionDigest.available).toBe(true);
     expect(() => parseHistorianDetail({
       ...detail,
-      schema_version: 'manyforge.historian_detail.v2',
+      schema_version: 'manyforge.historian_detail.v3',
     })).toThrow();
   });
 });
@@ -4218,18 +4187,20 @@ describe('addressed Robot Control parsers', () => {
       command: 'read',
       resident: true,
       operation: {
-        operation_id: 'operation-1',
+        operation_id: 1,
         operation_revision: 4,
         state: 'completed',
         participants: [{
-          progress: 1, terminal_error: null,
+          payload_kind: 'motion', progress: 1, terminal_error: null,
           control_binding_id: 'binding-1', control_binding_revision: `sha256:${'a'.repeat(64)}`,
         }],
-        active_stop_id: null,
-        active_stop_generation: null,
+        stop_event_id: null,
       },
     };
     expect(parseOperationObservation(response).resident).toBe(true);
+    expect(parseOperationObservation({
+      ...response, operation: { ...response.operation, stop_event_id: 7 },
+    }).stopEventId).toBe(7);
 
     const missing = structuredClone(response) as Record<string, unknown>;
     delete missing.resident;
@@ -4254,13 +4225,13 @@ describe('addressed Robot Control parsers', () => {
       command_target_id: 'arm',
     };
     const status = parseRuntimeScaleControlStatus({
-      api_version: 'manyforge.execution_command_response.v4',
+      api_version: 'manyforge.execution_command_response.v6',
       command: 'get_runtime_scale_control',
       ok: true,
       runtime_scale_control: {
         active_control_configuration_generation: 1,
         active_control_configuration_id: 'active-1',
-        active_operation_id: 'operation-1',
+        active_operation_id: 1,
         active_operation_revision: 5,
         active_operation_scale_generation: 2,
         application_state: 'applied',
@@ -4286,31 +4257,30 @@ describe('addressed Robot Control parsers', () => {
       },
       controlGeneration: 3,
       requestedScale: 0.5,
-      activeOperationId: 'operation-1',
+      activeOperationId: 1,
       activeOperationScaleGeneration: 2,
     });
 
     const accepted = parseRuntimeScaleControlAccepted({
       accepted: {
         accepted_at_ns: 123,
-        active_operation_id: 'operation-1',
+        active_operation_id: 1,
         active_operation_revision: 5,
         active_operation_scale_generation: 3,
         control_generation: 4,
         replay_status: 'accepted_new',
-        request_id: 'request-scale-1',
+        request_key: 'b'.repeat(32),
         requested_scale: 0.25,
         selector,
       },
-      api_version: 'manyforge.execution_command_response.v4',
+      api_version: 'manyforge.execution_command_response.v6',
       command: 'set_runtime_scale_control',
       ok: true,
     });
     expect(accepted).toMatchObject({
-      requestId: 'request-scale-1',
       controlGeneration: 4,
       requestedScale: 0.25,
-      activeOperationId: 'operation-1',
+      activeOperationId: 1,
     });
   });
 
@@ -4336,7 +4306,7 @@ describe('addressed Robot Control parsers', () => {
       ...member(command_target_id), component_id, command_target_id,
     });
     const response = {
-      api_version: 'manyforge.execution_command_response.v4', command: 'get_runtime_scale_control', ok: true,
+      api_version: 'manyforge.execution_command_response.v6', command: 'get_runtime_scale_control', ok: true,
       runtime_scale_control: {
         active_control_configuration_generation: null, active_control_configuration_id: null,
         active_operation_id: null, active_operation_revision: null, active_operation_scale_generation: null,
@@ -4360,10 +4330,10 @@ describe('addressed Robot Control parsers', () => {
       accepted: {
         accepted_at_ns: 123, active_operation_id: null, active_operation_revision: null,
         active_operation_scale_generation: null, control_generation: 2,
-        replay_status: 'accepted_new', request_id: 'request-group-1', requested_scale: 0.25,
+        replay_status: 'accepted_new', request_key: 'c'.repeat(32), requested_scale: 0.25,
         selector,
       },
-      api_version: 'manyforge.execution_command_response.v4',
+      api_version: 'manyforge.execution_command_response.v6',
       command: 'set_runtime_scale_control', ok: true,
     }).selector).toMatchObject({ kind: 'group', programBindingId: 'binding-program-1' });
     expect(() => parseRuntimeScaleControlStatus({
@@ -4464,13 +4434,13 @@ describe('addressed Robot Control parsers', () => {
       ok: true,
       command: 'status',
       status: {
-        owner_epoch: 'owner-1',
+        application_start_id: 'owner-1',
         cell_id: 'cell-1',
         active_publication_generation: 1,
         cell_stop_action: {
           available: true,
-          expected_stop_generation: 4,
-          latest_terminal: null,
+          last_completed: null,
+          last_event_id: 4,
           unavailable_reason: null,
         },
         graph_revision: 'sha256:graph',
@@ -4483,13 +4453,12 @@ describe('addressed Robot Control parsers', () => {
           target: directTarget('arm'),
           tcp_frame: directFrame('direct.tcp-frame'),
           active_tcp: { entry: directEntry('arm', 'direct.tcp-frame'), display: 'robot-a.tcp',
-            owner_epoch: 'owner-1', registration_generation: 1, sequence: 0 },
+            registration_generation: 1, sequence: 0 },
           operation_capability_id: 'execution.trajectory.execute',
           planning_capability_ids: ['planning.motion.joint_goal'],
           program_id: 'manyforge.direct_control.motion',
           program_revision: 'sha256:program',
           program_binding_id: 'sha256:binding',
-          program_run_id: 'direct-control-owner-1',
           observed_state: {
             complete: true,
             current_tcp_pose: {
@@ -4575,7 +4544,6 @@ describe('addressed Robot Control parsers', () => {
           program_binding_id: 'sha256:gripper-binding',
           program_id: 'manyforge.direct_control.gripper',
           program_revision: 'sha256:gripper-program',
-          program_run_id: 'direct-control-gripper-owner-1',
           resource: {
             coordinate_kind: 'linear_m',
             max_position: 0.04,
@@ -4637,21 +4605,21 @@ describe('addressed Robot Control parsers', () => {
         observed_targets: [],
       },
     };
-    // execution_identity.v2: runtime identity only.
+    // execution_identity.v3: runtime identity only.
     const identity = {
       active_publication_generation: 1,
       cell_id: 'cell-1',
       control_management_mode: 'component_lifecycle',
       graph_revision: 'sha256:graph',
-      owner_epoch: 'owner-1',
+      application_start_id: 'owner-1',
       retained_bundle_id: 'sha256:bundle',
-      schema_version: 'manyforge.execution_identity.v2',
+      schema_version: 'manyforge.execution_identity.v3',
     };
     const parsedIdentity = parseExecutionIdentity({
       command: 'identity', identity, ok: true,
-      api_version: 'manyforge.execution_command_response.v4',
+      api_version: 'manyforge.execution_command_response.v6',
     });
-    expect(parsedIdentity.ownerEpoch).toBe('owner-1');
+    expect(parsedIdentity.applicationStartId).toBe('owner-1');
     expect(parsedIdentity.controlManagementMode).toBe('component_lifecycle');
     // The Scene revision is not part of the execution identity.
     expect(parsedIdentity).not.toHaveProperty('sceneRevision');
@@ -4660,14 +4628,14 @@ describe('addressed Robot Control parsers', () => {
       command: 'identity',
       identity: { ...identity, motion_target_role_id: 'command_target' },
       ok: true,
-      api_version: 'manyforge.execution_command_response.v4',
+      api_version: 'manyforge.execution_command_response.v6',
     })).toThrow(/exactly/);
     expect(() => parseExecutionIdentity({
       command: 'identity',
-      identity: { ...identity, schema_version: 'manyforge.execution_identity.v1' },
+      identity: { ...identity, schema_version: 'manyforge.execution_identity.v2' },
       ok: true,
-      api_version: 'manyforge.execution_command_response.v4',
-    })).toThrow(/execution_identity.v2/);
+      api_version: 'manyforge.execution_command_response.v6',
+    })).toThrow(/execution_identity.v3/);
 
     const {
       observed_state: observedMotion,
@@ -4688,7 +4656,6 @@ describe('addressed Robot Control parsers', () => {
         program_binding_id: programBindingId,
         program_id: programId,
         program_revision: programRevision,
-        program_run_id: programRunId,
         ...command
       } = fields;
       return {
@@ -4698,7 +4665,6 @@ describe('addressed Robot Control parsers', () => {
             program_binding_id: programBindingId,
             program_id: programId,
             program_revision: programRevision,
-            program_run_id: programRunId,
           },
         },
         command_target_id: commandTargetId,
@@ -4711,11 +4677,11 @@ describe('addressed Robot Control parsers', () => {
         < JSON.stringify([right.command_target_id, right.operation_capability_id]) ? -1 : 1));
     const eligible = { command_eligible: true, reason: null };
     const targetsV4 = (components: unknown[]) => ({
-      api_version: 'manyforge.execution_command_response.v4',
+      api_version: 'manyforge.execution_command_response.v6',
       command: 'targets',
       identity,
       ok: true,
-      targets: { components, schema_version: 'manyforge.execution_targets.v4' },
+      targets: { components, schema_version: 'manyforge.execution_targets.v5' },
     });
     const observedRow = (
       target: Record<string, unknown>,
@@ -4752,26 +4718,27 @@ describe('addressed Robot Control parsers', () => {
       },
       supported: true,
     };
-    const controlV7 = (
+    const controlV8 = (
       observedTargets: unknown[],
       runtimeScaleControl: unknown = runtimeScale,
     ): { control_state: Record<string, unknown> } & Record<string, unknown> => ({
-      api_version: 'manyforge.execution_command_response.v4',
+      api_version: 'manyforge.execution_command_response.v6',
       command: 'control_state',
       control_state: {
         cell_stop_action: response.status.cell_stop_action,
         manual_operations: [] as unknown[],
         observed_targets: observedTargets,
         runtime_scale_control: runtimeScaleControl,
-        schema_version: 'manyforge.execution_control_state.v7',
+        schema_version: 'manyforge.execution_control_state.v8',
       },
       identity,
       ok: true,
     });
     type WireRow = Record<string, unknown>;
-    // The execution_status.v3 wire composition (identity.v2, targets.v4,
-    // control_state.v7 of one owner snapshot) of a fixture that lists its
-    // addressed targets in the internal layout.
+    // The execution_status.v4 wire composition (identity, targets.v5,
+    // control_state.v8 of one owner snapshot, and the per-robot check
+    // counts) of a fixture that lists its addressed targets in the internal
+    // layout.
     const composed = (fixture: { status: WireRow }) => {
       const source = fixture.status;
       const rowsAt = (list: unknown, single: unknown) => (
@@ -4790,7 +4757,7 @@ describe('addressed Robot Control parsers', () => {
       const componentIds = [...new Set([...motions, ...grippers]
         .map((row) => row.controllable_component_id as string))].sort();
       return {
-        api_version: 'manyforge.execution_command_response.v4',
+        api_version: 'manyforge.execution_command_response.v6',
         command: 'status',
         ok: true,
         status: {
@@ -4802,10 +4769,17 @@ describe('addressed Robot Control parsers', () => {
               ...grippers.map((row) => observedRow(row, 'coordinate', row.observed_state)),
             ],
             runtime_scale_control: motions.length === 0 ? null : runtimeScale,
-            schema_version: 'manyforge.execution_control_state.v7',
+            schema_version: 'manyforge.execution_control_state.v8',
           },
           identity,
-          schema_version: 'manyforge.execution_status.v3',
+          runtime_collision_checks: componentIds.map((componentId) => ({
+            check_period_ns: 50_000_000,
+            checks_late: 0,
+            checks_run: 0,
+            controllable_component_id: componentId,
+            periods_skipped: 0,
+          })),
+          schema_version: 'manyforge.execution_status.v4',
           targets: {
             components: componentIds.map((componentId) => ({
               availability: eligible,
@@ -4819,7 +4793,7 @@ describe('addressed Robot Control parsers', () => {
                   .map((row) => wireTarget(withoutObservation(row), 'gripper')),
               ]),
             })),
-            schema_version: 'manyforge.execution_targets.v4',
+            schema_version: 'manyforge.execution_targets.v5',
           },
         },
       };
@@ -4830,7 +4804,7 @@ describe('addressed Robot Control parsers', () => {
     const selectedTool = structuredClone(response);
     Object.assign(selectedTool.status.direct_control, {
       tcp_frame: null,
-      active_tcp: { entry: null, display: null, owner_epoch: 'owner-1', registration_generation: 1, sequence: 0 },
+      active_tcp: { entry: null, display: null, registration_generation: 1, sequence: 0 },
     });
     Object.assign(selectedTool.status.direct_control.observed_state, { current_tcp_pose: null });
     selectedTool.status.direct_control.target_descriptor.tcps[0].default = false;
@@ -4842,7 +4816,8 @@ describe('addressed Robot Control parsers', () => {
     expect(status.observedMotion!.positionsRad).toEqual([0.2]);
     expect(status.observedMotion!.currentTcpPose!.position_m.z_m).toBe(0.4);
     expect(status.observedGripper?.position).toBe(0.02);
-    expect(status.cellStopAction.expectedStopGeneration).toBe(4);
+    expect(status.cellStopAction.lastEventId).toBe(4);
+    expect(status.cellStopAction.lastCompleted).toBeNull();
     expect(status.directControl!.targetDescriptor.operationalJointLimits[0])
       .toMatchObject({
         deploymentMaxVelocityRadS: 1.5,
@@ -4859,12 +4834,12 @@ describe('addressed Robot Control parsers', () => {
     // default row; joint jog still works.
     const noTcp = structuredClone(response);
     Object.assign(noTcp.status.direct_control, { tcp_frame: null,
-      active_tcp: { entry: null, display: null, owner_epoch: 'owner-1', registration_generation: 1, sequence: 0 } });
+      active_tcp: { entry: null, display: null, registration_generation: 1, sequence: 0 } });
     Object.assign(noTcp.status.direct_control.observed_state, { current_tcp_pose: null });
     noTcp.status.direct_control.target_descriptor.tcps[0].default = false;
     const withoutTcp = parseExecutionOwnerStatus(composed(noTcp));
     expect(withoutTcp.directControl!.activeTcp).toMatchObject({ entry: null, display: null,
-      ownerEpoch: 'owner-1', registrationGeneration: 1, sequence: 0 });
+      applicationStartId: 'owner-1', registrationGeneration: 1, sequence: 0 });
     expect(withoutTcp.directControl!.tcpFrameRoleId).toBeNull();
     expect(withoutTcp.observedMotion!.currentTcpPose).toBeNull();
     expect(withoutTcp.directControl!.targetDescriptor.tcps.map((tcp) => tcp.isDefault)).toEqual([false]);
@@ -4927,10 +4902,30 @@ describe('addressed Robot Control parsers', () => {
     expect(() => parseExecutionOwnerStatus(aliased)).toThrow(/exactly/);
     const oldStatus = composed(response) as { status: WireRow };
     oldStatus.status.schema_version = 'manyforge.execution_status.v1';
-    expect(() => parseExecutionOwnerStatus(oldStatus)).toThrow(/execution_status.v3/);
+    expect(() => parseExecutionOwnerStatus(oldStatus)).toThrow(/execution_status.v4/);
+    // The released v3 is refused next to v4, with or without the new member.
+    const releasedStatus = composed(response) as { status: WireRow };
+    releasedStatus.status.schema_version = 'manyforge.execution_status.v3';
+    expect(() => parseExecutionOwnerStatus(releasedStatus)).toThrow(/execution_status.v4/);
+    delete releasedStatus.status.runtime_collision_checks;
+    expect(() => parseExecutionOwnerStatus(releasedStatus)).toThrow(/exactly/);
+    // OD-217 check rows: exact keys and non-negative integer counts.
+    const lateChecks = composed(response) as { status: WireRow };
+    lateChecks.status.runtime_collision_checks = [{
+      check_period_ns: 10_000_000, checks_late: 3, checks_run: 4,
+      controllable_component_id: 'robot-a', periods_skipped: 4,
+    }];
+    expect(() => parseExecutionOwnerStatus(lateChecks)).not.toThrow();
+    const extraCount = structuredClone(lateChecks);
+    (extraCount.status.runtime_collision_checks as WireRow[])[0].late_episodes = 2;
+    expect(() => parseExecutionOwnerStatus(extraCount))
+      .toThrow(/runtime_collision_checks\[0\]/);
+    const negativeCount = structuredClone(lateChecks);
+    (negativeCount.status.runtime_collision_checks as WireRow[])[0].checks_late = -1;
+    expect(() => parseExecutionOwnerStatus(negativeCount)).toThrow(/checks_late/);
     const tornStatus = composed(response) as { status: WireRow };
     tornStatus.status.targets = { components: [], schema_version: 'manyforge.execution_targets.v2' };
-    expect(() => parseExecutionOwnerStatus(tornStatus)).toThrow(/execution_targets.v4/);
+    expect(() => parseExecutionOwnerStatus(tornStatus)).toThrow(/execution_targets.v5/);
 
     const armRow = wireTarget(motionTarget, 'motion');
     const gripperRow = wireTarget(gripperTarget, 'gripper');
@@ -4943,7 +4938,7 @@ describe('addressed Robot Control parsers', () => {
       controllable_component_id: motionTarget.controllable_component_id,
       targets: byTargetKey([armRow, gripperRow]),
     }]);
-    const controlResponse = controlV7([armObserved, gripperObserved]);
+    const controlResponse = controlV8([armObserved, gripperObserved]);
     const scoped = parseExecutionControlStatus(targetsResponse, controlResponse);
     expect(scoped.directControlTargets).toHaveLength(1);
     expect(scoped.directControlGripperTargets).toHaveLength(1);
@@ -5170,7 +5165,7 @@ describe('addressed Robot Control parsers', () => {
         controllable_component_id: motionTarget.controllable_component_id,
         targets: [armRow],
       }]),
-      controlV7([armObserved]),
+      controlV8([armObserved]),
     );
     expect(armOnly.directControlGripper).toBeNull();
     expect(armOnly.directControlGripperTargets).toEqual([]);
@@ -5202,7 +5197,7 @@ describe('addressed Robot Control parsers', () => {
         },
       ].sort((left, right) => (
         left.controllable_component_id < right.controllable_component_id ? -1 : 1))),
-      controlV7([armObserved, observedRow(independentGripper, 'coordinate', observedGripper)]),
+      controlV8([armObserved, observedRow(independentGripper, 'coordinate', observedGripper)]),
     );
     expect(independent.directControlGripperTargets[0].controllableComponentId).toBe('gripper-1');
     expect(independent.components.find((row) => row.controllableComponentId === 'gripper-1'))
@@ -5215,7 +5210,7 @@ describe('addressed Robot Control parsers', () => {
         controllable_component_id: 'gripper-1',
         targets: [wireTarget(independentGripper, 'gripper')],
       }]),
-      controlV7([observedRow(independentGripper, 'coordinate', observedGripper)], null),
+      controlV8([observedRow(independentGripper, 'coordinate', observedGripper)], null),
     );
     expect(gripperOnly.directControl).toBeNull();
     expect(gripperOnly.observedMotion).toBeNull();
@@ -5238,7 +5233,7 @@ describe('addressed Robot Control parsers', () => {
           },
         ]),
       }]),
-      controlV7([observedRow(independentGripper, 'coordinate', observedGripper)], null),
+      controlV8([observedRow(independentGripper, 'coordinate', observedGripper)], null),
     );
     expect(withUnsupported.components[0].unsupportedTargets).toEqual([
       { commandTargetId: 'vacuum', operationCapabilityId: 'tool.vacuum.command' },
@@ -5254,14 +5249,14 @@ describe('addressed Robot Control parsers', () => {
           presentation: 'unsupported',
         }],
       }]),
-      controlV7([{
+      controlV8([{
         command_target_id: 'vacuum', controllable_component_id: 'gripper-1',
         observed: null, operation_capability_id: 'tool.vacuum.command',
       }], null),
     )).toThrow(/observations only for commandable addressed targets/);
 
     // An observation without its target, or a missing observation, is refused.
-    expect(() => parseExecutionControlStatus(targetsResponse, controlV7([armObserved])))
+    expect(() => parseExecutionControlStatus(targetsResponse, controlV8([armObserved])))
       .toThrow(/one observation row for the exact addressed target/);
     // Ineligibility needs an existing refusal reason, and vice versa.
     expect(() => parseExecutionControlStatus(
@@ -5270,13 +5265,15 @@ describe('addressed Robot Control parsers', () => {
         controllable_component_id: motionTarget.controllable_component_id,
         targets: [armRow],
       }]),
-      controlV7([armObserved]),
+      controlV8([armObserved]),
     )).toThrow(/refusal reason exactly when ineligible/);
     // Old wire versions are not accepted (one clean cutover).
     const legacyTargets = structuredClone(targetsResponse) as { targets: Record<string, unknown> };
-    legacyTargets.targets.schema_version = 'manyforge.execution_targets.v2';
-    expect(() => parseExecutionControlStatus(legacyTargets, controlResponse))
-      .toThrow(/execution_targets.v4/);
+    for (const legacy of ['manyforge.execution_targets.v2', 'manyforge.execution_targets.v4']) {
+      legacyTargets.targets.schema_version = legacy;
+      expect(() => parseExecutionControlStatus(legacyTargets, controlResponse))
+        .toThrow(/execution_targets.v5/);
+    }
     const groupedControlResponse: { control_state: Record<string, unknown> } = structuredClone(controlResponse);
     groupedControlResponse.control_state.runtime_scale_control = {
       ...runtimeScale,
@@ -5319,28 +5316,65 @@ describe('addressed Robot Control parsers', () => {
     ).toMatchObject({ kind: 'group', programBindingId: 'sha256:binding' });
     const retired = {
       resident: false, operation: {
-        program_run_id: motionTarget.program_run_id, operation_id: 'manual-1', operation_revision: 2,
+        program_run_id: null, operation_id: 11, operation_revision: 2,
         state: 'completed', participants: [{
-          progress: 1, terminal_error: null,
+          payload_kind: 'motion', progress: 1, terminal_error: null,
           controllable_component_id: motionTarget.controllable_component_id,
           command_target_id: motionTarget.command_target_id,
           control_binding_id: 'binding-arm', control_binding_revision: exactRevision,
         }],
-        active_stop_id: null, active_stop_generation: null,
+        stop_event_id: null,
       },
     };
     controlResponse.control_state.manual_operations = [retired];
     expect(parseExecutionControlStatus(targetsResponse, controlResponse).manualOperations[0])
-      .toMatchObject({operationId: 'manual-1', resident: false, state: 'completed'});
+      .toMatchObject({operationId: 11, resident: false, state: 'completed'});
     for (const rows of [
-      [{...retired, operation: {...retired.operation, program_run_id: 'foreign'}}],
+      [{...retired, operation: {...retired.operation, program_run_id: 99}}],
       [{...retired, operation: {...retired.operation, state: 'executing'}}],
-      [retired, {...retired, operation: {...retired.operation, operation_id: 'duplicate-target'}}],
+      [retired, {...retired, operation: {...retired.operation, operation_id: 12}}],
       [retired, retired, retired],
     ]) {
       controlResponse.control_state.manual_operations = rows;
       expect(() => parseExecutionControlStatus(targetsResponse, controlResponse)).toThrow();
     }
+    // Manual results are kept per target: two arms in one cell each keep
+    // their own latest result; two results for one target are refused.
+    const secondArm = <T,>(row: T): T => JSON.parse(
+      JSON.stringify(row).replaceAll('"robot-a"', '"robot-b"'),
+    ) as T;
+    const armB = secondArm(motionTarget);
+    const twoArmTargets = targetsV4([{
+      availability: eligible,
+      controllable_component_id: motionTarget.controllable_component_id,
+      targets: [armRow],
+    }, {
+      availability: eligible,
+      controllable_component_id: armB.controllable_component_id,
+      targets: [wireTarget(armB, 'motion')],
+    }]);
+    const twoArmControl = controlV8([
+      armObserved,
+      observedRow(armB, 'joint_positions', secondArm(observedMotion)),
+    ]);
+    const manualOn = (target: typeof motionTarget, operationId: number) => ({
+      ...retired,
+      operation: {
+        ...retired.operation,
+        operation_id: operationId,
+        participants: [{
+          ...retired.operation.participants[0],
+          controllable_component_id: target.controllable_component_id,
+          command_target_id: target.command_target_id,
+        }],
+      },
+    });
+    twoArmControl.control_state.manual_operations = [manualOn(motionTarget, 11), manualOn(armB, 12)];
+    expect(parseExecutionControlStatus(twoArmTargets, twoArmControl).manualOperations
+      .map((operation) => [operation.operationId, operation.controllableComponentId, operation.commandTargetId]))
+      .toEqual([[11, 'robot-a', 'arm'], [12, 'robot-b', 'arm']]);
+    twoArmControl.control_state.manual_operations = [manualOn(armB, 11), manualOn(armB, 12)];
+    expect(() => parseExecutionControlStatus(twoArmTargets, twoArmControl)).toThrow(/manual-target/);
     expect(scoped.directControl!.targetDescriptor).toEqual(
       status.directControl!.targetDescriptor,
     );
@@ -5348,33 +5382,31 @@ describe('addressed Robot Control parsers', () => {
 
     const stopped = structuredClone(response);
     Object.assign(stopped.status.cell_stop_action, {
-      latest_terminal: {
-        certificate: {
-          stop_certificate_id: 'stop-certificate.4',
-          stop_certificate_revision: 1,
-          stop_generation: 4,
-          stop_id: 'stop.4',
-        },
+      last_completed: {
+        applied: 'stop_all',
+        completed_at_ns: 9_000,
         escalated: true,
-        executed_stages: [{
-          action_class: 'controlled',
-          executed_mode: 'hard_deceleration',
-          operation_id: 'operation.1',
-          outcome: 'succeeded',
-          participant_id: 'participant.1',
-          stage_id: 'controlled.1',
-          stage_index: 1,
-          substitution_reason: 'soft mode unavailable',
-        }],
-        hard_stop_floor_used: false,
-        result: 'succeeded_escalated',
+        event_id: 4,
+        result: 'stopped_escalated',
       },
     });
     const stoppedStatus = parseExecutionOwnerStatus(composed(stopped));
-    expect(stoppedStatus.cellStopAction.latestTerminal?.certificate.stopId)
-      .toBe('stop.4');
-    expect(stoppedStatus.cellStopAction.latestTerminal?.executedStages[0])
-      .toMatchObject({ executedMode: 'hard_deceleration', stageIndex: 1 });
+    expect(stoppedStatus.cellStopAction.lastCompleted).toEqual({
+      eventId: 4, applied: 'stop_all', result: 'stopped_escalated', escalated: true, completedAtNs: 9_000,
+    });
+    // A completed event never is newer than the last accepted one, never
+    // `pending`, and names a Stop kind; the certificate shape is refused.
+    for (const completed of [
+      { event_id: 5 }, { result: 'pending' }, { applied: 'full_stop' },
+      { certificate: null },
+    ]) {
+      const wrong = structuredClone(stopped);
+      Object.assign(wrong.status.cell_stop_action.last_completed as unknown as object, completed);
+      expect(() => parseExecutionOwnerStatus(composed(wrong))).toThrow(/last_completed/);
+    }
+    const certificate = structuredClone(response);
+    Object.assign(certificate.status.cell_stop_action, { latest_terminal: null });
+    expect(() => parseExecutionOwnerStatus(composed(certificate))).toThrow(/cell_stop_action/);
     // The stop-fault latch is gone; a `fault` field is refused.
     const latched = structuredClone(stopped);
     Object.assign(latched.status.cell_stop_action, { fault: null });
@@ -5552,15 +5584,14 @@ describe('addressed Robot Control parsers', () => {
       ok: true,
       command: 'preview_motion',
       preview_receipt: {
-        schema_version: 'manyforge.direct_control_motion_preview.v4',
+        schema_version: 'manyforge.direct_control_motion_preview.v5',
         receipt_digest: 'sha256:receipt',
         intent_digest: 'sha256:intent',
-        request_id: 'request-1',
-        request_owner_epoch: 'owner-1',
+        request_key: 'c0112233445566778899aabbccddeeff',
         program_id: 'manyforge.direct_control.motion',
         program_revision: 'sha256:program',
         program_binding_id: 'sha256:binding',
-        program_run_id: 'direct-control-owner-1',
+        program_run_id: null,
         graph_revision: 'sha256:graph',
         retained_bundle_id: 'sha256:bundle',
         scene_revision: sceneRevision,
@@ -5571,7 +5602,6 @@ describe('addressed Robot Control parsers', () => {
             frame: { component_id: 'tool', frame_id: 'tool-tip' },
           },
           source: 'active_tcp',
-          owner_epoch: 'owner-1',
           registration_generation: 2,
           sequence: 0,
         },
@@ -5604,7 +5634,6 @@ describe('addressed Robot Control parsers', () => {
         frame: { componentId: 'tool', frameId: 'tool-tip' },
       },
       source: 'active_tcp',
-      ownerEpoch: 'owner-1',
       registrationGeneration: 2,
       sequence: 0,
     });
@@ -5645,13 +5674,17 @@ describe('addressed Robot Control parsers', () => {
       /active_tcp, joint_flange_fallback, or explicit_entry/,
     );
 
-    const missingOwner = structuredClone(response);
-    missingOwner.preview_receipt.resolved_tcp.owner_epoch = '';
-    expect(() => parseMotionPreviewResponse(missingOwner)).toThrow(/non-empty string/);
+    const retiredOwner = structuredClone(response);
+    Object.assign(retiredOwner.preview_receipt.resolved_tcp, { owner_epoch: 'owner-1' });
+    expect(() => parseMotionPreviewResponse(retiredOwner)).toThrow(/exactly/);
 
-    const crossedOwner = structuredClone(response);
-    crossedOwner.preview_receipt.resolved_tcp.owner_epoch = 'owner-2';
-    expect(() => parseMotionPreviewResponse(crossedOwner)).toThrow(/same owner epoch/);
+    const textKey = structuredClone(response);
+    textKey.preview_receipt.request_key = 'request-1';
+    expect(() => parseMotionPreviewResponse(textKey)).toThrow(/request_key/);
+
+    const ownerFence = structuredClone(response);
+    Object.assign(ownerFence.preview_receipt, { request_owner_epoch: 'owner-1' });
+    expect(() => parseMotionPreviewResponse(ownerFence)).toThrow(/exactly/);
 
     const zeroRegistration = structuredClone(response);
     zeroRegistration.preview_receipt.resolved_tcp.registration_generation = 0;
@@ -5674,15 +5707,14 @@ describe('addressed Robot Control parsers', () => {
       command: 'preview_capability_command',
       preview_receipt: {
         schema_version:
-          'manyforge.direct_control_capability_command_preview.v2',
+          'manyforge.direct_control_capability_command_preview.v3',
         receipt_digest: 'sha256:receipt',
         intent_digest: 'sha256:intent',
-        request_id: 'request-gripper-1',
-        request_owner_epoch: 'owner-1',
+        request_key: 'c0112233445566778899aabbccddeeff',
         program_id: 'manyforge.direct_control.gripper',
         program_revision: 'sha256:gripper-program',
         program_binding_id: 'sha256:gripper-binding',
-        program_run_id: 'direct-control-gripper-owner-1',
+        program_run_id: null,
         graph_revision: 'sha256:graph',
         retained_bundle_id: 'sha256:bundle',
         target: { component_id: 'robot', command_target_id: 'gripper' },
@@ -5717,13 +5749,19 @@ describe('addressed Robot Control parsers', () => {
     Object.assign(withScene.preview_receipt, { scene_revision: sceneRevision });
     expect(() => parseCapabilityCommandPreviewResponse(withScene))
       .toThrow(/exactly/);
+
+    // The request-id/owner-epoch version 2 is refused.
+    const previous = structuredClone(response);
+    previous.preview_receipt.schema_version =
+      'manyforge.direct_control_capability_command_preview.v2';
+    expect(() => parseCapabilityCommandPreviewResponse(previous)).toThrow();
   });
 });
 
 
 describe('persistent key value parsers', () => {
   const listing = {
-    schema_version: 'manyforge.persistent_key_values.v1',
+    schema_version: 'manyforge.persistent_key_values.v3',
     scenario_id: 'cell-pick',
     project_path: '/projects/cell-pick.scenario',
     program_revision: `sha256:${'a'.repeat(64)}`,
@@ -5741,17 +5779,16 @@ describe('persistent key value parsers', () => {
     ],
     edits: [{
       sequence: 2, project_path: '/projects/cell-pick.scenario', key: 'layer', action: 'set',
-      request_id: 'request.1', source_label: 'operator_ui',
+      application_start_id: '3f9a000000000001', request_key: '1'.repeat(32), source_label: 'operator_ui',
       program_run_id: null, node_instance_id: null, node_attempt_id: null,
       reason: null, detail: null,
     }, {
       sequence: 3, project_path: '/projects/cell-pick.scenario', key: 'layer', action: 'set',
-      request_id: null, source_label: 'program_node',
-      program_run_id: 'program-cycle.1', node_instance_id: 'set_layer', node_attempt_id: null,
+      // Written under an earlier application start than the first edit.
+      application_start_id: 'b07c000000000002', request_key: null, source_label: 'program_node',
+      program_run_id: 1, node_instance_id: 'set_layer', node_attempt_id: 4,
       reason: null, detail: null,
     }],
-    storage_fault: null,
-    apply_observation_fault: null,
   };
 
   it('parses stored values, their starting values and the audited edits', () => {
@@ -5768,29 +5805,28 @@ describe('persistent key value parsers', () => {
     ]);
     expect(parsed.sequence).toBe(3);
     expect(parsed.edits).toEqual([{
-      sequence: 2, key: 'layer', action: 'set',
-      requestId: 'request.1', sourceLabel: 'operator_ui',
+      sequence: 2, key: 'layer', action: 'set', applicationStartId: '3f9a000000000001',
+      requestKey: '1'.repeat(32), sourceLabel: 'operator_ui',
       programRunId: null, nodeInstanceId: null, nodeAttemptId: null,
       reason: null, detail: null,
     }, {
-      // A run's node write names the run and node instead of a request.
-      sequence: 3, key: 'layer', action: 'set',
-      requestId: null, sourceLabel: 'program_node',
-      programRunId: 'program-cycle.1', nodeInstanceId: 'set_layer', nodeAttemptId: null,
+      // A run's node write names the run and node instead of a request, and
+      // keeps the start that wrote it.
+      sequence: 3, key: 'layer', action: 'set', applicationStartId: 'b07c000000000002',
+      requestKey: null, sourceLabel: 'program_node',
+      programRunId: 1, nodeInstanceId: 'set_layer', nodeAttemptId: 4,
       reason: null, detail: null,
     }]);
-    expect(parsed.storageFault).toBeNull();
-    expect(parsed.applyObservationFault).toBeNull();
-    expect(parsePersistentKeyEdit({
-      schema_version: 'manyforge.persistent_key_edit.v1',
-      request_id: 'request.2', action: 'reset', key: 'layer', values: listing,
-    }).projectPath).toBe('/projects/cell-pick.scenario');
-    expect(parsePersistentKeyValuesCleared({
-      schema_version: 'manyforge.persistent_key_edit.v1',
-      request_id: 'request.3', action: 'clear',
-      project_path: '/projects/cell-pick.scenario', removed: 2,
+    // A stored-value edit answers at acceptance with its runner row (OD-214).
+    expect(parseProgramCommandReply({
+      schema_version: 'manyforge.program_command_reply.v1',
+      command: {
+        kind: 'persistent_value_reset', request_key: '2'.repeat(32), step: 'applying',
+        accepted_at_ns: 5, end: null,
+      },
     })).toEqual({
-      requestId: 'request.3', projectPath: '/projects/cell-pick.scenario', removed: 2,
+      kind: 'persistent_value_reset', requestKey: '2'.repeat(32), step: 'applying',
+      acceptedAtNs: 5, end: null,
     });
   });
 
@@ -5815,31 +5851,51 @@ describe('persistent key value parsers', () => {
       expect(() => parsePersistentKeyValues({ ...listing, project_path: projectPath }))
         .toThrow(/project_path/);
     }
-    expect(() => parsePersistentKeyEdit({
-      schema_version: 'manyforge.persistent_key_edit.v1',
-      request_id: 'request.2', action: 'clear', key: 'layer', values: listing,
-    })).toThrow(/set or reset/);
+    expect(() => parseProgramCommandReply({
+      schema_version: 'manyforge.persistent_key_edit.v2',
+      command: {
+        kind: 'persistent_values_clear', request_key: '2'.repeat(32), step: 'applying',
+        accepted_at_ns: 5, end: null,
+      },
+    })).toThrow(/schema_version/);
+    // Ids are integers and request keys 32 hex characters (contracts 1.4, 1.5).
+    expect(() => parsePersistentKeyValues({
+      ...listing, edits: [{ ...listing.edits[1], program_run_id: 'program-cycle.1' }],
+    })).toThrow(/program_run_id/);
+    expect(() => parsePersistentKeyValues({
+      ...listing, edits: [{ ...listing.edits[0], request_key: 'request.1' }],
+    })).toThrow(/request_key/);
+    // Every edit names the start that wrote it, in its 16-hex form.
+    for (const start of [undefined, null, '3F9A000000000001', '3f9a', '0000000000000000']) {
+      expect(() => parsePersistentKeyValues({
+        ...listing, edits: [{ ...listing.edits[0], application_start_id: start }],
+      })).toThrow(/application_start_id|exactly/);
+    }
+    expect(() => parsePersistentKeyValues({
+      ...listing, schema_version: 'manyforge.persistent_key_values.v2',
+    })).toThrow(/schema_version/);
+    expect(() => parseProgramCommandReply({
+      schema_version: 'manyforge.program_command_reply.v1',
+      command: {
+        kind: 'persistent_values_clear', request_id: 'request.3', step: 'applying',
+        accepted_at_ns: 5, end: null,
+      },
+    })).toThrow(/exactly/);
   });
 
-  it('parses dropped values with their reason and a storage fault', () => {
+  it('parses dropped values with their reason', () => {
     const dropped = {
       sequence: 4, project_path: '/projects/cell-pick.scenario', key: null, action: 'dropped',
-      request_id: null, source_label: 'committed_apply',
+      application_start_id: '3f9a000000000001', request_key: null, source_label: 'committed_apply',
       program_run_id: null, node_instance_id: null, node_attempt_id: null,
-      reason: 'applied_program_not_observed', detail: null,
+      reason: 'key_not_declared_persistent', detail: null,
     };
     const parsed = parsePersistentKeyValues({
       ...listing,
       edits: [dropped],
-      storage_fault: {
-        code: 'persistent_key_storage_unavailable', message: 'read-only file system',
-      },
     });
     expect(parsed.edits[0]).toMatchObject({
-      action: 'dropped', key: null, reason: 'applied_program_not_observed',
-    });
-    expect(parsed.storageFault).toEqual({
-      code: 'persistent_key_storage_unavailable', message: 'read-only file system',
+      action: 'dropped', key: null, reason: 'key_not_declared_persistent',
     });
     // A drop always names why; nothing else does.
     expect(() => parsePersistentKeyValues({
@@ -5850,26 +5906,12 @@ describe('persistent key value parsers', () => {
     })).toThrow(/reason/);
   });
 
-  it('parses a committed Apply the runner never observed as a named fault', () => {
-    const missed = `sha256:${'b'.repeat(64)}`;
-    const parsed = parsePersistentKeyValues({
-      ...listing,
-      edits: [{
-        sequence: 4, project_path: '/projects/cell-pick.scenario', key: null, action: 'fault',
-        request_id: null, source_label: 'committed_apply',
-        program_run_id: null, node_instance_id: null, node_attempt_id: null,
-        reason: 'applied_program_not_observed', detail: `committed Apply ${missed} was not observed`,
-      }],
-      apply_observation_fault: { code: 'applied_program_not_observed', record_digests: [missed] },
-    });
-    expect(parsed.edits[0]).toMatchObject({ action: 'fault', reason: 'applied_program_not_observed' });
-    expect(parsed.applyObservationFault).toEqual({
-      code: 'applied_program_not_observed', recordDigests: [missed],
-    });
+  it('refuses the removed Apply-observation fault', () => {
+    expect(() => parsePersistentKeyValues({ ...listing, apply_observation_fault: null }))
+      .toThrow(/exactly/);
     expect(() => parsePersistentKeyValues({
-      ...listing,
-      apply_observation_fault: { code: 'applied_program_not_observed', record_digests: [] },
-    })).toThrow(/at least one/);
+      ...listing, edits: [{ ...listing.edits[0], action: 'fault', reason: 'x' }],
+    })).toThrow(/action/);
   });
 });
 
@@ -5973,25 +6015,21 @@ it('projects a no-Program status with its Scenario origin', () => {
 
 
 describe('closed known Program Run outcomes', () => {
-  function outcome(code = 'program_run_started_then_failed') {
-    const before = code === 'program_run_stopped_before_start';
-    const stopped = before || code === 'program_run_superseded_by_stop';
-    return { detail: { code, message: stopped ? 'Operator Stop won' : 'Component became inactive',
-      details: { program_run_id: 'program-cycle.2', claim_generation: before ? null : 9,
-        needs_reset: true, cause_code: stopped ? 'program_run_superseded_by_stop' : 'program_required_component_not_active',
-        cause_message: stopped ? 'Operator Stop won' : 'Component became inactive',
-        ...(stopped ? { stopped_by_operator: true } : {}), ...(before ? { no_effect: true } : {}),
+  function outcome() {
+    return { detail: { code: 'program_run_started_then_failed', message: 'Component became inactive',
+      details: { program_run_id: 2, claim_generation: 9,
+        needs_reset: true, cause_code: 'component_not_enabled',
+        cause_message: 'Component became inactive',
         actual_native_comparison: 'preserved',
       } } };
   }
-  it.each(['program_run_started_then_failed', 'program_run_superseded_by_stop',
-    'program_run_stopped_before_start'])('reads the actual typed %s and native facts', (code) => {
-    const parsed = parseKnownProgramRunOutcome(outcome(code), code === 'program_run_stopped_before_start' ? 409 : 422);
-    expect(parsed.code).toBe(code);
+  it('reads the actual typed program_run_started_then_failed and native facts', () => {
+    const parsed = parseKnownProgramRunOutcome(outcome(), 422);
+    expect(parsed.code).toBe('program_run_started_then_failed');
     expect(parsed.details?.actual_native_comparison).toBe('preserved');
     expect(parsed.details?.needs_reset).toBe(true);
   });
-  it.each(['envelope-extra', 'dto-extra', 'unknown-kind', 'missing-run', 'reset-string',
+  it.each(['envelope-extra', 'dto-extra', 'unknown-kind', 'missing-run', 'run-text', 'reset-string',
     'claim-string', 'nested-native', 'foreign-stop-field', 'wrong-status'])('rejects %s', (caseName) => {
     const value = outcome() as unknown as { detail: Record<string, unknown>; [key: string]: unknown };
     const details = value.detail.details as Record<string, unknown>;
@@ -5999,6 +6037,7 @@ describe('closed known Program Run outcomes', () => {
     if (caseName === 'dto-extra') value.detail.kind = 'failed';
     if (caseName === 'unknown-kind') value.detail.code = 'program_outcome_other';
     if (caseName === 'missing-run') delete details.program_run_id;
+    if (caseName === 'run-text') details.program_run_id = 'program-cycle.2';
     if (caseName === 'reset-string') details.needs_reset = 'true';
     if (caseName === 'claim-string') details.claim_generation = '9';
     if (caseName === 'nested-native') details.actual_native_comparison = { changed: true };

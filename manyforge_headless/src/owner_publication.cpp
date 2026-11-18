@@ -44,10 +44,6 @@ CanonicalValue Text(const std::string_view value,
   return CanonicalValue(std::string(value));
 }
 
-CanonicalValue OptionalText(const std::optional<std::string> &value) {
-  return value.has_value() ? CanonicalValue(*value) : CanonicalValue(nullptr);
-}
-
 CanonicalValue Unsigned(const std::uint64_t value, const std::string_view label,
                         const bool nonzero = false) {
   Require(value <= kMaximumSafeInteger && (!nonzero || value != 0U),
@@ -110,7 +106,8 @@ CanonicalValue PublicationTransaction(
               {"apply_generation",
                Unsigned(transaction.apply_generation.value(),
                         "apply_generation", true)},
-              {"apply_id", CanonicalValue(transaction.apply_id.value())},
+              {"apply_id", Unsigned(transaction.apply_id.value(), "apply_id",
+                                    true)},
               {"kind", CanonicalValue("named_apply")},
           });
         } else {
@@ -249,6 +246,12 @@ RuntimeObservation(const component_manager::RuntimeUnitObservation &value) {
        RuntimeContractOfferDigest(
            value.observed_runtime_contract_offer_digest())},
   };
+  // OD-295 (1)(a): the age of the unit's newest report at this observation,
+  // information only (no limit applies to it); absent before a first report.
+  if (const auto age = value.report_age_ns())
+    fields.emplace_back("report_age_ns",
+                        Unsigned(std::min(*age, kMaximumSafeInteger),
+                                 "report_age_ns"));
   if (value.dropped_host_notice_lines()) {
     const auto count_value = [](const std::uint64_t count) {
       return count <= kMaximumSafeInteger
@@ -263,49 +266,15 @@ RuntimeObservation(const component_manager::RuntimeUnitObservation &value) {
   return CanonicalValue(std::move(fields));
 }
 
-CanonicalValue
-OptionalStrongId(const std::optional<core::ControlDomainRevision> &value) {
-  return value.has_value() ? CanonicalValue(value->value())
-                           : CanonicalValue(nullptr);
-}
-
-CanonicalValue
-OptionalStrongId(const std::optional<core::ControlBindingRevision> &value) {
-  return value.has_value() ? CanonicalValue(value->value())
-                           : CanonicalValue(nullptr);
-}
-
+// The status record carries only the component scope its readers use
+// (OD-281): the maintenance mapping in Headless and the component overview.
+// The full scope (domains, bindings, resources) stays in the Manager's Apply
+// journal; in the status it could make three records outgrow the frame.
 CanonicalValue FenceScope(const core::ConfigurationFenceScopeDTO &scope) {
   Require(scope.valid(), "Apply fence scope is invalid");
-  CanonicalValue::Array domains;
-  domains.reserve(scope.domains.size());
-  for (const auto &domain : scope.domains) {
-    domains.emplace_back(CanonicalValue(CanonicalValue::Object{
-        {"candidate_control_domain_revision",
-         OptionalStrongId(domain.candidate_control_domain_revision)},
-        {"control_domain_id", CanonicalValue(domain.control_domain_id.value())},
-        {"predecessor_control_domain_revision",
-         OptionalStrongId(domain.predecessor_control_domain_revision)},
-    }));
-  }
-  CanonicalValue::Array bindings;
-  bindings.reserve(scope.bindings.size());
-  for (const auto &binding : scope.bindings) {
-    bindings.emplace_back(CanonicalValue(CanonicalValue::Object{
-        {"candidate_control_binding_revision",
-         OptionalStrongId(binding.candidate_control_binding_revision)},
-        {"control_binding_id",
-         CanonicalValue(binding.control_binding_id.value())},
-        {"predecessor_control_binding_revision",
-         OptionalStrongId(binding.predecessor_control_binding_revision)},
-    }));
-  }
   return CanonicalValue(CanonicalValue::Object{
-      {"bindings", CanonicalValue(std::move(bindings))},
       {"controllable_component_ids",
        StrongIdArray(scope.controllable_component_ids)},
-      {"domains", CanonicalValue(std::move(domains))},
-      {"resources", StrongIdArray(scope.resources)},
   });
 }
 
@@ -390,18 +359,25 @@ ApplyFence(const component_manager::PersistedManagerApplyStatus &value) {
   });
 }
 
+// `installed_active`: this record's Apply installed the active configuration
+// (the active publication's named-Apply number and generation). Only that
+// record carries the preparation receipt, the one its readers use (OD-281);
+// every other record carries null. The journal keeps every receipt.
 CanonicalValue
-ApplyStatus(const component_manager::PersistedManagerApplyStatus &value) {
+ApplyStatus(const component_manager::PersistedManagerApplyStatus &value,
+            const bool installed_active) {
   const auto &intent = value.intent.intent;
-  CanonicalValue prepared_activation;
-  try {
-    prepared_activation = content_identity::parse_canonical_json(
-        intent.prepared_activation.canonical_receipt_json,
-        {component_manager::kMaximumManagerApplyPreparedReceiptBytes, 16U,
-         4096U});
-  } catch (const std::exception &error) {
-    throw std::runtime_error("stored Apply preparation receipt is invalid: " +
-                             std::string(error.what()));
+  CanonicalValue prepared_activation(nullptr);
+  if (installed_active) {
+    try {
+      prepared_activation = content_identity::parse_canonical_json(
+          intent.prepared_activation.canonical_receipt_json,
+          {component_manager::kMaximumManagerApplyPreparedReceiptBytes, 16U,
+           4096U});
+    } catch (const std::exception &error) {
+      throw std::runtime_error("stored Apply preparation receipt is invalid: " +
+                               std::string(error.what()));
+    }
   }
   const auto terminal_state =
       value.terminal_outcome.has_value()
@@ -411,7 +387,7 @@ ApplyStatus(const component_manager::PersistedManagerApplyStatus &value) {
   return CanonicalValue(CanonicalValue::Object{
       {"apply_generation",
        Unsigned(intent.apply_generation.value(), "apply_generation", true)},
-      {"apply_id", CanonicalValue(intent.apply_id.value())},
+      {"apply_id", CanonicalValue(static_cast<double>(intent.apply_id.value()))},
       {"candidate_graph_revision",
        CanonicalValue(intent.candidate_graph_revision.value())},
       {"candidate_retained_bundle_id",
@@ -429,12 +405,8 @@ ApplyStatus(const component_manager::PersistedManagerApplyStatus &value) {
            component_manager::ToString(intent.scene_initialization)))},
       {"request",
        CanonicalValue(CanonicalValue::Object{
-           {"correlation_id",
-            OptionalText(intent.request_context.correlation_id)},
-           {"request_id",
-            CanonicalValue(intent.request_context.request_id.value())},
-           {"request_owner_epoch",
-            CanonicalValue(intent.request_context.request_owner_epoch.value())},
+           {"request_key",
+            CanonicalValue(core::RequestKeyText(intent.request_context.request_key))},
            {"source_label",
             CanonicalValue(intent.request_context.source_label)},
        })},
@@ -848,12 +820,33 @@ CanonicalValue BuildManagerSourcePayload(
   // committed Apply published cannot be paired with that Apply's record.
   Require(ManagerRuntimeAccountsForCommittedApplies(runtime, apply_inventory),
           "active runtime predates a committed Apply publication");
-  CanonicalValue::Array applies;
-  applies.reserve(apply_inventory.size());
+  // At most three Apply records (OD-256): the running one, the one that
+  // installed the active configuration and the newest finished one (they may
+  // coincide). The journal keeps the rest, readable one at a time through
+  // `apply_status`; the inventory is in Apply-number order.
+  const auto *installer =
+      std::get_if<core::NamedApplyPublicationTransactionDTO>(
+          &publication.request.transaction_ref);
+  const component_manager::PersistedManagerApplyStatus *newest_terminal =
+      nullptr;
   for (const auto &apply : apply_inventory) {
-    Require(apply.intent.intent.cell_id == apply_journal.cell_id(),
+    if (apply.terminal_outcome.has_value()) {
+      newest_terminal = &apply;
+    }
+  }
+  CanonicalValue::Array applies;
+  for (const auto &apply : apply_inventory) {
+    const auto &intent = apply.intent.intent;
+    const bool installed_active =
+        installer != nullptr && installer->apply_id == intent.apply_id &&
+        installer->apply_generation == intent.apply_generation;
+    if (apply.terminal_outcome.has_value() && !installed_active &&
+        &apply != newest_terminal) {
+      continue;
+    }
+    Require(intent.cell_id == apply_journal.cell_id(),
             "Apply status belongs to a different cell");
-    applies.emplace_back(ApplyStatus(apply));
+    applies.emplace_back(ApplyStatus(apply, installed_active));
   }
   const bool apply_in_progress = std::any_of(
       apply_inventory.begin(), apply_inventory.end(),

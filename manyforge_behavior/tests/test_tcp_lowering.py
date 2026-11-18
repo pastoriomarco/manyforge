@@ -44,7 +44,7 @@ def test_planning_phase_uses_planning_selector():
     default = {"kind": "default_of_target", "target": target("gripper-1", "gripper-target")}
     selector = _tcp_selector_payload(default, targets=_targets())
     identity = NodeAttemptIdentity(
-        program_run_id="run", node_instance_id="planner", node_attempt_id="attempt"
+        program_run_id=1, node_instance_id="planner", node_attempt_id=1
     )
     payload = NativeKernelProgramPort._phase_motion_payload(
         identity=identity, parameters={"base_frame": frame("robot-1", "base")},

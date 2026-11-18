@@ -46,6 +46,7 @@ describe('ProgramRunSetup', () => {
     const markup = renderToStaticMarkup(
       <ProgramRunSetup
         applied={applied}
+        applicationStartId="3f9a000000000001"
         targets={[target('lite6_robot', 0.15), target('ur5e_robot', 0.25)]}
         groups={[{ groupId: 'all', nodeCount: 3, state: 'unavailable', velocity: '—' }]}
         admitted={{ kind: 'no_run' }}
@@ -80,6 +81,7 @@ describe('ProgramRunSetup', () => {
     const markup = renderToStaticMarkup(
       <ProgramRunSetup
         applied={twoTargets}
+        applicationStartId="3f9a000000000001"
         targets={[target('cell', 0.15, 'left'), target('cell', 0.25, 'right')]}
         groups={[]}
         admitted={{ kind: 'loading' }}
@@ -96,12 +98,14 @@ describe('ProgramRunSetup', () => {
 
   it('shows only the owner-admitted speed per exact robot, with a reason when absent', () => {
     const speeds = parseProgramRunAdmittedSpeeds({
-      schema_version: 'manyforge.program_run_admitted_speeds.v1',
-      program_run_id: 'run-1',
+      schema_version: 'manyforge.program_run_admitted_speeds.v2',
+      application_start_id: '3f9a000000000001',
+      display: '3f9a/run1',
+      program_run_id: 1,
       targets: [{
         controllable_component_id: 'lite6_robot',
         command_target_id: 'arm',
-        operation_id: 'op-7',
+        operation_id: 7,
         occurred_at_wall: '2026-10-04T10:00:00Z',
         requested_tcp_linear_speed_mps: 0.15,
         deployment_maximum_tcp_linear_speed_mps: 0.1,
@@ -111,6 +115,7 @@ describe('ProgramRunSetup', () => {
     const markup = renderToStaticMarkup(
       <ProgramRunSetup
         applied={applied}
+        applicationStartId="3f9a000000000001"
         targets={[target('lite6_robot', 0.1), target('ur5e_robot', 0.25)]}
         groups={[]}
         admitted={{ kind: 'ready', speeds }}
@@ -118,6 +123,8 @@ describe('ProgramRunSetup', () => {
     );
     expect(markup).toContain('<span class="program-run-setup-stat-label" title="TCP speed the execution owner admitted for this robot&#x27;s most recent prepared motion in this run (the request capped by the applied Deployment maximum), read from operation history. Motions not yet prepared have no admitted value; nothing is estimated here.">Last admitted</span><span class="program-run-setup-stat-value">0.1 m/s</span><span class="program-run-setup-stat-note">by the Kernel</span>');
     expect(markup).toContain('requested 0.15 m/s, Deployment maximum 0.1 m/s.">');
+    // The operation number in the display form of the current start (D4).
+    expect(markup).toContain('title="Admitted by the owner for operation 3f9a/op7 (prepared 2026-10-04T10:00:00Z)');
     // The UR5e has a Deployment maximum and a request but no prepared motion:
     // the GUI shows no estimate, only the reason.
     expect(markup).toMatch(/<div class="program-run-setup-stat" title="No motion of this robot has been prepared in this run yet[^"]*">/);
@@ -126,9 +133,24 @@ describe('ProgramRunSetup', () => {
 
   it('rejects an admitted-speed response that is not exactly the owner rows', () => {
     expect(() => parseProgramRunAdmittedSpeeds({
-      schema_version: 'manyforge.program_run_admitted_speeds.v1',
-      program_run_id: 'run-1',
+      schema_version: 'manyforge.program_run_admitted_speeds.v2',
+      application_start_id: '3f9a000000000001',
+      display: '3f9a/run1',
+      program_run_id: 1,
       targets: [{ controllable_component_id: 'lite6_robot', command_target_id: 'arm', admitted_tcp_linear_speed_mps: 0.1 }],
     })).toThrow();
+    // The reply names its start and display form (contract 1.5 "Display").
+    const valid = {
+      schema_version: 'manyforge.program_run_admitted_speeds.v2',
+      application_start_id: '3f9a000000000001',
+      display: '3f9a/run1',
+      program_run_id: 1,
+      targets: [],
+    };
+    expect(parseProgramRunAdmittedSpeeds(valid).programRunId).toBe(1);
+    const { application_start_id: _start, ...withoutStart } = valid;
+    void _start;
+    expect(() => parseProgramRunAdmittedSpeeds(withoutStart)).toThrow();
+    expect(() => parseProgramRunAdmittedSpeeds({ ...valid, program_run_id: 'run-1' })).toThrow();
   });
 });

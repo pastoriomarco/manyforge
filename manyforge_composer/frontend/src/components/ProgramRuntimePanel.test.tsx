@@ -1,8 +1,11 @@
 import { readFileSync } from 'node:fs';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ASSISTANT_TURN_IN_PROGRESS, type ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import {
+  ASSISTANT_TURN_IN_PROGRESS, PROGRAM_COMMAND_REASON, programPendingAfterProjection,
+  type ProgramRuntimeController,
+} from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type {
   ProgramBindingDocument,
@@ -43,6 +46,26 @@ import { initialSceneNotice } from '../state/initialSceneNotice';
 import type { ActivateExecuteController } from '../hooks/useActivateExecute';
 import { ActivateExecuteDialog } from './ActivateExecuteDialog';
 
+// Lets a test turn Halt confirmation off; null keeps the installation value.
+const composerSettingsOverride = vi.hoisted(() => ({ confirmHalt: null as boolean | null }));
+vi.mock('../hooks/useComposerSettings', async (original) => {
+  const actual = await original<typeof import('../hooks/useComposerSettings')>();
+  return {
+    ...actual,
+    useComposerSettings: () => {
+      const controller = actual.useComposerSettings();
+      const { confirmHalt } = composerSettingsOverride;
+      return confirmHalt === null ? controller : {
+        ...controller,
+        settings: {
+          ...controller.settings,
+          motionPanel: { ...controller.settings.motionPanel, confirmHalt },
+        },
+      };
+    },
+  };
+});
+
 /** A minimal Applied binding row for one direct `component/target` reference. */
 function targetBinding(
   componentId: string,
@@ -57,18 +80,18 @@ function targetBinding(
 
 function ordinaryMotionStopOffer(): CycleRecoveryOffer {
   return {
-    schemaVersion: 'manyforge.cycle_recovery_offer.v5',
+    schemaVersion: 'manyforge.cycle_recovery_offer.v6',
     offerId: `sha256:${'e'.repeat(64)}`,
     offerRevision: 1,
     generatedAtNs: 1,
     kernelAssessmentRevision: 1,
     controlCommandEpoch: 1,
-    operationId: 'operation.1',
+    operationId: 1,
     operationRevision: 1,
-    programRunId: 'program-run.1',
+    programRunId: 1,
     programBindingId: `sha256:${'c'.repeat(64)}`,
     nodeInstanceId: 'root',
-    nodeAttemptId: 'attempt.1',
+    nodeAttemptId: 1,
     participants: [],
     graphRevision: `sha256:${'b'.repeat(64)}`,
     retainedBundleId: `sha256:${'a'.repeat(64)}`,
@@ -77,10 +100,6 @@ function ordinaryMotionStopOffer(): CycleRecoveryOffer {
     deploymentGeneration: 1,
     sceneAdmissionEpoch: 1,
     poseSourceApplyGeneration: 1,
-    stopId: 'stop.1',
-    stopGeneration: 1,
-    stopCertificateId: 'stop-certificate.1',
-    stopCertificateRevision: 1,
     status: 'retry_ready',
     recoveryClass: 'ordinary_operator_stop',
     actions: [{
@@ -116,13 +135,12 @@ function ordinaryMotionStopControls(): NonNullable<
   ProgramRuntimeController['state']['controls']
 > {
   return {
-    ownerEpoch: 'program-runner.epoch.1',
-    programRunId: 'program-run.1',
+    programRunId: 1,
     recoveryOffer: ordinaryMotionStopOffer(),
     // An operator Stop is not a failure hold.
     recoveryHolds: [],
     executionSelections: {
-      selectionRevision: 1,
+      holdRevision: 1,
       motionHeld: true,
       groups: [{ groupId: 'all', nodeCount: 1, heldNodeCount: 1,
         state: 'held', stopAllowed: false,
@@ -193,6 +211,7 @@ function controller(
     state === 'succeeded' ? 'terminal_awaiting_reset' : 'running',
 ): ProgramRuntimeController {
   return {
+    applicationStartId: '3f9a000000000001',
     runnerAllows: vi.fn(() => true),
     runnerRefusal: vi.fn(() => null),
     // As the backend computes it: Execute only from an idle
@@ -200,15 +219,16 @@ function controller(
     readiness: cycleState === 'idle_after_reset'
       ? { can_execute: true, can_resume: false, motion_clear: true, blocked_reasons: [] }
       : { can_execute: false,
-        can_resume: ['running', 'intervention_required', 'full_stopped'].includes(state),
+        can_resume: ['running', 'intervention_required', 'halted'].includes(state),
         motion_clear: true,
         blocked_reasons: [{ code: 'run_in_progress', message: 'A run is in progress.' }] },
     cellLatch: null,
     composerRefusalReason: null,
+    runnerBusyReason: null,
     state: {
       currentScenario: null,
       applied: {
-        schemaVersion: 'manyforge.applied_program_selection.v4',
+        schemaVersion: 'manyforge.applied_program_selection.v5',
         scenarioId: 'cell-pick',
         projectPath: '/projects/cell-pick.scenario',
         sourceDocumentDigest: `sha256:${'a'.repeat(64)}`,
@@ -220,13 +240,11 @@ function controller(
         nodeEnvironmentDigest: `sha256:${'c'.repeat(64)}`,
         recordDigest: `sha256:${'a'.repeat(64)}`,
         sourceOwnerId: 'headless.program-apply',
-        sourceOwnerEpoch: 'headless.epoch.1',
         sourceGeneration: 1,
         assistantProjection: null,
         ownerIdentities: [{
-          ownerRole: 'headless_projection',
-          ownerId: 'headless.program-apply',
-          ownerEpoch: 'headless.epoch.1',
+          role: 'headless_projection',
+          applicationStartId: '3f9a00000000002a',
         }],
         program: {
           api_version: 'manyforge.program.v3',
@@ -282,13 +300,12 @@ function controller(
         },
       },
       run: {
-        schemaVersion: 'manyforge.program_run_status.v4',
+        schemaVersion: 'manyforge.program_run_status.v5',
         ownerId: 'program-runner.cell-a',
-        ownerEpoch: 'program-runner.epoch.1',
         runRevision: 4,
         state,
         capture: {
-          programRunId: 'program-run.1',
+          programRunId: 1,
           appliedRecordDigest: `sha256:${'d'.repeat(64)}`,
           scenarioId: 'cell-pick',
           sourceDocumentDigest: `sha256:${'a'.repeat(64)}`,
@@ -301,9 +318,8 @@ function controller(
           nodePolicies: [],
           nodePolicyDigest: 'sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945',
           ownerIdentities: [{
-            ownerRole: 'program_runner',
-            ownerId: 'program-runner.cell-a',
-            ownerEpoch: 'program-runner.epoch.1',
+            role: 'program_runner',
+            applicationStartId: '3f9a00000000002a',
           }],
         },
         treeStatus: 'running',
@@ -314,6 +330,7 @@ function controller(
         reason: null,
         message: '',
         runEnd: null,
+        halt: ['halting', 'halted'].includes(state) ? { kind: 'halt', sourceLabel: null } : null,
       },
       controls: null,
       nonExecutable: null,
@@ -330,7 +347,7 @@ function controller(
     cycleFailure: null,
     resetRobotPositionAvailability: { available: true, reason: null },
     active: [
-      'running', 'intervention_required', 'full_stopping', 'full_stopped',
+      'running', 'intervention_required', 'halting', 'halted',
       'stopping', 'finalizing',
     ]
       .includes(state),
@@ -341,8 +358,9 @@ function controller(
     stopMotion: vi.fn(),
     startMotion: vi.fn(),
     resumeMotion: vi.fn(),
-    fullStop: vi.fn(),
-    resumeFullStop: vi.fn(),
+    stopAll: vi.fn(async () => true),
+    halt: vi.fn(async () => true),
+    resumeHalt: vi.fn(),
     reset: vi.fn(),
     applyRecoveryAction: vi.fn(),
     writeRuntimeBlackboard: vi.fn(),
@@ -416,7 +434,7 @@ describe('Program runtime projection', () => {
       eventRevision: 2,
       kind: 'program_node_takeover_fallback',
       facts: {
-        nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'ordinary_containment',
+        nodeInstanceId: 'move', incumbentOperationId: 1, path: 'ordinary_containment',
         code: 'takeover_preparation_late', message: 'late', failureStage: null,
         preparationMs: 12.4, budgetMs: 30, planningCapMs: 24,
       },
@@ -591,7 +609,8 @@ describe('Program runtime projection', () => {
     );
 
     expect(markup).toContain('Program execution');
-    expect(markup).toContain('program-run.1');
+    // The run number in the display form of the current start (D4).
+    expect(markup).toContain('3f9a/run1 · revision 4');
     expect(markup).toContain('revision 4');
     expect(markup).toContain('next-pick');
     expect(markup).not.toContain('Selection for the next Run');
@@ -607,7 +626,7 @@ describe('Program runtime projection', () => {
   });
 
   it('offers typed runtime writes and shows the backend reason when they are refused', () => {
-    const halted = controller('full_stopped');
+    const halted = controller('halted');
     halted.state.applied!.program.blackboard = {
       namespaces: [],
       keys: [
@@ -618,7 +637,7 @@ describe('Program runtime projection', () => {
       ],
     };
     halted.runnerAllows = vi.fn((kind: string) => kind !== 'program_runtime_blackboard_write');
-    halted.runnerRefusal = vi.fn(() => 'program_run_state_full_stopped');
+    halted.runnerRefusal = vi.fn(() => 'program_run_state_halted');
     const markup = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={halted} />,
     );
@@ -629,7 +648,7 @@ describe('Program runtime projection', () => {
     expect(markup).toContain('<option value="layer">layer · int64</option>');
     expect(markup).not.toContain('limit · float64');
     expect(markup).not.toContain('reply · model_response');
-    expect(markup).toContain('Writes are refused now: program run state full stopped.');
+    expect(markup).toContain('Writes are refused now: program run state halted.');
     expect(markup).toMatch(/<button type="button" disabled="">Write current-run value<\/button>/);
     const source = readFileSync(new URL('./ProgramRuntimePanel.tsx', import.meta.url), 'utf8');
     expect(source).not.toContain('parseRuntimeValue');
@@ -714,10 +733,23 @@ describe('Program runtime projection', () => {
     );
     expect(executionStopped).toContain('<strong>Stopped</strong>');
 
-    const fullStopped = renderToStaticMarkup(
-      <ProgramRuntimePanel enabled controller={controller('full_stopped')} />,
+    const halted = renderToStaticMarkup(
+      <ProgramRuntimePanel enabled controller={controller('halted')} />,
     );
-    expect(fullStopped).toContain('<strong>Stopped</strong>');
+    expect(halted).toContain('<strong>Stopped</strong>');
+    // The cause of the current Halt shows while the run is halted.
+    expect(halted).toMatch(/aria-label="Halt cause"[^>]*><span>Halted by the operator\.<\/span>/);
+    const diskFull = controller('halted');
+    diskFull.state.run!.halt = { kind: 'halt', sourceLabel: 'headless.disk_cannot_keep_records' };
+    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={diskFull} />))
+      // The static markup escapes the apostrophe.
+      .toContain('Halted: the disk cannot keep ManyForge&#x27;s records.');
+    // Unknown or no-text kinds show nothing; the line goes with the Halt.
+    const planned = controller('halted');
+    planned.state.run!.halt = { kind: 'planned_stop', sourceLabel: null };
+    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={planned} />))
+      .not.toContain('Halt cause');
+    expect(executionStopped).not.toContain('Halt cause');
 
     const executionStoppedWithStaleOffer = controller(
       'stopped',
@@ -985,7 +1017,7 @@ describe('Program runtime projection', () => {
     expect(render(held)).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Resume<\/button>/);
   });
 
-  it('offers Resume and Reset, but not another Stop, after ordinary Motion Stop', () => {
+  it('offers Resume and Reset after ordinary Motion Stop; the All column keeps Stop all', () => {
     const motionStopped = controller('intervention_required');
     motionStopped.state.controls = ordinaryMotionStopControls();
 
@@ -999,7 +1031,7 @@ describe('Program runtime projection', () => {
 
     expect(markup).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Resume<\/button>/);
     expect(markup).toMatch(
-      /class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stopped<\/button>/,
+      /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stop<\/button>/,
     );
     expect(markup).toMatch(/class="transport-reset transport-unique-control meaningful"(?![^>]*disabled)[^>]*>Reset<\/button>/);
   });
@@ -1026,9 +1058,9 @@ describe('Program runtime projection', () => {
     expect(flow).toContain("setResetIntent(confirmReset ? 'stopping' : 'automatic');");
     expect(flow).toContain("await program.stopMotion(['all'])");
     // Halted: motion is already contained, so no refused motion Stop is sent.
-    expect(source).toContain('allGroup === undefined || allMotionQuiesced || programFullStopped');
+    expect(source).toContain('allGroup === undefined || allMotionQuiesced || programHalted');
     expect(source).toContain('state.runnerAvailable && executionSelectionIsQuiescent(allGroup)');
-    expect(flow).toContain('if (programFullStopping) return;');
+    expect(flow).toContain('if (programHalting) return;');
     expect(source).toContain(
       "if (resetIntent === 'stopping' && motionSettled) setResetIntent('confirm');",
     );
@@ -1090,8 +1122,9 @@ describe('Program runtime projection', () => {
     expect(markup).toMatch(
       /class="transport-group-resume"(?![^>]*disabled)[^>]*>Run<\/button>/,
     );
+    // The All column's Stop is Stop all: available whatever the group shows.
     expect(markup).toMatch(
-      /class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stopped<\/button>/,
+      /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stop<\/button>/,
     );
     expect(markup).toMatch(/type="range"[^>]*value="0.4"/);
     expect(markup).not.toMatch(/type="range"[^>]*disabled=/);
@@ -1103,7 +1136,7 @@ describe('Program runtime projection', () => {
     );
   });
 
-  it('keeps Halt disabled until a Program is executing', () => {
+  it('keeps Halt available with no Program executing', () => {
     const idle = controller('succeeded', 'idle_after_reset');
     idle.state.run = null;
     idle.state.controls = null;
@@ -1115,11 +1148,11 @@ describe('Program runtime projection', () => {
       /class="transport-run transport-unique-control"(?![^>]*disabled)[^>]*>Execute<\/button>/,
     );
     expect(markup).toMatch(
-      /class="danger-button transport-full-stop transport-unique-control"[^>]*disabled=""[^>]*>Halt<\/button>/,
+      /class="danger-button transport-full-stop transport-unique-control"(?![^>]*disabled)[^>]*>Halt<\/button>/,
     );
   });
 
-  it('gates a new Execute on false admission while preserving unknown and full-stop resume behavior', () => {
+  it('gates a new Execute on false admission while preserving unknown and Execute after Halt behavior', () => {
     const idle = controller('succeeded', 'idle_after_reset');
     idle.state.run = null;
     idle.state.controls = null;
@@ -1145,9 +1178,9 @@ describe('Program runtime projection', () => {
       /class="transport-run transport-unique-control"(?![^>]*disabled)[^>]*>Execute<\/button>/,
     );
 
-    const fullStopped = controller('full_stopped');
+    const halted = controller('halted');
     const resume = renderToStaticMarkup(
-      <ProgramTransportControls enabled program={fullStopped} robot={robotController()}
+      <ProgramTransportControls enabled program={halted} robot={robotController()}
         authoringAdmissionAllowed={false} />,
     );
     expect(resume).toMatch(
@@ -1171,7 +1204,7 @@ describe('Program runtime projection', () => {
     expect(allowed).toMatch(/class="transport-run"(?![^>]*disabled)[^>]*>Activate and execute<\/button>/);
   });
 
-  it('keeps paired commands disabled through Execute and selected-Stop transitions', () => {
+  it('keeps paired commands disabled through Execute; a pending Stop stays clickable', () => {
     const starting = controller('succeeded', 'idle_after_reset');
     starting.state.pending = 'run';
     const startingMarkup = renderToStaticMarkup(
@@ -1184,8 +1217,9 @@ describe('Program runtime projection', () => {
     expect(startingMarkup).toMatch(
       /class="transport-reset transport-unique-control"[^>]*disabled=""[^>]*title="Execute is in progress."/,
     );
+    // The All column's Stop (Stop all) names no run: it stays available.
     expect(startingMarkup).toMatch(
-      /class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stop<\/button>/,
+      /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stop<\/button>/,
     );
 
     const running = controller('running');
@@ -1196,25 +1230,20 @@ describe('Program runtime projection', () => {
       /class="transport-run transport-unique-control"[^>]*disabled=""[^>]*>Executing<\/button>/,
     );
 
-    running.state.selectionPending = [{
-      kind: 'motion-stop',
-      groupIds: ['all'],
-      requestId: 'stop-request.1',
-      ownerEpoch: 'program-runner.epoch.1',
-      programRunId: 'program-run.1',
-    }];
+    running.state.pending = 'stop-all';
     const stoppingMarkup = renderToStaticMarkup(
       <ProgramTransportControls enabled program={running} robot={robotController()} />,
     );
+    // The first press shows as Stopping; a repeated press sends another Stop.
     expect(stoppingMarkup).toMatch(
-      /class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stopping<\/button>/,
+      /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stopping<\/button>/,
     );
     expect(stoppingMarkup).toMatch(
       /class="transport-run transport-unique-control"[^>]*disabled=""[^>]*>Executing<\/button>/,
     );
   });
 
-  it.each(['stopping', 'mixed'] as const)('reflects selected group %s without redundant Stop or blocking active motion', (state) => {
+  it.each(['stopping', 'mixed'] as const)('reflects selected group %s and keeps its Stop clickable', (state) => {
     const running = controller('running');
     running.state.controls = ordinaryMotionStopControls();
     const group = running.state.controls.executionSelections!.groups[0];
@@ -1225,7 +1254,7 @@ describe('Program runtime projection', () => {
       <ProgramTransportControls enabled program={running} robot={robotController()} />,
     );
     if (state === 'stopping') {
-      expect(markup).toMatch(/class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stopping<\/button>/);
+      expect(markup).toMatch(/class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stopping<\/button>/);
     } else {
       expect(markup).toMatch(/class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stop<\/button>/);
     }
@@ -1300,6 +1329,40 @@ describe('Program runtime projection', () => {
     expect(markup).toMatch(/type="range"[^>]*disabled=/);
   });
 
+  it('disables runner commands with the reason while another Program command runs; Stop all and Halt stay', () => {
+    // OD-144: the runner publishes the command in progress, so every panel
+    // holds its runner commands back; Stops never pass through the runner.
+    expect(PROGRAM_COMMAND_REASON).toBe('Not available while another Program command is running.');
+    const title = 'title="Not available while another Program command is running\\."';
+    const stopped = controller('intervention_required');
+    stopped.state.controls = ordinaryMotionStopControls();
+    stopped.runnerBusyReason = PROGRAM_COMMAND_REASON;
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={stopped} robot={robotController()} />,
+    );
+    expect(markup).toMatch(new RegExp(`class="transport-group-resume" disabled="" ${title}[^>]*>Resume</button>`));
+    expect(markup).toMatch(new RegExp(`class="transport-reset transport-unique-control" disabled="" ${title}`));
+    expect(markup).toMatch(
+      /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stop<\/button>/,
+    );
+    expect(markup).toMatch(
+      /class="danger-button transport-full-stop transport-unique-control"(?![^>]*disabled)[^>]*>Halt<\/button>/,
+    );
+
+    const idle = controller('succeeded', 'idle_after_reset');
+    idle.state.run = null;
+    idle.state.controls = null;
+    idle.runnerBusyReason = PROGRAM_COMMAND_REASON;
+    expect(renderToStaticMarkup(
+      <ProgramTransportControls enabled program={idle} robot={robotController()} />,
+    )).toMatch(new RegExp(`class="transport-run transport-unique-control" disabled="" ${title}[^>]*>Execute</button>`));
+    // When the command ends (the member is null again) they are offered again.
+    stopped.runnerBusyReason = null;
+    expect(renderToStaticMarkup(
+      <ProgramTransportControls enabled program={stopped} robot={robotController()} />,
+    )).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Resume<\/button>/);
+  });
+
   it('gates group Resume on RunReadiness alone', () => {
     const program = controller();
     program.state.controls = ordinaryMotionStopControls();
@@ -1341,7 +1404,57 @@ describe('Program runtime projection', () => {
     );
   });
 
-  it('keeps motion Stop disabled while Program Execute is still starting', () => {
+  it('keeps Stop and Halt available whenever a run is running, whatever else is in progress', () => {
+    const groupStop = /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>(Stop|Stopping)<\/button>/;
+    const halt = /class="danger-button transport-full-stop transport-unique-control"(?![^>]*disabled)[^>]*>(Halt|Halting)<\/button>/;
+    const busy = (configure: (program: ProgramRuntimeController) => void) => {
+      const program = controller('running');
+      const controls = ordinaryMotionStopControls();
+      controls.recoveryOffer = null;
+      controls.executionSelections.groups[0].state = 'running';
+      controls.executionSelections.groups[0].stopAllowed = true;
+      program.state.controls = controls;
+      configure(program);
+      return renderToStaticMarkup(
+        <ProgramTransportControls enabled={false} program={program} robot={robotController()} />,
+      );
+    };
+    const cases: Array<[string, (program: ProgramRuntimeController) => void]> = [
+      // The connection is not current (delayed, stale, synchronizing).
+      ['connection not current', () => undefined],
+      ['cycle still starting', (program) => { program.cycleState = 'starting'; }],
+      ['runner projection not loaded', (program) => { program.state.runnerAvailable = false; }],
+      ['Run pending', (program) => { program.state.pending = 'run'; }],
+      ['Reset pending', (program) => { program.state.pending = 'reset'; }],
+      ['Halt pending', (program) => { program.state.pending = 'halt'; }],
+      ['unconfirmed speed change', (program) => { program.state.controlPending = 'runtime-scale'; }],
+      ['Stop pending', (program) => {
+        program.state.selectionPending = [{
+          kind: 'motion-stop', groupIds: ['all'], programRunId: 1,
+        }];
+      }],
+      ['another Program command in progress', (program) => {
+        program.runnerBusyReason = PROGRAM_COMMAND_REASON;
+      }],
+      ['owner Stop admission not projected', (program) => {
+        program.runnerAllows = vi.fn(() => false);
+        program.state.controls!.executionSelections.groups[0].stopAllowed = false;
+      }],
+    ];
+    for (const [name, configure] of cases) {
+      const markup = busy(configure);
+      expect(markup, name).toMatch(groupStop);
+      expect(markup, name).toMatch(halt);
+    }
+    // The All column's Stop is Stop all: a held All is no gate.
+    const held = busy((program) => {
+      program.state.controls!.executionSelections.groups[0].state = 'held';
+    });
+    expect(held).toMatch(groupStop);
+    expect(held).toMatch(halt);
+  });
+
+  it('keeps the All column Stop (Stop all) available while Program Execute is still starting', () => {
     const starting = controller('succeeded', 'starting');
     starting.state.run = null;
     starting.state.pending = 'run';
@@ -1355,7 +1468,7 @@ describe('Program runtime projection', () => {
     );
 
     expect(markup).toMatch(
-      /class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stop<\/button>/,
+      /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stop<\/button>/,
     );
   });
 
@@ -1471,10 +1584,10 @@ describe('Program runtime projection', () => {
     robot.state.status = statusFixture();
     robot.currentStatus = robot.state.status;
     const operation = {
-      programRunId: robot.state.status.directControlGripper!.programRunId,
-      operationId: 'faulted-gripper', operationRevision: 2, resident: true,
+      payloadKind: 'capability_command' as const,
+      operationId: 41, operationRevision: 2, resident: true,
       state: 'intervention_required' as const, progress: 0.78,
-      terminalError: 'Execution timeout exceeded', activeStopId: null, activeStopGeneration: null,
+      terminalError: 'Execution timeout exceeded', stopEventId: null,
     };
     robot.state.status.manualOperations = [operation];
     const idle = controller('succeeded', 'idle_after_reset');
@@ -1486,7 +1599,7 @@ describe('Program runtime projection', () => {
     });
     const [manual] = guidance();
     expect(manual).toMatchObject({
-      id: 'recovery.manual.faulted-gripper',
+      id: 'recovery.manual.41',
       severity: 'error',
       domain: 'recovery',
       title: 'Manual gripper recovery required',
@@ -1500,7 +1613,7 @@ describe('Program runtime projection', () => {
       enabled: true, program: idle, robot, motionActive: false,
       observationTransport: { phase: 'no_robot_loaded', message: 'No robot loaded' },
       onReviewProgramRecovery: vi.fn(),
-    }).map((notice) => notice.id)).toContain('recovery.manual.faulted-gripper');
+    }).map((notice) => notice.id)).toContain('recovery.manual.41');
     manual.actions?.[0].run();
     expect(openRecovery).toHaveBeenCalledWith(operation);
     const markup = renderToStaticMarkup(<ProgramTransportControls
@@ -1531,9 +1644,10 @@ describe('Program runtime projection', () => {
       selectRobot: vi.fn(), selectTool: vi.fn(), selectMode: vi.fn(),
     }) as unknown as RobotControlController;
     const operation = (target: string, command: string) => ({
-      programRunId: 'manual-run', operationId: `faulted-${command}`, operationRevision: 1,
+      payloadKind: command === 'gripper' ? 'capability_command' as const : 'motion' as const,
+      operationId: 42, operationRevision: 1,
       resident: true, state: 'intervention_required' as const, progress: 0.5,
-      terminalError: 'Execution timeout exceeded', activeStopId: null, activeStopGeneration: null,
+      terminalError: 'Execution timeout exceeded', stopEventId: null,
       controllableComponentId: target, commandTargetId: command,
     });
     selectManualRecoveryTarget(robot, operation('lite_gripper', 'gripper'));
@@ -1591,7 +1705,7 @@ describe('Program runtime projection', () => {
     program.readiness = null;
     expect(render()).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""[^>]*title="Execute readiness unavailable: the execution host&#x27;s state can&#x27;t be read."/);
     // Resume after Halt follows can_resume.
-    const halted = controller('full_stopped');
+    const halted = controller('halted');
     halted.readiness = { can_execute: false, can_resume: false, motion_clear: true, blocked_reasons: [] };
     const haltedMarkup = () => renderToStaticMarkup(<ProgramTransportControls
       enabled program={halted} robot={robot} />);
@@ -1640,18 +1754,22 @@ describe('Program runtime projection', () => {
     const robot = robotController();
     robot.currentStatus = statusFixture();
     const review = vi.fn();
+    const reset = vi.fn();
     const guidance = () => deriveTransportGuidance({
       enabled: true, program, robot, motionActive: false,
       onReviewProgramRecovery: review,
+      onReset: { run: reset, disabled: false },
     });
     const [recovery] = guidance();
     expect(recovery).toMatchObject({
       id: 'recovery.program', severity: 'error', title: 'Program recovery required',
       message: 'The Resume Motion outcome could not be confirmed. Reset is required.',
     });
-    expect(recovery.actions?.map((action) => action.label)).toEqual(['Review Program recovery']);
+    // A recovery-required cycle has no owner offers: its notice carries Reset.
+    expect(recovery.actions?.map((action) => action.label)).toEqual(['Reset']);
     recovery.actions?.[0].run();
-    expect(review).toHaveBeenCalledOnce();
+    expect(reset).toHaveBeenCalledOnce();
+    expect(review).not.toHaveBeenCalled();
     expect(renderToStaticMarkup(<ProgramTransportControls
       enabled program={program} robot={robot} />))
       .toMatch(/class="transport-reset transport-unique-control meaningful"(?![^>]*disabled)/);
@@ -1676,8 +1794,8 @@ describe('Program runtime projection', () => {
     expect(ended({ end_reason: 'stopped', details: { stopped_by: 'operator' } }))
       .toMatchObject({ severity: 'warning', title: 'Stopped by the operator' });
     expect(ended({ end_reason: 'cell_fault', details: { component_id: 'lite6_robot',
-      error: { code: 'fault_estop', message: 'e-stop' } } }))
-      .toMatchObject({ severity: 'error', title: 'Ended by a cell fault: lite6_robot (Emergency stop active)' });
+      error: { code: 'fault_protective_stop', message: 'protective stop' } } }))
+      .toMatchObject({ severity: 'error', title: 'Ended by a cell fault: lite6_robot (Robot stopped itself)' });
   });
 
   it('shows the run end reason in the run status tile', () => {
@@ -1739,7 +1857,7 @@ describe('Program runtime projection', () => {
       latched: true,
       causes: [
         { component_id: 'lite6_robot', kind: 'fault', fault: {
-          code: 'fault_estop', message: 'e-stop', clearable: true, operator_action: 'enable', since_ns: 1 } },
+          code: 'fault_protective_stop', message: 'protective stop', clearable: true, operator_action: 'enable', since_ns: 1 } },
         { component_id: 'plc_io', kind: 'offline' },
         { component_id: 'gripper', kind: 'activity_unknown' },
       ],
@@ -1747,10 +1865,14 @@ describe('Program runtime projection', () => {
     const [latch] = guidance();
     expect(latch).toMatchObject({
       id: 'cell.latch', severity: 'error',
-      title: '3 errors require attention · lite6_robot: Emergency stop active',
+      title: '3 errors require attention · lite6_robot: Robot stopped itself',
     });
     expect(latch.message).toContain('plc_io: offline.');
     expect(latch.message).toContain('gripper: can\'t report whether it is still moving.');
+    // Only a fault cause has a "Component fault" alarm, shown inside the item.
+    expect(latch.alarmSubjects).toEqual([
+      { definitionId: 'manyforge.runtime.component_fault', subjectId: 'lite6_robot' },
+    ]);
     // No acknowledgement, no Recover cell: the latch clears by itself.
     expect(latch.actions).toBeUndefined();
     const details = renderToStaticMarkup(<ProgramTransportControls
@@ -1906,9 +2028,9 @@ it('shows a failed accepted start and native comparison facts while Reset remain
   program.state.run = null; // Start failed before a host RunStatus existed.
   program.cycleFailure = {
     code: 'component_lifecycle_facts_stale',
-    message: 'Program run program-cycle.2 started, then failed. Reset the Program cycle.',
+    message: 'Program run 2 started, then failed. Reset the Program cycle.',
     details: { admission_changed: 'true', admission_generation_before: '36', admission_generation_after: '37',
-      snapshot_changed: 'false', program_run_id: 'program-cycle.2', claim_generation: 9, needs_reset: true },
+      snapshot_changed: 'false', program_run_id: 2, claim_generation: 9, needs_reset: true },
   };
   const robot = robotController();
   robot.currentStatus = statusFixture();
@@ -1922,7 +2044,7 @@ it('shows a failed accepted start and native comparison facts while Reset remain
   expect(notice.actions?.map((action) => [action.label, action.disabled])).toEqual([['Reset', false]]);
   notice.actions?.[0].run();
   expect(reset).toHaveBeenCalledOnce();
-  expect(notice.message).toContain('program-cycle.2');
+  expect(notice.message).toContain('Program run 2 started');
   expect(notice.message).toContain('Admission changed: true');
   expect(notice.message).toContain('Admission generation before: 36');
   expect(notice.message).toContain('Admission generation after: 37');
@@ -2069,6 +2191,294 @@ describe('Reset confirmation and persistent keys', () => {
         await open.unmount();
       }
     }
+  });
+});
+
+describe('Halt', () => {
+  const runningProgram = () => {
+    const program = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    controls.executionSelections.groups[0].state = 'running';
+    controls.executionSelections.groups[0].stopAllowed = true;
+    program.state.controls = controls;
+    return program;
+  };
+  const haltButton = (props: Record<string, unknown>) => String(props.className)
+    .startsWith('danger-button transport-full-stop');
+  const dialogOpen = (props: Record<string, unknown>) => props.id === 'program-halt-confirmation-title';
+  const confirmButton = (props: Record<string, unknown>) => props.children === 'Halt Program';
+  const text = (props: Record<string, unknown>) => [props.children].flat()
+    .filter((child) => typeof child === 'string').join('');
+  const waiting = (props: Record<string, unknown>) => props.role === 'status'
+    && props.children === 'Waiting for all motion groups to stop…';
+  const motionStopped = (props: Record<string, unknown>) => text(props).includes('Motion is stopped. ');
+  const stopNotConfirmed = (props: Record<string, unknown>) => props.className === 'inline-message severity-error'
+    && props.role === 'alert' && text(props).includes('Stop all not confirmed');
+
+  it.each([true, false])('sends Stop all at once and then asks only about halting the Program (Stop all accepted=%s)', async (accepted) => {
+    const program = runningProgram();
+    // Even with another command pending, Halt is not refused.
+    program.state.pending = 'reset';
+    program.state.controlPending = 'runtime-scale';
+    vi.mocked(program.stopAll).mockResolvedValue(accepted);
+    const open = await mountTransport(program);
+    try {
+      await open.press(haltButton);
+      await open.rerender();
+      expect(program.stopAll).toHaveBeenCalledTimes(1);
+      expect(program.stopMotion).not.toHaveBeenCalled();
+      // A refused Stop all does not end the Halt: the question follows
+      // and says so in the panel's error style.
+      expect(open.mounted(dialogOpen)).toBe(true);
+      expect(open.mounted(stopNotConfirmed)).toBe(!accepted);
+      // Motion is still moving: the dialog says it is waiting, never that it stopped.
+      expect(open.mounted(waiting)).toBe(true);
+      expect(open.mounted(motionStopped)).toBe(false);
+      expect(program.halt).not.toHaveBeenCalled();
+      // The confirm button is clickable before all motion has stopped.
+      expect(open.mounted((props) => confirmButton(props) && !props.disabled)).toBe(true);
+      await open.press(confirmButton);
+      expect(program.halt).toHaveBeenCalledTimes(1);
+    } finally { await open.unmount(); }
+  });
+
+  it('Cancel leaves the Program held after its Stop all; a repeated Halt sends another', async () => {
+    const program = runningProgram();
+    const open = await mountTransport(program);
+    try {
+      await open.press(haltButton);
+      await open.press((props) => props.children === 'Cancel');
+      expect(program.halt).not.toHaveBeenCalled();
+      await open.press(haltButton);
+      expect(program.stopAll).toHaveBeenCalledTimes(2);
+      expect(program.halt).not.toHaveBeenCalled();
+    } finally { await open.unmount(); }
+  });
+
+  it('sends Stop all and asks when all Program motion is already stopped', async () => {
+    const program = controller('intervention_required');
+    program.state.controls = ordinaryMotionStopControls();
+    const open = await mountTransport(program);
+    try {
+      await open.press(haltButton);
+      // Stop all also stops manual moves: it is sent whatever the groups show.
+      expect(program.stopAll).toHaveBeenCalledTimes(1);
+      expect(open.mounted(dialogOpen)).toBe(true);
+      expect(open.mounted(motionStopped)).toBe(true);
+      expect(open.mounted(waiting)).toBe(false);
+    } finally { await open.unmount(); }
+  });
+
+  it('names the refusal of Stop all in the dialog', async () => {
+    const program = runningProgram();
+    program.state.error = 'Owner refused the Stop.';
+    vi.mocked(program.stopAll).mockResolvedValue(false);
+    const open = await mountTransport(program);
+    try {
+      await open.press(haltButton);
+      await open.rerender();
+      expect(open.mounted((props) => stopNotConfirmed(props)
+        && text(props).includes('Owner refused the Stop.'))).toBe(true);
+      expect(open.mounted((props) => confirmButton(props) && !props.disabled)).toBe(true);
+    } finally { await open.unmount(); }
+  });
+
+  it.each(['halting', 'stopping'] as const)('repeats Stop all and Halt while the run is %s', async (runState) => {
+    const program = runningProgram();
+    program.state.run!.state = runState;
+    program.state.controls!.executionSelections.groups[0].state = 'stopping';
+    const open = await mountTransport(program);
+    try {
+      expect(open.mounted((props) => haltButton(props) && !props.disabled)).toBe(true);
+      // The All column's Stop is Stop all.
+      await open.press((props) => String(props.className) === 'danger-button transport-group-stop'
+        && !props.disabled);
+      expect(program.stopAll).toHaveBeenCalledTimes(1);
+      expect(program.stopMotion).not.toHaveBeenCalled();
+      await open.press(haltButton);
+      expect(program.stopAll).toHaveBeenCalledTimes(2);
+      expect(open.mounted(dialogOpen)).toBe(true);
+      await open.press(confirmButton);
+      expect(program.halt).toHaveBeenCalledTimes(1);
+    } finally { await open.unmount(); }
+  });
+
+  it('keeps the All column Stop (Stop all) and Halt available for a held run while it is stopping', () => {
+    const program = runningProgram();
+    program.state.run!.state = 'stopping';
+    program.state.controls!.executionSelections.groups[0].state = 'held';
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    );
+    expect(markup).toMatch(/class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*>Stop<\/button>/);
+    expect(markup).toMatch(/class="danger-button transport-full-stop transport-unique-control"(?![^>]*disabled)[^>]*>Halt<\/button>/);
+  });
+
+  it('shows the All column and Halt with no Program loaded; both stop the cell', async () => {
+    const program = controller('succeeded', 'idle_after_reset');
+    program.state.run = null;
+    program.state.controls = null;
+    program.state.applied = null;
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    );
+    expect(markup).toContain('>All groups</span>');
+    expect(markup).toMatch(/class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*title="Stop all motion in the cell, manual moves included, without resetting the Program\. Every group stays stopped until Resume\."[^>]*>Stop<\/button>/);
+    expect(markup).toMatch(/class="transport-group-resume"[^>]*disabled=""[^>]*title="No Program is running\."/);
+    expect(markup).toMatch(/class="transport-group-scale"[^>]*title="No Program is running\."/);
+    expect(markup).not.toContain('program_run_not_active');
+    expect(markup).toMatch(/class="danger-button transport-full-stop transport-unique-control"(?![^>]*disabled)[^>]*title="Stop all motion in the cell, then halt Program execution\."[^>]*>Halt<\/button>/);
+    composerSettingsOverride.confirmHalt = false;
+    const open = await mountTransport(program);
+    try {
+      await open.press((props) => String(props.className) === 'danger-button transport-group-stop');
+      expect(program.stopAll).toHaveBeenCalledTimes(1);
+      await open.press(haltButton);
+      expect(program.stopAll).toHaveBeenCalledTimes(2);
+      expect(program.halt).toHaveBeenCalledTimes(1);
+    } finally {
+      composerSettingsOverride.confirmHalt = null;
+      await open.unmount();
+    }
+  });
+
+  describe('enabled only when there is something to stop (OD-300)', () => {
+    const allStop = /class="danger-button transport-group-stop"([^>]*)>(?:Stop|Stopping)<\/button>/;
+    const halt = /class="danger-button transport-full-stop transport-unique-control"([^>]*)>(?:Halt|Halting)<\/button>/;
+    const attributes = (markup: string, pattern: RegExp) => markup.match(pattern)?.[1] ?? '';
+    const idleCell = () => {
+      const program = controller('succeeded', 'idle_after_reset');
+      program.state.run = null;
+      program.state.controls = null;
+      program.state.applied = null;
+      return program;
+    };
+    const liveRobot = () => ({ ...robotController(), statusFeedCurrent: true });
+    const render = (program: ProgramRuntimeController, robot: RobotControlController) => renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robot} />,
+    );
+
+    it('disables Stop all and Halt with nothing moving and no run, and says why', () => {
+      const markup = render(idleCell(), liveRobot());
+      expect(attributes(markup, allStop)).toContain('disabled=""');
+      expect(attributes(markup, allStop)).toContain('title="Nothing is moving."');
+      expect(attributes(markup, halt)).toContain('disabled=""');
+      expect(attributes(markup, halt)).toContain('title="Nothing is running."');
+    });
+
+    it('keeps both enabled while the status feed is not current', () => {
+      const markup = render(idleCell(), { ...robotController(), statusFeedCurrent: false });
+      expect(attributes(markup, allStop)).not.toContain('disabled');
+      expect(attributes(markup, halt)).not.toContain('disabled');
+    });
+
+    it('enables both for a manual move in the cell; Halt with no run is Stop all, without the question', async () => {
+      const robot = liveRobot();
+      const status = statusFixture();
+      status.manualOperations = [{
+        payloadKind: 'motion', operationId: 7, operationRevision: 1, resident: true,
+        state: 'executing', progress: 0.2, terminalError: null, stopEventId: null,
+      }];
+      robot.currentStatus = status;
+      const program = idleCell();
+      const markup = render(program, robot);
+      expect(attributes(markup, allStop)).not.toContain('disabled');
+      expect(attributes(markup, halt)).not.toContain('disabled');
+      const open = await mountTransport(program, robot);
+      try {
+        await open.press(haltButton);
+        expect(program.stopAll).toHaveBeenCalledTimes(1);
+        expect(program.halt).toHaveBeenCalledTimes(1);
+        expect(open.mounted(dialogOpen)).toBe(false);
+      } finally { await open.unmount(); }
+    });
+
+    it('keeps Halt, not Stop all, for a held run with nothing moving', () => {
+      const program = runningProgram();
+      program.state.run!.state = 'intervention_required';
+      program.state.controls!.executionSelections.groups[0].state = 'held';
+      const markup = render(program, liveRobot());
+      expect(attributes(markup, allStop)).toContain('disabled=""');
+      expect(attributes(markup, halt)).not.toContain('disabled');
+    });
+
+    it('enables both while Program motion runs', () => {
+      const markup = render(runningProgram(), liveRobot());
+      expect(attributes(markup, allStop)).not.toContain('disabled');
+      expect(attributes(markup, halt)).not.toContain('disabled');
+    });
+  });
+
+  describe('without confirmation', () => {
+    afterEach(() => { composerSettingsOverride.confirmHalt = null; });
+
+    it.each([true, false])('sends Stop all and then Halt at once, without waiting (Stop all accepted=%s)', async (accepted) => {
+      composerSettingsOverride.confirmHalt = false;
+      const program = runningProgram();
+      const order: string[] = [];
+      vi.mocked(program.stopAll).mockImplementation(async () => { order.push('stop_all'); return accepted; });
+      vi.mocked(program.halt).mockImplementation(async () => { order.push('halt'); return true; });
+      const open = await mountTransport(program);
+      try {
+        await open.press(haltButton);
+        expect(open.mounted(dialogOpen)).toBe(false);
+        expect(order).toEqual(['stop_all', 'halt']);
+        expect(program.stopMotion).not.toHaveBeenCalled();
+      } finally { await open.unmount(); }
+    });
+  });
+});
+
+describe('Pending flags after fast owner transitions', () => {
+  it('offers Resume and Reset after Halt then Execute on a run whose motion is held', () => {
+    // Execute after Halt: the resumed run is held again by its first tree
+    // tick, so the projection goes from halted straight back to
+    // intervention_required.
+    const program = controller('intervention_required');
+    program.state.controls = ordinaryMotionStopControls();
+    program.state.controls.recoveryOffer = null;
+    const resumed = program.state.run!;
+    const halted = { ...resumed, state: 'halted' as const, runRevision: resumed.runRevision - 2 };
+    program.state.pending = programPendingAfterProjection(
+      'resume-halt', resumed, program.state.controls,
+      { cycleGeneration: 1, state: 'running',
+        programRunId: resumed.capture.programRunId, cycleClaimGeneration: 1 },
+      halted,
+      { cycleGeneration: 1, programRunId: halted.capture.programRunId,
+        runRevision: halted.runRevision },
+    );
+    expect(program.state.pending).toBeNull();
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+    );
+    expect(markup).toMatch(/class="transport-run transport-unique-control"[^>]*>Executing<\/button>/);
+    expect(markup).not.toContain('Executing…');
+    expect(markup).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Resume<\/button>/);
+    expect(markup).toMatch(/class="transport-reset[^"]*"(?![^>]*disabled)[^>]*>Reset<\/button>/);
+  });
+
+  it('asks the Reset question once the run ends while Reset waits for motion to stop', async () => {
+    const program = controller('running');
+    const controls = ordinaryMotionStopControls();
+    controls.recoveryOffer = null;
+    controls.executionSelections.groups[0].state = 'running';
+    program.state.controls = controls;
+    vi.mocked(program.stopMotion).mockResolvedValue(true);
+    const open = await mountTransport(program);
+    try {
+      await open.press((props) => props.children === 'Reset'
+        && String(props.className).startsWith('transport-reset'));
+      await open.rerender();
+      expect(open.mounted((props) => props.id === 'program-reset-confirmation-title')).toBe(false);
+      // The run ended before its group was seen held.
+      program.state.run = { ...program.state.run!, state: 'stopped' };
+      program.cycleState = 'terminal_awaiting_reset';
+      controls.executionSelections.groups[0].state = 'unavailable';
+      await open.rerender();
+      await open.rerender();
+      expect(open.mounted((props) => props.id === 'program-reset-confirmation-title')).toBe(true);
+    } finally { await open.unmount(); }
   });
 });
 
@@ -2390,6 +2800,15 @@ describe('Recovery class label', () => {
     )).toBe('Robot position feedback lost');
   });
 
+  it('names a checks-stopped runtime-monitor Stop by its reason, not as a collision', () => {
+    // OD-217: the deadman's Stop keeps the runtime_collision class.
+    expect(recoveryClassLabel(offer('runtime_collision', 'runtime_monitor_checks_stopped')))
+      .toBe('Collision checks stopped');
+    expect(recoveryClassLabel(
+      offer('runtime_collision', 'operation_failed', 'runtime_monitor_checks_stopped'),
+    )).toBe('Collision checks stopped');
+  });
+
   it('keeps the class label for an actual collision and other classes', () => {
     expect(recoveryClassLabel(offer('runtime_collision', 'execution_aborted', 'runtime_collision_fault')))
       .toBe('Runtime collision');
@@ -2669,7 +3088,7 @@ describe('Active TCP Resume confirmation', () => {
 
 describe('Active TCP confirmation for halted Program and ready group', () => {
   function markHalted(program: ProgramRuntimeController) {
-    program.state.run!.state = 'full_stopped';
+    program.state.run!.state = 'halted';
     // The backend's readiness for a halted run.
     program.readiness = { can_execute: false, can_resume: true, motion_clear: true, blocked_reasons: [] };
     for (const group of program.state.controls!.executionSelections.groups) {
@@ -2708,13 +3127,13 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
       motion.activeTcp = { ...motion.activeTcp!, entry: null, display: null, sequence: 2 };
       await transport.rerender();
       await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
-      expect(program.resumeFullStop).not.toHaveBeenCalled();
+      expect(program.resumeHalt).not.toHaveBeenCalled();
       await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
-      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+      expect(program.resumeHalt).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
 
-  it('refreshes changed Full Stop TCP values before resuming', async () => {
+  it('refreshes changed Halt TCP values before resuming', async () => {
     const { program, robot, status } = setup();
     const transport = await mountTransport(program, robot);
     try {
@@ -2729,14 +3148,14 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
       }, display: 'robot-a.flange', sequence: 2 };
       await transport.rerender();
       await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
-      expect(program.resumeFullStop).not.toHaveBeenCalled();
+      expect(program.resumeHalt).not.toHaveBeenCalled();
       expect(transport.mounted((p) => Array.isArray(p.children)
         && p.children.every((child) => typeof child === 'string')
         && JSON.stringify(p.children) === JSON.stringify([
         'robot-a', ': Active TCP is now ', 'robot-a.flange', ' (was ', 'robot-a.tcp', ').',
       ]))).toBe(true);
       await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
-      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+      expect(program.resumeHalt).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
 
@@ -2754,11 +3173,11 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
       motion.activeTcp = { ...initial, sequence: 2 };
       await transport.rerender();
       await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
-      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+      expect(program.resumeHalt).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
 
-  it('skips the Full Stop dialog when the current TCP becomes unavailable', async () => {
+  it('skips the Halt TCP dialog when the current TCP becomes unavailable', async () => {
     const { program, robot, status } = setup();
     const transport = await mountTransport(program, robot);
     try {
@@ -2770,28 +3189,28 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
       robot.tcpResumeStatus = null;
       await transport.rerender();
       await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
-      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+      expect(program.resumeHalt).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
 
-  it('skips the Full Stop dialog after an execution owner replacement', async () => {
+  it('skips the Halt TCP dialog after an execution owner replacement', async () => {
     const { program, robot, status } = setup();
     const transport = await mountTransport(program, robot);
     try {
       markHalted(program);
       await transport.rerender();
-      status.ownerEpoch = 'new-owner';
+      status.applicationStartId = 'new-owner';
       status.directControlTargets[0].activeTcp = {
         ...status.directControlTargets[0].activeTcp!, entry: null, display: null,
-        ownerEpoch: 'new-owner', sequence: 2,
+        applicationStartId: 'new-owner', sequence: 2,
       };
       await transport.rerender();
       await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
-      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+      expect(program.resumeHalt).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
 
-  it('skips the Full Stop dialog when the page first observes an already halted run', async () => {
+  it('skips the Halt TCP dialog when the page first observes an already halted run', async () => {
     const { program, robot, status } = setup();
     markHalted(program);
     const transport = await mountTransport(program, robot);
@@ -2801,7 +3220,7 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
       };
       await transport.rerender();
       await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
-      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+      expect(program.resumeHalt).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
 
@@ -2816,11 +3235,11 @@ describe('Active TCP confirmation for halted Program and ready group', () => {
       };
       await transport.rerender();
       await transport.press((p) => typeof p.className === 'string' && p.className.includes('transport-run'));
-      expect(program.resumeFullStop).not.toHaveBeenCalled();
+      expect(program.resumeHalt).not.toHaveBeenCalled();
       robot.tcpResumeStatus = null;
       await transport.rerender();
       await transport.press((p) => p.children === 'Resume' && p.className === 'primary-action');
-      expect(program.resumeFullStop).toHaveBeenCalledOnce();
+      expect(program.resumeHalt).toHaveBeenCalledOnce();
     } finally { await transport.unmount(); }
   });
 

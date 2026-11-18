@@ -18,7 +18,9 @@ import { ApplyImpact } from './ApplyImpact';
 import type {
   ManagerDiffProjection,
   ManagerGraphProjection,
+  ManagerOutstandingExchange,
 } from '../types/api';
+import { ManagerWaitingOn } from './ManagerWaitingOn';
 import {
   componentRowText,
   type ComponentManagerRow,
@@ -69,11 +71,13 @@ export function ComponentManagerTabs({ tab, onTab, pendingChanges }: {
 }
 
 /** Desired (Draft) against active (Manager Applied), with routes to the detail. */
-export function ComponentManagerSummary({ controller, rows, graph, diff, onNavigate, onOpenComponents }: {
+export function ComponentManagerSummary({ controller, rows, graph, diff, outstandingExchanges = [], onNavigate, onOpenComponents }: {
   controller: DeploymentWorkspaceController;
   rows: readonly ComponentManagerRow[];
   graph: ManagerGraphProjection | null;
   diff: ManagerDiffProjection | null;
+  /** What the Manager waits on now (live Manager section); information only. */
+  outstandingExchanges?: readonly ManagerOutstandingExchange[];
   onNavigate: (tab: ComponentManagerTab) => void;
   /** Opens the Components section (per-component status and settings). */
   onOpenComponents?: () => void;
@@ -102,6 +106,9 @@ export function ComponentManagerSummary({ controller, rows, graph, diff, onNavig
           {diff === null ? 'unknown' : diff.converged ? 'converged'
             : `${diff.desiredUnits.length} desired · ${diff.observedUnits.length} observed units`}
         </dd></div>
+        {outstandingExchanges.length > 0 && (
+          <div><dt>Manager waiting on</dt><dd><ManagerWaitingOn exchanges={outstandingExchanges} /></dd></div>
+        )}
       </dl>
       {workspace?.runAdmission.ready === false && workspace.runAdmission.reason && (
         <p className="inline-message severity-info" role="status">

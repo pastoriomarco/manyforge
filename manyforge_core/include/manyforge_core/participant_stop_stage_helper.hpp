@@ -48,10 +48,10 @@ struct GoalCancelAttempt final {
 /// participant's identity, its ordinary, fault and interrupt-scope Stop plans,
 /// and the trajectory exactly as submitted. Built once at dispatch.
 struct StopStageDispatchedGoalDTO final {
-  ExecutionGoalKey key;
+  ControllerGoalId key;
   /// The trajectory exactly as submitted (path time, complete derivatives).
   TrajectoryDTO trajectory;
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ControllableComponentId controllable_component_id;
@@ -136,24 +136,24 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
                           std::shared_ptr<ExecutionSampleAssociation> association,
                           std::shared_ptr<GoalCancelAttempt> cancel = {});
   /// Remove only an exact goal whose Submit returned known-not-dispatched.
-  void ForgetKnownUnsent(const ExecutionGoalKey& key);
+  void ForgetKnownUnsent(const ControllerGoalId& key);
 
   /// Pending moving replacement, recorded in the sole sent-goal list. All
   /// storage is reserved before the transport call; Record cannot allocate.
-  [[nodiscard]] bool ReserveReplacement(const ExecutionGoalKey& source);
-  void RecordReplacement(ExecutionGoalKey key, TrajectoryDTO trajectory,
+  [[nodiscard]] bool ReserveReplacement(const ControllerGoalId& source);
+  void RecordReplacement(ControllerGoalId key, TrajectoryDTO trajectory,
                          std::shared_ptr<ExecutionSampleAssociation> association,
                          double planned_controller_offset_s,
                          std::shared_ptr<GoalCancelAttempt> cancel) noexcept;
   [[nodiscard]] bool HasPendingReplacement() const;
   /// The owning participant has exact rejected/no-effect or scoped Stop proof.
-  void RetireSettledReplacement(const ExecutionGoalKey& key) noexcept;
-  [[nodiscard]] bool CanCompleteNaturally(const ExecutionGoalKey& source) const;
+  void RetireSettledReplacement(const ControllerGoalId& key) noexcept;
+  [[nodiscard]] bool CanCompleteNaturally(const ControllerGoalId& source) const;
   /// Requests cancellation newest-first for every possibly live retained key.
   [[nodiscard]] bool CancelLiveGoals(std::chrono::steady_clock::time_point deadline =
       std::chrono::steady_clock::time_point::max());
   [[nodiscard]] ExecutionPortCommandResultDTO CancelExactGoal(
-      const ExecutionGoalKey& key, std::shared_ptr<GoalCancelAttempt> attempt,
+      const ControllerGoalId& key, std::shared_ptr<GoalCancelAttempt> attempt,
       std::chrono::steady_clock::time_point deadline);
   /// Exact supersession/recognition was checked under the participant mutex.
   /// Swap prebuilt Stop authority and compact only that proven predecessor.
@@ -192,7 +192,7 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
       std::optional<std::chrono::steady_clock::time_point> deadline = std::nullopt);
 
   struct SentGoal {
-    ExecutionGoalKey key;
+    ControllerGoalId key;
     TrajectoryDTO trajectory;
     /// On-path replacements only: the mapping back to the dispatched path.
     std::optional<StopReplacementCursorMapDTO> cursor_map;
@@ -222,7 +222,7 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
       const std::string& mode);
   /// One dispatched Stop replacement, from its send result to its settlement.
   [[nodiscard]] ParticipantStopStageResultDTO FinishReplacement(
-      Run& run, const ExecutionPortCommandResultDTO& sent, const ExecutionGoalKey& next,
+      Run& run, const ExecutionPortCommandResultDTO& sent, const ControllerGoalId& next,
       TrajectoryDTO sent_trajectory, std::optional<StopReplacementCursorMapDTO> cursor_map,
       const std::optional<ExecutionControllerSampleDTO>& baseline, TimePoint dispatched_at,
       const ExecutionControllerSampleDTO& trip, const std::string& mode,
@@ -256,9 +256,9 @@ class ParticipantStopStageHelper final : public IControlDomainExecutionPort {
   /// Non-terminal sent goals, newest first.
   [[nodiscard]] std::vector<SentGoal> LiveGoals() const;
   [[nodiscard]] std::optional<std::uint64_t> SourceExecutionId(
-      const ExecutionGoalKey& key) const;
+      const ControllerGoalId& key) const;
   /// Next replacement key of the dispatched goal (generation advances).
-  [[nodiscard]] ExecutionGoalKey NextKey() const;
+  [[nodiscard]] ControllerGoalId NextKey() const;
   /// Records a replacement that may have reached the mechanism.
   void Record(SentGoal goal);
 

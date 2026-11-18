@@ -31,7 +31,7 @@ IoSignalDescriptorDTO descriptor(std::string name, InterruptSourceId source) {
 std::unique_ptr<IoSignalSubsystem> signals(FakeClock& clock, bool same_source = false,
                                            std::size_t registrations = 8, std::size_t records = 8) {
   auto created = IoSignalSubsystem::Create(
-      {RequestOwnerEpoch("host"), 1, {descriptor("a", kA), descriptor("b", same_source ? kA : kB)}},
+      {1, {descriptor("a", kA), descriptor("b", same_source ? kA : kB)}},
       {2, 2, records, registrations, 128, 1024}, clock);
   if (!created.ok()) return {};
   auto service = std::move(created.value());
@@ -73,13 +73,12 @@ std::shared_ptr<const CheckedIoCondition> condition(bool compound = false, bool 
 }
 
 IoOperationRuleScopeDTO operation_scope() {
-  return {OperationId("operation"),
+  return {OperationNumber(1001U),
           OperationRevision(1),
-          OperationParticipantId("participant"),
+          OperationParticipantId{OperationNumber(902U), 1U},
           ControllableComponentId("io"),
           CommandTargetId("arm"),
-          ControllerGoalId("goal"),
-          ControllerGoalGeneration(1),
+          ControllerGoalId{OperationNumber(901U), 1U, 1U},
           7,
           ContentDigest("prepared.digest"),
           MotionInterruptScopeId("scope")};
@@ -263,8 +262,7 @@ TEST(IoSignalRuleTest, SharedRegistrationBoundsAndExactRuleLifetimesDoNotFollowR
   auto service = signals(clock, false, 3);
   ASSERT_TRUE(service);
   ASSERT_TRUE(service->Publish(frame(1, 0, false)).ok());
-  const IoWatchScopeDTO scope{
-      RequestOwnerEpoch("runner"), ProgramRunId("run"), {ProgramNodeInstanceId("wait"), "attempt"}};
+  const IoWatchScopeDTO scope{ProgramRunNumber(107U), {ProgramNodeInstanceId("wait"), NodeAttemptNumber(1U)}};
   const auto wait = service->RegisterLevelWatch({scope, id(), true});
   ASSERT_TRUE(wait.ok());
   auto activation_request = request();
@@ -274,8 +272,7 @@ TEST(IoSignalRuleTest, SharedRegistrationBoundsAndExactRuleLifetimesDoNotFollowR
   ASSERT_TRUE(activation.ok());
   ASSERT_TRUE(operation.ok());
   EXPECT_FALSE(service->ArmRule(request()).ok());
-  ASSERT_TRUE(
-      service->ReleaseRunWatches(scope.program_runner_owner_epoch, scope.program_run_id).ok());
+  ASSERT_TRUE(service->ReleaseRunWatches(scope.program_run_id).ok());
   EXPECT_EQ(service->ReadWatch(wait.value()).value().state, IoWatchState::kReleased);
   EXPECT_EQ(service->ReadRuleEvidence(activation.value()).value().state,
             IoRuleRegistrationState::kArmed);
@@ -285,8 +282,7 @@ TEST(IoSignalRuleTest, SharedRegistrationBoundsAndExactRuleLifetimesDoNotFollowR
   std::get<IoOperationRuleScopeDTO>(wrong.scope).operation_revision = OperationRevision(2);
   EXPECT_FALSE(service->RetireRule(wrong).ok());
   EXPECT_FALSE(service->ReadRuleEvidence(wrong).ok());
-  IoWatchRegistrationDTO wrong_kind{operation.value().owner_epoch,
-                                    operation.value().catalog_generation,
+  IoWatchRegistrationDTO wrong_kind{operation.value().catalog_generation,
                                     operation.value().registration_id, scope};
   EXPECT_FALSE(service->ReleaseWatch(wrong_kind).ok());
   ASSERT_TRUE(service->RetireRule(operation.value()).ok());
@@ -299,9 +295,6 @@ TEST(IoSignalRuleTest, SharedRegistrationBoundsAndExactRuleLifetimesDoNotFollowR
   auto rearmed = service->ArmRule(request(MotionInterruptActivationMode::kTripIfAlreadyActive));
   ASSERT_TRUE(rearmed.ok());
   EXPECT_GT(rearmed.value().registration_id, operation.value().registration_id);
-  auto old_owner = rearmed.value();
-  old_owner.owner_epoch = RequestOwnerEpoch("old");
-  EXPECT_FALSE(service->ReadRuleEvidence(old_owner).ok());
   auto old_generation = rearmed.value();
   ++old_generation.catalog_generation;
   EXPECT_FALSE(service->RetireRule(old_generation).ok());
@@ -482,7 +475,7 @@ TEST(IoSignalRuleTest,
   synthetic.update_mode = IoSignalUpdateMode::kChangeOnly;
   synthetic.freshness = {IoFreshnessMode::kProviderValidity, std::nullopt};
   synthetic.liveness = IoSignalLivenessMode::kInProcess;
-  auto created = IoSignalSubsystem::Create({RequestOwnerEpoch("host"), 2, {synthetic}, {kA}},
+  auto created = IoSignalSubsystem::Create({2, {synthetic}, {kA}},
                                            {1, 1, 8, 8, 128, 1024}, clock);
   ASSERT_TRUE(created.ok());
   auto stable = std::move(created.value());
@@ -566,7 +559,6 @@ TEST(IoSignalRuleTest, ImmutableRuleServiceConfigurationNeedsNoSampleOrRegistrat
   ASSERT_TRUE(service);
   const auto before = service->RuleServiceConfiguration();
   ASSERT_TRUE(before.ok());
-  EXPECT_EQ(before.value().owner_epoch, RequestOwnerEpoch("host"));
   EXPECT_EQ(before.value().catalog_generation, 1U);
   EXPECT_EQ(before.value().maximum_registrations, 3U);
   ASSERT_TRUE(service->Publish(frame(1, 0, false)).ok());
@@ -655,7 +647,7 @@ TEST(IoSignalRuleTest, LargestProductGrammarConditionRetainsEveryAcquiredSourceS
   auto checked = CheckIoCondition(std::move(definition),
       {maximum_inputs, maximum_nodes, maximum_nodes - 1U, 8U, 128U, 1024U});
   ASSERT_TRUE(checked.ok()) << checked.error().message;
-  auto created = IoSignalSubsystem::Create({RequestOwnerEpoch("host"), 1U, descriptors},
+  auto created = IoSignalSubsystem::Create({1U, descriptors},
       {maximum_inputs, maximum_inputs, 4U, 1U, 128U, 1024U}, clock);
   ASSERT_TRUE(created.ok()) << created.error().message;
   auto service = std::move(created.value());

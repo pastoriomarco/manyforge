@@ -14,6 +14,16 @@
 
 namespace manyforge::core::testing {
 
+/// A distinct non-empty mechanism goal id for tests: the counter in the last
+/// eight bytes, big-endian.
+[[nodiscard]] inline MechanismGoalId TestMechanismGoalId(std::uint64_t counter) {
+  MechanismGoalId id;
+  for (std::size_t index = 0; index < 8U; ++index) {
+    id.bytes[15U - index] = static_cast<std::uint8_t>(counter >> (8U * index));
+  }
+  return id;
+}
+
 /// Scriptable `IExecutionPort` test double.
 ///
 /// Records every command and returns the scripted result (default
@@ -30,17 +40,17 @@ namespace manyforge::core::testing {
 class FakeExecutionPort final : public IExecutionPort {
  public:
   struct SubmitCall {
-    ExecutionGoalKey key;
+    ControllerGoalId key;
     TrajectoryDTO trajectory;
   };
   struct ReplaceCall {
-    ExecutionGoalKey active_key;
-    ExecutionGoalKey next_key;
+    ControllerGoalId active_key;
+    ControllerGoalId next_key;
     TrajectoryDTO trajectory;
     std::optional<ExecutionReplacementStartDTO> start{};
   };
   struct CancelCall {
-    ExecutionGoalKey key;
+    ControllerGoalId key;
   };
   struct SetScaleCall {
     double value;
@@ -49,9 +59,15 @@ class FakeExecutionPort final : public IExecutionPort {
 
   // --- IExecutionPort -----------------------------------------------------
 
-  ExecutionPortCommandResultDTO Submit(const ExecutionGoalKey& key,
+  ExecutionPortCommandResultDTO Submit(const ControllerGoalId& key,
                                        const TrajectoryDTO& trajectory,
                                        std::shared_ptr<ExecutionDispatchToken> token = {}) override {
+    std::function<void(const std::shared_ptr<ExecutionDispatchToken>&)> before_submit;
+    {
+      std::lock_guard lock(mutex_);
+      before_submit = before_submit_;
+    }
+    if (before_submit) before_submit(token);
     std::lock_guard lock(mutex_);
     if (token && !token->TryAdmit())
       return {ExecutionPortDispatch::kNotDispatched, ExecutionPortRefusal::kStaleKey, std::nullopt};
@@ -65,7 +81,7 @@ class FakeExecutionPort final : public IExecutionPort {
   }
 
   ExecutionPortCommandResultDTO Replace(
-      const ExecutionGoalKey& active_key, const ExecutionGoalKey& next_key,
+      const ControllerGoalId& active_key, const ControllerGoalId& next_key,
       const TrajectoryDTO& trajectory, std::shared_ptr<ExecutionDispatchToken> token = {}) override {
     std::lock_guard lock(mutex_);
     if (token && !token->TryAdmit())
@@ -80,7 +96,7 @@ class FakeExecutionPort final : public IExecutionPort {
   }
 
   ExecutionPortCommandResultDTO ReplaceScheduled(
-      const ExecutionGoalKey& active_key, const ExecutionGoalKey& next_key,
+      const ControllerGoalId& active_key, const ControllerGoalId& next_key,
       const TrajectoryDTO& trajectory, const ExecutionReplacementStartDTO& start,
       std::shared_ptr<ExecutionDispatchToken> token = {}) override {
     std::lock_guard lock(mutex_);
@@ -93,7 +109,7 @@ class FakeExecutionPort final : public IExecutionPort {
     return result;
   }
 
-  ExecutionPortCommandResultDTO Cancel(const ExecutionGoalKey& key, std::chrono::steady_clock::time_point = std::chrono::steady_clock::time_point::max()) override {
+  ExecutionPortCommandResultDTO Cancel(const ControllerGoalId& key, std::chrono::steady_clock::time_point = std::chrono::steady_clock::time_point::max()) override {
     std::lock_guard lock(mutex_);
     commands_.emplace_back(CancelCall{key});
     return NextResultLocked();
@@ -116,7 +132,7 @@ class FakeExecutionPort final : public IExecutionPort {
   }
 
   std::optional<ExecutionGoalObservationDTO> ReadGoal(
-      const ExecutionGoalKey& key) const override {
+      const ControllerGoalId& key) const override {
     std::lock_guard lock(mutex_);
     const auto it = goals_.find(key);
     if (it == goals_.end()) {
@@ -155,7 +171,7 @@ class FakeExecutionPort final : public IExecutionPort {
     queued_results_.push_back(std::move(result));
   }
 
-  void SetGoalPhase(const ExecutionGoalKey& key, ExecutionGoalPhase phase,
+  void SetGoalPhase(const ControllerGoalId& key, ExecutionGoalPhase phase,
                     std::optional<TimePoint> accepted_stamp_ns = std::nullopt) {
     std::lock_guard lock(mutex_);
     auto& goal = GoalLocked(key);
@@ -167,8 +183,8 @@ class FakeExecutionPort final : public IExecutionPort {
 
   /// Script a terminal result. `preempted_by` is required with, and only
   /// meaningful for, `kPreemptedBy`.
-  void FinishGoal(const ExecutionGoalKey& key, ExecutionGoalResult result,
-                  std::optional<ExecutionGoalKey> preempted_by = std::nullopt,
+  void FinishGoal(const ControllerGoalId& key, ExecutionGoalResult result,
+                  std::optional<ControllerGoalId> preempted_by = std::nullopt,
                   std::optional<TimePoint> terminal_local_receipt_stamp = std::nullopt) {
     std::lock_guard lock(mutex_);
     auto& goal = GoalLocked(key);
@@ -186,19 +202,19 @@ class FakeExecutionPort final : public IExecutionPort {
   }
 
   /// Script the goal's latest action feedback.
-  void SetGoalFeedback(const ExecutionGoalKey& key, ExecutionGoalFeedbackDTO feedback) {
+  void SetGoalFeedback(const ControllerGoalId& key, ExecutionGoalFeedbackDTO feedback) {
     std::lock_guard lock(mutex_);
     GoalLocked(key).latest_feedback = std::move(feedback);
   }
 
   /// Script the time the cancel was actually sent. Does not end the goal.
-  void MarkCancelSent(const ExecutionGoalKey& key, TimePoint local_stamp) {
+  void MarkCancelSent(const ControllerGoalId& key, TimePoint local_stamp) {
     std::lock_guard lock(mutex_);
     GoalLocked(key).cancel_sent_local_stamp = local_stamp;
   }
 
   /// Script the receipt of a cancel acknowledgement. Does not end the goal.
-  void AcknowledgeCancel(const ExecutionGoalKey& key, TimePoint local_receipt_stamp) {
+  void AcknowledgeCancel(const ControllerGoalId& key, TimePoint local_receipt_stamp) {
     std::lock_guard lock(mutex_);
     GoalLocked(key).cancel_ack_local_receipt_stamp = local_receipt_stamp;
   }
@@ -215,6 +231,15 @@ class FakeExecutionPort final : public IExecutionPort {
   void SetOnReadSample(std::function<void(std::optional<ExecutionControllerSampleDTO>&)> hook) {
     std::lock_guard lock(mutex_);
     on_read_sample_ = std::move(hook);
+  }
+
+  /// Runs at the start of every `Submit`, before the port lock and before the
+  /// send's token is admitted, with that token: holds a send that is pending
+  /// in its sender (e.g. until a Stop stage fenced it). Must not call back
+  /// into the port.
+  void SetBeforeSubmit(std::function<void(const std::shared_ptr<ExecutionDispatchToken>&)> hook) {
+    std::lock_guard lock(mutex_);
+    before_submit_ = std::move(hook);
   }
 
   void SetReadiness(ExecutionReadinessDTO readiness) {
@@ -270,17 +295,16 @@ class FakeExecutionPort final : public IExecutionPort {
     return result;
   }
 
-  void RegisterPendingLocked(const ExecutionGoalKey& key) {
+  void RegisterPendingLocked(const ControllerGoalId& key) {
     ExecutionGoalObservationDTO goal;
     goal.key = key;
-    goal.mechanism_goal_id =
-        MechanismGoalId("fake-goal-" + std::to_string(++mechanism_goal_counter_));
+    goal.mechanism_goal_id = TestMechanismGoalId(++mechanism_goal_counter_);
     goal.binding_epoch = readiness_.binding_epoch;
     goal.phase = ExecutionGoalPhase::kPending;
     StoreLocked(key, std::move(goal));
   }
 
-  ExecutionGoalObservationDTO& GoalLocked(const ExecutionGoalKey& key) {
+  ExecutionGoalObservationDTO& GoalLocked(const ControllerGoalId& key) {
     if (goals_.find(key) == goals_.end()) {
       ExecutionGoalObservationDTO goal;
       goal.key = key;
@@ -291,7 +315,7 @@ class FakeExecutionPort final : public IExecutionPort {
   }
 
   /// Insert or replace a record; a new key joins the ring as the newest.
-  void StoreLocked(const ExecutionGoalKey& key, ExecutionGoalObservationDTO goal) {
+  void StoreLocked(const ControllerGoalId& key, ExecutionGoalObservationDTO goal) {
     if (goals_.insert_or_assign(key, std::move(goal)).second) {
       record_order_.push_back(key);
     }
@@ -317,11 +341,12 @@ class FakeExecutionPort final : public IExecutionPort {
   std::optional<double> last_scale_;
   std::vector<Command> commands_;
   std::vector<ExecutionPortCommandResultDTO> queued_results_;
-  std::map<ExecutionGoalKey, ExecutionGoalObservationDTO> goals_;
+  std::map<ControllerGoalId, ExecutionGoalObservationDTO> goals_;
   /// Keys of `goals_`, oldest first.
-  std::deque<ExecutionGoalKey> record_order_;
+  std::deque<ControllerGoalId> record_order_;
   mutable std::optional<ExecutionControllerSampleDTO> sample_;
   std::function<void(std::optional<ExecutionControllerSampleDTO>&)> on_read_sample_;
+  std::function<void(const std::shared_ptr<ExecutionDispatchToken>&)> before_submit_;
   ExecutionReadinessDTO readiness_{true, true, true, ExecutionBindingEpoch{1U}};
   ExecutionTimingDTO timing_{};
   ExecutionLaneFactsDTO lane_facts_{};

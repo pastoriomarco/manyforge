@@ -15,13 +15,12 @@ from manyforge_program_runner.execution_transport import (
 )
 
 _A = "sha256:" + "a" * 64
-_API = {"api_version": "manyforge.execution_command_response.v4"}
+_API = {"api_version": "manyforge.execution_command_response.v6"}
 
 
 def _query() -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.target_observation_query.v2",
-        "owner_epoch": "kernel.epoch.7",
+        "schema_version": "manyforge.target_observation_query.v3",
         "program_binding_id": _A,
         "kind": "io_signal",
         "signal": {"component_id": "cell_io", "signal_name": "part_present"},
@@ -47,14 +46,12 @@ def _value(**overrides: Any) -> dict[str, Any]:
 
 def _request() -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.io_watch_request.v2",
-        "owner_epoch": "kernel.epoch.7",
+        "schema_version": "manyforge.io_watch_request.v3",
         "program_binding_id": _A,
-        "program_runner_owner_epoch": "runner.epoch.3",
         "claim_generation": 5,
-        "program_run_id": "run.1",
+        "program_run_id": 1,
         "node_instance_id": "wait",
-        "node_attempt_id": "attempt.1",
+        "node_attempt_id": 1,
         "signal": {"component_id": "cell_io", "signal_name": "part_present"},
         "condition": {"kind": "level", "expected_value": True},
     }
@@ -62,13 +59,11 @@ def _request() -> dict[str, Any]:
 
 def _registration() -> dict[str, Any]:
     return {
-        "owner_epoch": "kernel.epoch.7",
         "catalog_generation": "1",
         "registration_id": "7",
         "scope": {
-            "program_runner_owner_epoch": "runner.epoch.3",
-            "program_run_id": "run.1",
-            "node": {"node_instance_id": "wait", "node_attempt_id": "attempt.1"},
+            "program_run_id": 1,
+            "node": {"node_instance_id": "wait", "node_attempt_id": 1},
         },
     }
 
@@ -104,7 +99,7 @@ def test_io_signal_answers_are_exact(monkeypatch, tmp_path, bad) -> None:
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
     observation = {
         **_query(),
-        "schema_version": "manyforge.target_observation.v2",
+        "schema_version": "manyforge.target_observation.v3",
         # The actual host projection names its outer evaluation time.
         "evaluated_at_ns": "9223372036854775807",
         "value": _value(),
@@ -184,7 +179,7 @@ def test_registration_echo_is_not_compared(monkeypatch, tmp_path) -> None:
 
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
     registration = _registration()
-    registration["scope"]["node"]["node_attempt_id"] = "attempt.2"
+    registration["scope"]["node"]["node_attempt_id"] = 2
     monkeypatch.setattr(
         ExecutionCommandClient,
         "_exchange_on",
@@ -281,18 +276,16 @@ def test_host_error_envelopes_keep_their_code_and_reason(
 
 def _scope_request() -> dict[str, Any]:
     return {
-        "schema_version": "manyforge.io_watch_scope_release.v1",
-        "owner_epoch": "kernel.epoch.7",
+        "schema_version": "manyforge.io_watch_scope_release.v2",
         "program_binding_id": _A,
-        "program_runner_owner_epoch": "runner.epoch.3",
         "claim_generation": 5,
-        "program_run_id": "run.1",
+        "program_run_id": 1,
         "node_instance_id": "wait",
-        "node_attempt_id": "attempt.1",
+        "node_attempt_id": 1,
     }
 
 
-def test_scope_release_sends_the_closed_eight_field_scope_request(
+def test_scope_release_sends_the_closed_six_field_scope_request(
     monkeypatch, tmp_path
 ) -> None:
     transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
@@ -306,7 +299,7 @@ def test_scope_release_sends_the_closed_eight_field_scope_request(
     monkeypatch.setattr(ExecutionCommandClient, "_exchange_on", exchange_on)
     assert transport.release_io_watch_scope(_scope_request()) is None
     assert sent == [{
-        "api_version": "manyforge.execution_command.v3",
+        "api_version": "manyforge.execution_command.v4",
         "command": "release_io_watch",
         "attribution": sent[0]["attribution"],
         "scope_request": _scope_request(),

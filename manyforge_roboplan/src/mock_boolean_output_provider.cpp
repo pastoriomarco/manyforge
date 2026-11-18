@@ -170,7 +170,8 @@ SetOutputResult MockBooleanOutputProvider::WriteOutput(const core::IoSignalId &s
                                              std::nullopt, std::nullopt}};
   };
   std::shared_ptr<const void> driver_pin;
-  std::lock_guard lock(state_->mutex);
+  bool echo_not_scheduled = false;
+  std::unique_lock lock(state_->mutex);
   const auto alias = std::find_if(state_->aliases.begin(), state_->aliases.end(),
                                   [&](const auto &row) { return row.signal_id == signal; });
   if (alias == state_->aliases.end())
@@ -186,9 +187,11 @@ SetOutputResult MockBooleanOutputProvider::WriteOutput(const core::IoSignalId &s
       state_->model_observer(value, state_->clock.now());
     } catch (...) {
       // The write is accepted; a failed synthetic echo doesn't undo it.
-      std::cerr << "Mock I/O echo could not be scheduled\n";
+      echo_not_scheduled = true;
     }
   }
+  lock.unlock();
+  if (echo_not_scheduled) std::cerr << "Mock I/O echo could not be scheduled\n";
   return {core::ActionOutcome::kSucceeded, std::nullopt};
 }
 

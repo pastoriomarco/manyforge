@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v3
 content_version: 3.0.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:59fa3d425937116723fbb04ae19c8775fae761ae3061d5da5eac5f328889fef5
+catalog_digest: sha256:cc7d43f05623ebbb3b1012ca7c0557eceb47bbab38bd6eec3345e1261c032318
 schema_types:
   tcp_selector:
     type: object
@@ -3625,7 +3625,11 @@ entries:
   category: gripper
   description: Reads the gripper target's current command state once and compares
     it with expected_state. Succeeds on a match and fails without waiting when the
-    state differs.
+    state differs. This is the state of the last gripper command, not proof that a
+    part is held. Reached means the controller reported the goal reached (position
+    gripper) or the valve output was delivered and the dwell elapsed (pneumatic gripper
+    with a valve output). A pneumatic gripper that is display-only or switches its
+    valves through mapped I/O has no command state; Apply refuses the node.
   stability: stable
   tags:
   - gripper
@@ -3695,7 +3699,11 @@ entries:
   category: gripper
   description: Waits until the captured gripper command reaches expected_state. Fails
     on timeout, when the command or its source is replaced or unavailable, or when
-    the command reports failed.
+    the command reports failed. This is the command state, not proof that a part is
+    held. Reached means the controller reported the goal reached (position gripper)
+    or the valve output was delivered and the dwell elapsed (pneumatic gripper with
+    a valve output). A pneumatic gripper that is display-only or switches its valves
+    through mapped I/O has no command state; Apply refuses the node.
   stability: stable
   tags:
   - gripper
@@ -4025,7 +4033,7 @@ entries:
   name: Stop operation
   category: recovery
   description: Requests a Stop for the current operation of the target and succeeds
-    when that Stop is certified. It fails when the Stop is not certified.
+    when that Stop is complete. It fails when a stopped participant was not contained.
   stability: stable
   tags:
   - kernel
@@ -4062,11 +4070,12 @@ entries:
       implementation_id: kernel_stop_operation_v1
   observability:
     event_family: manyforge.program.node
-- id: kernel.full_stop
-  name: Full Stop
+- id: kernel.cell_stop
+  name: Cell Stop
   category: recovery
-  description: Requests a Full Stop of the whole cell and succeeds when that Stop
-    is certified. It fails when the Stop is not certified.
+  description: Stops every operation in the cell, manual ones included, without holding
+    the Program, and succeeds when that Stop is complete. It fails when a stopped
+    participant was not contained.
   stability: stable
   tags:
   - kernel
@@ -4082,13 +4091,13 @@ entries:
   execution:
     blocking: true
     cancellable: false
-    owner_api: kernel.full_stop
+    owner_api: kernel.cell_stop
   outcomes:
     success: stop_certified
     failure: stop_failed
   runners:
     py_trees:
-      implementation_id: kernel_full_stop_v1
+      implementation_id: kernel_cell_stop_v1
   observability:
     event_family: manyforge.program.node
 - id: kernel.reset_operation

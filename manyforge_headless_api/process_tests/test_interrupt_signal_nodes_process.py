@@ -34,11 +34,13 @@ from manyforge_headless_api.client import HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.process_tests.test_process_stack import (
     ProcessStack,
+    _apply_command,
     _read_only_tree,
     keep_failure_evidence,
 )
 from manyforge_headless_api.process_tests.test_dual_robot_grouped_execution import (
     _activate_loaded_components,
+    _application_start_id,
     _component_states,
     _disable_for_reload,
     _native_events,
@@ -213,9 +215,12 @@ def _load(
     """One ordinary Composer Load and Apply, optionally followed by activation."""
 
     with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer:
-        loaded = composer.request("POST", "/api/scenario/load", body={"path": str(project)})
-        # Load waits for the whole Apply; components end prepared.
-        assert loaded["outcome"] == "succeeded", loaded
+        # Load answers at acceptance; its row is followed to the end of the
+        # whole Apply; components end prepared.
+        loaded = _apply_command(
+            composer, "/api/scenario/load", {"path": str(project)}, timeout_seconds=30.0
+        )
+        assert loaded["end"]["outcome"] == "succeeded", loaded
         if activate_components:
             component_ids = _activate_loaded_components(stack)
             # The Lite 6 machine owner `lite6` is a component too;
@@ -271,10 +276,20 @@ def _write_runtime_configuration_candidate(directory: Path, project: Path) -> Pa
     return target
 
 
-def _node_operations(stack: ProcessStack, program_run_id: str) -> dict[str, list[str]]:
+def _runtime_controls(client: HeadlessHttpClient, program_run_id: int) -> dict[str, Any]:
+    """The run's runtime controls, a read naming this start's ``A`` (1.6)."""
+
+    return client.request(
+        "GET",
+        f"/api/program/runs/{program_run_id}/runtime-controls",
+        params=(("application_start_id", _application_start_id(client)),),
+    )
+
+
+def _node_operations(stack: ProcessStack, program_run_id: int) -> dict[str, list[int]]:
     """Accepted native operation ids per Program node instance of this Run."""
 
-    nodes: dict[str, list[str]] = {}
+    nodes: dict[str, list[int]] = {}
     for event in _native_events(stack):
         if (
             event["record_kind"] != "operation_accepted"
@@ -295,23 +310,21 @@ def _rule_row(operation: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return participant["participant_id"], row
 
 
-def _stop_terminal(stack: ProcessStack, stop_id: str, stop_generation: int) -> dict[str, Any]:
-    """The Stop's detailed terminal record from the native events route
-    (the same `stop_terminal_projected` row the Runner's events reader keeps)."""
+def _stop_completed(stack: ProcessStack, event_id: int) -> dict[str, Any]:
+    """The Stop event's completion row from the native events route."""
 
     deadline = time.monotonic() + 10.0
     while True:
         rows = [
             event["payload"]
             for event in _native_events(stack)
-            if event["record_kind"] == "stop_terminal_projected"
-            and event["payload"]["stop_id"] == stop_id
-            and event["payload"]["stop_generation"] == stop_generation
+            if event["record_kind"] == "stop_event_completed"
+            and event["payload"]["event_id"] == event_id
         ]
         if rows:
-            (terminal,) = rows
-            return terminal
-        assert time.monotonic() < deadline, f"no stop_terminal_projected for {stop_id}"
+            (completed,) = rows
+            return completed
+        assert time.monotonic() < deadline, f"no stop_event_completed for {event_id}"
         time.sleep(0.02)
 
 
@@ -334,8 +347,6 @@ def _stop_chain(native: ExecutionCommandClient, participant: dict[str, Any]) -> 
 
 @pytest.mark.skipif(_skip_reason() is not None, reason=str(_skip_reason()))
 def test_move_until_signal_trips_and_completes_over_the_real_wire() -> None:
-    from manyforge_behavior.interrupt_outcome import contained_stages_from_stop_terminal
-
     with _signal_stack() as (stack, project):
         applied = _load(stack, project)
         with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
@@ -351,7 +362,7 @@ def test_move_until_signal_trips_and_completes_over_the_real_wire() -> None:
             terminal_run = _wait_run_state(
                 client, program_run_id, {"succeeded", "failed", "stopped"}, timeout_seconds=90.0
             )
-            controls = client.program_runtime_controls(program_run_id)
+            controls = _runtime_controls(client, program_run_id)
         # The authored logic.check_value nodes read node_outcome.search_trip ==
         # signal_trip and node_outcome.search_no_trip == no_signal_trip from
         # the Run's blackboard; the sequence succeeds only if both match.
@@ -387,23 +398,26 @@ def test_move_until_signal_trips_and_completes_over_the_real_wire() -> None:
         participant_id, trip_row = _rule_row(trip)
         assert trip_row["terminal_cause"] == "signal_trip", trip_row
         assert trip_row["evidence"]["trip"] is not None, trip_row
-        assert trip_row["stop_result"] in {"succeeded_nominal", "succeeded_escalated"}, trip_row
-        assert isinstance(trip_row["stop_id"], str) and trip_row["stop_id"], trip_row
+        assert trip_row["stop_result"] in {"stopped", "stopped_escalated"}, trip_row
+        event_id = trip_row["stop_event_id"]
+        assert type(event_id) is int and event_id >= 1, trip_row
 
-        # The Stop terminal record of exactly that Stop and certificate proves
-        # the stage that contained the trip, within the robot's Stop chain.
-        stop_terminal = _stop_terminal(stack, trip_row["stop_id"], trip_row["stop_generation"])
-        assert stop_terminal["state"] == "succeeded", stop_terminal
-        assert stop_terminal["details_truncated"] is False, stop_terminal
-        contained = contained_stages_from_stop_terminal(
-            trip_row, stop_terminal, operation_id=trip_operation_id
-        )
-        assert contained is not None and set(contained) == {participant_id}, (
-            contained, stop_terminal)
-        chain = _stop_chain(native, trip["participants"][0])
-        assert contained[participant_id] in chain, (contained, chain)
-        print(f"search_trip: {trip_row['stop_result']}, contained by stage "
-              f"{contained[participant_id]!r} of {chain}")
+        # The participant's own Stop state (§6.3.1) names the stage that
+        # contained the trip, within the robot's Stop chain; no journal read.
+        (participant,) = trip["participants"]
+        participant_stop = participant["stop"]
+        assert participant_stop["stop_event_id"] == event_id, participant_stop
+        assert participant_stop["phase"] == "stopped", participant_stop
+        chain = _stop_chain(native, participant)
+        assert participant_stop["containing_stage_id"] in chain, (participant_stop, chain)
+        # The History completion row of that event agrees.
+        completed = _stop_completed(stack, event_id)
+        assert completed["result"] == trip_row["stop_result"], completed
+        (entry,) = [row for row in completed["covered"]
+                    if row["operation_id"] == trip_operation_id]
+        assert entry["phase"] == "stopped", completed
+        print(f"search_trip ({participant_id}): {trip_row['stop_result']}, contained by "
+              f"stage {participant_stop['containing_stage_id']!r} of {chain}")
 
 
 IO_SCENARIO_ID = "mock_lite6_io_nodes_process"
@@ -491,8 +505,9 @@ def test_trial_d_mock_script_retains_value_and_operator_ack_times_out_over_real_
             _start_motion(client, started, request_id="trial-d-mock.motion-start")
             deadline = time.monotonic() + 30.0
             terminal: dict[str, Any] = {}
+            start = _application_start_id(client)
             while time.monotonic() < deadline:
-                observed = client.program_run(run_id)
+                observed = client.program_run(run_id, application_start_id=start)
                 for node, status in observed["node_statuses"].items():
                     if last_statuses.get(node) != status:
                         transitions.append({
@@ -505,7 +520,7 @@ def test_trial_d_mock_script_retains_value_and_operator_ack_times_out_over_real_
                     terminal = observed
                     break
                 time.sleep(0.01)
-            controls = client.program_runtime_controls(run_id)
+            controls = _runtime_controls(client, run_id)
         # Keep observed timing, not a new tight wall-clock timing requirement.
         evidence = {
             "scope": "D-derived Mock-only; no external PLC/manual ACK-success qualification",
@@ -582,3 +597,162 @@ def test_inactive_runtime_apply_rejoins_retained_io_component() -> None:
         assert selected_after["deploymentRevision"] != selected_before["deploymentRevision"]
         assert motion_after["lifecycle"] == "prepared", motion_after
         assert io_after["lifecycle"] == "prepared", io_after
+
+
+RETRY_SCENARIO = "mock_lite6_motion_retry"
+RETRY_SCENARIO_ID = "mock_lite6_motion_retry_process"
+
+
+def _write_retry_scenario(directory: Path) -> Path:
+    """The shipped motion-retry example: an arm-only Program whose moves use
+    the Current TCP on a Lite6 carrying its gripper. Only the ROS ``plc_io``
+    peer and the global rule, which the Program does not use, are left out."""
+
+    from manyforge_composer.backend.scenario_artifacts import (
+        build_scenario_document,
+        load_scenario_artifact,
+        save_scenario_artifact,
+    )
+
+    examples = Path(os.environ["MANYFORGE_EXAMPLE_SCENARIO_ROOT"])
+    source = examples / f"{RETRY_SCENARIO}.scenario"
+    trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
+    deployment = deepcopy(trial["deployment_draft"])
+    deployment["components"] = [
+        row for row in deployment["components"] if row["component_id"] != "plc_io"
+    ]
+    deployment["policies"]["interrupt_rules"] = []
+    target = directory / f"{RETRY_SCENARIO_ID}.scenario"
+    scenario = build_scenario_document(
+        scenario_id=RETRY_SCENARIO_ID,
+        name=RETRY_SCENARIO_ID,
+        description="mock_lite6_motion_retry without the unused ROS plc_io peer and rule.",
+        program_draft=deepcopy(trial["program_draft"]),
+        deployment_draft=deployment,
+        manyforge_version=(REPOSITORY_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+        last_known_status="unknown",
+    )
+    save_scenario_artifact(
+        scenario, str(target), allowed_roots=[str(directory), str(examples)], overwrite=False,
+        source_project_path=str(source),
+    )
+    return target
+
+
+@pytest.mark.skipif(_skip_reason() is not None, reason=str(_skip_reason()))
+def test_arm_only_program_moves_at_the_mounted_gripper_current_tcp() -> None:
+    """0.2.1 regression: a Program that never references the mounted gripper
+    failed its first Current move with runtime_motion_endpoint_unresolved."""
+
+    with _signal_stack(_write_retry_scenario) as (stack, project):
+        applied = _load(stack, project, scenario_id=RETRY_SCENARIO_ID)
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            binding = headless.program_applied()["program_binding"]
+        # The Program never names the gripper: only the robot's TCP list does.
+        assert {row["target"]["component_id"] for row in binding["target_bindings"]} == {
+            "lite6_robot"
+        }, binding
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
+            started = _start_run(
+                stack,
+                scenario_id=RETRY_SCENARIO_ID,
+                source_document_digest=applied["source_document_digest"],
+                applied=applied,
+            )
+            program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
+            _start_motion(client, started, request_id="retry.motion-start")
+            terminal_run = _wait_run_state(
+                client, program_run_id, {"succeeded", "failed", "stopped"}, timeout_seconds=90.0
+            )
+        assert terminal_run["state"] == "succeeded", terminal_run
+        operations = _node_operations(stack, program_run_id)
+        assert operations.get("start_rest") and operations.get("end_rest"), operations
+
+
+def _status_scenario_writer(source_scenario: str, scenario_id: str, gripper: str, command: str):
+    """The source example's Deployment with a Program that opens its gripper
+    and then checks and waits for the command state `reached`."""
+
+    def write(directory: Path) -> Path:
+        from manyforge_composer.backend.scenario_artifacts import (
+            build_scenario_document,
+            load_scenario_artifact,
+            save_scenario_artifact,
+        )
+
+        examples = Path(os.environ["MANYFORGE_EXAMPLE_SCENARIO_ROOT"])
+        source = examples / f"{source_scenario}.scenario"
+        trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
+        program = deepcopy(trial["program_draft"])
+        (root,) = program["forest"]
+        (opened,) = [row for row in root["children"] if row["instance_id"] == command]
+        target = {"component_id": gripper, "command_target_id": "gripper"}
+        root["children"] = [
+            opened,
+            {"children": [], "instance_id": "check_reached", "node_id": "gripper.check_status",
+             "parameters": {"target": target, "expected_state": "reached"}},
+            {"children": [], "instance_id": "wait_reached", "node_id": "gripper.wait_for_status",
+             "parameters": {"target": target, "expected_state": "reached", "timeout_s": 5.0}},
+        ]
+        target_path = directory / f"{scenario_id}.scenario"
+        scenario = build_scenario_document(
+            scenario_id=scenario_id,
+            name=scenario_id,
+            description=f"{source_scenario}: open the gripper, then check its command state.",
+            program_draft=program,
+            deployment_draft=deepcopy(trial["deployment_draft"]),
+            manyforge_version=(REPOSITORY_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+            last_known_status="unknown",
+        )
+        save_scenario_artifact(
+            scenario, str(target_path), allowed_roots=[str(directory), str(examples)],
+            overwrite=False, source_project_path=str(source),
+        )
+        return target_path
+
+    return write
+
+
+@pytest.mark.skipif(_skip_reason() is not None, reason=str(_skip_reason()))
+@pytest.mark.parametrize("source_scenario,gripper,command", [
+    # Pneumatic, valve-only (Mock Lite gripper): reached = delivered + dwell.
+    ("mock_lite6_pick_and_place", "lite_gripper", "open_gripper_start"),
+    # Position gripper with controller feedback.
+    ("mock_ur10e_pick_and_place", "robotiq_2f_140", "command_gripper"),
+])
+def test_gripper_status_reports_the_command_state_of_a_standalone_gripper(
+    source_scenario: str, gripper: str, command: str,
+) -> None:
+    """The gripper runs as its own component; its status owner resolves
+    through its feedback binding and reports the command state."""
+
+    scenario_id = f"{source_scenario}_status_process"
+    writer = _status_scenario_writer(source_scenario, scenario_id, gripper, command)
+    with _signal_stack(writer) as (stack, project):
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
+            loaded = _apply_command(
+                client, "/api/scenario/load", {"path": str(project)}, timeout_seconds=30.0
+            )
+            assert loaded["end"]["outcome"] == "succeeded", loaded
+            component_ids = _activate_loaded_components(stack)
+            assert gripper in component_ids, component_ids
+            stack.wait_authoring_admission(expected_allowed=True)
+            applied = client.program_applied()
+            assert applied["scenario_id"] == scenario_id, applied
+            started = _start_run(
+                stack,
+                scenario_id=scenario_id,
+                source_document_digest=applied["source_document_digest"],
+                applied=applied,
+            )
+            program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
+            _start_motion(client, started, request_id=f"{scenario_id}.motion-start")
+            terminal_run = _wait_run_state(
+                client, program_run_id, {"succeeded", "failed", "stopped"}, timeout_seconds=90.0
+            )
+        assert terminal_run["state"] == "succeeded", terminal_run
+        statuses = terminal_run["node_statuses"]
+        for node in (command, "check_reached", "wait_reached"):
+            assert statuses[node] == "success", (node, terminal_run)

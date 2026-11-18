@@ -10,6 +10,8 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -23,7 +25,6 @@ enum class ResourceSlotState {
   kDispatched,
   kStopping,
   kTerminal,
-  kUnreconciledExternalOrOrphanGoal,
 };
 
 struct ResourceSlotControllerAuthorityDTO final {
@@ -38,14 +39,14 @@ struct ResourceSlotControllerAuthorityDTO final {
 };
 
 struct ResourceSlotOwnerDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ParticipantBindingIdentityDTO binding_identity;
   ResourceSlotControllerAuthorityDTO controller_authority;
 
   ResourceSlotOwnerDTO() = default;
-  ResourceSlotOwnerDTO(OperationId operation, OperationRevision revision,
+  ResourceSlotOwnerDTO(OperationNumber operation, OperationRevision revision,
                        OperationParticipantId participant, ControlDomainId domain,
                        ControlDomainRevision domain_revision, ControlBindingId binding,
                        ControlBindingRevision binding_revision, ControllerTopologyId topology,
@@ -73,10 +74,10 @@ struct ResourceSlotSnapshotDTO final {
   ResourceId resource_id;
   ResourceSlotState state{ResourceSlotState::kFree};
   std::optional<ResourceSlotOwnerDTO> owner;
-  /// Latest Kernel Stop generation that fenced this resource. It remains
-  /// monotonic across terminal acknowledgement/reuse so resource-addressed
-  /// Stop expectations never regain an older value accidentally.
-  StopGeneration stop_generation{0U};
+  /// The latest Kernel Stop event that fenced this resource (0 = none). Event
+  /// ids rise per application start, so it only rises, across terminal
+  /// acknowledgement and reuse.
+  StopEventId stop_event_id{0U};
 
   friend bool operator==(const ResourceSlotSnapshotDTO&, const ResourceSlotSnapshotDTO&) = default;
 };
@@ -122,47 +123,57 @@ struct ResourceSlotOwnerTransferDTO final {
                          const ResourceSlotOwnerTransferDTO&) = default;
 };
 
-/// One exact participant owner in an atomic multi-owner Stop fence. Rows are a
-/// canonical keyed set ordered by (operation_id, participant_id); resources are
-/// non-empty, sorted, unique, and disjoint across the complete request.
-struct ResourceSlotStopFenceOwnerDTO final {
-  ResourceSlotOwnerDTO expected_owner;
-  std::vector<ResourceId> resources;
-  OperationRevision next_operation_revision;
-
-  friend bool operator==(const ResourceSlotStopFenceOwnerDTO&,
-                         const ResourceSlotStopFenceOwnerDTO&) = default;
+/// One participant row of a Stop fence (design §3.1 E1). It names the
+/// participant's own slot owner and resource list (non-empty, sorted, unique;
+/// disjoint across the batch); nothing is copied. Rows are ordered by
+/// (operation_id, participant_id). `fence`: move the slots to kStopping and
+/// stamp the event; false: raise only the owner's operation revision (an
+/// operation's participant that this Stop does not start).
+struct ResourceSlotStopFenceRow final {
+  const ResourceSlotOwnerDTO* expected_owner{};
+  std::span<const ResourceId> resources{};
+  OperationRevision next_operation_revision{0U};
+  bool fence{};
 };
 
-/// Canonical bounded all-or-nothing Stop fence. Orphan resources name retained
-/// external/effect-uncertain slots that are already admission-closed but must
-/// be stamped by the same Stop generation as the owned scopes.
-struct ResourceSlotStopFenceRequestDTO final {
-  std::uint64_t expected_operation_resource_generation{};
-  StopGeneration stop_generation{0U};
-  std::vector<ResourceSlotStopFenceOwnerDTO> owners;
-  std::vector<ResourceId> orphan_resources;
-  /// Exact non-fenced owners of revised operations. Preserve phase and Stop generation.
-  std::vector<ResourceSlotStopFenceOwnerDTO> revision_only_owners{};
-
-  friend bool operator==(const ResourceSlotStopFenceRequestDTO&,
-                         const ResourceSlotStopFenceRequestDTO&) = default;
-};
-
-struct ResourceSlotStopFenceResultDTO final {
+/// Kernel-owned scratch of `stop_fence_batch`, allocated once at Kernel
+/// construction (`stop_fence_scratch_`) for `owner_capacity` (`N_max`) rows
+/// and `kMaxKernelResourceSlots` slots, so a Stop fence allocates nothing. The
+/// Kernel fills the rows (`clear`, `add_owner`) under its state lock; only the
+/// table writes the slot fields, under its data lock.
+struct ResourceSlotStopFenceScratch final {
+  explicit ResourceSlotStopFenceScratch(const std::size_t owner_capacity) {
+    rows.reserve(owner_capacity);
+    slot_indices.reserve(kMaxKernelResourceSlots);
+    claimed.assign(kMaxKernelResourceSlots, 0U);
+  }
+  void clear() noexcept { rows.clear(); }
+  /// One participant row: its own slot owner and resources (not copied; they
+  /// must stay unchanged until the fence returns). `revision_only`: raise
+  /// only the owner's operation revision (a participant of the operation that
+  /// this Stop does not start). Rows within the reserved capacity never
+  /// allocate.
+  void add_owner(const ResourceSlotOwnerDTO& owner, const std::span<const ResourceId> resources,
+                 const OperationRevision next_operation_revision,
+                 const bool revision_only) noexcept {
+    if (rows.size() == rows.capacity()) return;
+    rows.push_back(ResourceSlotStopFenceRow{&owner, resources, next_operation_revision,
+                                            !revision_only});
+  }
+  std::vector<ResourceSlotStopFenceRow> rows{};
+  /// Slot index of every row resource, rows in order.
+  std::vector<std::size_t> slot_indices{};
+  /// Per slot index: claimed by a row of the current batch (overlap check);
+  /// all zero between calls.
+  std::vector<std::uint8_t> claimed{};
+  /// The table generation after the last successful fence.
   std::uint64_t operation_resource_generation{};
-  StopGeneration stop_generation{0U};
-  std::vector<ResourceSlotOwnerDTO> revised_owners;
-  std::vector<ResourceId> orphan_resources;
-
-  friend bool operator==(const ResourceSlotStopFenceResultDTO&,
-                         const ResourceSlotStopFenceResultDTO&) = default;
 };
 
 /// One atomic read of the operation/resource truth owned by a slot table.
 /// Counts are operation counts, not resource counts. Reserved operations are
-/// queued; dispatched, stopping, terminal-awaiting-acknowledgement, and
-/// unreconciled orphan work are active for Apply-admission purposes.
+/// queued; dispatched, stopping and terminal-awaiting-acknowledgement work is
+/// active for Apply-admission purposes.
 struct ResourceSlotAdmissionSnapshotDTO final {
   std::uint64_t operation_resource_generation{};
   /// Installed runtime identity, including candidate facts staged under an
@@ -262,12 +273,19 @@ class ResourceSlotTable final {
       const std::vector<ResourceSlotReservationOwnerDTO>& owners, ResourceSlotState next_state,
       OperationRevision next_operation_revision);
 
-  /// Atomically fence a canonical set of distinct operation-participant owners
-  /// plus any retained orphan/effect-uncertain resources. Every precondition is
-  /// checked before any slot changes; success advances the table generation
-  /// exactly once regardless of owner count.
-  [[nodiscard]] Result<ResourceSlotStopFenceResultDTO> stop_fence_batch(
-      const ResourceSlotStopFenceRequestDTO& request);
+  /// E1: atomically fence the participant rows of one Stop event. Every
+  /// precondition is checked before any slot changes: each row's owner matches
+  /// its slots; a fenced row's slots are reserved, dispatched or terminal (a
+  /// terminal observation does not prove that an in-flight provider call
+  /// returned, so its exact Stop fence stays admissible); each row's revision
+  /// advances; scopes are disjoint. Success moves fenced slots to kStopping,
+  /// stamps `stop_event_id`, writes every row's next operation revision into
+  /// its slots' owner and advances the table generation once. Called under the
+  /// Kernel's state lock: takes only the data lock, allocates nothing, never
+  /// throws. The rows are `scratch.rows`. Returns nothing on success, else
+  /// the refusal reason code (the Kernel records it as `fence_degraded`).
+  [[nodiscard]] std::optional<std::string_view> stop_fence_batch(
+      StopEventId stop_event_id, ResourceSlotStopFenceScratch& scratch) noexcept;
 
   /// Clear an exact pre-dispatch reservation or acknowledged terminal scope.
   [[nodiscard]] Result<void> release(const ResourceSlotOwnerDTO& owner,
@@ -277,20 +295,6 @@ class ResourceSlotTable final {
   /// coordinated scope. No partial release is observable.
   [[nodiscard]] Result<void> release_batch(
       const std::vector<ResourceSlotReservationOwnerDTO>& owners);
-
-  /// Mark free resources conservatively unavailable after Kernel replacement.
-  /// No prior operation owner is recreated and this performs no controller or
-  /// transport effect. Later recovery must prove fresh quiescence before an
-  /// explicit reconciliation surface may release the marks.
-  [[nodiscard]] Result<void> mark_unreconciled_external_or_orphan_goal(
-      const std::vector<ResourceId>& resources);
-
-  /// Atomically release only the exact canonical orphan-resource subset named
-  /// by a fresh owner-issued reconciliation snapshot. A stale table generation
-  /// or any non-orphan row rejects before mutation.
-  [[nodiscard]] Result<std::uint64_t> reconcile_unreconciled_external_or_orphan_goal(
-      std::uint64_t expected_operation_resource_generation,
-      const std::vector<ResourceId>& resources);
 
   /// Replace the selected runtime inventory while preserving every unchanged
   /// occupied slot. An empty candidate is the valid no-commandable-component
@@ -312,12 +316,17 @@ class ResourceSlotTable final {
           route_published_active_control_configurations);
 
   [[nodiscard]] std::vector<ResourceSlotSnapshotDTO> snapshot() const;
+  /// Whether any of `resources` is still owned by `owner` (same operation
+  /// and participant). Takes only the data lock; allocates nothing. The Stop
+  /// core calls it under the Kernel lock.
+  [[nodiscard]] bool owner_holds_any(const ResourceSlotOwnerDTO& owner,
+                                     std::span<const ResourceId> resources) const noexcept;
   [[nodiscard]] ResourceSlotTableSnapshotDTO coherent_snapshot() const;
   [[nodiscard]] ResourceSlotAdmissionSnapshotDTO admission_snapshot(
       const std::vector<ResourceId>& affected_resources) const;
   /// Canonical unique operation owners currently retained by at least one
-  /// slot. Orphan-unreconciled slots have no operation owner and are omitted.
-  [[nodiscard]] std::vector<OperationId> active_operation_ids() const;
+  /// slot.
+  [[nodiscard]] std::vector<OperationNumber> active_operation_ids() const;
   [[nodiscard]] bool shares_admission_mutex(
       const std::shared_ptr<std::recursive_mutex>& admission_mutex) const noexcept;
 

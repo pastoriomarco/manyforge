@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { managerSectionOutstandingExchanges } from '../api/parsers/manager';
 
+import { displayApplyId } from '../api/applicationIdentity';
 import { api } from '../api/client';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { ComponentCatalogState } from '../hooks/useComponentCatalog';
@@ -122,6 +124,9 @@ export function DeploymentCompositionPanel({
     onDismiss: () => setError(null),
   });
   const maintenance = snapshot?.componentOverview.maintenanceOperation ?? null;
+  const managerPayload = snapshot?.runtime.sections.manager.payload ?? null;
+  const outstandingExchanges = useMemo(
+    () => managerSectionOutstandingExchanges(managerPayload), [managerPayload]);
   const inventoryApply = readModel === null
     ? null
     : selectManagerApplyInventoryIdentity(readModel.status.status.apply.records);
@@ -129,6 +134,7 @@ export function DeploymentCompositionPanel({
     maintenance === null ? inventoryApply : null,
     snapshot?.runtime.sections.manager ?? null,
     transportStatus,
+    snapshot?.applicationStartId ?? null,
   );
   const maintenanceStatus = maintenance === null ? inventoryStatus : advertisedStatus;
   const [reloadToken, setReloadToken] = useState(0);
@@ -258,6 +264,10 @@ export function DeploymentCompositionPanel({
           )}
           <div className="program-declaration-form compact">
             <h3>Manager Apply inventory</h3>
+            <p className="panel-intro">
+              The running Apply, the one that installed the active configuration and the newest
+              finished one. Older Applies are in History.
+            </p>
             {readModel.status.status.apply.records.length === 0 ? (
               <p className="panel-intro">No Manager Apply has been recorded.</p>
             ) : (
@@ -265,15 +275,15 @@ export function DeploymentCompositionPanel({
                 {[...readModel.status.status.apply.records]
                   .sort((left, right) => (
                     right.applyGeneration - left.applyGeneration
-                    || right.applyId.localeCompare(left.applyId)
+                    || right.applyId - left.applyId
                   ))
                   .map((record) => (
                     <li key={record.applyId + ':' + record.applyGeneration}>
-                      <strong>{shortIdentity(record.applyId)}</strong>
+                      <strong>{displayApplyId(snapshot?.applicationStartId, record.applyId)}</strong>
                       {' · generation ' + record.applyGeneration}
                       {' · ' + (record.terminalState ?? record.phase)}
                       <small>
-                        {' request ' + shortIdentity(record.request.requestId)}
+                        {' request ' + shortIdentity(record.request.requestKey)}
                         {' · target ' + shortIdentity(record.candidateRetainedBundleId)}
                       </small>
                     </li>
@@ -349,6 +359,7 @@ export function DeploymentCompositionPanel({
             rows={rows}
             graph={readModel?.graph ?? null}
             diff={readModel?.diff ?? null}
+            outstandingExchanges={outstandingExchanges}
             onNavigate={setTab}
             onOpenComponents={onOpenComponents}
           />

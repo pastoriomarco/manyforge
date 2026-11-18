@@ -14,10 +14,13 @@ namespace manyforge::roboplan_backend {
 /// fills it). Nothing here is inferred by ManyForge: it is the controller's
 /// own report.
 struct Ros2ControlObservation final {
-  /// The exact owner and task of a latched ROS owner stall, if any.
+  /// The exact owner and task of the current ROS owner stall, if any.
   std::optional<std::string> owner_stalled;
-  /// The component's launch exited, or its ROS executor failed.
+  /// The component's launch exited by itself.
   std::optional<std::string> process_fault;
+  /// One of its ROS transport executors failed (or its rebuild is not yet
+  /// qualified); Recover rebuilds the transport.
+  std::optional<std::string> transport_fault;
   /// A lane guard's fault awaiting Recover (the Isaac command-age guard).
   std::optional<std::string> guard_fault;
   /// A vendor tool-context call that may have changed the controller without

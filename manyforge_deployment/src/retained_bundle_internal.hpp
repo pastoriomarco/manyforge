@@ -36,16 +36,10 @@ struct PreparedControlDomainArtifact final {
   std::vector<RetainedArtifactInput> artifacts;
 };
 
-enum class PreparedRuntimeUnitKind {
-  kReference,
-  kRos2ControlExecution = 2,
-};
-
 struct PreparedRuntimeUnitArtifact final {
   core::RuntimeUnitId runtime_unit_id;
   std::string manifest_bytes;
   std::string launchable_bytes;
-  PreparedRuntimeUnitKind kind;
   const BuildQualifiedProductContract *contract;
 };
 

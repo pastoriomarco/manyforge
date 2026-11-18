@@ -40,6 +40,21 @@ from manyforge_headless_api.client import HeadlessClientError
 
 
 _DIGEST = "sha256:" + "1" * 64
+_APPLY_KEY = "e" * 32
+
+
+def _command(client: TestClient, path: str, body: dict[str, Any], key: str = _APPLY_KEY):
+    """Post one Apply-level command (OD-214) with its request key."""
+
+    return client.post(path, json={**body, "request_key": key})
+
+
+def _ended(state: ComposerState, key: str = _APPLY_KEY) -> dict[str, Any]:
+    """The command's row once it ended."""
+
+    row = state.apply_commands.ended_row(key)
+    assert row is not None and row["end"] is not None
+    return row
 
 
 def test_scene_preparation_unavailable_keeps_typed_http_error() -> None:
@@ -414,6 +429,12 @@ def _focused_document() -> dict[str, Any]:
 
 
 class _Coordinator:
+    def settle_before_preparation(self) -> None:
+        """No local claim is pending in these route-unit tests."""
+
+    def manager_submission_sent(self, _claim) -> None:
+        """The parent claim's hand-over is the real coordinator's concern."""
+
     def execute(
         self,
         _envelope,
@@ -525,11 +546,10 @@ def _request(workspace: dict[str, Any], **extra: Any) -> dict[str, Any]:
         "draftId": workspace["draft"]["id"],
         "expectedDraftRevision": workspace["draft"]["revision"],
         "expectedAdmissionGeneration": 1,
-        "requestOwnerEpoch": "browser-test",
-        "requestId": "request-"
-        + str(workspace["draft"]["revision"])
-        + "-"
-        + extra.pop("kind", "edit"),
+        "applicationStartId": "3f9a0000000000a1",
+        # One key per (revision, kind), as distinct browser requests.
+        "requestKey": f"{workspace['draft']['revision']:016x}"
+        + extra.pop("kind", "edit").encode("utf-8").hex()[:16].ljust(16, "0"),
         "expectedWorkspaceEpoch": identity["workspaceEpoch"],
         "expectedWorkspaceRevision": identity["workspaceRevision"],
         **extra,
@@ -572,7 +592,7 @@ def _seed_existing_deployment(
 
 
 def _client(tmp_path: Path) -> tuple[TestClient, ComposerState]:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     _replace_deployment_session(
         state,
         DeploymentDraftSession(compiler=_compile),
@@ -581,14 +601,67 @@ def _client(tmp_path: Path) -> tuple[TestClient, ComposerState]:
     state.headless_client = _Headless()  # type: ignore[assignment]
     state.allowed_fs_roots = [str(tmp_path)]
     state.allowed_deployment_write_roots = [str(tmp_path)]
-    state.current_scenario = lambda: {  # type: ignore[method-assign]
-        "ready": False,
-        "current_scenario": None,
-        "unavailable_reasons": ["not_applied"],
-    }
     app = FastAPI()
     app.include_router(create_deployment_draft_router(state))
     return TestClient(app), state
+
+
+def test_workspace_read_while_apply_publishes_shows_not_ready(
+    tmp_path: Path,
+) -> None:
+    """OD-265: one publication read; an Apply ending mid-read is no 500."""
+
+    client, state = _client(tmp_path)
+    digest = "sha256:" + "a" * 64
+    published = {
+        "ready": True,
+        "unavailable_reasons": [],
+        "published_scenario": {
+            "deployment_artifact_id": "cell",
+            "deployment_revision": digest,
+            "retained_bundle_id": digest,
+            "graph_revision": digest,
+            "program_id": "p",
+            "program_revision": digest,
+            "scenario_id": "s",
+            "source_document_digest": digest,
+            "program_outcome": {"kind": "bound", "program_binding_id": digest},
+        },
+    }
+    reads = iter(
+        [
+            {
+                "ready": False,
+                "published_scenario": None,
+                "unavailable_reasons": ["deployment_not_published"],
+            },
+            published,
+        ]
+    )
+    # The Apply's publication becomes ready after the first read, and the
+    # Manager has converged on it.
+    state.published_scenario = lambda: next(reads)  # type: ignore[method-assign]
+    fresh = {"available": True, "freshness": "fresh", "known_gaps": []}
+    state.headless_client.manager_status = lambda: {  # type: ignore[union-attr]
+        "source": fresh,
+        "status": {
+            "manager_ready": True,
+            "runtime": {"converged": True},
+            "active": {"retained_bundle_id": digest, "graph_revision": digest},
+        },
+    }
+    state.headless_client.manager_diff = lambda: {  # type: ignore[union-attr]
+        "source": fresh,
+        "converged": True,
+    }
+
+    response = client.get("/api/deployment/workspace")
+
+    assert response.status_code == 200, response.text
+    applied = response.json()["managerApplied"]
+    assert applied["deploymentRevision"] is None
+    assert applied["scenarioId"] is None
+    assert applied["activationOrder"] is None
 
 
 @pytest.mark.parametrize("route", ["save", "save-as"])
@@ -617,7 +690,7 @@ def test_refused_deployment_save_writes_no_artifact(
         json=_request(workspace, path=["name"], value="Edited cell"),
     ).json()
     source_bytes = source.read_bytes()
-    state.authoring_admission = AuthoringAdmissionCoordinator(Refusing())  # type: ignore[arg-type]
+    state.authoring_admission = AuthoringAdmissionCoordinator(Refusing(), 0x3F9A0000000000A1)  # type: ignore[arg-type]
 
     refused = client.post(
         f"/api/deployment/{route}",
@@ -1012,7 +1085,6 @@ def test_deployment_preview_and_apply_are_orchestrated_server_side(
                     "available": True,
                     "freshness": "fresh",
                     "known_gaps": [],
-                    "source_owner_epoch": "manager.epoch.1",
                 },
                 "status": {
                     "manager_ready": True,
@@ -1057,7 +1129,7 @@ def test_deployment_preview_and_apply_are_orchestrated_server_side(
         "authoring_allowed": True, "admission_generation": 3,
     }
     CandidateHeadless.manager_apply_status = (  # type: ignore[attr-defined]
-        lambda _self, apply_id, generation: {"ok": True, "state": "succeeded"}
+        lambda _self, apply_id, generation, *, application_start_id: {"ok": True, "state": "succeeded"}
     )
     state.headless_client = CandidateHeadless()  # type: ignore[assignment]
     impact = {
@@ -1082,7 +1154,7 @@ def test_deployment_preview_and_apply_are_orchestrated_server_side(
             "manager_apply": None,
             "preparation": None,
             "phases_ms": {},
-            "apply_id": "apply-1" if apply else None,
+            "apply_id": 1 if apply else None,
             "apply_generation": 1 if apply else None,
         }
         if prepare_only:
@@ -1120,44 +1192,53 @@ def test_deployment_preview_and_apply_are_orchestrated_server_side(
     assert actions == []
 
     cycle["state"] = "running"
-    refused = client.post(
-        "/api/deployment/apply", json={"scope": scope}
+    refused = _command(
+        client, "/api/deployment/apply", {"scope": scope}, "1" * 32
     )
     assert refused.status_code == 409, refused.text
     assert refused.json()["detail"]["code"] == "apply_refused_run_in_progress"
+    # A refusal at once keeps its reply and is a refused row.
+    refused_row = state.apply_commands.rows.find("1" * 32)
+    assert refused_row["accepted_at_ns"] is None
+    assert refused_row["end"]["code"] == "apply_refused_run_in_progress"
     assert actions == [] and submitted == []
 
     cycle["state"] = "idle_after_reset"
     # Bound to the Preview the user saw: a changed input is refused first.
-    stale = client.post(
-        "/api/deployment/apply",
-        json={"scope": {**scope, "deployment_draft_revision": -1}},
+    stale = _command(
+        client, "/api/deployment/apply",
+        {"scope": {**scope, "deployment_draft_revision": -1}}, "2" * 32,
     )
     assert stale.status_code == 409, stale.text
     assert stale.json()["detail"]["code"] == "activation_input_changed_after_confirmation"
     assert actions == [] and submitted == []
 
-    applied = client.post(
-        "/api/deployment/apply", json={"scope": scope}
-    )
+    applied = _command(client, "/api/deployment/apply", {"scope": scope})
     assert applied.status_code == 200, applied.text
+    assert applied.json()["schema_version"] == "manyforge.apply_command_reply.v1"
+    assert applied.json()["command"]["kind"] == "deployment_apply"
+    ended = _ended(state)
     assert actions == [
         ("disable", "lite_gripper"),
         ("disable", "lite6_robot"),
         ("prepare", "lite6_robot"),
     ]
     assert submitted[-1]["expected_admission_generation"] == 3
-    assert submitted[-1]["scene_initialization"] == "initialize"
-    assert applied.json() == {
-        "outcome": "succeeded",
-        "components": [
-            {"component_id": "lite6_robot", "disposition": "replace",
-             "lifecycle_after": "prepared"},
-            {"component_id": "lite_gripper", "disposition": "remove"},
-            {"component_id": "camera", "disposition": "retain",
-             "lifecycle_after": "enabled"},
-        ],
-    }
+    assert submitted[-1]["scene_initialization"] == "preserve"
+    assert ended["end"]["outcome"] == "succeeded"
+    # A succeeded Apply-level row keeps its component rows (OD-214 contract
+    # §3.1): the panel's success text is built from them.
+    assert ended["end"]["details"] == {"components": [
+        {"component_id": "lite6_robot", "disposition": "replace",
+         "lifecycle_after": "prepared"},
+        {"component_id": "lite_gripper", "disposition": "remove"},
+        {"component_id": "camera", "disposition": "retain",
+         "lifecycle_after": "enabled"},
+    ]}
+    # The workspace document publishes the row (v2).
+    workspace = client.get("/api/deployment/workspace").json()
+    assert workspace["schemaVersion"] == "manyforge.composer_deployment_workspace.v2"
+    assert workspace["apply_commands"]["ended"][0] == ended
 
     # Nothing changed since Applied: refused before the finished run's Reset
     # or any disable (409 deployment_apply_nothing_to_apply).
@@ -1189,9 +1270,9 @@ def test_deployment_preview_and_apply_are_orchestrated_server_side(
     )
     cycle["state"] = "terminal_awaiting_reset"
     before = (list(actions), len(submitted))
-    unchanged = client.post(
-        "/api/deployment/apply", json={"scope": client.post(
-            "/api/deployment/preview", json={}).json()["scope"]}
+    unchanged = _command(
+        client, "/api/deployment/apply", {"scope": client.post(
+            "/api/deployment/preview", json={}).json()["scope"]}, "3" * 32,
     )
     assert unchanged.status_code == 409, unchanged.text
     assert unchanged.json()["detail"]["code"] == "deployment_apply_nothing_to_apply"
@@ -1321,8 +1402,7 @@ def _scenario_revert_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     class CandidateHeadless(_Headless):
         def manager_status(self):
             return {
-                "source": {"available": True, "freshness": "fresh", "known_gaps": [],
-                           "source_owner_epoch": "manager.epoch.1"},
+                "source": {"available": True, "freshness": "fresh", "known_gaps": []},
                 "status": {"manager_ready": True, "active": {
                     "retained_bundle_id": "sha256:" + "2" * 64,
                     "graph_revision": "sha256:" + "3" * 64,
@@ -1365,14 +1445,15 @@ def test_scenario_revert_activates_saved_program_and_deployment_and_restores_bot
     client, state, compiled, saved_program, program_model, effects = (
         _scenario_revert_setup(tmp_path, monkeypatch)
     )
-    response = client.post("/api/deployment/revert", json={})
+    response = _command(client, "/api/deployment/revert", {})
 
     assert response.status_code == 200, response.text
-    assert response.json() == {"outcome": "succeeded", "components": []}
+    assert response.json()["command"]["kind"] == "deployment_revert"
+    assert _ended(state)["end"]["outcome"] == "succeeded"
     assert len(effects) == 1
     assert effects[0]["deployment"] == compiled.document
     assert effects[0]["program"] == saved_program
-    assert effects[0]["scene_initialization"] == "initialize"
+    assert effects[0]["scene_initialization"] == "preserve"
     assert state.deployment_draft_session.retained_state()["document"] == compiled.document
     assert state.draft_session.retained_state()["authoring"]["description"] == (
         program_model.to_dict()["description"]
@@ -1382,7 +1463,7 @@ def test_scenario_revert_activates_saved_program_and_deployment_and_restores_bot
 def test_scenario_revert_goes_through_its_preview_and_is_bound_to_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client, _state, _compiled, _saved_program, _program_model, effects = (
+    client, state, _compiled, _saved_program, _program_model, effects = (
         _scenario_revert_setup(tmp_path, monkeypatch)
     )
     preview = client.post("/api/deployment/revert/preview", json={})
@@ -1391,16 +1472,17 @@ def test_scenario_revert_goes_through_its_preview_and_is_bound_to_it(
     assert effects == []  # the Preview changes nothing
 
     scope = preview.json()["scope"]
-    stale = client.post(
-        "/api/deployment/revert",
-        json={"scope": {**scope, "program_draft_revision": -1}},
+    stale = _command(
+        client, "/api/deployment/revert",
+        {"scope": {**scope, "program_draft_revision": -1}}, "4" * 32,
     )
     assert stale.status_code == 409, stale.text
     assert stale.json()["detail"]["code"] == "activation_input_changed_after_confirmation"
     assert effects == []
 
-    reverted = client.post("/api/deployment/revert", json={"scope": scope})
+    reverted = _command(client, "/api/deployment/revert", {"scope": scope})
     assert reverted.status_code == 200, reverted.text
+    _ended(state)
     assert len(effects) == 1
 
 
@@ -1413,8 +1495,7 @@ def test_scenario_revert_partial_contained_install_keeps_the_claim(
         _scenario_revert_setup(tmp_path, monkeypatch)
     )
     headless = _Headless(generation=1)
-    coordinator = AuthoringAdmissionCoordinator(headless)  # type: ignore[arg-type]
-    coordinator.recover()
+    coordinator = AuthoringAdmissionCoordinator(headless, 0x3F9A0000000000A1)  # type: ignore[arg-type]
     state.authoring_admission = coordinator
 
     def fail_program_restore(*_args, **_kwargs):
@@ -1424,12 +1505,13 @@ def test_scenario_revert_partial_contained_install_keeps_the_claim(
     monkeypatch.setattr(
         state.draft_session, "install_prepared_replacement", fail_program_restore
     )
-    response = client.post("/api/deployment/revert", json={})
+    response = _command(client, "/api/deployment/revert", {})
 
     # The orchestrated Revert ends `failed` with the failed step's code.
     assert response.status_code == 200, response.text
-    assert response.json()["outcome"] == "failed"
-    assert response.json()["error"]["code"] == "composer_workspace_install_failed"
+    end = _ended(state)["end"]
+    assert end["outcome"] == "failed"
+    assert end["code"] == "composer_workspace_install_failed"
     assert state.authoring_workspace.failed_closed is not None
     assert effects == []
     # Never settled as proven no effect: the claim is retained, admission blocked.
@@ -1439,7 +1521,7 @@ def test_scenario_revert_partial_contained_install_keeps_the_claim(
 
 
 def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -> None:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     receipt = {
         "expected_current": {
             "retained_bundle_id": "sha256:" + "2" * 64,
@@ -1473,7 +1555,7 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
             return {
                 "ok": True,
                 "state": "pending",
-                "apply_id": "apply.1",
+                "apply_id": 1,
                 "apply_generation": 1,
                 "candidate_projection_revision": {
                     "retained_bundle_id": receipt["candidate_retained_bundle_id"],
@@ -1498,10 +1580,9 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
             "prepared_activation": prepared_activation,
             "candidate_preview": {"candidate_receipt": receipt},
             "manager_apply": {
-                "request_id": "request.1",
-                "request_owner_epoch": "manager.epoch.1",
+                "request_key": "1" * 32,
+                "application_start_id": "3f9a0000000000a1",
                 "source_label": "manyforge_composer_deployment_apply",
-                "correlation_id": "browser.1",
                 "deployment_artifact_id": "cell-a",
                 "deployment_revision": "sha256:" + "9" * 64,
                 "expected_current": receipt["expected_current"],
@@ -1529,7 +1610,7 @@ def test_activation_submits_exact_preparation_to_manager_without_post_rebind() -
 
 
 def test_manager_apply_rejection_keeps_manager_code_and_message() -> None:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
 
     class Headless:
         def manager_apply(self, _body):
@@ -1543,7 +1624,7 @@ def test_manager_apply_rejection_keeps_manager_code_and_message() -> None:
 
     state.headless_client = Headless()  # type: ignore[assignment]
     with pytest.raises(AuthoringOperationError) as caught:
-        state.apply_manager_deployment_candidate({"manager_apply": {"request_id": "r.1"}})
+        state.apply_manager_deployment_candidate({"manager_apply": {"request_key": "1" * 32}})
     # The Composer code that drives settlement stays the same; only the text
     # names Manager's precise cause.
     assert caught.value.code == "manager_apply_rejected"
@@ -1558,12 +1639,12 @@ def test_manager_apply_rejection_keeps_manager_code_and_message() -> None:
 
     state.headless_client = Bare()  # type: ignore[assignment]
     with pytest.raises(AuthoringOperationError) as bare:
-        state.apply_manager_deployment_candidate({"manager_apply": {"request_id": "r.2"}})
+        state.apply_manager_deployment_candidate({"manager_apply": {"request_key": "2" * 32}})
     assert str(bare.value) == "Manager rejected the exact Deployment candidate"
 
 
 def test_only_typed_preacceptance_rejection_becomes_definite_manager_refusal() -> None:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
 
     class Headless:
         effect: str | None = "none"
@@ -1577,7 +1658,7 @@ def test_only_typed_preacceptance_rejection_becomes_definite_manager_refusal() -
                 status_code=400,
                 details=details,
                 response={
-                    "api_version": "manyforge.manager_command_response.v2",
+                    "api_version": "manyforge.manager_command_response.v3",
                     "ok": False,
                     "error": {
                         "code": "apply_rejected",
@@ -1591,7 +1672,7 @@ def test_only_typed_preacceptance_rejection_becomes_definite_manager_refusal() -
     state.headless_client = headless  # type: ignore[assignment]
     with pytest.raises(AuthoringOperationError) as rejected:
         state.apply_manager_deployment_candidate(
-            {"manager_apply": {"request_id": "isaac-load.1"}}
+            {"manager_apply": {"request_key": "3" * 32}}
         )
     assert rejected.value.code == "manager_apply_rejected"
     assert str(rejected.value) == (
@@ -1605,7 +1686,7 @@ def test_only_typed_preacceptance_rejection_becomes_definite_manager_refusal() -
     headless.effect = None
     with pytest.raises(HeadlessClientError) as unknown:
         state.apply_manager_deployment_candidate(
-            {"manager_apply": {"request_id": "isaac-load.2"}}
+            {"manager_apply": {"request_key": "4" * 32}}
         )
     assert unknown.value.code == "apply_rejected"
 
@@ -1870,7 +1951,7 @@ def test_save_as_path_rebase_matches_saved_scenario_but_real_edits_do_not() -> N
         rebase_deployment_intent_sources,
     )
 
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     source_root = Path("/workspace/source/cell")
     destination_root = Path("/workspace/copies/deep/cell")
     deployment = {
@@ -1940,7 +2021,7 @@ def test_save_as_path_rebase_matches_saved_scenario_but_real_edits_do_not() -> N
 
 
 def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     _replace_deployment_session(
         state,
         DeploymentDraftSession(compiler=_compile),
@@ -1980,16 +2061,15 @@ def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():
         def program_run_start(self, _body):
             raise AssertionError("Run must be rejected before transport")
 
-    state.authoring_admission = AuthoringAdmissionCoordinator(None)  # type: ignore[arg-type]
+    state.authoring_admission = AuthoringAdmissionCoordinator(None, 0x3F9A0000000000A1)  # type: ignore[arg-type]
     app = FastAPI()
     app.include_router(create_headless_router(Headless(), state))  # type: ignore[arg-type]
     response = TestClient(app).post(
         "/api/program/runs",
         json={
-            "request_id": "run-1",
-            "request_owner_epoch": "browser-1",
+            "request_key": "a1" * 16,
+            "application_start_id": "3f9a0000000000a1",
             "source_label": "test",
-            "correlation_id": None,
             "scenario_id": "cell-a",
             "source_document_digest": _DIGEST,
             "expected_applied_record_digest": _DIGEST,
@@ -2004,7 +2084,7 @@ def test_run_rejects_a_loaded_deployment_draft_that_is_not_manager_applied():
 
 
 def test_run_uses_the_existing_transport_when_deployment_draft_matches_applied():
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     _replace_deployment_session(
         state,
         DeploymentDraftSession(compiler=_compile),
@@ -2030,18 +2110,17 @@ def test_run_uses_the_existing_transport_when_deployment_draft_matches_applied()
 
     class Headless:
         def program_run_start(self, body):
-            return {"accepted_request_id": body["request_id"]}
+            return {"accepted_request_key": body["request_key"]}
 
-    state.authoring_admission = AuthoringAdmissionCoordinator(None)  # type: ignore[arg-type]
+    state.authoring_admission = AuthoringAdmissionCoordinator(None, 0x3F9A0000000000A1)  # type: ignore[arg-type]
     app = FastAPI()
     app.include_router(create_headless_router(Headless(), state))  # type: ignore[arg-type]
     response = TestClient(app).post(
         "/api/program/runs",
         json={
-            "request_id": "run-1",
-            "request_owner_epoch": "browser-1",
+            "request_key": "a1" * 16,
+            "application_start_id": "3f9a0000000000a1",
             "source_label": "test",
-            "correlation_id": None,
             "scenario_id": "cell-a",
             "source_document_digest": _DIGEST,
             "expected_applied_record_digest": _DIGEST,
@@ -2049,11 +2128,11 @@ def test_run_uses_the_existing_transport_when_deployment_draft_matches_applied()
         },
     )
     assert response.status_code == 200
-    assert response.json() == {"accepted_request_id": "run-1"}
+    assert response.json() == {"accepted_request_key": "a1" * 16}
 
 
 def test_run_rejects_unapplied_program_draft_before_transport() -> None:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     state.draft_session.snapshot = lambda: {"program_revision": _DIGEST}  # type: ignore[method-assign]
     state.published_scenario = lambda: {  # type: ignore[method-assign]
         "ready": True,
@@ -2064,16 +2143,15 @@ def test_run_rejects_unapplied_program_draft_before_transport() -> None:
         def program_run_start(self, _body):
             raise AssertionError("Run must be rejected before transport")
 
-    state.authoring_admission = AuthoringAdmissionCoordinator(None)  # type: ignore[arg-type]
+    state.authoring_admission = AuthoringAdmissionCoordinator(None, 0x3F9A0000000000A1)  # type: ignore[arg-type]
     app = FastAPI()
     app.include_router(create_headless_router(Headless(), state))  # type: ignore[arg-type]
     response = TestClient(app).post(
         "/api/program/runs",
         json={
-            "request_id": "run-1",
-            "request_owner_epoch": "browser-1",
+            "request_key": "a1" * 16,
+            "application_start_id": "3f9a0000000000a1",
             "source_label": "test",
-            "correlation_id": None,
             "scenario_id": "cell-a",
             "source_document_digest": _DIGEST,
             "expected_applied_record_digest": _DIGEST,
@@ -2087,7 +2165,7 @@ def test_run_rejects_unapplied_program_draft_before_transport() -> None:
 @pytest.mark.parametrize("command_kind", ["program_motion_start", "operation_start",
                                          "direct_http_operation", "direct_http_refused"])
 def test_only_program_start_rejects_unapplied_deployment_before_transport(command_kind: str) -> None:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     _replace_deployment_session(
         state,
         DeploymentDraftSession(compiler=_compile),
@@ -2120,15 +2198,15 @@ def test_only_program_start_rejects_unapplied_deployment_before_transport(comman
                 raise HeadlessClientError("authoring_not_ready", "activation holds admission", status_code=409)
             return {"accepted": True}
 
-    state.authoring_admission = AuthoringAdmissionCoordinator(None)  # type: ignore[arg-type]
+    state.authoring_admission = AuthoringAdmissionCoordinator(None, 0x3F9A0000000000A1)  # type: ignore[arg-type]
     app = FastAPI()
     app.include_router(create_headless_router(Headless(), state))  # type: ignore[arg-type]
     if command_kind.startswith("direct_http_"):
         body = {
-            "request_context": {"request_id": "manual", "request_owner_epoch": "owner",
-                                "source_label": "test", "correlation_id": None},
+            "request_context": {"request_key": "b1" * 16, "source_label": "test"},
+            "application_start_id": "3f9a0000000000a1",
             "program_id": "manual", "program_revision": _DIGEST,
-            "program_binding_id": _DIGEST, "program_run_id": "manual-run",
+            "program_binding_id": _DIGEST, "program_run_id": None,
             "expected_graph_revision": _DIGEST, "expected_retained_bundle_id": _DIGEST,
             "expected_scene_revision": {"scene_id": _DIGEST, "revision_id": 1, "content_hash": _DIGEST},
             "participants": [{"target": {"component_id": "robot", "command_target_id": "arm"},
@@ -2160,24 +2238,24 @@ def test_only_program_start_rejects_unapplied_deployment_before_transport(comman
         "/api/control/commands",
         json={
             "command_envelope": {
-                "schema_version": "manyforge.execution_command.v1",
+                "schema_version": "manyforge.execution_command.v2",
                 "command_kind": command_kind,
-                "correlation_id": "manual-start-1",
                 "source_label": "test",
-                "control_session_id": None,
+                "control_session_number": None,
                 "client_sequence": None,
                 "freshness": {
                     "context_id": "freshness-1",
-                    "receiver_incarnation": "headless-1",
-                    "semantic_owner_epoch": "program-1",
                     "execution_control_revision": 1,
                     "issued_server_sequence": "1",
                     "valid_for_ns": 750_000_000,
                 },
-                "expected_semantic_owner_epoch": "program-1",
                 "expected_execution_control_revision": 1,
             },
-            "payload": {},
+            # A session-less command carries its key and `A` in the payload.
+            "payload": {
+                "request_key": "c1" * 16,
+                "application_start_id": "3f9a0000000000a1",
+            },
         },
     )
     if command_kind == "program_motion_start":
@@ -2190,7 +2268,7 @@ def test_only_program_start_rejects_unapplied_deployment_before_transport(comman
 
 @pytest.mark.parametrize("route", ["control_command", "recovery_action"])
 def test_retry_is_refused_with_unapplied_draft_and_reset_is_not(route: str) -> None:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     applied = {"program_revision": "sha256:" + "2" * 64}
     state.draft_session.snapshot = lambda: {  # type: ignore[method-assign]
         "program_loaded": True, "program_revision": _DIGEST,
@@ -2209,18 +2287,16 @@ def test_retry_is_refused_with_unapplied_draft_and_reset_is_not(route: str) -> N
             submitted.append(body["action_id"])
             return {"accepted": True}
 
-    state.authoring_admission = AuthoringAdmissionCoordinator(None)  # type: ignore[arg-type]
+    state.authoring_admission = AuthoringAdmissionCoordinator(None, 0x3F9A0000000000A1)  # type: ignore[arg-type]
     app = FastAPI()
     app.include_router(create_headless_router(Headless(), state))  # type: ignore[arg-type]
     client = TestClient(app)
 
     def recover(action_id: str):
         payload = {
-            "request_id": f"recovery-{action_id}",
-            "request_owner_epoch": "browser-1",
+            "request_key": action_id.encode("utf-8").hex()[:32].ljust(32, "0"),
+            "application_start_id": "3f9a0000000000a1",
             "source_label": "test",
-            "correlation_id": None,
-            "expected_owner_epoch": "program-1",
             "offer_id": _DIGEST,
             "offer_revision": 1,
             "action_id": action_id,
@@ -2230,21 +2306,17 @@ def test_retry_is_refused_with_unapplied_draft_and_reset_is_not(route: str) -> N
             return client.post("/api/cycle/recovery-actions", json=payload)
         return client.post("/api/control/commands", json={
             "command_envelope": {
-                "schema_version": "manyforge.execution_command.v1",
+                "schema_version": "manyforge.execution_command.v2",
                 "command_kind": "execution_recovery",
-                "correlation_id": f"recovery-{action_id}",
                 "source_label": "test",
-                "control_session_id": None,
+                "control_session_number": None,
                 "client_sequence": None,
                 "freshness": {
                     "context_id": "freshness-1",
-                    "receiver_incarnation": "headless-1",
-                    "semantic_owner_epoch": "program-1",
                     "execution_control_revision": 1,
                     "issued_server_sequence": "1",
                     "valid_for_ns": 750_000_000,
                 },
-                "expected_semantic_owner_epoch": "program-1",
                 "expected_execution_control_revision": 1,
             },
             "payload": payload,
@@ -2281,19 +2353,19 @@ def _configuration_preparation(tmp_path: Path):
         "node_environment_digest": digest, "assistant_mode": "forbidden",
     }
     preview = {
-        "api_version": "manyforge.manager_command_response.v2", "ok": True,
+        "api_version": "manyforge.manager_command_response.v3", "ok": True,
         "converged": False,
         "diff": {kind: {"added": [], "changed": [], "removed": []} for kind in (
             "component_attachments", "controllable_components", "control_bindings",
             "control_domains", "model_instances", "runtime_units",
         )},
         "candidate_receipt": {
-            "schema_version": "manyforge.manager_deployment_candidate_receipt.v2",
+            "schema_version": "manyforge.manager_deployment_candidate_receipt.v3",
             "deployment_artifact_id": "deployment.fixture", "deployment_revision": digest,
             "prepared_activation_id": digest,
             "candidate_retained_bundle_id": "bundle.next", "candidate_graph_revision": "graph.next",
             "expected_current": current, "expected_admission_generation": 1,
-            "manager_owner_epoch": "manager.epoch.1", "impact_digest": digest,
+            "impact_digest": digest,
             "destructive_impact": False, "receipt_digest": digest,
         },
         "impact": {
@@ -2309,27 +2381,41 @@ def _configuration_preparation(tmp_path: Path):
     }
 
     class Headless:
-        def prepare_activation(self, _request):
+        def prepare_activation(self, request):
+            # OD-214: answered at acceptance; this preparation already ended.
+            return {
+                "schema_version": "manyforge.activation_preparation_reply.v1",
+                "command": {
+                    "kind": "activation_preparation",
+                    "request_key": request["request_key"],
+                    "captured_input_digest": request["captured_input_digest"],
+                    "step": "preparing", "accepted_at_ns": "1",
+                    "end": {"outcome": "succeeded", "code": None, "details": None,
+                            "finished_at_ns": "2"},
+                },
+            }
+
+        def prepared_activation(self, captured_input_digest):
+            assert captured_input_digest == digest
             return {"prepared_activation": deepcopy(prepared_activation)}
 
         def manager_status(self):
             return {
-                "source": {"available": True, "freshness": "fresh", "known_gaps": [],
-                           "source_owner_epoch": "manager.epoch.1"},
+                "source": {"available": True, "freshness": "fresh", "known_gaps": []},
                 "status": {"manager_ready": True, "active": dict(current)},
             }
 
         def manager_deployment_candidate_preview(self, _request):
             return deepcopy(preview)
 
-    state = ComposerState(allowed_fs_roots=[str(tmp_path)])
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)])
     state.headless_client = Headless()  # type: ignore[assignment]
     intent = {
         "scenario_id": "cell", "project_path": "/projects/cell.scenario",
         "source_document_digest": digest, "captured_input_digest": digest,
         "deployment": {}, "model_source_closure": {}, "program": None, "program_role_assignment": {},
         "expected_manager_current": current, "expected_admission_generation": 1,
-        "manager_request_id": "request", "correlation_id": "correlation",
+        "application_start_id": "3f9a0000000000a1", "request_key": "d1" * 16,
         "confirmation_token": None, "draft_id": "draft", "draft_revision": 1,
     }
     return state, intent, preview
@@ -2390,9 +2476,104 @@ def test_concurrent_preparations_wait_for_each_other_instead_of_refusing(tmp_pat
     assert len(results) == 2
 
 
+def _preparation_follow(state: ComposerState, statuses: list[Any]) -> list[dict[str, Any]]:
+    """Make Headless accept the preparation and publish ``statuses`` after."""
+
+    accepted = state.headless_client.prepare_activation
+    replies: list[dict[str, Any]] = []
+
+    def prepare(request):
+        reply = accepted(request)
+        reply["command"]["end"] = None  # still running when answered
+        reply["command"]["step"] = "awaiting_admission"
+        replies.append(reply)
+        return reply
+
+    def cycle_status():
+        value = statuses.pop(0)
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    state.headless_client.prepare_activation = prepare  # type: ignore[union-attr]
+    state.headless_client.program_cycle_status = cycle_status  # type: ignore[union-attr]
+    state._ACTIVATION_PREPARATION_POLL_S = 0.0  # type: ignore[misc]
+    return replies
+
+
+def _preparation_rows(key: str, digest: str, end: dict[str, Any] | None) -> dict[str, Any]:
+    row = {"kind": "activation_preparation", "request_key": key,
+           "captured_input_digest": digest, "step": "preparing",
+           "accepted_at_ns": "1", "end": end}
+    return ({"in_progress": row, "ended": []} if end is None
+            else {"in_progress": None, "ended": [row]})
+
+
+def test_a_preparation_is_followed_to_its_end_in_the_status(tmp_path: Path) -> None:
+    # OD-214 (T35): no limit on the wait; the status says when it ended,
+    # and the prepared activation is read by its digest.
+    state, intent, _preview = _configuration_preparation(tmp_path)
+    statuses: list[Any] = []
+    replies = _preparation_follow(state, statuses)
+    succeeded = {"outcome": "succeeded", "code": None, "details": None, "finished_at_ns": "2"}
+
+    def fill(request_key: str) -> None:
+        digest = intent["captured_input_digest"]
+        statuses.extend([
+            {"activation_preparation": _preparation_rows(request_key, digest, None)},
+            # The runner's absence never hides the preparation's own status.
+            HeadlessClientError("program_runner_unavailable", "gone", 503, details={
+                "activation_preparation": _preparation_rows(request_key, digest, None)}),
+            {"activation_preparation": _preparation_rows(request_key, digest, succeeded)},
+        ])
+
+    original = state.headless_client.prepare_activation
+
+    def prepare(request):
+        fill(request["request_key"])
+        return original(request)
+
+    state.headless_client.prepare_activation = prepare  # type: ignore[union-attr]
+    prepared = state._prepare_authored_deployment_candidate(intent, None, apply=True)
+    assert prepared["manager_apply"] is not None
+    assert statuses == []
+    assert len(replies) == 1 and len(replies[0]["command"]["request_key"]) == 32
+
+
+@pytest.mark.parametrize("outcome,status", [("refused", 409), ("failed", None),
+                                            ("unknown", None)])
+def test_a_preparation_that_did_not_succeed_raises_its_code(
+    tmp_path: Path, outcome: str, status: int | None
+) -> None:
+    state, intent, _preview = _configuration_preparation(tmp_path)
+    statuses: list[Any] = []
+    _preparation_follow(state, statuses)
+    original = state.headless_client.prepare_activation
+    end = {"outcome": outcome, "code": "activation_preparation_failed",
+           "details": {"preparer_detail": "x"}, "finished_at_ns": "2"}
+
+    def prepare(request):
+        statuses.append({"activation_preparation": _preparation_rows(
+            request["request_key"], intent["captured_input_digest"], end)})
+        return original(request)
+
+    state.headless_client.prepare_activation = prepare  # type: ignore[union-attr]
+    expected = HTTPException if status is not None else HeadlessClientError
+    with pytest.raises(expected) as raised:
+        state._prepare_authored_deployment_candidate(intent, None, apply=True)
+    if status is not None:
+        # A refused end is the definite refusal before any effect.
+        assert raised.value.status_code == 409
+        assert raised.value.detail["code"] == "activation_preparation_failed"
+        assert raised.value.detail["details"] == {"preparer_detail": "x"}
+    else:
+        assert raised.value.code == "activation_preparation_failed"
+        assert raised.value.status_code is None
+
+
 def test_activation_order_comes_from_exact_applied_capture_not_draft(monkeypatch: pytest.MonkeyPatch) -> None:
     from manyforge_composer.backend.routes_deployment_draft import _workspace
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     state.headless_client = object()  # type: ignore[assignment]
     publication = {"scenario_id": "cell", "deployment_revision": _DIGEST,
                    "retained_bundle_id": "bundle", "graph_revision": _DIGEST}
@@ -2411,7 +2592,7 @@ def test_workspace_publishes_whether_saved_differs_from_the_exact_applied_deploy
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from manyforge_composer.backend.routes_deployment_draft import _workspace
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     state.headless_client = object()  # type: ignore[assignment]
     session = DeploymentDraftSession(compiler=_compile)
     _replace_deployment_session(state, session)
@@ -2466,7 +2647,7 @@ def test_workspace_publishes_whether_saved_differs_from_the_exact_applied_deploy
     None,
 ])
 def test_captured_authoring_context_requires_checked_scenario_origin(origin) -> None:
-    state = ComposerState()
+    state = ComposerState(application_start_id=0x3F9A0000000000A1)
     with pytest.raises(AuthoringOperationError) as error:
         state._captured_deployment_context({"deployment": {"name": "current"},
             "scenario_id": "cell_a", "source_document_digest": _DIGEST,

@@ -61,8 +61,7 @@ enum class ActionOutcome : std::uint8_t {
 
 /// Vendor-neutral fault codes (plan, "Fault catalogue").
 enum class FaultCode : std::uint8_t {
-  kEstop = 0,
-  kProtectiveStop,
+  kProtectiveStop = 0,
   kSafeguardStop,
   kLimitViolation,
   kSelfCollision,
@@ -74,6 +73,9 @@ enum class FaultCode : std::uint8_t {
   kProcessExited,
   kVendorFault,
   kOwnerStalled,
+  /// A ROS connection inside ManyForge (a transport executor) failed;
+  /// Recover rebuilds it.
+  kRosTransportFailed,
 };
 
 enum class FaultOperatorAction : std::uint8_t {
@@ -219,6 +221,9 @@ struct CellLatchCause final {
   CellLatchCauseKind kind{CellLatchCauseKind::kFault};
   std::optional<Fault> fault;
   std::optional<ComponentStop> stop{};
+  /// The component state's reason, when it explains the cause: for
+  /// `kActivityUnknown` after a failed Stop, `kStopUnconfirmedReason`.
+  std::optional<ComponentStateReason> reason{};
 
   friend bool operator==(const CellLatchCause&, const CellLatchCause&) = default;
 };
@@ -238,6 +243,10 @@ struct CellLatch final {
 /// owner isn't usable (`offline`, `not_prepared` or `fault`).
 inline constexpr std::string_view kOwnerUnavailableReason = "owner_unavailable";
 inline constexpr std::string_view kStoppedByEstopReason = "stopped_by_estop";
+/// A Stop of this component's participant ended uncontained (stop state
+/// model §3.6 F2): the Kernel shows its activity as unknown until its
+/// controller reports idle in a state observed after the failure.
+inline constexpr std::string_view kStopUnconfirmedReason = "stop_unconfirmed";
 
 /// The reason codes of a component `offline` by the operator's own power
 /// action (power off, reboot). Such a component isn't a latch cause.

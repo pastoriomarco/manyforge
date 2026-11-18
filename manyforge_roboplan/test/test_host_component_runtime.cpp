@@ -32,7 +32,7 @@ class InstantAdapter final : public core::IComponentAdapter {
     state.lifecycle = lifecycle_;
     state.activity = activity_;
     if (lifecycle_ == ComponentLifecycle::kFault)
-      state.fault = core::Fault{core::FaultCode::kEstop, "E-stop", true,
+      state.fault = core::Fault{core::FaultCode::kProtectiveStop, "Protective stop", true,
                                 core::FaultOperatorAction::kEnable, std::nullopt,
                                 std::nullopt, {}, 0};
     state.observed_at_ns = now_ns;
@@ -138,6 +138,81 @@ TEST(HostComponentRuntime, RemovedComponentsLeaveThePublication) {
   EXPECT_EQ(recorder.observed.back().size(), 1U);
 }
 
+// OD-311: the host's Apply sequence. After its last refusal the host takes
+// the leaving components out of the coordinated set, then stops their
+// processes; a stopped stream of a leaving component is no longer published
+// (and never reaches the latch), the staying ones stay published with their
+// `last_action` and Apply reservation, and the candidate's set comes later.
+TEST(HostComponentRuntime, LeavingComponentsAreUnpublishedBeforeTheirProcessesStop) {
+  core::FakeClock clock;
+  Recorder recorder;
+  HostComponentRuntime runtime(clock, HooksFor(recorder));
+  auto robot = std::make_shared<InstantAdapter>();
+  auto io = std::make_shared<InstantAdapter>();
+  auto removed_sensor = std::make_shared<InstantAdapter>();
+  static_cast<void>(
+      runtime.SetComponents({{"robot", robot}, {"io", io}, {"sensor", removed_sensor}}));
+  ASSERT_TRUE(runtime.Submit("robot", ComponentAction::kPrepare).ok());
+  WaitForLastAction(runtime, "robot");
+
+  // Apply replaces "io", removes "sensor" and reserves both ("robot" stays).
+  std::vector<std::string> reserved;
+  ASSERT_FALSE(runtime.ReserveForApply({"io", "sensor"}, reserved).has_value());
+  // Leaving components out, before the process stop.
+  // Their (finished) workers join at once.
+  static_cast<void>(runtime.SetComponents({{"robot", robot}}));
+  // The process stop: the leaving adapters' streams stop.
+  io->set(ComponentLifecycle::kFault, ComponentActivity::kUnknown);
+  removed_sensor->set(ComponentLifecycle::kFault, ComponentActivity::kUnknown);
+  runtime.Refresh();
+  {
+    const auto publication = runtime.Read();
+    ASSERT_EQ(publication.states.size(), 1U);
+    EXPECT_EQ(publication.states.front().component_id, "robot");
+    ASSERT_TRUE(publication.states.front().last_action.has_value());
+    EXPECT_EQ(publication.states.front().last_action->action, ComponentAction::kPrepare);
+    std::lock_guard lock(recorder.mutex);
+    for (const auto &observed : recorder.observed) {
+      if (observed.size() != 1U) continue;  // published before the removal
+      for (const auto &state : observed)
+        EXPECT_NE(state.lifecycle, ComponentLifecycle::kFault) << state.component_id;
+    }
+  }
+  // A leaving component takes no action meanwhile.
+  const auto refused = runtime.Submit("io", ComponentAction::kPrepare);
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "component_not_found");
+
+  // replace_current: the candidate's set, with the replaced "io".
+  auto replacement = std::make_shared<InstantAdapter>();
+  static_cast<void>(runtime.SetComponents({{"robot", robot}, {"io", replacement}}));
+  const auto publication = runtime.Read();
+  ASSERT_EQ(publication.states.size(), 2U);
+  EXPECT_EQ(publication.states[1].component_id, "io");
+  EXPECT_EQ(publication.states[1].lifecycle, ComponentLifecycle::kNotPrepared);
+  runtime.ReleaseApplyReservation(reserved);
+}
+
+// OD-311: an Apply refused after the leaving components left puts the
+// installed set back (the host's `coordinate_installed_without({})`): a
+// stopped component shows its own state again.
+TEST(HostComponentRuntime, RefusedApplyCoordinatesTheInstalledComponentsAgain) {
+  core::FakeClock clock;
+  Recorder recorder;
+  HostComponentRuntime runtime(clock, HooksFor(recorder));
+  auto robot = std::make_shared<InstantAdapter>();
+  auto io = std::make_shared<InstantAdapter>();
+  static_cast<void>(runtime.SetComponents({{"robot", robot}, {"io", io}}));
+  static_cast<void>(runtime.SetComponents({{"robot", robot}}));
+  io->set(ComponentLifecycle::kFault, ComponentActivity::kUnknown);
+
+  static_cast<void>(runtime.SetComponents({{"robot", robot}, {"io", io}}));
+  const auto publication = runtime.Read();
+  ASSERT_EQ(publication.states.size(), 2U);
+  EXPECT_EQ(publication.states[1].component_id, "io");
+  EXPECT_EQ(publication.states[1].lifecycle, ComponentLifecycle::kFault);
+}
+
 TEST(HostComponentRuntime, EnableOpensRoutesBeforeReportingSuccess) {
   core::FakeClock clock;
   Recorder recorder;
@@ -225,7 +300,7 @@ TEST(HostComponentRuntime, SharedTransportRecoveryUsesTheRecordedMemberAction) {
   auto hooks = HooksFor(recorder);
   hooks.shared_transport_fault = [&](const std::string &id) -> std::optional<core::Fault> {
     if (id != "io" || !faulted.load()) return std::nullopt;
-    return core::Fault{core::FaultCode::kProcessExited,
+    return core::Fault{core::FaultCode::kRosTransportFailed,
                        "ROS transport executor thread failed: test (owner /manyforge_generic_io)",
                        true, core::FaultOperatorAction::kRecover, std::nullopt,
                        std::nullopt, {}, 0};
@@ -285,7 +360,7 @@ TEST(HostComponentRuntime, SharedTransportFaultIsPublishedWithUnknownActivity) {
   auto hooks = HooksFor(recorder);
   hooks.shared_transport_fault = [](const std::string &id) -> std::optional<core::Fault> {
     if (id != "io") return std::nullopt;
-    return core::Fault{core::FaultCode::kProcessExited,
+    return core::Fault{core::FaultCode::kRosTransportFailed,
                        "ROS transport executor thread failed: test (owner /manyforge_generic_io)",
                        true, core::FaultOperatorAction::kRecover, std::nullopt,
                        std::nullopt, {}, 0};
@@ -299,7 +374,7 @@ TEST(HostComponentRuntime, SharedTransportFaultIsPublishedWithUnknownActivity) {
   EXPECT_EQ(states[0].lifecycle, ComponentLifecycle::kFault);
   EXPECT_EQ(states[0].activity, ComponentActivity::kUnknown);
   ASSERT_TRUE(states[0].fault);
-  EXPECT_EQ(states[0].fault->code, core::FaultCode::kProcessExited);
+  EXPECT_EQ(states[0].fault->code, core::FaultCode::kRosTransportFailed);
   EXPECT_NE(states[0].fault->message.find("/manyforge_generic_io"), std::string::npos);
 }
 

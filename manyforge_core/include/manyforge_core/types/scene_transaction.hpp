@@ -199,7 +199,7 @@ using ResolvedSceneOperationDTO =
 
 /// Immutable owner-produced transaction passed to native projections.
 struct SceneTransactionDTO final {
-  RequestId request_id;
+  RequestKey request_key;
   RequestAttributionDTO attribution{};
   std::uint64_t transaction_sequence{};
   ProjectionRevisionDTO prior_projection_revision;
@@ -240,7 +240,7 @@ struct NativeProjectionRebuildDTO final {
            maintenance_successor.has_value() ==
                maintenance_predecessor.has_value() &&
            (!maintenance_successor.has_value() ||
-            (!maintenance_successor->first.empty() &&
+            (maintenance_successor->first.nonzero() &&
              maintenance_successor->second.nonzero() &&
              maintenance_predecessor->valid() &&
              maintenance_predecessor->retained_bundle_id ==
@@ -360,7 +360,7 @@ struct ProjectionCommitResultDTO final {
 };
 
 struct SceneCommitResultDTO final {
-  RequestId request_id;
+  RequestKey request_key;
   RequestReplayStatusDTO replay_status;
   bool success{};
   std::optional<ErrorDTO> error;
@@ -409,9 +409,6 @@ inline bool ProjectionCommitResultDTO::presence_valid() const noexcept {
 }
 
 inline bool SceneCommitResultDTO::presence_valid() const noexcept {
-  if (request_id.empty()) {
-    return false;
-  }
   if (success) {
     return IsAcceptedRequestReplayStatus(replay_status) && !error.has_value() &&
            transaction_sequence.has_value() && *transaction_sequence != 0U &&

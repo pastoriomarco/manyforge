@@ -11,6 +11,7 @@
 #include <array>
 #include <manyforge_deployment/cell_kinematic_index.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <map>
 #include <mutex>
@@ -276,18 +277,49 @@ void InsertProviderOccurrence(
       physical.value().runtime_unit_epochs, std::move(provider_epochs)};
 }
 
+struct HeldRunSources final {
+  std::shared_ptr<const deployment::ProgramBinding> binding;
+  std::shared_ptr<const deployment::ProgramBindingContract> program;
+};
+
+// OD-234: the held run's Program and Binding as verified at its capture, only
+// when they are exactly this Binding, its Program and this product; otherwise
+// none, and the caller reads and verifies its sources.
+[[nodiscard]] HeldRunSources
+HeldRunSourcesFor(const core::ProgramRunResolutionContext &held_run,
+                  const core::ProgramBindingId &program_binding_id,
+                  const deployment::RetainedBundle &bundle) {
+  const auto *sources = detail::SealedProgramRunSourcesOf(held_run);
+  if (sources == nullptr || !sources->binding || !sources->program) return {};
+  const auto &binding = sources->binding->value();
+  const auto &program = sources->program->value();
+  if (sources->binding->program_binding_id() != program_binding_id ||
+      binding.retained_bundle_id != bundle.retained_bundle_id() ||
+      binding.graph_revision != bundle.value().cell_graph.graph_revision ||
+      program.program_id != binding.program_id ||
+      program.program_revision != binding.program_revision)
+    return {};
+  return {sources->binding, sources->program};
+}
+
 } // namespace
 
 core::Result<core::ProgramTargetBindingDTO>
 ProductBackedRuntimeParticipantResolver::ResolveOperationTarget(
     const core::ProgramBindingId &program_binding_id,
-    const core::ProgramTargetReferenceDTO &target_ref) const {
+    const core::ProgramTargetReferenceDTO &target_ref,
+    const core::ProgramRunResolutionContext &held_run) const {
   try {
-    const auto binding = LoadProgramBinding(program_binding_id);
+    // OD-234: a query of the held run reads the copy verified at its capture.
+    auto held = HeldRunSourcesFor(held_run, program_binding_id, *retained_bundle_);
+    const auto binding =
+        held.binding ? std::move(held.binding) : LoadProgramBinding(program_binding_id);
     if (!binding)
       throw std::invalid_argument("no exact retained Program Binding");
-    const auto program = LoadProgram(binding->value().program_id,
-                                     binding->value().program_revision);
+    const auto program =
+        held.program ? std::move(held.program)
+                     : LoadProgram(binding->value().program_id,
+                                   binding->value().program_revision);
     if (!program ||
         program->value().node_environment != binding->value().node_environment)
       throw std::invalid_argument("no exact canonical Program");
@@ -624,16 +656,7 @@ ProductBackedRuntimeParticipantResolver::ActiveTcpContactBodies(
   const auto robot = value.controllable_component_id;
   auto endpoint = ResolveRobotTcp(
       core::TcpSelectorDTO{core::CurrentTcpDTO{}}, robot, active->rows(), active->reference(),
-      [](const core::ProgramTargetReferenceDTO &) { return std::optional<core::TcpEntryReferenceDTO>{}; },
-      [&](const core::TcpEntryReferenceDTO &entry) -> std::optional<std::vector<core::CollisionBodyRoleId>> {
-        const TcpFrameAssociation *found = nullptr;
-        for (const auto &association : active->associations()) {
-          if (association.reference != entry) continue;
-          if (found) return std::nullopt;
-          found = &association;
-        }
-        return found ? std::optional(found->contact_body_role_ids) : std::nullopt;
-      });
+      [](const core::ProgramTargetReferenceDTO &) { return std::optional<core::TcpEntryReferenceDTO>{}; });
   if (!endpoint.ok()) return Reply::Err(endpoint.error());
   value.motion_endpoint = std::move(endpoint.value());
   auto binding = core::verify_runtime_participant_binding(std::move(value));
@@ -990,15 +1013,15 @@ ProductBackedRuntimeParticipantResolver::ResolveRobotTcp(
     const std::optional<core::TcpEntryReferenceDTO> &active,
     const std::function<std::optional<core::TcpEntryReferenceDTO>(const core::ProgramTargetReferenceDTO &)>
         &default_tcp_of_target,
-    const std::function<std::optional<std::vector<core::CollisionBodyRoleId>>(
-        const core::TcpEntryReferenceDTO &)> &contact_roles_of,
     const bool joint_goal) const {
   using Endpoint = core::RuntimeMotionEndpointBindingDTO;
   // Current with no Active TCP, or form 2 with no default TCP.
   const auto no_tcp = [&](const std::optional<core::ProgramTargetReferenceDTO> &target) {
     core::ErrorDTO error{std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
-                         "no end-effector TCP; choose one",
-                         {{"reason", "end_effector_tcp_unavailable"}, {"robot", robot.value()}}};
+                         target ? "the component has no default TCP; choose one"
+                                : "no end-effector TCP; choose one",
+                         {{"reason", target ? "default_tcp_unavailable" : "end_effector_tcp_unavailable"},
+                          {"robot", robot.value()}}};
     if (target) {
       error.details.emplace("component_id", target->component_id.value());
       error.details.emplace("command_target_id", target->command_target_id.value());
@@ -1022,41 +1045,17 @@ ProductBackedRuntimeParticipantResolver::ResolveRobotTcp(
   } else {
     selected = std::get<core::TcpEntryReferenceDTO>(selector);
   }
-  const auto *selected_target = retained_model_map_.find_target(
-      selected->target.component_id, selected->target.command_target_id);
-  if (!selected_target)
-    return core::Result<Endpoint>::Err(core::active_tcp_unknown_error(robot, *selected));
-  const auto qualified = std::any_of(selected_target->frames.begin(), selected_target->frames.end(),
-      [&](const auto &frame) {
-        const auto *model = std::get_if<deployment::CompositionComponentModelFrame>(&frame.frame);
-        return model && model->controllable_component_id == selected->frame.component_id &&
-               frame.frame_role_id == selected->frame.frame_id;
-      });
-  if (!qualified || !retained_model_map_.kinematic_index().carries(
-                        selected->target.component_id, selected->frame.component_id))
-    return core::Result<Endpoint>::Err(core::active_tcp_unknown_error(robot, *selected));
-  const RobotTcp *row = nullptr;
-  for (const auto &candidate : rows)
-    if (candidate.entry == *selected) { row = &candidate; break; }
-  if (!row) {
-    for (const auto &candidate : rows) {
-      if (candidate.frame.reference != selected->frame) continue;
-      if (row) return Reject<Endpoint>("TCP frame maps to multiple retained entries",
-                                       "runtime_motion_endpoint_ambiguous");
-      row = &candidate;
-    }
-  }
-  if (!row) return core::Result<Endpoint>::Err(core::active_tcp_unknown_error(robot, *selected));
-  if (!retained_model_map_.kinematic_index().carries(robot, selected->frame.component_id))
-    return core::Result<Endpoint>::Err(core::tcp_tool_not_mounted_error(robot, *selected));
-  const auto contact_roles = contact_roles_of(*selected);
-  if (!contact_roles)
-    return Reject<Endpoint>("TCP target/frame association is absent or ambiguous",
-                            "runtime_motion_endpoint_unresolved", core::ErrorCode::kMissingReference);
-  Endpoint endpoint{selected->target, row->frame, {}, *contact_roles};
+  const auto selection =
+      deployment::select_robot_tcp(retained_model_map_, robot, rows, *selected);
+  if (!selection.ok()) return core::Result<Endpoint>::Err(selection.error());
+  const RobotTcp *row = selection.value();
+  // The robot's TCP-list row carries the frame and its owner's contact
+  // bodies, whatever else the Program references.
+  const auto &contact_roles = row->contact_body_role_ids;
+  Endpoint endpoint{selected->target, row->frame, {}, contact_roles};
   // The contact bodies are the owner's, from the exact model map.
   const auto &bodies = retained_model_map_.model_collision_bodies();
-  for (const auto &role : *contact_roles) {
+  for (const auto &role : contact_roles) {
     const auto body = std::find_if(bodies.begin(), bodies.end(), [&](const auto &candidate) {
       return candidate.owner_component_id == row->frame.reference.component_id &&
              candidate.model_instance_id == row->frame.model_instance_id &&
@@ -1083,7 +1082,8 @@ ProductBackedRuntimeParticipantResolver::Resolve(
     const core::OperationIntentDTO &operation,
     const std::size_t participant_index,
     const RobotTcpReader &supplied_robot_tcps,
-    std::optional<core::PreviewTcpCapture> *preview_tcp_capture) const {
+    std::optional<core::PreviewTcpCapture> *preview_tcp_capture,
+    const core::ProgramRunResolutionContext &held_run) const {
   if (preview_tcp_capture) preview_tcp_capture->reset();
   const RobotTcpReader robot_tcps =
       supplied_robot_tcps ? supplied_robot_tcps : RobotTcpReader(ReadHostRobotTcps);
@@ -1131,15 +1131,6 @@ ProductBackedRuntimeParticipantResolver::Resolve(
             value.controllable_component_id, state->rows(),
             state->reference(),
             [](const core::ProgramTargetReferenceDTO &) { return std::optional<core::TcpEntryReferenceDTO>{}; },
-            [&](const core::TcpEntryReferenceDTO &entry) -> std::optional<std::vector<core::CollisionBodyRoleId>> {
-              const TcpFrameAssociation *found = nullptr;
-              for (const auto &association : state->associations()) {
-                if (association.reference != entry) continue;
-                if (found) return std::nullopt;
-                found = &association;
-              }
-              return found ? std::optional(found->contact_body_role_ids) : std::nullopt;
-            },
             motion != nullptr && std::holds_alternative<core::JointGoalDTO>(motion->motion));
         if (!endpoint.ok())
           return core::Result<core::RuntimeParticipantBinding>::Err(endpoint.error());
@@ -1178,7 +1169,14 @@ ProductBackedRuntimeParticipantResolver::Resolve(
           *precomposed, collision_body_aliases_);
     }
 
-    const auto binding = LoadProgramBinding(operation.program_binding_id);
+    // OD-234: work of the held run uses the copy verified at its capture;
+    // any other operation reads and verifies its sources.
+    auto held = HeldRunSourcesFor(held_run, operation.program_binding_id,
+                                  *retained_bundle_);
+    auto binding = std::move(held.binding);
+    auto program = std::move(held.program);
+    if (binding == nullptr)
+      binding = LoadProgramBinding(operation.program_binding_id);
     if (binding == nullptr ||
         binding->value().program_id != operation.program_id ||
         binding->value().program_revision != operation.program_revision) {
@@ -1188,8 +1186,8 @@ ProductBackedRuntimeParticipantResolver::Resolve(
           "runtime_program_binding_unavailable",
           core::ErrorCode::kMissingReference);
     }
-    const auto program =
-        LoadProgram(operation.program_id, operation.program_revision);
+    if (program == nullptr)
+      program = LoadProgram(operation.program_id, operation.program_revision);
     if (program == nullptr || program->value().node_environment !=
                                   binding->value().node_environment) {
       return Reject<core::RuntimeParticipantBinding>(
@@ -1244,27 +1242,6 @@ ProductBackedRuntimeParticipantResolver::Resolve(
           [&](const core::ProgramTargetReferenceDTO &target_ref) {
             const auto row = find_role(target_ref);
             return row == targets.end() ? std::optional<core::TcpEntryReferenceDTO>{} : row->default_tcp;
-          },
-          [&](const core::TcpEntryReferenceDTO &entry) -> std::optional<std::vector<core::CollisionBodyRoleId>> {
-            if (std::holds_alternative<core::CurrentTcpDTO>(motion != nullptr ? motion->tcp_endpoint : set_tcp->tcp)) {
-              if (!state) return std::nullopt;
-              const TcpFrameAssociation *found = nullptr;
-              for (const auto &association : state->associations()) {
-                if (association.reference != entry) continue;
-                if (found) return std::nullopt;
-                found = &association;
-              }
-              return found ? std::optional(found->contact_body_role_ids) : std::nullopt;
-            }
-            const auto target_row = find_role(entry.target);
-            if (target_row == targets.end()) return std::nullopt;
-            const core::ProgramTargetFrameAssociationDTO *found = nullptr;
-            for (const auto &association : target_row->frame_associations) {
-              if (association.frame != entry.frame) continue;
-              if (found) return std::nullopt;
-              found = &association;
-            }
-            return found ? std::optional(found->contact_body_role_ids) : std::nullopt;
           },
           motion != nullptr && std::holds_alternative<core::JointGoalDTO>(motion->motion));
       if (!endpoint.ok())
@@ -1330,9 +1307,11 @@ core::Result<RetainedResolvedParticipant>
 ProductBackedRuntimeParticipantResolver::ResolveExecutionParticipant(
     const core::OperationIntentDTO &operation,
     const std::size_t participant_index,
+    const core::ProgramRunResolutionContext &held_run,
     const RobotTcpReader &robot_tcps) const {
   std::optional<core::PreviewTcpCapture> preview_tcp_capture;
-  auto binding = Resolve(operation, participant_index, robot_tcps, &preview_tcp_capture);
+  auto binding = Resolve(operation, participant_index, robot_tcps,
+                         &preview_tcp_capture, held_run);
   if (!binding.ok())
     return core::Result<RetainedResolvedParticipant>::Err(binding.error());
   // B7: the endpoint frame's owner (the motion component or a tool mounted on

@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-import hashlib
 import json
 import logging
 import os
 from pathlib import Path
+import select
 import socket
 import struct
-import time
 from typing import Any, Final
 
 import rfc8785
@@ -24,25 +23,23 @@ from .private_transport import (
 
 
 EXECUTION_SOCKET_FILE: Final = "execution-command.sock"
-# The operator-alarm attention heartbeat is served beside Stop on the
-# independent control socket; it never waits behind ordinary traffic.
-EXECUTION_CONTROL_SOCKET_FILE: Final = "execution-control.sock"
-EXECUTION_COMMAND_VERSION: Final = "manyforge.execution_command.v3"
-EXECUTION_RESPONSE_VERSION: Final = "manyforge.execution_command_response.v4"
+# The operator-alarm attention heartbeat is served on the independent
+# component socket; it never waits behind ordinary traffic.
+EXECUTION_COMPONENT_SOCKET_FILE: Final = "execution-component.sock"
+EXECUTION_COMMAND_VERSION: Final = "manyforge.execution_command.v4"
+EXECUTION_RESPONSE_VERSION: Final = "manyforge.execution_command_response.v5"
 MAXIMUM_PACKET_BYTES: Final = 1024 * 1024
 MAXIMUM_RESPONSE_BYTES: Final = 4 * 1024 * 1024
-_CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1"
 _COMMANDS: Final = frozenset(
     {
         "cell_admission_get",
         "cell_admission_acquire",
         "cell_admission_release",
-        "cell_admission_reconcile",
         "cell_admission_recovery_receipt",
         "cell_admission_publish_operator_alarm_attention",
     }
 )
-_ATTENTION_ACCEPTED_KEYS: Final = frozenset({"generation", "owner_epoch"})
+_ATTENTION_ACCEPTED_KEYS: Final = frozenset({"generation"})
 _ERROR_RESPONSE_KEYS: Final = frozenset(
     {"api_version", "command", "error", "ok"}
 )
@@ -63,12 +60,10 @@ _INTENT_KEYS: Final = frozenset(
         "claim_kind",
         "expected_admission_generation",
         "intervention_evidence",
-        "owner_epoch",
         "owner_role",
         "owner_transaction_id",
         "program_cycle_evidence",
-        "request_id",
-        "request_payload_digest",
+        "request_key",
         "scope",
     }
 )
@@ -76,20 +71,10 @@ _RELEASE_KEYS: Final = frozenset(
     {
         "acquired_admission_generation",
         "claim_generation",
-        "owner_epoch",
         "owner_role",
         "owner_transaction_id",
-        "request_id",
-        "request_payload_digest",
+        "request_key",
         "settlement",
-    }
-)
-_RECONCILE_KEYS: Final = frozenset(
-    {
-        "current_owner_epochs",
-        "kernel_owner_epoch",
-        "reconciliation_evidence_digest",
-        "retained_claims",
     }
 )
 _RECOVERY_QUERY_KEYS: Final = frozenset(
@@ -98,11 +83,8 @@ _RECOVERY_QUERY_KEYS: Final = frozenset(
 _RECOVERY_RECEIPT_KEYS: Final = frozenset(
     {
         "admission_generation",
-        "current_owner_epochs",
         "held_claims",
-        "kernel_owner_epoch",
         "matched_claim",
-        "matched_reconcile_settlement",
         "matched_release",
         "status",
     }
@@ -178,22 +160,12 @@ class CellAdmissionClient:
             )
         return value
 
-    def _socket_timeout(self, deadline: float | None) -> float:
-        """Per-operation timeout, never past an overall monotonic deadline."""
-
-        if deadline is None:
-            return self._timeout_seconds
-        remaining = deadline - time.monotonic()
-        if remaining <= 0.0:
-            raise TimeoutError("cell-admission command deadline elapsed")
-        return min(remaining, self._timeout_seconds)
-
     def _exchange(
         self,
         packet: dict[str, Any],
         *,
-        deadline: float | None = None,
         socket_file: str = EXECUTION_SOCKET_FILE,
+        stop_fd: int | None = None,
     ) -> dict[str, Any]:
         try:
             encoded = rfc8785.dumps(packet)
@@ -219,10 +191,12 @@ class CellAdmissionClient:
                         socket.SO_RCVBUF,
                         MAXIMUM_RESPONSE_BYTES,
                     )
-                    # With a deadline every blocking step (connect, send,
-                    # receive) gets only the time that remains of it.
+                    # Only the connection is limited (OD-214): a connected
+                    # request waits for its answer, ended by the host's
+                    # answer, by the socket closing when the host exits
+                    # (an empty read), or by the caller's stop pipe.
                     operation = "settimeout"
-                    client.settimeout(self._socket_timeout(deadline))
+                    client.settimeout(self._timeout_seconds)
                     operation = "connect"
                     client.connect(socket_address)
                     if hasattr(socket, "SO_PEERCRED"):
@@ -235,12 +209,24 @@ class CellAdmissionClient:
                         if peer_uid != os.geteuid():
                             raise OSError("peer is not owned by the current user")
                     operation = "settimeout"
-                    client.settimeout(self._socket_timeout(deadline))
+                    client.settimeout(None)
+                    if stop_fd is not None:
+                        # The host taking the packet or the caller's stop: a
+                        # host whose queue is full never holds a shutdown.
+                        operation = "select"
+                        _, writable, _ = select.select([stop_fd], [client], [])
+                        if not writable:
+                            raise ConnectionAbortedError("the exchange was stopped")
                     operation = "send"
                     if client.send(encoded) != len(encoded):
                         raise OSError("command packet was truncated")
-                    operation = "settimeout"
-                    client.settimeout(self._socket_timeout(deadline))
+                    if stop_fd is not None:
+                        # The answer, the host closing the connection or
+                        # the caller's stop (OD-296 pattern).
+                        operation = "select"
+                        readable, _, _ = select.select([client, stop_fd], [], [])
+                        if stop_fd in readable:
+                            raise ConnectionAbortedError("the exchange was stopped")
                     operation = "recvmsg"
                     payload, _ancillary, flags, _address = client.recvmsg(
                         MAXIMUM_RESPONSE_BYTES
@@ -278,7 +264,8 @@ class CellAdmissionClient:
         command: str,
         request: Mapping[str, Any] | None,
         *,
-        deadline: float | None = None,
+        stop_fd: int | None = None,
+        program_cycle_status: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if command not in _COMMANDS:
             raise ValueError("unsupported cell-admission command")
@@ -293,11 +280,13 @@ class CellAdmissionClient:
             if not isinstance(request, Mapping):
                 raise TypeError("cell-admission request must be a mapping")
             packet["request"] = dict(request)
+        if program_cycle_status is not None:
+            packet["program_cycle_status"] = dict(program_cycle_status)
         response = self._exchange(
             packet,
-            deadline=deadline,
+            stop_fd=stop_fd,
             socket_file=(
-                EXECUTION_CONTROL_SOCKET_FILE
+                EXECUTION_COMPONENT_SOCKET_FILE
                 if command == "cell_admission_publish_operator_alarm_attention"
                 else EXECUTION_SOCKET_FILE
             ),
@@ -380,10 +369,19 @@ class CellAdmissionClient:
             )
         return value
 
-    def acquire(self, intent: Mapping[str, Any]) -> dict[str, Any]:
+    def acquire(
+        self,
+        intent: Mapping[str, Any],
+        *,
+        program_cycle_status: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """A Program Reset claim carries the runner's current cycle status
+        beside its intent, and only it does (OD-139)."""
         if set(intent) not in (_INTENT_KEYS, _INTENT_KEYS | {"program_node_evidence"}):
             raise ValueError("claim intent is not the exact A1 projection")
-        result = self._call("cell_admission_acquire", intent)
+        result = self._call(
+            "cell_admission_acquire", intent, program_cycle_status=program_cycle_status
+        )
         try:
             nonnegative_int64(result.get("accepted_at_ns"))
         except ValueError as error:
@@ -416,13 +414,6 @@ class CellAdmissionClient:
             raise ValueError("claim release is not the exact A1 projection")
         return self._authoring(self._call("cell_admission_release", release))
 
-    def reconcile(self, reconciliation: Mapping[str, Any]) -> dict[str, Any]:
-        if set(reconciliation) != _RECONCILE_KEYS:
-            raise ValueError("reconciliation is not the exact A1 projection")
-        return self._authoring(
-            self._call("cell_admission_reconcile", reconciliation)
-        )
-
     def recovery_receipt(self, query: Mapping[str, Any]) -> dict[str, Any]:
         if set(query) != _RECOVERY_QUERY_KEYS:
             raise ValueError("recovery query is not the exact A1 projection")
@@ -435,11 +426,8 @@ class CellAdmissionClient:
                 "conflicting",
                 "held_exact",
                 "released_exact",
-                "reconciled_exact",
             }
-            or not isinstance(result.get("kernel_owner_epoch"), str)
             or not isinstance(result.get("held_claims"), list)
-            or not isinstance(result.get("current_owner_epochs"), list)
         ):
             raise CellAdmissionError(
                 "execution_command_response_invalid",
@@ -449,23 +437,24 @@ class CellAdmissionClient:
         return result
 
     def publish_operator_alarm_attention(
-        self, projection: Mapping[str, Any], *, deadline: float
+        self, projection: Mapping[str, Any], *, stop_fd: int | None = None
     ) -> dict[str, Any]:
         """Publish the Alarm Lifecycle Owner's fenced motion-attention view.
 
-        The Kernel retains the newest generation of one owner epoch and alone
-        evaluates it at Run/Resume/recovery admission. The
-        whole exchange (connect, send, receive) ends by the monotonic
-        ``deadline``; a later Kernel acceptance is then unobserved here.
+        The Kernel retains the newest generation and alone
+        evaluates it at Run/Resume/recovery admission, judging its age by
+        its own freshness bound. The wait for the acceptance has no time
+        limit (OD-307): it ends by the Kernel's answer, by the socket closing
+        when the host exits, or by ``stop_fd`` (the read end of the caller's
+        stop pipe) becoming readable.
         """
         result = self._call(
             "cell_admission_publish_operator_alarm_attention",
             projection,
-            deadline=deadline,
+            stop_fd=stop_fd,
         )
         if (
             set(result) != _ATTENTION_ACCEPTED_KEYS
-            or result.get("owner_epoch") != projection.get("owner_epoch")
             or result.get("generation") != projection.get("generation")
         ):
             raise CellAdmissionError(
@@ -473,60 +462,6 @@ class CellAdmissionClient:
                 "native operator-alarm attention acceptance is malformed",
             )
         return result
-
-    def recovery_inventory(
-        self, *, owner_epoch: str
-    ) -> dict[str, Any]:
-        """Obtain one exact Kernel inventory through an unknown Program probe."""
-        probe_digest = "sha256:" + hashlib.sha256(
-            rfc8785.dumps(
-                {
-                    "owner_epoch": owner_epoch,
-                    "probe": "program-runner-recovery-inventory",
-                }
-            )
-        ).hexdigest()
-        return self.recovery_receipt(
-            {
-                "intent": {
-                    "claim_kind": "program_cycle",
-                    "owner_role": "program_runner",
-                    "owner_epoch": owner_epoch,
-                    "owner_transaction_id": "program-runner-recovery-inventory",
-                    "request_id": "program-runner-recovery-inventory",
-                    "request_payload_digest": probe_digest,
-                    "expected_admission_generation": 1,
-                    "scope": {"resources": [], "configurations": []},
-                    "program_cycle_evidence": {
-                        "draft_program_revision": probe_digest,
-                        "applied_program_revision": probe_digest,
-                    },
-                    "intervention_evidence": None,
-                },
-                "expected_claim": None,
-                "expected_release": None,
-            }
-        )
-
-
-def cell_admission_owner_epoch_reconciliation_evidence_digest(
-    owner_role: str, owner_epoch: str
-) -> str:
-    """Mirror CellAdmissionOwnerEpochReconciliationEvidenceDigest framing."""
-    if not owner_role or not owner_epoch:
-        raise ValueError("owner reconciliation identity must be non-empty")
-    payload = rfc8785.dumps(
-        {"owner_epoch": owner_epoch, "owner_role": owner_role}
-    )
-    preimage = b"\0".join(
-        (
-            _CONTENT_IDENTITY_PREFIX,
-            b"cell-admission-owner-epoch-reconciliation-evidence",
-            b"1.0",
-            payload,
-        )
-    )
-    return "sha256:" + hashlib.sha256(preimage).hexdigest()
 
 
 def _unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -543,5 +478,4 @@ __all__ = [
     "CellAdmissionError",
     "EXECUTION_COMMAND_VERSION",
     "EXECUTION_RESPONSE_VERSION",
-    "cell_admission_owner_epoch_reconciliation_evidence_digest",
 ]

@@ -89,7 +89,7 @@ function AiModelComponentForm({ controller, effective, component }: {
         (value) => value.trim())}
       {field('Token environment variable', 'api_key_env', envNameProblem,
         (value) => (value.trim() === '' ? null : value.trim()))}
-      <p className="field-help">Optional; must start with MANYFORGE_AI_. Export it with the token before starting the workbench.</p>
+      <p className="field-help">Optional; must start with MANYFORGE_AI_. Export it with the token before starting ManyForge.</p>
       <div className="button-row">
         <button type="button" disabled={disabled}
           onClick={() => { void controller.mutate(['components', component.index], 'remove'); }}>Remove AI model</button>

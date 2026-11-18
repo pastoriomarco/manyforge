@@ -84,8 +84,9 @@ class IAssistantHostLink {
 
 /// The adapter: `prepare`/`recover` (re)start the host with serving off;
 /// `enable`/`disable` switch serving and wait, on the action's thread, until
-/// the host reports the bridge serving or stopped, within the component's
-/// lifecycle command time from the action's start.
+/// the host reports the bridge serving or stopped, the host exits, or a Stop
+/// interrupts it (no time limit). An Enable that does not complete withdraws
+/// its serving request.
 class AssistantComponentAdapter final : public core::IComponentAdapter {
  public:
   /// `pause` runs between two reads of the host's report (production:
@@ -94,7 +95,6 @@ class AssistantComponentAdapter final : public core::IComponentAdapter {
                             ComponentProcessLauncher start_process,
                             std::shared_ptr<IAssistantHostLink> link,
                             std::shared_ptr<core::IClock> clock,
-                            std::chrono::nanoseconds lifecycle_command_timeout,
                             std::function<void()> pause = {});
 
   [[nodiscard]] core::ComponentState State(std::int64_t now_ns) const override;
@@ -108,7 +108,6 @@ class AssistantComponentAdapter final : public core::IComponentAdapter {
   ComponentProcessLauncher start_process_;
   std::shared_ptr<IAssistantHostLink> link_;
   std::shared_ptr<core::IClock> clock_;
-  std::chrono::nanoseconds lifecycle_command_timeout_;
   std::function<void()> pause_;
   mutable std::mutex mutex_;
   std::shared_ptr<IComponentProcess> process_;

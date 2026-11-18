@@ -101,8 +101,14 @@ def test_non_executable_outcome_uses_exact_direct_target() -> None:
 class _AuthoringPassThrough:
     """Keep route-unit tests focused; the real gate has dedicated tests."""
 
-    receiver_epoch = "composer-snapshot.test"
+    application_start_id = 0x3F9A0000000000A1
     mutation_ready = True
+
+    def settle_before_preparation(self) -> None:
+        """No local claim is pending in these route-unit tests."""
+
+    def manager_submission_sent(self, _claim) -> None:
+        """The parent claim's hand-over is the real coordinator's concern."""
 
     def execute(
         self,
@@ -214,7 +220,7 @@ def _client(
 ) -> TestClient:
     return TestClient(
         create_app(
-            _enable_authoring(ComposerState()),
+            _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1)),
             security=SecurityConfig(
                 allowed_fs_roots=allowed_fs_roots or [str(tmp_path)],
                 allowed_program_write_roots=allowed_program_write_roots,
@@ -235,8 +241,8 @@ def _fence(workspace: dict) -> dict:
         "draftId": workspace["draft"]["draftId"],
         "expectedDraftRevision": workspace["draft"]["draftRevision"],
         "expectedAdmissionGeneration": 1,
-        "requestOwnerEpoch": "test-browser.epoch.1",
-        "requestId": "test-browser.request.1",
+        "applicationStartId": "3f9a0000000000a1",
+        "requestKey": "0123456789abcdef0123456789abcdef",
         "expectedWorkspaceEpoch": identity["workspaceEpoch"],
         "expectedWorkspaceRevision": identity["workspaceRevision"],
     }
@@ -244,7 +250,7 @@ def _fence(workspace: dict) -> dict:
 
 def _motion_identity() -> dict:
     return {
-        "owner_epoch": "owner-1",
+        "application_start_id": "owner-1",
         "graph_revision": "graph-1",
         "retained_bundle_id": "bundle-1",
     }
@@ -297,7 +303,7 @@ def _motion_control_projection(*, sequence: int = 1) -> dict:
             "command_target_id": "arm",
             "operation_capability_id": "execution.trajectory.execute",
             "active_tcp": {"entry": _entry(), "display": "robot.tcp",
-                           "owner_epoch": "owner", "registration_generation": 1, "sequence": 1},
+                           "registration_generation": 1, "sequence": 1},
             "observed": {"kind": "joint_positions", "complete": True,
                 "current_tcp_pose": pose(0.3),
                 "tcp_poses": [{"entry": _entry(frame="tcp"), "pose": pose(0.3)},
@@ -354,7 +360,7 @@ def _node_environment_projection() -> dict:
             }
         )
     return {
-        "schema_version": "manyforge.node_environment_projection.v2",
+        "schema_version": "manyforge.node_environment_projection.v3",
         "retained_bundle_id": "bundle-1",
         "graph_revision": "graph-1",
         "catalog_id": manifest.catalog_id,
@@ -386,10 +392,8 @@ def _node_environment_projection() -> dict:
             "freshness": "fresh",
             "known_gaps": [],
             "projection_generation": 1,
-            "projection_owner_epoch": "headless.epoch.1",
             "receiver_age_ns": 0,
             "source_generation": 1,
-            "source_owner_epoch": "manager.epoch.1",
             "source_owner_id": "component-manager.test",
             "source_content_digest": "sha256:" + "a" * 64,
         },
@@ -685,7 +689,7 @@ def test_observed_move_names_each_refusal_cause_before_any_draft_change(
             return {}
 
     program = Program(_SOURCE_PROGRAM, build_node_environment().catalog)
-    state = _enable_authoring(ComposerState(program=program))
+    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1, program=program))
     state.headless_client = Headless()  # type: ignore[assignment]
     state.execution_observation_source = ExecutionObservationSource(
         state.headless_client  # type: ignore[arg-type]
@@ -793,7 +797,7 @@ def test_observed_move_names_a_failed_robot_pose_read_before_any_draft_change(
             return _node_environment_projection()
 
     program = Program(_SOURCE_PROGRAM, build_node_environment().catalog)
-    state = _enable_authoring(ComposerState(program=program))
+    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1, program=program))
     state.headless_client = Headless()  # type: ignore[assignment]
     state.execution_observation_source = ExecutionObservationSource(
         state.headless_client  # type: ignore[arg-type]
@@ -863,7 +867,7 @@ def test_observed_move_reads_one_exact_source_snapshot_under_the_claim(
             return {}
 
     program = Program(_SOURCE_PROGRAM, build_node_environment().catalog)
-    state = _enable_authoring(ComposerState(program=program))
+    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1, program=program))
     state.headless_client = Headless()  # type: ignore[assignment]
     state.execution_observation_source = ExecutionObservationSource(
         state.headless_client  # type: ignore[arg-type]
@@ -927,7 +931,7 @@ def test_observed_move_is_one_revision_fenced_draft_mutation(tmp_path: Path, mon
             return {}
 
     program = Program(_SOURCE_PROGRAM, build_node_environment().catalog)
-    state = _enable_authoring(ComposerState(program=program))
+    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1, program=program))
     state.headless_client = Headless()  # type: ignore[assignment]
     state.execution_observation_source = ExecutionObservationSource(
         state.headless_client  # type: ignore[arg-type]
@@ -976,8 +980,8 @@ def test_observed_move_is_one_revision_fenced_draft_mutation(tmp_path: Path, mon
 def test_observed_scene_save_preserves_program_metadata_and_source_identity() -> None:
     class Headless:
         def scene(self) -> dict:
-            return {
-                "logical_scene": {
+            return {"logical_scene": {
+                "available": True, "freshness": "fresh", "known_gaps": [], "payload": {
                     "access": {
                         "active_projection": {
                             "retained_bundle_id": "bundle",
@@ -1010,7 +1014,7 @@ def test_observed_scene_save_preserves_program_metadata_and_source_identity() ->
                         }],
                     },
                 }
-            }
+            }}
 
     catalog = build_node_environment().catalog
     document = Program(_SOURCE_PROGRAM, catalog).to_dict()
@@ -1021,7 +1025,7 @@ def test_observed_scene_save_preserves_program_metadata_and_source_identity() ->
         identity_domain="program-revision",
         api_version="manyforge.program.v3",
     )
-    state = ComposerState(program=Program.from_dict(document, catalog))
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, program=Program.from_dict(document, catalog))
     state.headless_client = Headless()  # type: ignore[assignment]
 
     arguments, identity = _observed_scene_arguments(
@@ -1039,7 +1043,7 @@ def test_observed_scene_save_preserves_program_metadata_and_source_identity() ->
 
 
 def _carried_scene() -> dict:
-    return {"logical_scene": {
+    return {"logical_scene": {"available": True, "freshness": "fresh", "known_gaps": [], "payload": {
         "access": {"active_projection": {"retained_bundle_id": "bundle"}},
         "snapshot": {"transaction_sequence": 7, "objects": [{
             "scene_resource_id": "part",
@@ -1052,7 +1056,7 @@ def _carried_scene() -> dict:
             "provider_evidence": None,
             "support_contacts": [],
         }]},
-    }}
+    }}}
 
 
 @pytest.mark.parametrize(
@@ -1083,7 +1087,7 @@ def test_observed_scene_refusal_is_marked_no_effect_and_logged_by_code(
             return _node_environment_projection()
 
     program = Program(_SOURCE_PROGRAM, build_node_environment().catalog)
-    state = _enable_authoring(ComposerState(program=program))
+    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1, program=program))
     state.headless_client = Headless()  # type: ignore[assignment]
     state.execution_observation_source = ExecutionObservationSource(
         state.headless_client  # type: ignore[arg-type]
@@ -1321,7 +1325,7 @@ def test_node_policy_rejections_are_atomic_and_do_not_read_headless(
 
     headless = FailOnHeadlessCall()
     program = Program(source, build_node_environment().catalog)
-    state = _enable_authoring(ComposerState(
+    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1,
         program=program,
         program_source_path=str(source),
     ))
@@ -1483,7 +1487,7 @@ def test_refused_program_save_writes_no_artifact(
             raise AssertionError("a refused Save takes no claim")
 
     source = _copy_program(tmp_path)
-    state = _enable_authoring(ComposerState(allowed_fs_roots=[str(tmp_path)]))
+    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)]))
     client = TestClient(
         create_app(
             state,
@@ -1511,7 +1515,7 @@ def test_refused_program_save_writes_no_artifact(
     ).json()["workspace"]
     before = client.get("/api/program/workspace").json()
     source_bytes = source.read_bytes()
-    state.authoring_admission = AuthoringAdmissionCoordinator(Refusing())  # type: ignore[arg-type]
+    state.authoring_admission = AuthoringAdmissionCoordinator(Refusing(), 0x3F9A0000000000A1)  # type: ignore[arg-type]
 
     target = tmp_path / "saved"
     refused = client.post(
@@ -1539,7 +1543,7 @@ def test_save_draft_refusal_is_marked_only_before_the_write(
     the write (the race) is never marked as no-effect."""
 
     source = _copy_program(tmp_path)
-    state = _enable_authoring(ComposerState(allowed_fs_roots=[str(tmp_path)]))
+    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1, allowed_fs_roots=[str(tmp_path)]))
     client = TestClient(
         create_app(
             state,
@@ -1619,7 +1623,7 @@ def test_create_app_security_fallback_overrides_preseeded_write_roots(
     read_root.mkdir()
     preseeded_write_root.mkdir()
     source = _copy_program(read_root)
-    state = _enable_authoring(ComposerState(
+    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1,
         allowed_fs_roots=[str(preseeded_write_root)],
         allowed_program_write_roots=[str(preseeded_write_root)],
     ))
@@ -2144,11 +2148,10 @@ def test_workspace_reports_the_names_each_draft_formula_reads(tmp_path: Path) ->
 
 def _reset_apply_context(**changes) -> dict:
     return {
-        "schemaVersion": "manyforge.composer_reset_apply_context.v1",
+        "schemaVersion": "manyforge.composer_reset_apply_context.v2",
         "correlationId": "reset-apply.1",
         "document": "program",
-        "programRunId": "program-run.7",
-        "programRunnerOwnerEpoch": "program-runner.epoch.1",
+        "programRunId": 7,
         "cycleGeneration": 7,
         "draftId": "draft-1",
         "draftRevision": 3,
@@ -2172,7 +2175,7 @@ def test_reset_apply_context_is_bounded_logged_once_and_grants_nothing(
     [record] = [row for row in caplog.records if row.msg == "reset_apply_context"]
     assert record.reset_apply_correlation_id == "reset-apply.1"
     assert (record.document, record.program_run_id, record.cycle_generation) == (
-        "program", "program-run.7", 7,
+        "program", 7, 7,
     )
     assert record.draft_revision == 3
     # Metadata only: no Draft, workspace or runtime change.
@@ -2181,6 +2184,7 @@ def test_reset_apply_context_is_bounded_logged_once_and_grants_nothing(
     for invalid in (
         _reset_apply_context(document="scene"),
         _reset_apply_context(cycleGeneration=-1),
+        _reset_apply_context(programRunId="program-run.7"),
         _reset_apply_context(draftId=""),
         {**_reset_apply_context(), "authority": "reset"},
     ):
@@ -2189,12 +2193,30 @@ def test_reset_apply_context_is_bounded_logged_once_and_grants_nothing(
         ).status_code == 422
 
 
+def test_reset_apply_context_names_the_revert_that_follows_the_reset(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = _client(tmp_path)
+    with caplog.at_level("INFO", logger="manyforge_composer.reset_apply"):
+        for action in ("revert", None):
+            body = _reset_apply_context(action=action) if action else _reset_apply_context()
+            assert client.post(
+                "/api/authoring/reset-apply-contexts", json=body
+            ).status_code == 200
+    records = [row for row in caplog.records if row.msg == "reset_apply_context"]
+    # Without the field the Reset is followed by an Apply, as before.
+    assert [record.action for record in records] == ["revert", "apply"]
+    assert client.post(
+        "/api/authoring/reset-apply-contexts", json=_reset_apply_context(action="load")
+    ).status_code == 422
+
+
 @pytest.mark.parametrize("correlation", [None, "reset-apply.1"])
-def test_program_apply_preserves_a_shared_reset_apply_correlation(
+def test_program_apply_sends_the_browser_start_id_and_a_fresh_manager_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, correlation: str | None
 ) -> None:
     program = Program(_copy_program(tmp_path), build_node_environment().catalog)
-    state = _enable_authoring(ComposerState(program=program))
+    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1, program=program))
     submitted: list[dict] = []
 
     class Admission(_AuthoringPassThrough):
@@ -2221,13 +2243,13 @@ def test_program_apply_preserves_a_shared_reset_apply_correlation(
     )
     monkeypatch.setattr(routes_draft, "_active_catalog", lambda s: s.node_catalog)
     monkeypatch.setattr(routes_draft, "_workspace", lambda _s: {})
-    monkeypatch.setattr(state, "_manager_current", lambda _s, **_kw: ("bundle", "graph", "epoch"))
+    monkeypatch.setattr(state, "_manager_current", lambda _s, **_kw: ("bundle", "graph"))
 
     def execute(intent, claim, *, apply, prepared=None, prepare_only=False):
         if prepare_only:
             return {"confirmation_required": False, "prepared_activation": {}}
         submitted.append(intent)
-        return {"status": "accepted", "apply_id": "apply-1", "apply_generation": 4}
+        return {"status": "accepted", "apply_id": 1, "apply_generation": 4}
 
     monkeypatch.setattr(state, "execute_authored_deployment_candidate", execute)
     client = TestClient(create_app(state, security=SecurityConfig(
@@ -2249,12 +2271,27 @@ def test_program_apply_preserves_a_shared_reset_apply_correlation(
         body["correlationId"] = correlation
     response = client.post("/api/program/apply", json=body)
 
-    assert response.status_code == 202, response.text
+    # OD-214: answered at acceptance with the row; it ends once the Manager
+    # accepted the Apply, and names that Manager Apply.
+    assert response.status_code == 200, response.text
+    assert response.json()["schema_version"] == "manyforge.apply_command_reply.v1"
+    row = response.json()["command"]
+    assert (row["kind"], row["request_key"]) == ("program_apply", body["requestKey"])
+    ended = state.apply_commands.ended_row(body["requestKey"])
+    assert (ended["end"]["outcome"], ended["end"]["code"]) == ("succeeded", None)
+    assert ended["step"] == "applying"
+    assert ended["step_source"] == {
+        "status": "manager_apply", "apply_id": 1, "apply_generation": 4,
+    }
     assert submitted[0]["scene_initialization"] == "preserve"
     assert "typed_parameter_overrides" not in submitted[0]
-    # The Manager record carries the shared reference with its own request ID.
-    assert submitted[0]["correlation_id"] == (correlation or body["requestId"])
-    assert submitted[0]["manager_request_id"].startswith("program-activation-")
+    # The Manager Apply carries the browser's `A` unchanged and its own fresh
+    # key; the reset-apply correlation stays a Composer log link only.
+    assert submitted[0]["application_start_id"] == body["applicationStartId"]
+    assert len(submitted[0]["request_key"]) == 32
+    assert submitted[0]["request_key"] != body["requestKey"]
+    assert "correlation_id" not in submitted[0]
+    assert "manager_request_id" not in submitted[0]
 
 
 
@@ -2263,7 +2300,7 @@ def test_program_apply_refuses_a_no_op_before_any_effect(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     program = Program(_copy_program(tmp_path), build_node_environment().catalog)
-    state = _enable_authoring(ComposerState(program=program))
+    state = _enable_authoring(ComposerState(application_start_id=0x3F9A0000000000A1, program=program))
 
     class Admission(_AuthoringPassThrough):
         def execute_external_submission(self, *_args, **_kwargs):
@@ -2303,7 +2340,7 @@ def test_program_revert_refuses_saved_equal_to_applied_before_any_effect(
     source = _copy_program(tmp_path)
     program = Program(source, build_node_environment().catalog)
     state = _enable_authoring(
-        ComposerState(program=program, program_source_path=str(source))
+        ComposerState(application_start_id=0x3F9A0000000000A1, program=program, program_source_path=str(source))
     )
 
     class Admission(_AuthoringPassThrough):
@@ -2371,7 +2408,7 @@ def _program_revert_scenario(
     source = _copy_program(tmp_path)
     program = Program(source, build_node_environment().catalog)
     state = _enable_authoring(
-        ComposerState(program=program, program_source_path=str(source))
+        ComposerState(application_start_id=0x3F9A0000000000A1, program=program, program_source_path=str(source))
     )
     deployment = DeploymentDraftSession(compiler=_compile_as_is)
     retained = deployment.retained_state()
@@ -2431,13 +2468,13 @@ def _program_revert_scenario(
     monkeypatch.setattr(routes_draft, "_applied_context", lambda _s: (
         SimpleNamespace(program_revision="sha256:" + "c" * 64), None,
     ))
-    monkeypatch.setattr(state, "_manager_current", lambda _s, **_kw: ("bundle", "graph", "epoch"))
+    monkeypatch.setattr(state, "_manager_current", lambda _s, **_kw: ("bundle", "graph"))
 
     def execute(intent, claim, *, apply, prepared=None, prepare_only=False):
         manager_calls.append("prepare_only" if prepare_only else "apply")
         if prepare_only:
             return {"confirmation_required": False, "prepared_activation": {}}
-        return {"status": "accepted", "apply_id": "apply-1", "apply_generation": 4}
+        return {"status": "accepted", "apply_id": 1, "apply_generation": 4}
 
     monkeypatch.setattr(state, "execute_authored_deployment_candidate", execute)
     client = TestClient(create_app(state, security=SecurityConfig(
@@ -2475,9 +2512,14 @@ def test_program_revert_refuses_a_saved_deployment_other_than_applied_before_any
     }})
     response = client.post("/api/program/revert", json=body)
 
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["code"] == "scenario_revert_requires_deployment"
-    assert response.json()["detail"]["effect"] == "none"
+    # OD-214: the check runs after acceptance (in the preparation): the row
+    # ends refused, with no effect.
+    assert response.status_code == 200, response.text
+    ended = state.apply_commands.ended_row(body["requestKey"])
+    assert ended["kind"] == "program_revert"
+    assert (ended["end"]["outcome"], ended["end"]["code"]) == (
+        "refused", "scenario_revert_requires_deployment")
+    assert ended["step"] == "previewing"
     # Refused before the Manager preview: no Manager call at all.
     assert manager_calls == []
     assert state.draft_session.retained_state() == program_before
@@ -2505,7 +2547,12 @@ def test_program_revert_restores_both_drafts_to_saved_in_one_workspace_revision(
     }})
     response = client.post("/api/program/revert", json=body)
 
-    assert response.status_code == 202, response.text
+    assert response.status_code == 200, response.text
+    ended = state.apply_commands.ended_row(body["requestKey"])
+    assert (ended["end"]["outcome"], ended["step"]) == ("succeeded", "applying")
+    assert ended["step_source"] == {
+        "status": "manager_apply", "apply_id": 1, "apply_generation": 4,
+    }
     assert manager_calls == ["manager_status", "prepare_only", "apply"]
     # The Deployment Draft that left Saved returns to it together with the
     # Program restore, in one workspace revision.
@@ -2532,8 +2579,7 @@ def test_program_revert_partial_contained_install_keeps_the_claim(
         applied_deployment=saved,
     )
     headless = _Headless(generation=1)
-    coordinator = AuthoringAdmissionCoordinator(headless)  # type: ignore[arg-type]
-    coordinator.recover()
+    coordinator = AuthoringAdmissionCoordinator(headless, 0x3F9A0000000000A1)  # type: ignore[arg-type]
     state.authoring_admission = coordinator
 
     def fail_after_program_restore(_identity):
@@ -2549,9 +2595,12 @@ def test_program_revert_partial_contained_install_keeps_the_claim(
     }})
     response = client.post("/api/program/revert", json=body)
 
-    assert response.status_code == 503, response.text
-    assert response.json()["detail"]["code"] == "composer_workspace_install_failed"
-    assert "effect" not in response.json()["detail"]
+    # OD-214: a failure after acceptance ends the row `failed` (not refused).
+    assert response.status_code == 200, response.text
+    ended = state.apply_commands.ended_row(body["requestKey"])
+    assert (ended["end"]["outcome"], ended["end"]["code"]) == (
+        "failed", "composer_workspace_install_failed")
+    assert ended["step"] == "applying"
     assert state.authoring_workspace.failed_closed is not None
     assert "apply" not in manager_calls
     # Never settled as proven no effect: the claim is retained, admission blocked.
@@ -2584,7 +2633,7 @@ def test_observed_pose_selector_uses_live_active_and_verified_default(monkeypatc
         routes_draft._observed_move_arguments(state, args)
     assert missing_default.value.code == "observed_move_target_unbound"
     parameters["tcp_endpoint"] = {"kind": "current"}
-    status["active_tcp"] = {"entry": None, "display": None, "owner_epoch": "owner",
+    status["active_tcp"] = {"entry": None, "display": None,
                             "registration_generation": 1, "sequence": 2}
     with pytest.raises(DraftSessionError) as missing_active:
         routes_draft._observed_move_arguments(state, args)
@@ -2594,7 +2643,7 @@ def test_observed_pose_selector_uses_live_active_and_verified_default(monkeypatc
         routes_draft._observed_move_arguments(state, args)
     assert missing_status.value.code == "observed_move_unavailable"
     status["active_tcp"] = {"entry": _entry(frame="flange"),
-                            "display": "robot.flange", "owner_epoch": "owner",
+                            "display": "robot.flange",
                             "registration_generation": 1, "sequence": 3}
     binding["target_bindings"][0]["robot_tcps"][1]["frame"]["model_revision"] = "other"
     with pytest.raises(DraftSessionError) as changed_model:

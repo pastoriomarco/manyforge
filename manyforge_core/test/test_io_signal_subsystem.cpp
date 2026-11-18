@@ -29,13 +29,11 @@ IoSignalLimitsDTO limits(std::size_t records = 8, std::size_t watches = 8) {
 }
 
 IoSignalCatalogDTO catalog(std::vector<IoSignalDescriptorDTO> signals = {descriptor()}) {
-  return {RequestOwnerEpoch("host.1"), 1, std::move(signals)};
+  return {1, std::move(signals)};
 }
 
-IoWatchScopeDTO scope(std::string run = "run.1", std::string owner = "runner.1") {
-  return {RequestOwnerEpoch(std::move(owner)),
-          ProgramRunId(std::move(run)),
-          {ProgramNodeInstanceId("wait"), "attempt.1"}};
+IoWatchScopeDTO scope(std::uint64_t run = 1U) {
+  return {ProgramRunNumber(run), {ProgramNodeInstanceId("wait"), NodeAttemptNumber(1U)}};
 }
 
 IoSignalPublicationDTO publication(std::uint64_t sequence, bool value, std::string name = "input",
@@ -58,7 +56,7 @@ IoSourceAcquisitionDTO acquisition(const IoSignalPublicationDTO& sample, TimePoi
 }
 
 IoSourceCursorDTO origin(InterruptSourceId source = kSourceA) {
-  return {RequestOwnerEpoch("host.1"), 1, std::move(source), 0};
+  return {1, std::move(source), 0};
 }
 
 TEST(IoSignalSubsystemTest, ValidatesWholeCatalogAndExplicitBoundsBeforeConstruction) {
@@ -237,11 +235,11 @@ TEST(IoSignalSubsystemTest, StaleOrUnavailableBaselineStaysPendingUntilFreshMatc
   auto subsystem = std::move(created.value());
   ASSERT_TRUE(subsystem->InstallSource(kSourceA, kIncarnation, std::nullopt).ok());
   ASSERT_TRUE(subsystem->Publish(acquisition(publication(1, true), clock.now())).ok());
-  const auto fresh_watch = subsystem->RegisterLevelWatch({scope("fresh"), signal_id(), true});
+  const auto fresh_watch = subsystem->RegisterLevelWatch({scope(142U), signal_id(), true});
   ASSERT_TRUE(fresh_watch.ok());
   EXPECT_EQ(subsystem->ReadWatch(fresh_watch.value()).value().state, IoWatchState::kMatched);
   clock.advance(11);
-  const auto stale_watch = subsystem->RegisterLevelWatch({scope("stale"), signal_id(), true});
+  const auto stale_watch = subsystem->RegisterLevelWatch({scope(143U), signal_id(), true});
   ASSERT_TRUE(stale_watch.ok());
   EXPECT_EQ(subsystem->ReadWatch(stale_watch.value()).value().state, IoWatchState::kPending);
   ASSERT_TRUE(
@@ -286,27 +284,23 @@ TEST(IoSignalSubsystemTest, ExplicitSourceReplacementInvalidatesBaselineAndFence
             replacement);
 }
 
-TEST(IoSignalSubsystemTest, ExactReleaseAndRunTeardownCannotReleaseOtherOwnerOrReviveTokens) {
+TEST(IoSignalSubsystemTest, ExactReleaseAndRunTeardownCannotReleaseAnotherRunOrReviveTokens) {
   FakeClock clock;
   auto created = IoSignalSubsystem::Create(catalog(), limits(), clock);
   ASSERT_TRUE(created.ok());
   auto subsystem = std::move(created.value());
   ASSERT_TRUE(subsystem->InstallSource(kSourceA, kIncarnation, std::nullopt).ok());
   const auto own = subsystem->RegisterLevelWatch({scope(), signal_id(), true});
-  const auto other = subsystem->RegisterLevelWatch({scope("run.2"), signal_id(), true});
+  const auto other = subsystem->RegisterLevelWatch({scope(2U), signal_id(), true});
   ASSERT_TRUE(own.ok());
   ASSERT_TRUE(other.ok());
   auto forged = own.value();
-  forged.scope.program_run_id = ProgramRunId("run.2");
+  forged.scope.program_run_id = ProgramRunNumber(2U);
   EXPECT_FALSE(subsystem->ReleaseWatch(forged).ok());
   auto stale = own.value();
   ++stale.catalog_generation;
   EXPECT_FALSE(subsystem->ReadWatch(stale).ok());
-  ASSERT_TRUE(
-      subsystem->ReleaseRunWatches(RequestOwnerEpoch("runner.other"), ProgramRunId("run.1")).ok());
-  EXPECT_EQ(subsystem->ReadWatch(own.value()).value().state, IoWatchState::kPending);
-  ASSERT_TRUE(
-      subsystem->ReleaseRunWatches(RequestOwnerEpoch("runner.1"), ProgramRunId("run.1")).ok());
+  ASSERT_TRUE(subsystem->ReleaseRunWatches(ProgramRunNumber(1U)).ok());
   ASSERT_TRUE(subsystem->Publish(acquisition(publication(1, true), clock.now())).ok());
   EXPECT_EQ(subsystem->ReadWatch(own.value()).value().state, IoWatchState::kReleased);
   EXPECT_EQ(subsystem->ReadWatch(other.value()).value().state, IoWatchState::kMatched);
@@ -618,34 +612,30 @@ TEST(IoSignalSubsystemTest, SyntheticInvalidAndReplacementCannotBorrowPriorValid
   EXPECT_EQ(service->ReadSignal(signal_id()).value().availability, IoSignalAvailability::kFresh);
 }
 
-TEST(IoSignalSubsystemTest, NodeReleaseErasesOnlyExactOwnerRunNodeAttemptWatches) {
+TEST(IoSignalSubsystemTest, NodeReleaseErasesOnlyExactRunNodeAttemptWatches) {
   FakeClock clock;
   auto created = IoSignalSubsystem::Create(catalog(), limits(), clock);
   ASSERT_TRUE(created.ok());
   auto& service = *created.value();
   const auto own = scope();
   auto other_attempt = own;
-  other_attempt.node.node_attempt_id = "attempt.2";
+  other_attempt.node.node_attempt_id = NodeAttemptNumber(2U);
   const auto first = service.RegisterLevelWatch({own, signal_id(), true});
   const auto duplicate = service.RegisterLevelWatch({own, signal_id(), false});
   const auto next = service.RegisterLevelWatch({other_attempt, signal_id(), true});
-  const auto other_run = service.RegisterLevelWatch({scope("run.2"), signal_id(), true});
-  const auto other_owner =
-      service.RegisterLevelWatch({scope("run.1", "runner.2"), signal_id(), true});
+  const auto other_run = service.RegisterLevelWatch({scope(2U), signal_id(), true});
   ASSERT_TRUE(first.ok());
   ASSERT_TRUE(duplicate.ok());
   ASSERT_TRUE(next.ok());
   ASSERT_TRUE(other_run.ok());
-  ASSERT_TRUE(other_owner.ok());
   ASSERT_TRUE(service.ReleaseNodeWatches(own).ok());
   EXPECT_TRUE(service.ReleaseNodeWatches(own).ok());
   EXPECT_EQ(service.ReadWatch(first.value()).value().state, IoWatchState::kReleased);
   EXPECT_EQ(service.ReadWatch(duplicate.value()).value().state, IoWatchState::kReleased);
   EXPECT_EQ(service.ReadWatch(next.value()).value().state, IoWatchState::kPending);
   EXPECT_EQ(service.ReadWatch(other_run.value()).value().state, IoWatchState::kPending);
-  EXPECT_EQ(service.ReadWatch(other_owner.value()).value().state, IoWatchState::kPending);
   auto malformed = own;
-  malformed.node.node_attempt_id.clear();
+  malformed.node.node_attempt_id = NodeAttemptNumber(0U);
   EXPECT_FALSE(service.ReleaseNodeWatches(malformed).ok());
 }
 

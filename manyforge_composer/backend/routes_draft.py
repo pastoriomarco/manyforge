@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-import hashlib
 import math
 from pathlib import Path
 from typing import Any, Callable, Literal, NoReturn
@@ -28,6 +27,7 @@ from manyforge_headless_api.program_binding_projection import (
 )
 from pydantic import BaseModel, ConfigDict, Field
 
+from .deployment_draft import DeploymentDraftError
 from .draft_session import (
     DraftSessionError,
     OPERATOR_DRAFT_MUTATIONS,
@@ -39,7 +39,19 @@ from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
     read_active_node_environment,
 )
-from .apply_orchestration import recorded_apply
+from .application_identity import (
+    ApplicationStartIdText,
+    RequestKeyText,
+    new_request_key,
+    parse_application_start_id,
+)
+from .apply_orchestration import (
+    ApplyRefused,
+    apply_accepted,
+    apply_step,
+    apply_step_source,
+    one_apply_at_a_time,
+)
 from .reset_apply_log import log_reset_apply_link
 from .program_artifacts import (
     ProgramArtifactError,
@@ -125,10 +137,8 @@ class _DraftFence(BaseModel):
     expected_admission_generation: int = Field(
         alias="expectedAdmissionGeneration", ge=1, le=9_007_199_254_740_991
     )
-    request_owner_epoch: str = Field(
-        alias="requestOwnerEpoch", min_length=1, max_length=256
-    )
-    request_id: str = Field(alias="requestId", min_length=1, max_length=256)
+    application_start_id: ApplicationStartIdText = Field(alias="applicationStartId")
+    request_key: RequestKeyText = Field(alias="requestKey")
     expected_workspace_epoch: str = Field(
         alias="expectedWorkspaceEpoch", min_length=1, max_length=256
     )
@@ -139,8 +149,8 @@ class _DraftFence(BaseModel):
     def admission_envelope(self) -> AuthoringMutationEnvelope:
         return AuthoringMutationEnvelope(
             expected_admission_generation=self.expected_admission_generation,
-            request_owner_epoch=self.request_owner_epoch,
-            request_id=self.request_id,
+            application_start_id=parse_application_start_id(self.application_start_id),
+            request_key=bytes.fromhex(self.request_key),
         )
 
     def require_workspace_fence(self, identity) -> None:
@@ -228,6 +238,41 @@ class _AppliedContext:
     projection_document: dict[str, Any]
 
 
+def _program_apply_command(state: Any, kind: str, request_key: str, run: Any) -> dict[str, Any]:
+    """Program Apply/Revert as an Apply-level command (OD-214, OP-6 (a)).
+
+    It answers at acceptance with ``manyforge.apply_command_reply.v1``; it
+    holds the one Apply slot like Apply, Load and New (one row at a time).
+    Its row ends once the Manager accepted the Apply (or it was already
+    applied), as its reply did; the ended row's `step_source` names that
+    Manager Apply.
+    """
+
+    def slotted() -> Any:
+        try:
+            with one_apply_at_a_time():
+                return run()
+        except ApplyRefused as refusal:
+            if refusal.code != "apply_in_progress":
+                raise
+            _raise_workspace_error(
+                DraftSessionError(refusal.code, str(refusal), status_code=409)
+            )
+
+    return state.apply_commands.run(state.headless_client, kind, request_key, slotted)
+
+
+def _program_apply_submitted(result: dict[str, Any]) -> None:
+    """Name the Manager Apply the submission started on the `applying` step."""
+
+    apply_id, generation = result.get("apply_id"), result.get("apply_generation")
+    if type(apply_id) is int and type(generation) is int:
+        apply_step_source(
+            "applying",
+            {"status": "manager_apply", "apply_id": apply_id, "apply_generation": generation},
+        )
+
+
 def _raise_workspace_error(error: Exception) -> NoReturn:
     if isinstance(error, DraftSessionError):
         raise draft_session_http_exception(error) from error
@@ -240,6 +285,12 @@ def _raise_workspace_error(error: Exception) -> NoReturn:
         raise HTTPException(
             status_code=error.status_code,
             detail=detail,
+        ) from error
+    if isinstance(error, DeploymentDraftError):
+        # A scene-object rename that also renames Deployment Draft links.
+        raise HTTPException(
+            status_code=error.status_code,
+            detail={"code": error.code, "message": str(error)},
         ) from error
     if isinstance(error, AuthoringWorkspaceError):
         detail = {"code": error.code, "message": str(error)}
@@ -999,7 +1050,8 @@ def _observed_scene_arguments(
             status_code=503,
             detail={"headless_code": error.code},
         ) from error
-    logical = projection.get("logical_scene")
+    section = projection.get("logical_scene")
+    logical = section.get("payload") if isinstance(section, dict) else None
     access = logical.get("access") if isinstance(logical, dict) else None
     snapshot = logical.get("snapshot") if isinstance(logical, dict) else None
     active = access.get("active_projection") if isinstance(access, dict) else None
@@ -1085,6 +1137,58 @@ def _observed_scene_arguments(
         "scene_resource_id": arguments["scene_resource_id"],
     }
     return {"scene_resource": resource}, source_identity
+
+
+_SCENE_RENAME_MUTATION = "scene_draft_rename_object"
+
+
+def _commit_scene_rename(
+    state: ComposerState,
+    body: DraftMutationRequest,
+    prepared: Any,
+    details: dict[str, Any],
+) -> tuple[Any, list[str]]:
+    """Commit a prepared scene-object rename with the Deployment Draft's links.
+
+    A Deployment Draft that names the renamed object (pose-source links, their
+    stream budgets, geometric-contact inputs) is renamed in the same Draft-only
+    whole-Scenario commit as the Program Draft, the way Scenario Discard
+    commits both Drafts. Otherwise this is an ordinary Program Draft edit.
+    """
+
+    deployment = state.deployment_draft_session
+    draft_id, revision, compiled, paths = deployment.preview_scene_resource_rename(
+        details["previous_scene_resource_id"], details["renamed_scene_resource_id"]
+    )
+    if compiled is None:
+        return (
+            commit_draft_edit(
+                state,
+                body,
+                operation_kind="mutate_draft",
+                install=lambda: state.draft_session.install_prepared_mutation(prepared),
+            ),
+            [],
+        )
+
+    def install() -> bool:
+        changed = state.draft_session.install_prepared_mutation(prepared)
+        return deployment.commit_compiled(
+            compiled, draft_id=draft_id, expected_revision=revision
+        ) or changed
+
+    return (
+        commit_draft_edit(
+            state,
+            body,
+            operation_kind="mutate_draft",
+            session="scenario",
+            # Both Draft fences before either install.
+            validate=lambda: deployment.require_current(draft_id, revision),
+            install=install,
+        ),
+        paths,
+    )
 
 
 def _source_resolved_mutation(
@@ -1304,7 +1408,6 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         body: _DraftFence,
         program_document: dict[str, Any] | None,
         *,
-        correlation_id: str | None = None,
         require_deployment: Callable[[dict[str, Any]], None] | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Prepare one complete immutable activation for a Program change.
@@ -1369,7 +1472,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 }
             )
         )
-        bundle, graph, _manager_epoch = state._manager_current(
+        bundle, graph = state._manager_current(
             state.headless_client.manager_status(), phase="program_activation.preview"
         )
         intent = {
@@ -1386,13 +1489,10 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 "graph_revision": graph,
             },
             "expected_admission_generation": body.expected_admission_generation,
-            "manager_request_id": "program-activation-"
-            + hashlib.sha256(
-                f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
-            ).hexdigest()[:32],
-            # Preserve a correction's shared reference; otherwise the request
-            # is its own correlation.
-            "correlation_id": correlation_id or body.request_id,
+            # The browser's `A`, forwarded unchanged; the Manager Apply is
+            # named by its own key, minted with this intent.
+            "application_start_id": body.application_start_id,
+            "request_key": new_request_key().hex(),
             "confirmation_token": None,
             "draft_id": body.draft_id,
             "draft_revision": body.expected_draft_revision,
@@ -1482,19 +1582,27 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 catalog=state.node_catalog,
                 draft_id=body.draft_id,
             )
-            commit = commit_draft_edit(
-                state,
-                body,
-                operation_kind="mutate_draft",
-                install=lambda: state.draft_session.install_prepared_mutation(
-                    prepared
-                ),
-            )
+            details = thaw_json(prepared.details)
+            if body.mutation == _SCENE_RENAME_MUTATION and prepared.changed:
+                commit, details["deployment_references"] = _commit_scene_rename(
+                    state, body, prepared, details
+                )
+            else:
+                if body.mutation == _SCENE_RENAME_MUTATION:
+                    details["deployment_references"] = []
+                commit = commit_draft_edit(
+                    state,
+                    body,
+                    operation_kind="mutate_draft",
+                    install=lambda: state.draft_session.install_prepared_mutation(
+                        prepared
+                    ),
+                )
         except Exception as error:
             _raise_workspace_error(error)
         return {
             "mutation": prepared.tool_id,
-            "details": thaw_json(prepared.details),
+            "details": details,
             "workspace": _workspace(state),
             "authoringWorkspace": commit.snapshot.as_dict(),
         }
@@ -1722,9 +1830,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
             _raise_workspace_error(error)
 
     @router.post("/api/program/apply")
-    def apply_draft(body: ApplyDraftRequest) -> JSONResponse:
-        return recorded_apply(
-            state.headless_client, "program_apply", lambda: _apply_draft(body)
+    def apply_draft(body: ApplyDraftRequest) -> dict[str, Any]:
+        return _program_apply_command(
+            state, "program_apply", body.request_key, lambda: _apply_draft(body)
         )
 
     def _apply_draft(body: ApplyDraftRequest) -> JSONResponse:
@@ -1753,8 +1861,11 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     "Nothing to apply: the Program Draft already matches Applied",
                     status_code=409,
                 )
+            # Accepted: the checks before any preparation passed (OD-214).
+            apply_accepted()
+            apply_step("previewing")
             intent, prepared = prepare_program_activation(
-                body, program.to_dict(), correlation_id=body.correlation_id
+                body, program.to_dict()
             )
             coordinator = state.authoring_admission
             if coordinator is None:
@@ -1779,6 +1890,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                         status_code=409,
                     )
 
+            apply_step("applying")
             result = coordinator.execute_external_submission(
                 body.admission_envelope(),
                 operation_kind="apply_program",
@@ -1790,15 +1902,16 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     intent, claim, apply=True, prepared=prepared
                 ),
             )
+            _program_apply_submitted(result)
             if body.correlation_id is not None:
                 log_reset_apply_link(
                     "program_apply",
                     correlation_id=body.correlation_id,
-                    request_id=body.request_id,
+                    request_key=body.request_key,
                     outcome=str(result.get("status")),
                     apply_id=result.get("apply_id"),
                     apply_generation=result.get("apply_generation"),
-                    manager_request_id=intent["manager_request_id"],
+                    manager_request_key=intent["request_key"],
                     draft_id=body.draft_id,
                     draft_revision=body.expected_draft_revision,
                 )
@@ -1815,7 +1928,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 log_reset_apply_link(
                     "program_apply",
                     correlation_id=body.correlation_id,
-                    request_id=body.request_id,
+                    request_key=body.request_key,
                     outcome="error",
                     error_code=_error_code(error),
                     draft_id=body.draft_id,
@@ -1833,10 +1946,10 @@ def create_draft_router(state: ComposerState) -> APIRouter:
         except Exception as error:
             _raise_workspace_error(error)
 
-    @router.post("/api/program/revert", status_code=202)
-    def revert_draft(body: RevertDraftRequest) -> JSONResponse:
-        return recorded_apply(
-            state.headless_client, "program_revert", lambda: _revert_draft(body)
+    @router.post("/api/program/revert")
+    def revert_draft(body: RevertDraftRequest) -> dict[str, Any]:
+        return _program_apply_command(
+            state, "program_revert", body.request_key, lambda: _revert_draft(body)
         )
 
     def _revert_draft(body: RevertDraftRequest) -> JSONResponse:
@@ -1872,6 +1985,9 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                         status_code=409,
                     )
 
+            # Accepted: the checks before any preparation passed (OD-214).
+            apply_accepted()
+            apply_step("previewing")
             intent, prepared = prepare_program_activation(
                 body,
                 saved_program.to_dict() if saved_program is not None else None,
@@ -1921,11 +2037,14 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                     notify=False,
                     context=AuthoringOperationContext(
                         operation="revert_program",
-                        request_owner_epoch=body.request_owner_epoch,
-                        request_id=body.request_id,
+                        application_start_id=parse_application_start_id(
+                            body.application_start_id
+                        ),
+                        request_key=bytes.fromhex(body.request_key),
                     ),
                 )
 
+            apply_step("applying")
             result = coordinator.execute_external_submission(
                 body.admission_envelope(),
                 operation_kind="revert_program",
@@ -1940,6 +2059,7 @@ def create_draft_router(state: ComposerState) -> APIRouter:
                 ),
                 after_release=state.authoring_workspace.publish_commit_wake,
             )
+            _program_apply_submitted(result)
             return JSONResponse(
                 status_code=202 if result["status"] == "accepted" else 200,
                 content={

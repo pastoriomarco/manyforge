@@ -23,7 +23,6 @@ export function nodeEnvironmentRefreshKey(
   const components = snapshot.componentOverview.components
     .map((component) => ({
       id: component.id,
-      ownerEpoch: component.ownerEpoch,
       ownerId: component.ownerId,
       reasonCode: component.reasonCode,
       required: component.required,
@@ -31,7 +30,7 @@ export function nodeEnvironmentRefreshKey(
     }))
     .sort((left, right) => left.id.localeCompare(right.id));
   return JSON.stringify({
-    receiverEpoch: snapshot.receiverEpoch,
+    applicationStartId: snapshot.applicationStartId,
     manager: {
       available: manager.available,
       freshness: manager.freshness,
@@ -42,7 +41,6 @@ export function nodeEnvironmentRefreshKey(
       retainedBundleId: typeof active?.retained_bundle_id === 'string'
         ? active.retained_bundle_id
         : null,
-      sourceOwnerEpoch: manager.sourceOwnerEpoch,
       sourceOwnerId: manager.sourceOwnerId,
     },
     readiness: snapshot.componentOverview.readiness,
@@ -64,7 +62,7 @@ export function viewerModelRefreshKey(
   const active = objectValue(payload?.active);
   const runtime = objectValue(payload?.runtime);
   return JSON.stringify({
-    receiverEpoch: snapshot.receiverEpoch,
+    applicationStartId: snapshot.applicationStartId,
     manager: {
       available: manager.available,
       freshness: manager.freshness,
@@ -84,7 +82,6 @@ export function viewerModelRefreshKey(
       runtimeConverged: typeof runtime?.converged === 'boolean'
         ? runtime.converged
         : null,
-      sourceOwnerEpoch: manager.sourceOwnerEpoch,
       sourceOwnerId: manager.sourceOwnerId,
     },
   });
@@ -147,9 +144,8 @@ export function managerActivationSettlementKey(
     return MANAGER_ACTIVATION_PENDING;
   }
   return JSON.stringify({
-    receiverEpoch: snapshot.receiverEpoch,
+    applicationStartId: snapshot.applicationStartId,
     sourceOwnerId: manager.sourceOwnerId,
-    sourceOwnerEpoch: manager.sourceOwnerEpoch,
     cellId: typeof payload.cell_id === 'string' ? payload.cell_id : null,
     retainedBundleId,
     graphRevision,
@@ -204,15 +200,16 @@ function currentCommittedApplyIdentity(
   active: Record<string, unknown>,
   retainedBundleId: string,
   graphRevision: string,
-): { applyId: string; applyGeneration: number } | null {
+): { applyId: number; applyGeneration: number } | null {
   // The active publication pointer, not Manager Apply history order, names the
   // exact Apply that currently owns this active configuration.
   const publication = objectValue(active.publication);
   const transaction = objectValue(publication?.transaction);
   if (transaction?.kind !== 'named_apply') return null;
-  const applyId = typeof transaction.apply_id === 'string' ? transaction.apply_id : '';
+  const applyId = transaction.apply_id;
   const applyGeneration = transaction.apply_generation;
-  if (applyId.trim().length === 0 || typeof applyGeneration !== 'number'
+  if (typeof applyId !== 'number' || !Number.isSafeInteger(applyId) || applyId <= 0
+      || typeof applyGeneration !== 'number'
       || !Number.isSafeInteger(applyGeneration) || applyGeneration <= 0) {
     return null;
   }
@@ -233,7 +230,7 @@ function currentCommittedApplyIdentity(
       || prepared.graph_revision !== graphRevision) {
     return null;
   }
-  return { applyId: applyId.trim(), applyGeneration };
+  return { applyId, applyGeneration };
 }
 
 /**
@@ -252,10 +249,9 @@ export function managerReadinessTransientRetryKey(
   }
   const manager = snapshot.runtime.sections.manager;
   const sourceOwnerId = manager.sourceOwnerId?.trim() ?? '';
-  const sourceOwnerEpoch = manager.sourceOwnerEpoch?.trim() ?? '';
   if (!manager.available || manager.freshness !== 'fresh' || manager.knownGaps.length > 0
       || !Number.isSafeInteger(manager.sourceGeneration) || (manager.sourceGeneration ?? 0) <= 0
-      || sourceOwnerId.length === 0 || sourceOwnerEpoch.length === 0) {
+      || sourceOwnerId.length === 0) {
     return null;
   }
   const payload = objectValue(manager.payload);
@@ -281,8 +277,10 @@ export function managerReadinessTransientRetryKey(
   );
   if (applyIdentity === null) return null;
   return JSON.stringify({
+    // The start of the snapshot this key is built from: Apply ids and
+    // generations restart with each start.
+    applicationStartId: snapshot.applicationStartId,
     sourceOwnerId,
-    sourceOwnerEpoch,
     cellId,
     retainedBundleId,
     graphRevision,

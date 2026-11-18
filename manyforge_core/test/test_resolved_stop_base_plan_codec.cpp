@@ -49,13 +49,13 @@ namespace {
 }
 
 [[nodiscard]] PreparedParticipantStopPlanContextDTO PreparedContext() {
-  return {OperationId("operation.main"),
+  return {OperationNumber(1001U),
           OperationRevision(3U),
-          OperationParticipantId("participant.arm"),
+          OperationParticipantId{OperationNumber(901U), 1U},
           ProgramId("program.main"),
           ProgramRevision(Digest('1')),
           ProgramBindingId(Digest('2')),
-          ProgramRunId("run.main"),
+          ProgramRunNumber(124U),
           StopProfile(),
           ParticipantStopProfilePurposeDTO::kMotionInterruptScope,
           std::string("scope.contact"),
@@ -657,9 +657,9 @@ TEST(PreparedParticipantStopPlanCodec, FreezesProfileMappingAndDeploymentDefault
             std::string::npos);
   EXPECT_NE(encoded.value().find("\"parameter_source\":\"deployment_default\""), std::string::npos);
   EXPECT_EQ(content_identity::sha256_digest(encoded.value()),
-            "sha256:eb9a9bc7737cfa5cab4137226f17e21b824c8c11b28c5140464c9d136bf7ebdd");
+            "sha256:a999a677643b80b287e06d12c90820fb6551921d8aa284881aecd27e567cffd9");
   EXPECT_EQ(plan.participant_stop_invocation_plan_digest.value(),
-            "sha256:1cb4e686baac6e639645775103b40f486548737fe8067a8369777457198f03c9");
+            "sha256:d6fcb1544356246d68cd7cf400cbf0699c55e81c28e95bf24aaa6e748c967706");
 }
 
 TEST(PreparedParticipantStopPlanCodec, AcceptsFastFaultProfileAndPreservesClosedPlan) {

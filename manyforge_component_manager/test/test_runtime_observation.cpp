@@ -31,7 +31,7 @@ RuntimeUnitExpectation Expectation(
     const std::string& runtime_unit_id,
     std::vector<std::string> dependencies = {},
     const std::uint64_t maximum_presence_age_ns = 100,
-    const std::uint64_t maximum_report_age_ns = 100,
+    const std::optional<std::uint64_t> maximum_report_age_ns = 100,
     const std::optional<std::uint64_t> maximum_progress_age_ns =
         std::nullopt,
     std::string product_identity = "product-v1",
@@ -358,6 +358,27 @@ TEST(RuntimeObservationReducer, DuplicateAndConflictDoNotRenewFreshness) {
   EXPECT_EQ(metrics.rejection_reasons.at(
                 "source_report_sequence_regressed"),
             1U);
+}
+
+// OD-295 (1)(a): without a report-age limit (the Manager's case) an old
+// report is information only and never by itself unconverges the unit.
+TEST(RuntimeObservationReducer, ReportAgeWithoutLimitIsInformation) {
+  ManualClock clock;
+  RuntimeObservationReducer subject(
+      [&clock] { return clock(); },
+      {"unit"});
+  const auto target = Expectation("unit", {}, 100, std::nullopt);
+  EXPECT_TRUE(subject.ObserveProcess(Presence("unit", "epoch")));
+  EXPECT_TRUE(subject.IngestSourceReport(Report("unit", "epoch")));
+  clock.Advance(1000);
+  EXPECT_TRUE(subject.ObserveProcess(Presence("unit", "epoch", 2)));
+
+  const auto snapshot = subject.Evaluate({target});
+  const auto observation = snapshot.observation("unit");
+  ASSERT_NE(observation, nullptr);
+  EXPECT_TRUE(observation->converged());
+  EXPECT_EQ(observation->report_age_ns(), 1000);
+  EXPECT_TRUE(observation->reason_codes().empty());
 }
 
 TEST(RuntimeObservationReducer, ReportRefreshDoesNotFabricateProgress) {

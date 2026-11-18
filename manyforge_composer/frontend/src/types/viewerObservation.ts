@@ -13,8 +13,8 @@ export interface ExecutionObservationTarget {
 }
 
 export interface ExecutionObservationFrame {
-  schemaVersion: 'manyforge.execution_observation_frame.v4';
-  ownerEpoch: string;
+  schemaVersion: 'manyforge.execution_observation_frame.v5';
+  applicationStartId: string;
   cellId: string;
   retainedBundleId: string;
   graphRevision: string;

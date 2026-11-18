@@ -56,7 +56,6 @@ constexpr WireNames<ActionOutcome, 3U> kOutcomeNames{{
 }};
 
 constexpr WireNames<FaultCode, 13U> kFaultCodeNames{{
-    {FaultCode::kEstop, "fault_estop"},
     {FaultCode::kProtectiveStop, "fault_protective_stop"},
     {FaultCode::kSafeguardStop, "fault_safeguard_stop"},
     {FaultCode::kLimitViolation, "fault_limit_violation"},
@@ -69,6 +68,7 @@ constexpr WireNames<FaultCode, 13U> kFaultCodeNames{{
     {FaultCode::kProcessExited, "fault_process_exited"},
     {FaultCode::kVendorFault, "fault_vendor"},
     {FaultCode::kOwnerStalled, "component_owner_stalled"},
+    {FaultCode::kRosTransportFailed, "fault_ros_transport_failed"},
 }};
 
 constexpr WireNames<FaultOperatorAction, 3U> kOperatorActionNames{{
@@ -202,7 +202,12 @@ std::vector<CellLatchCause> cell_latch_causes(const std::vector<ComponentState>&
     } else if (state.lifecycle == ComponentLifecycle::kOffline) {
       causes.push_back({state.component_id, CellLatchCauseKind::kOffline, std::nullopt});
     } else if (state.activity == ComponentActivity::kUnknown) {
-      causes.push_back({state.component_id, CellLatchCauseKind::kActivityUnknown, std::nullopt});
+      // A failed Stop's "stop unconfirmed" (§3.6 F2) names its reason.
+      const bool stop_unconfirmed =
+          state.reason.has_value() && state.reason->code == kStopUnconfirmedReason;
+      causes.push_back({state.component_id, CellLatchCauseKind::kActivityUnknown, std::nullopt,
+                        std::nullopt,
+                        stop_unconfirmed ? state.reason : std::optional<ComponentStateReason>{}});
     }
   }
   return causes;

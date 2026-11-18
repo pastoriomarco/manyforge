@@ -38,7 +38,6 @@ constexpr std::string_view kRelativeToAttachedPolicy =
     "continuous_relative_to_attached";
 constexpr std::string_view kPoseApplicationRequestApiVersion =
     "manyforge.scene_runtime_pose_application.v1";
-constexpr std::uint64_t kMaximumSafeInteger = 9007199254740991ULL;
 constexpr std::size_t kMaximumTextBytes = 1024U;
 
 core::ErrorDTO Error(const std::string_view code,
@@ -275,68 +274,6 @@ const core::CapabilityProviderBindingDTO *SelectProvider(
         "active bundle has no exact cell-global pose-update provider");
   }
   return selected;
-}
-
-CanonicalValue Unsigned(const std::uint64_t value,
-                        const std::string_view label) {
-  if (value > kMaximumSafeInteger) {
-    throw std::invalid_argument(std::string(label) +
-                                " exceeds the I-JSON safe range");
-  }
-  return CanonicalValue(static_cast<double>(value));
-}
-
-CanonicalValue Integer(const std::int64_t value, const std::string_view label) {
-  if (value < 0) {
-    throw std::invalid_argument(std::string(label) + " must be nonnegative");
-  }
-  return content_identity::nonnegative_int64_value(value);
-}
-
-CanonicalValue
-ProjectionRevisionValue(const core::ProjectionRevisionDTO &revision) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"graph_revision", CanonicalValue(revision.graph_revision.value())},
-      {"retained_bundle_id",
-       CanonicalValue(revision.retained_bundle_id.value())},
-      {"scene_revision",
-       CanonicalValue(CanonicalValue::Object{
-           {"content_hash",
-            CanonicalValue(revision.scene_revision.content_hash.value())},
-           {"revision_id",
-            Unsigned(revision.scene_revision.revision_id, "scene revision")},
-           {"scene_id",
-            CanonicalValue(revision.scene_revision.scene_id.value())},
-       })},
-  });
-}
-
-std::string SceneRequestId(const core::ProjectionRevisionDTO &projection,
-                           const core::SceneObjectProviderEvidenceDTO &evidence,
-                           const PoseSourceObservation &observation) {
-  return "scene-runtime-pose-" +
-         content_identity::sha256_digest(content_identity::canonical_json(
-             CanonicalValue(CanonicalValue::Object{
-                 {"api_version", CanonicalValue(std::string(
-                                     kPoseApplicationRequestApiVersion))},
-                 {"expected_projection_revision",
-                  ProjectionRevisionValue(projection)},
-                 {"expires_at_ns",
-                  Integer(observation.expires_at_ns, "expires_at_ns")},
-                 {"object_id", CanonicalValue(observation.key.object_id)},
-                 {"payload", observation.payload},
-                 {"policy_id", CanonicalValue(observation.key.policy_id)},
-                 {"observed_at_ns",
-                  Integer(observation.observed_at_ns, "observed_at_ns")},
-                 {"provider_source_epoch",
-                  CanonicalValue(evidence.provider_source_epoch)},
-                 {"source_epoch", CanonicalValue(observation.source_epoch)},
-                 {"source_epoch_order", Unsigned(observation.source_epoch_order,
-                                                 "source_epoch_order")},
-                 {"source_id", CanonicalValue(observation.key.source_id)},
-                 {"source_sequence",
-                  Unsigned(observation.source_sequence, "source_sequence")},
-             })));
 }
 
 // URDF origin: translation, then fixed-axis roll, pitch and yaw.
@@ -664,16 +601,16 @@ bool SceneRuntimePoseApplicationResult::valid() const noexcept {
   case SceneRuntimePoseApplicationStatus::kDeferredBeforePlanning:
   case SceneRuntimePoseApplicationStatus::kDeferredBetweenNodes:
   case SceneRuntimePoseApplicationStatus::kBuffered:
-    return !scene_request_id.has_value() && !projection_revision.has_value() &&
+    return !scene_request_key.has_value() && !projection_revision.has_value() &&
            !update_status.has_value();
   case SceneRuntimePoseApplicationStatus::kCommitted:
-    return scene_request_id.has_value() && !scene_request_id->empty() &&
+    return scene_request_key.has_value() &&
            projection_revision.has_value() && projection_revision->valid() &&
            update_status.has_value();
   case SceneRuntimePoseApplicationStatus::kAlreadyApplied:
   case SceneRuntimePoseApplicationStatus::kSkippedAttached:
   case SceneRuntimePoseApplicationStatus::kUnchanged:
-    return scene_request_id.has_value() && !scene_request_id->empty() &&
+    return scene_request_key.has_value() &&
            projection_revision.has_value() && projection_revision->valid() &&
            !update_status.has_value();
   }
@@ -682,15 +619,20 @@ bool SceneRuntimePoseApplicationResult::valid() const noexcept {
 
 SceneRuntimePoseProjector::SceneRuntimePoseProjector(
     core::ISceneAuthority &scene_authority, core::CellId cell_id,
+    SceneRuntimeRequestKeyMinter mint_request_key,
     SceneRuntimeReferenceLinkResolver reference_resolver,
     SceneRuntimeCarrierStopRequester carrier_stop_requester,
     SceneRuntimeCarriedObjectLostSignalPublisher signal_publisher)
     : scene_authority_(scene_authority), cell_id_(std::move(cell_id)),
+      mint_request_key_(std::move(mint_request_key)),
       reference_resolver_(std::move(reference_resolver)),
       carrier_stop_requester_(std::move(carrier_stop_requester)),
       signal_publisher_(std::move(signal_publisher)) {
   if (cell_id_.empty()) {
     throw std::invalid_argument("pose projector cell_id must be non-empty");
+  }
+  if (!mint_request_key_) {
+    throw std::invalid_argument("pose projector requires its request-key minter");
   }
 }
 
@@ -762,8 +704,9 @@ SceneRuntimePoseProjector::Apply(
               "derived pose-provider evidence is invalid"));
   }
 
-  auto request_id =
-      core::RequestId(SceneRequestId(projection, evidence, observation));
+  // The Manager's class 1 key of this observation's scene request (contract
+  // 1.4): minted once here, never resent.
+  const auto request_key = mint_request_key_();
   core::SceneObjectStateDTO object_state{
       core::SceneResourceId(observation.key.object_id), false, false,
       std::nullopt, std::nullopt};
@@ -783,7 +726,7 @@ SceneRuntimePoseProjector::Apply(
   if (object_state.attached &&
       (policy == "before_planning" || policy == "continuous_unattached")) {
     auto result = SceneRuntimePoseApplicationResult{
-        SceneRuntimePoseApplicationStatus::kSkippedAttached, request_id,
+        SceneRuntimePoseApplicationStatus::kSkippedAttached, request_key,
         projection, std::nullopt, std::nullopt};
     return core::Result<SceneRuntimePoseApplicationResult>::Ok(
         std::move(result));
@@ -799,7 +742,7 @@ SceneRuntimePoseProjector::Apply(
     // The Manager supplied this exact observation's retained success. A carrier
     // may have moved since; never reapply the same old world observation to it.
     return core::Result<SceneRuntimePoseApplicationResult>::Ok(
-        {SceneRuntimePoseApplicationStatus::kAlreadyApplied, request_id,
+        {SceneRuntimePoseApplicationStatus::kAlreadyApplied, request_key,
          projection, std::nullopt, prior_application->pose_measurement});
   }
   if (!object_state.attached) {
@@ -839,7 +782,7 @@ SceneRuntimePoseProjector::Apply(
       measurement.drift = grasp->drift;
       if (grasp->lost)
         return CarriedObjectLost(carried.value().attachment, grasp->drift,
-                                 projection, request_id, decoded.pose,
+                                 projection, request_key, decoded.pose,
                                  measurement);
     }
     update_pose = carried.value().observed_in_carrier;
@@ -871,7 +814,7 @@ SceneRuntimePoseProjector::Apply(
         if (const auto grasp = MeasureGrasp(attachment.value(), measured)) {
           if (grasp->lost) {
             return CarriedObjectLost(attachment.value(), grasp->drift,
-                                     projection, request_id, decoded.pose);
+                                     projection, request_key, decoded.pose);
           }
           if (const auto *carrier =
                   std::get_if<core::ComponentSceneFrameRefDTO>(
@@ -916,13 +859,13 @@ SceneRuntimePoseProjector::Apply(
   if (same_origin && current_pose &&
       WithinDeadband(*current_pose, update_pose, deadband)) {
     return core::Result<SceneRuntimePoseApplicationResult>::Ok(
-        {SceneRuntimePoseApplicationStatus::kUnchanged, request_id, projection,
+        {SceneRuntimePoseApplicationStatus::kUnchanged, request_key, projection,
          std::nullopt, pose_measurement});
   }
 
   std::optional<core::SceneCommitResultDTO> submitted;
   try {
-    submitted = Commit(request_id, projection,
+    submitted = Commit(request_key, projection,
                        core::UpdateObjectPoseRequestDTO{
                            core::SceneResourceId(observation.key.object_id),
                            update_pose,
@@ -958,7 +901,7 @@ SceneRuntimePoseProjector::Apply(
               std::move(details)));
   }
   auto result = SceneRuntimePoseApplicationResult{
-      SceneRuntimePoseApplicationStatus::kCommitted, committed.request_id,
+      SceneRuntimePoseApplicationStatus::kCommitted, committed.request_key,
       *committed.committed_projection_revision, committed.update_status,
       pose_measurement};
   if (!result.valid()) {
@@ -970,16 +913,11 @@ SceneRuntimePoseProjector::Apply(
 }
 
 core::SceneCommitResultDTO
-SceneRuntimePoseProjector::Commit(core::RequestId request_id,
+SceneRuntimePoseProjector::Commit(const core::RequestKey request_key,
                                   const core::ProjectionRevisionDTO &projection,
                                   core::SceneOperationRequestDTO operation) {
   core::SceneTransactionRequestDTO request{
-      core::PublicRequestContextDTO{
-          request_id,
-          scene_authority_.CurrentRequestOwnerEpoch(),
-          "scene_runtime_pose_source",
-          request_id.value(),
-      },
+      core::PublicRequestContextDTO{request_key, "scene_runtime_pose_source"},
       {},
       projection,
       std::move(operation),
@@ -1042,7 +980,7 @@ SceneRuntimePoseProjector::CarriedObjectLost(
     const core::CarriedObjectAttachmentDTO &attachment,
     const SceneRuntimePoseDistance &distance,
     const core::ProjectionRevisionDTO &projection,
-    const core::RequestId &request_id,
+    const core::RequestKey request_key,
     const core::Pose3DTO &observed_in_cell,
     std::optional<SceneRuntimePoseMeasurement> pose_measurement) {
   const auto &bound = attachment.grasp_lost_check->bound;
@@ -1061,7 +999,7 @@ SceneRuntimePoseProjector::CarriedObjectLost(
       {"rotation_rad", std::to_string(distance.rotation_rad)},
       {"bound_translation_m", std::to_string(bound.translation_m)},
       {"bound_rotation_rad", std::to_string(bound.rotation_rad)},
-      {"event_id", request_id.value()},
+      {"event_id", core::RequestKeyText(request_key)},
       {"detach", flag(response.detach)},
   };
   const auto *measured_body =
@@ -1086,8 +1024,8 @@ SceneRuntimePoseProjector::CarriedObjectLost(
   const SceneRuntimeCarriedObjectLoss loss{
       attachment.scene_resource_id, attachment.carried_object_attachment_id,
       attachment.controllable_component_id, attachment.command_target_id,
-      projection.graph_revision, request_id.value() + ".stop",
-      request_id.value(), response.set_key};
+      projection.graph_revision, core::RequestKeyText(request_key),
+      response.set_key};
   // 1. The gripper's system signal, for every response: Program rules,
   //    move-until-signal and wait nodes react to it like an I/O input.
   //    A target without that signal (not a gripper target of the committed
@@ -1123,7 +1061,7 @@ SceneRuntimePoseProjector::CarriedObjectLost(
     bool detached_ok = false;
     try {
       const auto detached = Commit(
-          core::RequestId(request_id.value() + ".detach"), projection,
+          mint_request_key_(), projection,
           core::DetachCarriedObjectRequestDTO{
               attachment.carried_object_attachment_id,
               attachment.carried_object_attachment_revision, observed_in_cell,

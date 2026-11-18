@@ -9,7 +9,7 @@ void ExecutionCorrelationTracker::set_from_request(const ExecuteRequestDTO& requ
   }
   {
     std::lock_guard<std::mutex> lock(program_run_id_mutex_);
-    program_run_id_ = request.binding.program_run_id.value();
+    program_run_id_ = request.binding.program_run_id;
   }
   {
     std::lock_guard<std::mutex> lock(action_span_mutex_);
@@ -46,7 +46,7 @@ void ExecutionCorrelationTracker::clear_move_id() {
 void ExecutionCorrelationTracker::clear_program_run_and_action_span() {
   {
     std::lock_guard<std::mutex> lock(program_run_id_mutex_);
-    program_run_id_.clear();
+    program_run_id_.reset();
   }
   {
     std::lock_guard<std::mutex> lock(action_span_mutex_);
@@ -76,8 +76,8 @@ std::optional<ResolvedExecutionBindingDTO> ExecutionCorrelationTracker::resolved
 void ExecutionCorrelationTracker::stamp_details(std::map<std::string, std::string>& details) const {
   {
     std::lock_guard<std::mutex> lock(program_run_id_mutex_);
-    if (!program_run_id_.empty()) {
-      details.emplace("program_run_id", program_run_id_);
+    if (program_run_id_) {
+      details.emplace("program_run_id", std::to_string(program_run_id_->value()));
     }
   }
   {
@@ -86,8 +86,8 @@ void ExecutionCorrelationTracker::stamp_details(std::map<std::string, std::strin
       const auto& span = *action_span_;
       details.emplace("action_source", to_string(span.action_source));
       details.emplace("action_span_id", span.action_span_id);
-      if (!span.program_run_id.empty()) {
-        details.emplace("action_span_program_run_id", span.program_run_id);
+      if (span.program_run_id) {
+        details.emplace("action_span_program_run_id", std::to_string(span.program_run_id->value()));
       }
       if (!span.node_instance_id.empty()) {
         details.emplace("node_instance_id", span.node_instance_id);

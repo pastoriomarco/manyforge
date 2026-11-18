@@ -3,6 +3,7 @@
 #include <limits>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/prepared_planning_codec.hpp>
+#include <manyforge_core/types/operation_member_id_json.hpp>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -50,6 +51,16 @@ void exact(const CanonicalValue& value, std::initializer_list<std::string_view> 
 std::string text(const CanonicalValue& value) {
   if (!value.is_string()) fail("string_required");
   return value.as_string();
+}
+OperationParticipantId participant_id_from(const CanonicalValue& value) {
+  const auto parsed = ParseOperationParticipantId(value);
+  if (!parsed) fail("participant_id_invalid");
+  return *parsed;
+}
+ControllerGoalId controller_goal_id_from(const CanonicalValue& value) {
+  const auto parsed = ParseControllerGoalId(value);
+  if (!parsed) fail("controller_goal_id_invalid");
+  return *parsed;
 }
 double number(const CanonicalValue& value) {
   if (!value.is_number() || !std::isfinite(value.as_number())) fail("finite_number_required");
@@ -148,8 +159,8 @@ void validate_replacement_input(const MovingReplacementInputDTO& input) {
   };
   const auto positive = [](double value) { return std::isfinite(value) && value > 0.0; };
   const double seam = input.divergence_cursor_s - input.source_cursor_s;
-  if (input.source_goal.controller_goal_id.empty() ||
-      !safe_counter(input.source_goal.controller_goal_generation) ||
+  if (!input.source_goal.nonzero() ||
+      input.source_goal.operation_id.value() > 9'007'199'254'740'991ULL ||
       !safe_counter(input.source_binding_epoch) || !std::isfinite(input.source_cursor_s) ||
       input.source_cursor_s < 0.0 || !std::isfinite(input.divergence_cursor_s) || !positive(seam) ||
       prefix.waypoints.front().time_from_start_s != 0.0 ||
@@ -912,12 +923,7 @@ void validate_replacement_request(const PlanRequestDTO& r) {
 CanonicalValue replacement_value(const MovingReplacementInputDTO& m) {
   validate_replacement_input(m);
   CanonicalValue::Object fields{
-      {"source_goal",
-       CanonicalValue(CanonicalValue::Object{
-           {"controller_goal_id", CanonicalValue(m.source_goal.controller_goal_id.value())},
-           {"controller_goal_generation",
-            CanonicalValue(
-                static_cast<double>(m.source_goal.controller_goal_generation.value()))}})},
+      {"source_goal", ControllerGoalIdValue(m.source_goal)},
       {"source_binding_epoch", CanonicalValue(static_cast<double>(m.source_binding_epoch.value()))},
       {"source_cursor_s", CanonicalValue(m.source_cursor_s)},
       {"source_prefix_trajectory", trajectory_value(m.source_prefix_trajectory, nullptr, true)},
@@ -941,11 +947,8 @@ MovingReplacementInputDTO get_replacement(const CanonicalValue& v) {
          "source_speed_profile", "source_per_resource_dynamics_limits",
          "remaining_preparation_budget_s"},
         {"remaining_planning_budget_s"});
-  const auto& goal = member(v, "source_goal");
-  exact(goal, {"controller_goal_id", "controller_goal_generation"});
   MovingReplacementInputDTO result{
-      {ControllerGoalId(text(member(goal, "controller_goal_id"))),
-       ControllerGoalGeneration(safe_unsigned(member(goal, "controller_goal_generation"), true))},
+      controller_goal_id_from(member(v, "source_goal")),
       ExecutionBindingEpoch(safe_unsigned(member(v, "source_binding_epoch"), true)),
       number(member(v, "source_cursor_s")),
       get_trajectory(member(v, "source_prefix_trajectory"), nullptr, true),
@@ -984,12 +987,11 @@ CanonicalValue plan_request_value(const PlanRequestDTO& r) {
         CanonicalValue::Object{{"runtime_unit_id", CanonicalValue(u.runtime_unit_id.value())},
                                {"runtime_epoch", CanonicalValue(u.runtime_epoch.value())}});
   CanonicalValue::Object f{
-      {"operation_id", CanonicalValue(r.operation_id.value())},
-      {"participant_id", CanonicalValue(r.participant_id.value())},
+      {"operation_id", CanonicalValue(static_cast<double>(r.operation_id.value()))},
+      {"participant_id", OperationParticipantIdValue(r.participant_id)},
       {"program_id", CanonicalValue(r.program_id.value())},
       {"program_revision", CanonicalValue(r.program_revision.value())},
       {"program_binding_id", CanonicalValue(r.program_binding_id.value())},
-      {"program_run_id", CanonicalValue(r.program_run_id.value())},
       {"move_id", CanonicalValue(r.move_id.value())},
       {"controllable_component_id", CanonicalValue(r.controllable_component_id.value())},
       {"component_type_id", CanonicalValue(r.component_type_id.value())},
@@ -1054,12 +1056,19 @@ CanonicalValue plan_request_value(const PlanRequestDTO& r) {
         CanonicalValue(CanonicalValue::Object{
             {"action_source", CanonicalValue(to_string(r.action_span->action_source))},
             {"action_span_id", CanonicalValue(r.action_span->action_span_id)},
-            {"program_run_id", CanonicalValue(r.action_span->program_run_id)},
+            {"program_run_id",
+             r.action_span->program_run_id
+                 ? CanonicalValue(static_cast<double>(r.action_span->program_run_id->value()))
+                 : CanonicalValue(nullptr)},
             {"node_instance_id", CanonicalValue(r.action_span->node_instance_id)},
             {"node_attempt_id", CanonicalValue(r.action_span->node_attempt_id)},
             {"parent_node_attempt_id", CanonicalValue(r.action_span->parent_node_attempt_id)}}));
   if (r.contact_policy_id)
     f.emplace_back("contact_policy_id", CanonicalValue(*r.contact_policy_id));
+  // Manual work has no run.
+  if (r.program_run_id)
+    f.emplace_back("program_run_id",
+                   CanonicalValue(static_cast<double>(r.program_run_id->value())));
   if (r.moving_replacement)
     f.emplace_back("moving_replacement", replacement_value(*r.moving_replacement));
   return CanonicalValue(std::move(f));
@@ -1068,16 +1077,17 @@ PlanRequestDTO get_plan_request(const CanonicalValue& v) {
   const bool ha = v.find_object_member("action_span") != nullptr;
   const bool hc = v.find_object_member("contact_policy_id") != nullptr;
   const bool hm = v.find_object_member("moving_replacement") != nullptr;
+  const bool hr = v.find_object_member("program_run_id") != nullptr;
   if (object(v).size() !=
-      47U + (ha ? 1U : 0U) + (hc ? 1U : 0U) + (hm ? 1U : 0U))
+      46U + (ha ? 1U : 0U) + (hc ? 1U : 0U) + (hm ? 1U : 0U) + (hr ? 1U : 0U))
     fail("plan_request_member_count_invalid");
   PlanRequestDTO r{
-      OperationId(text(member(v, "operation_id"))),
-      OperationParticipantId(text(member(v, "participant_id"))),
+      OperationNumber(safe_unsigned(member(v, "operation_id"), true)),
+      participant_id_from(member(v, "participant_id")),
       ProgramId(text(member(v, "program_id"))),
       ProgramRevision(text(member(v, "program_revision"))),
       ProgramBindingId(text(member(v, "program_binding_id"))),
-      ProgramRunId(text(member(v, "program_run_id"))),
+      std::nullopt,
       MoveId(text(member(v, "move_id"))),
       ControllableComponentId(text(member(v, "controllable_component_id"))),
       ComponentTypeId(text(member(v, "component_type_id"))),
@@ -1130,12 +1140,12 @@ PlanRequestDTO get_plan_request(const CanonicalValue& v) {
       {},
       nullptr,
       nullptr};
-  r.operation_id = OperationId(text(member(v, "operation_id")));
-  r.participant_id = OperationParticipantId(text(member(v, "participant_id")));
+  r.operation_id = OperationNumber(safe_unsigned(member(v, "operation_id"), true));
+  r.participant_id = participant_id_from(member(v, "participant_id"));
   r.program_id = ProgramId(text(member(v, "program_id")));
   r.program_revision = ProgramRevision(text(member(v, "program_revision")));
   r.program_binding_id = ProgramBindingId(text(member(v, "program_binding_id")));
-  r.program_run_id = ProgramRunId(text(member(v, "program_run_id")));
+  if (hr) r.program_run_id = ProgramRunNumber(safe_unsigned(member(v, "program_run_id"), true));
   r.move_id = MoveId(text(member(v, "move_id")));
   r.controllable_component_id =
       ControllableComponentId(text(member(v, "controllable_component_id")));
@@ -1218,7 +1228,10 @@ PlanRequestDTO get_plan_request(const CanonicalValue& v) {
     if (!src) fail("action_source_invalid");
     r.action_span = ActionSpanDTO{*src,
                                   text(member(a, "action_span_id")),
-                                  text(member(a, "program_run_id")),
+                                  member(a, "program_run_id").is_null()
+                                      ? std::optional<ProgramRunNumber>{}
+                                      : ProgramRunNumber(
+                                            safe_unsigned(member(a, "program_run_id"), true)),
                                   text(member(a, "node_instance_id")),
                                   text(member(a, "node_attempt_id")),
                                   text(member(a, "parent_node_attempt_id"))};

@@ -117,7 +117,7 @@ public:
   ros::Ros2TransportResources &resources;
   std::shared_ptr<ros::Ros2TransportResources> epoch_resources;
   std::unique_ptr<ros::Ros2ControlExecutionBackend> adapter;
-  core::ExecutionGoalKey key{core::ControllerGoalId("perf.feedback"), core::ControllerGoalGeneration(1)};
+  core::ControllerGoalId key{core::OperationNumber(1U), 1U, 1U};
   FeedbackRig() : resources_owner(ros::Ros2TransportResources::create(
                       "manyforge_perf_feedback_" + fake::unique_suffix(), "", 2,
                       std::make_shared<NullSink>(), "arm", clock)),

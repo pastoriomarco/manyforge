@@ -22,6 +22,14 @@ template <typename Counter>
   return value.nonzero() && value.value() <= kMaximumIJsonInteger;
 }
 
+[[nodiscard]] bool identity(const OperationParticipantId& value) noexcept {
+  return value.nonzero() && value.operation_id.value() <= kMaximumIJsonInteger;
+}
+
+[[nodiscard]] bool identity(const ControllerGoalId& value) noexcept {
+  return value.nonzero() && value.operation_id.value() <= kMaximumIJsonInteger;
+}
+
 [[nodiscard]] bool stable_error(const ErrorDTO& value) noexcept {
   if (value.code.empty() || value.code.size() > 128U ||
       value.code.find('\0') != std::string::npos || value.message.size() > 1024U ||
@@ -72,7 +80,7 @@ template <typename Available, typename Selected, typename Matches>
 
 [[nodiscard]] bool participant_identity_shape(
     const PreparedOperationParticipantDTO& participant) noexcept {
-  return digest(participant.prepared_contract_digest) && identity(participant.operation_id) &&
+  return digest(participant.prepared_contract_digest) && participant.operation_id.nonzero() &&
          counter(participant.operation_revision) && identity(participant.participant_id) &&
          identity(participant.controllable_component_id) &&
          identity(participant.command_target_id) && identity(participant.capability_id) &&
@@ -156,8 +164,7 @@ template <typename Available, typename Selected, typename Matches>
 
 [[nodiscard]] bool backend_identity_matches(
     const ExecutionBackendStatusDTO& status, const PreparedOperationParticipantDTO& participant,
-    const ControllerGoalId& controller_goal_id,
-    ControllerGoalGeneration controller_goal_generation) noexcept {
+    const ControllerGoalId& controller_goal_id) noexcept {
   return status.operation_id == participant.operation_id &&
          status.operation_revision == participant.operation_revision &&
          status.participant_id == participant.participant_id &&
@@ -175,7 +182,6 @@ template <typename Available, typename Selected, typename Matches>
          status.active_control_configuration_generation ==
              participant.controller().active_control_configuration_generation &&
          status.controller_goal_id == controller_goal_id &&
-         status.controller_goal_generation == controller_goal_generation &&
          status.provider_runtime_epoch == participant.controller().control_provider.runtime_epoch &&
          status.resources == participant.resources;
 }
@@ -458,18 +464,14 @@ Result<PrepareParticipantResultDTO> MakePrepareParticipantResult(
 
 std::optional<std::string_view> prepared_execution_handle_field_error(
     const ExecutionHandle& handle, const PreparedOperationParticipantDTO& participant,
-    const ControllerGoalId& controller_goal_id,
-    const ControllerGoalGeneration controller_goal_generation) noexcept {
-  if (!participant_identity_shape(participant) || !identity(controller_goal_id) ||
-      !counter(controller_goal_generation)) {
+    const ControllerGoalId& controller_goal_id) noexcept {
+  if (!participant_identity_shape(participant) || !identity(controller_goal_id)) {
     return "prepared_execution_handle_request_identity_invalid";
   }
   if (!handle.wait_for_completion || !handle.get_snapshot) {
     return "prepared_execution_handle_observer_missing";
   }
   if (!handle.controller_goal_id.has_value() || *handle.controller_goal_id != controller_goal_id ||
-      !handle.controller_goal_generation.has_value() ||
-      *handle.controller_goal_generation != controller_goal_generation ||
       !handle.prepared_contract_digest.has_value() ||
       *handle.prepared_contract_digest != participant.prepared_contract_digest) {
     return "prepared_execution_handle_membership_mismatch";
@@ -479,12 +481,9 @@ std::optional<std::string_view> prepared_execution_handle_field_error(
 
 std::optional<std::string_view> execution_backend_status_field_error(
     const ExecutionBackendStatusDTO& status, const PreparedOperationParticipantDTO& participant,
-    const ControllerGoalId& controller_goal_id,
-    ControllerGoalGeneration controller_goal_generation) noexcept {
+    const ControllerGoalId& controller_goal_id) noexcept {
   if (!participant_identity_shape(participant) || !identity(controller_goal_id) ||
-      !counter(controller_goal_generation) ||
-      !backend_identity_matches(status, participant, controller_goal_id,
-                                controller_goal_generation)) {
+      !backend_identity_matches(status, participant, controller_goal_id)) {
     return "execution_backend_status_identity_invalid";
   }
   if (!std::isfinite(status.accepted_trajectory_time_s) ||
@@ -514,7 +513,7 @@ std::optional<std::string_view> execution_backend_status_field_error(
 
 Result<ExecutionBackendStatusDTO> MakeExecutionBackendStatus(
     const PreparedOperationParticipantDTO& participant, const ControllerGoalId& controller_goal_id,
-    ControllerGoalGeneration controller_goal_generation, ExecutionBackendStateDTO state,
+    ExecutionBackendStateDTO state,
     double accepted_trajectory_time_s, double progress, std::uint64_t source_sequence,
     std::int64_t receiver_local_receipt_timestamp_ns, std::optional<ErrorDTO> error) {
   ExecutionBackendStatusDTO status{participant.operation_id,
@@ -533,7 +532,6 @@ Result<ExecutionBackendStatusDTO> MakeExecutionBackendStatus(
                                    participant.controller().active_control_configuration_id,
                                    participant.controller().active_control_configuration_generation,
                                    controller_goal_id,
-                                   controller_goal_generation,
                                    participant.controller().control_provider.runtime_epoch,
                                    participant.resources,
                                    state,
@@ -543,7 +541,7 @@ Result<ExecutionBackendStatusDTO> MakeExecutionBackendStatus(
                                    receiver_local_receipt_timestamp_ns,
                                    std::move(error)};
   if (const auto field_error = execution_backend_status_field_error(
-          status, participant, controller_goal_id, controller_goal_generation)) {
+          status, participant, controller_goal_id)) {
     return Result<ExecutionBackendStatusDTO>::Err(invalid_projection(*field_error));
   }
   return Result<ExecutionBackendStatusDTO>::Ok(std::move(status));

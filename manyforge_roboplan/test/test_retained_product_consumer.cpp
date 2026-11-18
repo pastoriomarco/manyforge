@@ -1,6 +1,8 @@
+#include "held_program_run.hpp"
 #include "sealed_program_execution_capture.hpp"
 #include <manyforge_core/types/program_io_condition.hpp>
 #include <gtest/gtest.h>
+#include <manyforge_core/testing/request_key_fixture.hpp>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
@@ -663,14 +665,13 @@ require_fixture_one(const Range &values, Predicate predicate,
         {runtime_unit.runtime_unit_id, runtime_unit.runtime_epoch});
   }
   return core::ResolvedExecutionBindingDTO{
-      core::OperationId("operation:reference-resolution"),
-      core::OperationParticipantId("participant:reference-resolution"),
-      core::ControllerGoalId("goal:reference-resolution"),
-      core::ControllerGoalGeneration(1U),
+      core::OperationNumber(1001U),
+      core::OperationParticipantId{core::OperationNumber(902U), 1U},
+      core::ControllerGoalId{core::OperationNumber(901U), 1U, 1U},
       value.program_id,
       value.program_revision,
       value.program_binding_id,
-      core::ProgramRunId("run:reference-resolution"),
+      core::ProgramRunNumber(116U),
       value.controllable_component_id,
       value.component_type_id,
       value.component_type_revision,
@@ -852,7 +853,6 @@ fixture_robot_tcps(const core::RuntimeParticipantBinding &binding,
 
 [[nodiscard]] core::OperationIntentDTO
 make_motion_operation(const core::RuntimeParticipantBinding &binding,
-                      const core::RequestOwnerEpoch &owner_epoch,
                       const core::SceneRevision &scene_revision) {
   const auto &value = binding.value();
   std::vector<std::string> source_joint_names;
@@ -871,13 +871,11 @@ make_motion_operation(const core::RuntimeParticipantBinding &binding,
     goal_positions.front() = 0.05;
   }
   return core::OperationIntentDTO{
-      core::PublicRequestContextDTO{core::RequestId("request.native.motion.1"),
-                                    owner_epoch, "retained_product_consumer",
-                                    std::nullopt},
+      core::PublicRequestContextDTO{core::TestRequestKey("request.native.motion.1"), "retained_product_consumer"},
       value.program_id,
       value.program_revision,
       value.program_binding_id,
-      core::ProgramRunId("run.native.motion.1"),
+      core::ProgramRunNumber(123U),
       value.graph_revision,
       value.retained_bundle_id,
       scene_revision,
@@ -904,6 +902,17 @@ make_motion_operation(const core::RuntimeParticipantBinding &binding,
               {},
               {}}}},
       core::OperationCoordinationPolicy::kIndependent};
+}
+
+/// Holds a fence through the gate's ordinary acquisition, at the resource
+/// generation the gate observes now. The scopes held here pin no predecessor
+/// configuration: they name no domain, or the gate has no table reporting one.
+void hold_fence(ManagedKernelAdmissionGate &gate,
+                const core::ConfigurationFenceId &fence_id,
+                const core::ConfigurationFenceScopeDTO &scope) {
+  gate.AcquireFenceDurably(fence_id, scope,
+                           gate.Observe(scope).operation_resource_generation,
+                           {}, [] {});
 }
 
 [[nodiscard]] core::ConfigurationFenceScopeDTO make_runtime_fence_scope(
@@ -3597,7 +3606,8 @@ fixture_tcp_endpoint_resolver_factory() {
         std::make_shared<core::RuntimeParticipantRegistry>(std::move(bindings));
     return
         [registry](const core::OperationIntentDTO &operation,
-                   const std::size_t participant_index)
+                   const std::size_t participant_index,
+                   const core::ProgramRunResolutionContext &)
             -> core::Result<RetainedResolvedParticipant> {
           auto binding = registry->resolve(operation, participant_index);
           if (!binding.ok()) {
@@ -3867,7 +3877,6 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
                                  {}},
           candidate_binding, RoboPlanCandidateComputerConfig{.rng_seed = 7U},
           std::move(candidate_config)));
-  const core::RequestOwnerEpoch owner_epoch("native.runtime.epoch.1");
   RetainedExecutionHostConfig runtime_config{
       core::CacheConfig{},
       core::ExecutionKernelConfig{},
@@ -4052,7 +4061,7 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
         *materialized.bundle, artifacts, expected, configuration, arm_binding);
     auto readiness = deployment::seal_runtime_participant_stop_readiness(
         *materialized.bundle, plan, core::ComponentLifecycleGeneration(1U),
-        expected, arm_binding);
+        expected, arm_binding, 1'500'000'000);
     ASSERT_TRUE(readiness.ok()) << readiness.error().message;
     runtime_input.motion_stop_readiness = std::move(readiness.value());
   }
@@ -4113,8 +4122,8 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
           package_root, bundle, model_map, std::move(composed),
           std::vector<core::ProgramBindingId>{});
       return RetainedRuntimeParticipantResolver{
-          [resolver](const auto &operation, auto index) {
-            return resolver->ResolveExecutionParticipant(operation, index);
+          [resolver](const auto &operation, auto index, const auto &held_run) {
+            return resolver->ResolveExecutionParticipant(operation, index, held_run);
           }};
     };
   }
@@ -4286,7 +4295,8 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
     if (moving_budget_check)
       runtime->participant_resolver_factory = [](auto) {
         return RetainedRuntimeParticipantResolver{
-            [](const core::OperationIntentDTO &, std::size_t) {
+            [](const core::OperationIntentDTO &, std::size_t,
+               const core::ProgramRunResolutionContext &) {
               return core::Result<RetainedResolvedParticipant>::Err(
                   {"unused_route_fixture",
                    "route fixture dispatches no operations",
@@ -4299,15 +4309,20 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
                                         {runtime->motion_binding}),
                                     rows)
                               : runtime->participant_resolver;
+    core::ResourceAddressedExecutionKernelConfig kernel_config{
+        core::kTestApplicationStartId, materialized.bundle->value().cell_graph.cell_id, 1024U,
+        resolver, &admission_gate,
+        materialized.bundle->value().cell_graph.graph_revision};
+    // These checks end with Program work of a run the Kernel holds.
+    if (check == Lite6MotionCheck::kCompose || check == Lite6MotionCheck::kRefreshCellModel)
+      kernel_config = ProgramCycleReadyConfig(std::move(kernel_config),
+                                              materialized.bundle->retained_bundle_id());
     RetainedCellRuntimeInput cell_input{
         runtime->clock,
         runtime->scheduler,
         temporary.path() / "cell-operation-journal.sqlite3",
         std::move(rows),
-        core::ResourceAddressedExecutionKernelConfig{
-            owner_epoch, materialized.bundle->value().cell_graph.cell_id, 1024U,
-            resolver, &admission_gate,
-            materialized.bundle->value().cell_graph.graph_revision}};
+        std::move(kernel_config)};
     stable_cell =
         std::make_unique<RetainedCellRuntime>(std::move(cell_input));
     runtime->cell_runtime_owner = stable_cell.get();
@@ -4348,7 +4363,7 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
     const core::RuntimeEpoch station_epoch("geometric.actual.station.driver");
     auto driver = take(host_detail::IoProviderDriverRecord::Create(
         {domain.control_domain_id, domain.control_domain_revision,
-         core::ResolvedProviderDomainScopeDTO{provider, station_epoch, {}, {}}},
+         core::ResolvedProviderDomainScopeDTO{provider, station_epoch, {}}},
         {domain.control_domain_id, domain.control_domain_revision,
          provider.provider_instance_id, provider.provider_manifest_id,
          provider.provider_manifest_revision, provider.provider_runtime_unit_id,
@@ -4613,7 +4628,7 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
         materialized.bundle->retained_bundle_id(), graph.graph_revision,
         separated_scene.revision};
     const core::SceneTransactionDTO separation{
-        core::RequestId("geometric-separate-target"),
+        core::TestRequestKey("geometric-separate-target"),
         {},
         separated_scene.transaction_sequence,
         prior_revision,
@@ -4736,7 +4751,7 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
         std::distance(registrations.begin(), secondary));
     const core::ConfigurationFenceId fence_id("same-controller.reseal.apply");
     const core::ConfigurationFenceScopeDTO scope{};
-    admission_gate.RestoreFence(fence_id, scope);
+    hold_fence(admission_gate, fence_id, scope);
     const auto reseal = [&](auto candidate_registrations) {
       return reseal_retained_execution_host_for_apply(
           *runtime,
@@ -4835,10 +4850,10 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
     EXPECT_NE(motion_registration->default_operator_stop_profile->per_joint_max_deceleration,
               motion_registration->default_fault_stop_profile->per_joint_max_deceleration);
     const core::PreparedParticipantStopPlanContextDTO context{
-        core::OperationId("fault-projection.operation"), core::OperationRevision(1U),
-        core::OperationParticipantId("fault-projection.participant"),
+        core::OperationNumber(1002U), core::OperationRevision(1U),
+        core::OperationParticipantId{core::OperationNumber(903U), 1U},
         core::ProgramId("fault-projection.program"), core::ProgramRevision(std::string(kZeroDigest)),
-        core::ProgramBindingId(std::string(kZeroDigest)), core::ProgramRunId("fault-projection.run"),
+        core::ProgramBindingId(std::string(kZeroDigest)), core::ProgramRunNumber(137U),
         motion_registration->default_fault_stop_profile,
         core::ParticipantStopProfilePurposeDTO::kFault, std::nullopt,
         motion_registration->stop_node_category};
@@ -5304,10 +5319,12 @@ void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
   EXPECT_EQ(expanded.value().waypoints.front().positions_rad.size(),
             expanded.value().joint_names.size());
 
-  const auto motion_accepted =
-      runtime->cell_addressed_kernel->execute(make_motion_operation(
-          arm_binding, owner_epoch,
-          inventory->projection_binding.projection_revision.scene_revision));
+  // Program work of the run the Kernel holds.
+  auto motion = make_motion_operation(
+      arm_binding, inventory->projection_binding.projection_revision.scene_revision);
+  HoldProgramRun(*runtime->cell_addressed_kernel, arm_binding, *motion.program_run_id);
+  motion.participants.front().execution_scope = HeldProgramRunMotionScope();
+  const auto motion_accepted = runtime->cell_addressed_kernel->execute(motion);
   ASSERT_FALSE(motion_accepted.ok());
   EXPECT_EQ(motion_accepted.error().details.at("reason"),
             "runtime_route_publication_required");
@@ -5437,7 +5454,7 @@ void check_refreshed_cell_model(
   EXPECT_EQ(unfenced.error().details.at("reason"),
             "native_model_refresh_fence_not_held");
   EXPECT_EQ(runtime.kinematic_model->current_generation(), predecessor);
-  admission_gate.RestoreFence(fence_id, scope);
+  hold_fence(admission_gate, fence_id, scope);
 
   // A candidate that changes the controller's own kinematic target is not a
   // retain; it is refused before any consumer changes.
@@ -5929,7 +5946,7 @@ TEST(RetainedProductCrossConsumer,
   const core::ConfigurationFenceId reseal_fence_id(
       "joined.invalid-retained-reseal.apply");
   const core::ConfigurationFenceScopeDTO empty_reseal_scope{};
-  reseal_gate.RestoreFence(reseal_fence_id, empty_reseal_scope);
+  hold_fence(reseal_gate, reseal_fence_id, empty_reseal_scope);
   const auto unchanged_state_binding = primary->motion_state_channel->binding();
   const auto invalid_reseal = reseal_retained_execution_host_for_apply(
       *primary,
@@ -5957,7 +5974,7 @@ TEST(RetainedProductCrossConsumer,
       temporary.path() / "joined-operation-journal.sqlite3",
       primary->participant_registrations,
       core::ResourceAddressedExecutionKernelConfig{
-          core::RequestOwnerEpoch("joined.owner.epoch.1"),
+          core::kTestApplicationStartId,
           bundle.value().cell_graph.cell_id, 1024U,
           primary->participant_resolver, nullptr,
           bundle.value().cell_graph.graph_revision}});
@@ -5983,7 +6000,7 @@ TEST(RetainedProductCrossConsumer,
     const core::ConfigurationFenceId peer_reseal_fence_id(
         "joined.peer-reseal.apply");
     const core::ConfigurationFenceScopeDTO peer_reseal_scope{};
-    peer_reseal_gate.RestoreFence(peer_reseal_fence_id, peer_reseal_scope);
+    hold_fence(peer_reseal_gate, peer_reseal_fence_id, peer_reseal_scope);
     const auto retained_rebind = peer->rebind_motion_route;
     ASSERT_TRUE(retained_rebind);
     std::optional<std::future_status> reader_during_reseal;
@@ -6021,7 +6038,7 @@ TEST(RetainedProductCrossConsumer,
       {&primary->motion_binding, &peer->motion_binding});
   const core::ConfigurationFenceId rejoin_fence_id(
       "joined.root-replacement.apply");
-  rejoin_gate.RestoreFence(rejoin_fence_id, rejoin_scope);
+  hold_fence(rejoin_gate, rejoin_fence_id, rejoin_scope);
   const auto root_swapped = rejoin_retained_execution_host_participants(
       peer, {primary}, joined_resolver_factory, rejoin_gate, rejoin_fence_id,
       rejoin_scope);
@@ -6803,7 +6820,7 @@ TEST(RetainedProductCrossConsumer,
       initial_revision.retained_bundle_id, initial_revision.graph_revision,
       candidate_scene.revision};
   const core::SceneTransactionDTO transaction{
-      core::RequestId("projection-add-second-object"),
+      core::TestRequestKey("projection-add-second-object"),
       {},
       2U,
       initial_revision,
@@ -6899,7 +6916,7 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_EQ(projection->snapshot(), current_world);
 
   auto conflicting = transaction;
-  conflicting.request_id = core::RequestId("conflicting-reuse");
+  conflicting.request_key = core::TestRequestKey("conflicting-reuse");
   const auto conflict = projection->ApplyTransaction(conflicting);
   EXPECT_EQ(conflict.result,
             core::ProjectionCommitResultStateDTO::kRejectedRollbackProven);
@@ -6930,7 +6947,7 @@ TEST(RetainedProductCrossConsumer,
           mismatched_effective)
           .value();
   const core::SceneTransactionDTO mismatched_policy_transaction{
-      core::RequestId("projection-mismatched-effective-policy"),
+      core::TestRequestKey("projection-mismatched-effective-policy"),
       {},
       3U,
       candidate_revision,
@@ -6961,7 +6978,7 @@ TEST(RetainedProductCrossConsumer,
       candidate_revision.retained_bundle_id, candidate_revision.graph_revision,
       uncertain_scene.revision};
   const core::SceneTransactionDTO uncertain_transaction{
-      core::RequestId("projection-injected-uncertain-effect"),
+      core::TestRequestKey("projection-injected-uncertain-effect"),
       {},
       3U,
       candidate_revision,
@@ -7003,7 +7020,7 @@ TEST(RetainedProductCrossConsumer,
   std::optional<core::SceneTransactionDTO> oldest_retained_transaction;
   for (std::uint64_t sequence = 3U; sequence <= 5U; ++sequence) {
     const core::SceneTransactionDTO no_op{
-        core::RequestId("projection-bounded-replay-" +
+        core::TestRequestKey("projection-bounded-replay-" +
                         std::to_string(sequence)),
         {},
         sequence,
@@ -7185,7 +7202,7 @@ TEST(RetainedProductCrossConsumer,
   const core::NativeProjectionRebuildDTO maintenance_request{
       added_binding, maintenance_revision, products.planning_collision_model,
       std::make_shared<const core::LogicalSceneSnapshotDTO>(maintenance_scene),
-      std::pair{core::ApplyId("apply-initial-scene"), core::ApplyGeneration(1U)},
+      std::pair{core::ApplyId(1U), core::ApplyGeneration(1U)},
       candidate_revision};
   const auto maintenance = added_projection->RebuildProjection(maintenance_request);
   ASSERT_TRUE(maintenance.presence_valid());
@@ -7199,7 +7216,7 @@ TEST(RetainedProductCrossConsumer,
             maintenance.native_projection_generation);
   auto foreign_apply = maintenance_request;
   foreign_apply.maintenance_successor =
-      std::pair{core::ApplyId("other-apply"), core::ApplyGeneration(1U)};
+      std::pair{core::ApplyId(2U), core::ApplyGeneration(1U)};
   EXPECT_EQ(added_projection->RebuildProjection(foreign_apply).result,
             core::ProjectionCommitResultStateDTO::kRejectedRollbackProven);
 }
@@ -7336,10 +7353,8 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
       package_root, materialized.bundle, model_map, representatives, {});
   const auto &selected_program = selected.front()->value();
   const core::ProgramRunExecutionCaptureDTO capture_request{
-      core::RequestOwnerEpoch("kernel.capture"),
-      core::RequestOwnerEpoch("runner.capture"),
       core::CellAdmissionClaimGeneration(1U),
-      core::ProgramRunId("run.capture"),
+      core::ProgramRunNumber(129U),
       selected_program.program_id,
       selected_program.program_revision,
       selected_program.program_binding_id,
@@ -7513,7 +7528,7 @@ TEST(RetainedProductCrossConsumer,
   const auto scene = make_projection_runtime_shadow_snapshot(
       bundle.value().cell_graph.cell_id);
   const auto operation = make_motion_operation(
-      physical, core::RequestOwnerEpoch("kernel.endpoint"),
+      physical,
       scene.shared()->revision);
   const auto resolved =
       resolver.Resolve(operation, 0U, fixture_robot_tcps(physical, &program_binding));
@@ -7580,7 +7595,7 @@ TEST(RetainedProductCrossConsumer, RuntimeTcpUsesTheDeclaredTargetFrameAlias) {
       package_root, materialized.bundle, model_map, {physical},
       {program_binding.program_binding_id()});
   const auto scene = make_projection_runtime_shadow_snapshot(bundle.value().cell_graph.cell_id);
-  auto operation = make_motion_operation(physical, core::RequestOwnerEpoch("kernel.alias"),
+  auto operation = make_motion_operation(physical,
                                          scene.shared()->revision);
   std::get<core::MotionParticipantIntentDTO>(operation.participants.front().payload).tcp_endpoint = entry;
   const auto resolved = resolver.Resolve(operation, 0U, read);
@@ -7726,10 +7741,10 @@ TEST(RetainedProductCrossConsumer,
       core::CellId(std::string(cell_id)));
   for (std::size_t index = 0U; index < physical_bindings.size(); ++index) {
     auto operation = make_motion_operation(
-        physical_bindings[index], core::RequestOwnerEpoch("kernel.epoch.two"),
+        physical_bindings[index],
         scene.shared()->revision);
-    operation.request_context.request_id =
-        core::RequestId("request.two-lite6." + std::to_string(index + 1U));
+    operation.request_context.request_key =
+        core::TestRequestKey("request.two-lite6." + std::to_string(index + 1U));
     ASSERT_TRUE(resolver.ValidateExecutionOrigin(operation).ok());
     auto forged = operation;
     forged.program_id = core::ProgramId("forged-direct-program");
@@ -7926,7 +7941,7 @@ TEST(RetainedProductCrossConsumer,
   }
 
   auto unknown = make_motion_operation(
-      physical_bindings.front(), core::RequestOwnerEpoch("kernel.epoch.two"),
+      physical_bindings.front(),
       scene.shared()->revision);
   unknown.program_binding_id = core::ProgramBindingId("unknown-binding");
   const auto rejected = resolver.Resolve(unknown, 0U);
@@ -8215,7 +8230,7 @@ commit_observed_move(const SceneProjectionFixture &fixture,
   auto next = make_lazy_scene(fixture.cell_id(),
                               current.revision.revision_id + 1U, x_m);
   const core::SceneTransactionDTO transaction{
-      core::RequestId("lazy-move-" + std::to_string(next.revision.revision_id)),
+      core::TestRequestKey("lazy-move-" + std::to_string(next.revision.revision_id)),
       {},
       next.transaction_sequence,
       fixture.revision(current),
@@ -8419,10 +8434,8 @@ TEST(RetainedProductConsumerTest,
       fixture.artifacts.path());
   const auto &value = fixture.authored_binding->value();
   const core::ProgramRunExecutionCaptureDTO request{
-      core::RequestOwnerEpoch("kernel"),
-      core::RequestOwnerEpoch("runner"),
       core::CellAdmissionClaimGeneration(1U),
-      core::ProgramRunId("run"),
+      core::ProgramRunNumber(107U),
       value.program_id,
       value.program_revision,
       value.program_binding_id,
@@ -8454,10 +8467,8 @@ TEST(RetainedProductConsumerTest,
   Fixture fixture;
   const auto &value = fixture.authored_binding->value();
   const core::ProgramRunExecutionCaptureDTO request{
-      core::RequestOwnerEpoch("kernel.sealed.capture"),
-      core::RequestOwnerEpoch("runner.sealed.capture"),
       core::CellAdmissionClaimGeneration(1U),
-      core::ProgramRunId("run.sealed.capture"),
+      core::ProgramRunNumber(110U),
       value.program_id,
       value.program_revision,
       value.program_binding_id,
@@ -8482,9 +8493,6 @@ TEST(RetainedProductConsumerTest,
     EXPECT_EQ(capture.value().table.get(), table);
     EXPECT_EQ(capture.value().binding.get(), binding);
     EXPECT_EQ(capture.value().blackboard_key_declarations.get(), declarations);
-    EXPECT_EQ(capture.value().request_owner_epoch, request.request_owner_epoch);
-    EXPECT_EQ(capture.value().program_runner_owner_epoch,
-              request.program_runner_owner_epoch);
     EXPECT_EQ(capture.value().claim_generation, request.claim_generation);
     EXPECT_EQ(capture.value().program_run_id, request.program_run_id);
     EXPECT_TRUE(capture.value().io_conditions->program_node_conditions.empty());
@@ -8525,8 +8533,7 @@ TEST(RetainedProductConsumerTest, PneumaticCaptureDeclaresTheBoundIoEffects) {
   const auto &valve = gripper->pneumatic_io->outputs.front();
   const auto &sensor = gripper->pneumatic_io->inputs.front();
   core::ProgramRunExecutionCaptureDTO request{
-      core::RequestOwnerEpoch("kernel"), core::RequestOwnerEpoch("runner"),
-      core::CellAdmissionClaimGeneration(1U), core::ProgramRunId("run.pneumatic"),
+      core::CellAdmissionClaimGeneration(1U), core::ProgramRunNumber(118U),
       binding.program_id, binding.program_revision, binding.program_binding_id,
       binding.retained_bundle_id, binding.graph_revision, {}};
   const auto capture = detail::ResolveSealedProgramCapture(
@@ -8745,7 +8752,7 @@ TEST(RetainedProductConsumerTest, ToolTcpMoveIsOwnerStampedThroughTheRealPlanner
                                                    {physical}, {}, artifacts.path());
   const auto scene = make_projection_runtime_shadow_snapshot(bundle.value().cell_graph.cell_id);
   auto operation =
-      make_motion_operation(physical, core::RequestOwnerEpoch("kernel.b7"), scene.shared()->revision);
+      make_motion_operation(physical, scene.shared()->revision);
   operation.program_id = compiled->value().program_id;
   operation.program_revision = compiled->value().program_revision;
   operation.program_binding_id = compiled->value().program_binding_id;
@@ -8868,6 +8875,159 @@ TEST(RetainedProductConsumerTest, ToolTcpMoveIsOwnerStampedThroughTheRealPlanner
     EXPECT_EQ(refused.error->details.at("reason"), "native_planner_participant_binding_mismatch");
   }
 }
+
+// OD-234 (1): the run's Program and Program Binding are read and verified once,
+// at its capture, and the run's operations resolve from that copy. With the
+// files gone from disk the run still resolves, anything else reads the disk,
+// the copy goes with the capture, and the next run's capture notices.
+TEST(RetainedProductConsumerTest, HeldRunResolvesFromTheProgramVerifiedAtCapture) {
+  namespace fixture = deployment::test::maintained_activation_fixture_detail;
+  ScopedTemporaryRoot package, artifacts;
+  const auto product = deployment::test::MaterializeMaintainedInterruptDeployment(
+      package.path(),
+      deployment::parse_strict_json_model_yaml(R"({"interrupt_rules":[]})").root());
+  ASSERT_TRUE(product.model_map);
+  const auto &bundle = *product.bundle;
+  const auto &model_map = *product.model_map;
+  const core::ControllableComponentId arm_id("lite6_robot");
+  const core::ControllableComponentId tool_id("lite_gripper");
+  auto authored = deployment::parse_strict_json_model_yaml(R"({
+    "api_version":"manyforge.program.v3","program_id":"held_run_copy_test",
+    "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "program_profile":"composable-cell-v1","name":"Held run copy test",
+    "catalog":{"api_version":"manyforge.node_catalog.v3","content_version":"0.0.0"},
+    "tree":{"node_id":"sequence","instance_id":"root","parameters":{},"children":[
+      {"node_id":"motion.move_to_joint_target","instance_id":"move",
+      "parameters":{"target":{"component_id":"lite6_robot","command_target_id":"arm"},
+        "base_frame":{"component_id":"lite6_robot","frame_id":"base"},
+        "tcp_endpoint":{"kind":"entry",
+          "target":{"component_id":"lite_gripper","command_target_id":"gripper"},
+          "frame":{"component_id":"lite_gripper","frame_id":"tcp"}},
+        "goal":[{"joint_name":"joint1","position_rad":0.0}]},"children":[]},
+      {"node_id":"gripper.check_status","instance_id":"status",
+       "parameters":{"target":{"component_id":"lite_gripper","command_target_id":"gripper"},
+                     "expected_state":"idle"},"children":[]}]}
+  })").root();
+  auto catalog = *authored.find_object_member("catalog");
+  catalog = fixture::With(std::move(catalog), "content_version",
+      deployment::CanonicalValue(bundle.value().catalogs.node_environment.content_version));
+  authored = fixture::With(std::move(authored), "catalog", std::move(catalog));
+  authored = deployment::normalize_program_authoring(authored);
+  const auto revision = deployment::detail::compute_content_identity(
+      authored, {"program-revision", "manyforge.program.v3", "program_revision"});
+  authored = fixture::With(std::move(authored), "program_revision", deployment::CanonicalValue(revision));
+  deployment::FilesystemCatalogArtifactStore catalogs(package.path());
+  const auto program = deployment::verify_program_binding_contract(
+      deployment::canonical_json(authored), bundle, model_map, catalogs);
+  const auto compiled = deployment::compile_program_binding(*program, bundle, model_map, catalogs);
+  ASSERT_NE(compiled, nullptr);
+  stage_prepared_activation(artifacts.path(), product);
+  {
+    deployment::FilesystemCatalogArtifactStore activation_catalog(artifacts.path());
+    deployment::FilesystemProgramRepository programs(artifacts.path());
+    deployment::FilesystemProgramBindingRepository bindings(artifacts.path());
+    ASSERT_TRUE(programs.put_if_absent(program, bundle));
+    ASSERT_TRUE(bindings.put_if_absent(compiled, bundle, model_map, activation_catalog));
+  }
+  // The published Program and Binding leave the disk, and come back unchanged.
+  const auto aside = std::filesystem::path(artifacts.path().string() + ".aside");
+  const auto hide_published = [&] { std::filesystem::rename(artifacts.path(), aside); };
+  const auto restore_published = [&] { std::filesystem::rename(aside, artifacts.path()); };
+
+  const auto physical = make_fixture_runtime_participant(
+      bundle, model_map, arm_id, core::CommandTargetId("arm"), std::nullopt, std::nullopt,
+      std::nullopt, core::CapabilityId("execution.trajectory.execute"));
+  ProductBackedRuntimeParticipantResolver resolver(package.path(), product.bundle, model_map,
+                                                   {physical}, {}, artifacts.path());
+  const auto &value = compiled->value();
+  const core::ProgramRunExecutionCaptureDTO request{
+      core::CellAdmissionClaimGeneration(1U), core::ProgramRunNumber(9131U),
+      value.program_id, value.program_revision, value.program_binding_id,
+      value.retained_bundle_id, value.graph_revision, {}};
+  const auto scene = make_projection_runtime_shadow_snapshot(bundle.value().cell_graph.cell_id);
+  auto operation = make_motion_operation(physical, scene.shared()->revision);
+  operation.program_id = value.program_id;
+  operation.program_revision = value.program_revision;
+  operation.program_binding_id = value.program_binding_id;
+  operation.program_run_id = request.program_run_id;
+  auto &participant = operation.participants.front();
+  participant.target = {arm_id, core::CommandTargetId("arm")};
+  std::get<core::MotionParticipantIntentDTO>(participant.payload).tcp_endpoint =
+      core::TcpEntryReferenceDTO{{tool_id, core::CommandTargetId("gripper")},
+                                 {tool_id, core::FrameRoleId("tcp")}};
+  const auto read_from_disk = resolver.ResolveExecutionParticipant(operation, 0U);
+  ASSERT_TRUE(read_from_disk.ok()) << read_from_disk.error().message;
+
+  // The capture carries the copy as its resolution context; the Kernel keeps
+  // the capture for the run and hands the context back for the run's work.
+  std::optional<core::ProgramRunExecutionCaptureDTO> held;
+  {
+    auto captured = resolver.ResolveProgramCapture(request);
+    ASSERT_TRUE(captured.ok()) << captured.error().message;
+    held = std::move(captured.value());
+  }
+  ASSERT_TRUE(held->binding);
+  ASSERT_TRUE(held->resolution_context);
+  const std::weak_ptr<const core::ProgramBindingDTO> binding_lifetime = held->binding;
+  const std::weak_ptr<const void> context_lifetime = held->resolution_context;
+  const core::ProgramTargetReferenceDTO arm_target{arm_id, core::CommandTargetId("arm")};
+  hide_published();
+
+  // The run's work no longer touches the sources: with the files gone its
+  // operations resolve exactly as before, also through a recomposed resolver,
+  // and so does its operation query.
+  const auto &context = held->resolution_context;
+  const auto from_copy = resolver.ResolveExecutionParticipant(operation, 0U, context);
+  ASSERT_TRUE(from_copy.ok()) << from_copy.error().message;
+  EXPECT_EQ(from_copy.value().binding.value(), read_from_disk.value().binding.value());
+  EXPECT_EQ(from_copy.value().motion_endpoint_owner, read_from_disk.value().motion_endpoint_owner);
+  const auto recomposed = resolver.WithComposedParticipants({physical});
+  const auto recomposed_copy = recomposed->ResolveExecutionParticipant(operation, 0U, context);
+  ASSERT_TRUE(recomposed_copy.ok()) << recomposed_copy.error().message;
+  EXPECT_EQ(recomposed_copy.value().binding.value(), read_from_disk.value().binding.value());
+  const auto queried =
+      resolver.ResolveOperationTarget(value.program_binding_id, arm_target, context);
+  ASSERT_TRUE(queried.ok()) << queried.error().message;
+  EXPECT_EQ(queried.value().target, arm_target);
+
+  // No context, or a context that is not exactly the request's Binding and
+  // Program, takes the full path and finds no files.
+  EXPECT_FALSE(resolver.ResolveExecutionParticipant(operation, 0U).ok());
+  EXPECT_FALSE(resolver.ResolveOperationTarget(value.program_binding_id, arm_target).ok());
+  auto other_binding = operation;
+  other_binding.program_binding_id = core::ProgramBindingId("held.run.other.binding");
+  auto other_revision = operation;
+  other_revision.program_revision = core::ProgramRevision(std::string(kZeroDigest));
+  for (const auto *mismatch : {&other_binding, &other_revision})
+    EXPECT_FALSE(resolver.ResolveExecutionParticipant(*mismatch, 0U, context).ok());
+  EXPECT_FALSE(resolver
+                   .ResolveOperationTarget(core::ProgramBindingId("held.run.other.binding"),
+                                           arm_target, context)
+                   .ok());
+
+  // Run end: the Kernel drops the capture and the copy goes with it.
+  held.reset();
+  EXPECT_TRUE(binding_lifetime.expired());
+  EXPECT_TRUE(context_lifetime.expired());
+
+  // The next run is captured afresh: the change on disk is noticed there.
+  auto next = request;
+  next.claim_generation = core::CellAdmissionClaimGeneration(2U);
+  next.program_run_id = core::ProgramRunNumber(9132U);
+  EXPECT_FALSE(resolver.ResolveProgramCapture(next).ok());
+  restore_published();
+  const auto second = resolver.ResolveProgramCapture(next);
+  ASSERT_TRUE(second.ok()) << second.error().message;
+  ASSERT_TRUE(second.value().resolution_context);
+  hide_published();
+  auto next_operation = operation;
+  next_operation.program_run_id = next.program_run_id;
+  EXPECT_TRUE(resolver
+                  .ResolveExecutionParticipant(next_operation, 0U,
+                                               second.value().resolution_context)
+                  .ok());
+  restore_published();
+}
 #endif
 
 TEST(RetainedProductConsumerTest,
@@ -8878,10 +9038,8 @@ TEST(RetainedProductConsumerTest,
       fixture.artifacts.path());
   const auto &value = fixture.authored_binding->value();
   const core::ProgramRunExecutionCaptureDTO request{
-      core::RequestOwnerEpoch("kernel.sealed.capture"),
-      core::RequestOwnerEpoch("runner.sealed.capture"),
       core::CellAdmissionClaimGeneration(1U),
-      core::ProgramRunId("run.sealed.capture"),
+      core::ProgramRunNumber(110U),
       value.program_id,
       value.program_revision,
       value.program_binding_id,
@@ -8902,12 +9060,15 @@ TEST(RetainedProductConsumerTest,
   EXPECT_EQ(
       direct.value().io_conditions->referenced_program_blackboard_keys,
       delegated.value().io_conditions->referenced_program_blackboard_keys);
-  std::vector<core::ProgramRunExecutionCaptureDTO> injected(4U, request);
+  std::vector<core::ProgramRunExecutionCaptureDTO> injected(5U, request);
   injected[0].table = direct.value().table;
   injected[1].binding = direct.value().binding;
   injected[2].blackboard_key_declarations =
       direct.value().blackboard_key_declarations;
   injected[3].io_conditions = direct.value().io_conditions;
+  // OD-234: the resolution context, too, comes only from the sealed pair.
+  ASSERT_TRUE(direct.value().resolution_context);
+  injected[4].resolution_context = direct.value().resolution_context;
   for (const auto &candidate : injected) {
     const auto pure = detail::ResolveSealedProgramCapture(
         candidate, fixture.program, fixture.authored_binding, *fixture.bundle);

@@ -7,6 +7,7 @@ import random
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -31,6 +32,8 @@ from manyforge_ros_bringup.sim_plc import (  # noqa: E402
     other_nodes,
     fully_qualified,
     parse_config,
+    start_spinning,
+    stop_spinning,
     wait_for_occupied,
 )
 
@@ -556,6 +559,32 @@ class Latest:
     def _on(self, msg):
         self.values.append(msg.data)
         self.stamps.append(time.monotonic())
+
+
+def test_exit_joins_the_spin_thread_and_leaves_no_thread_behind(ros):
+    # OD-259: the spin thread is an ordinary thread and the exit path joins it
+    # without a time limit, so interpreter finalization never meets it. The
+    # guard-condition callback proves spin() is running before the stop.
+    rclpy, _node = ros
+    from rclpy.executors import MultiThreadedExecutor
+
+    before = set(threading.enumerate())
+    node = rclpy.create_node(f"sim_plc_exit_test_{os.getpid()}")
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    spinning = threading.Event()
+    guard = node.create_guard_condition(spinning.set)
+    spinner = start_spinning(executor)
+    guard.trigger()
+    spinning.wait()
+
+    stop_spinning(executor, spinner)
+    node.destroy_guard_condition(guard)
+    node.destroy_node()
+
+    assert not spinner.daemon
+    assert not spinner.is_alive()
+    assert set(threading.enumerate()) == before
 
 
 def test_ros_ack_delay_mirror_and_ready(ros, tmp_path):

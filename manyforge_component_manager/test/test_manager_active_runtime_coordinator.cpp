@@ -50,19 +50,19 @@ ManagedRow(const std::string &runtime_unit_id,
       ContentDigest(std::string(kDigestOne)),
       ContentDigest(std::string(kDigestTwo)),
       std::move(dependencies),
-      {RuntimeRoleId("manager_fixture")},
+      {RuntimeRoleId("ros2_control_execution")},
       EndpointRoleId("status"),
-      "manyforge.reference-runtime-status",
+      "manyforge.ros2_control_execution.status",
       "status-revision-1",
       "private-controller",
-      "manyforge.posix_sh.retained_script",
+      "manyforge.installed_execution_target",
       "adapter-revision-1",
       "retained-raw-artifact",
       "retrieval-revision-1",
       ContentDigest(std::string(kDigestThree)),
       1U,
       "linux",
-      "posix.1-2017",
+      "manyforge.ros2_control_execution_host.abi.v1",
       requirement.value(),
       qualified.offer().offer_digest,
   };
@@ -79,7 +79,7 @@ ManagedRow(const std::string &runtime_unit_id,
       ActiveBundlePublicationReceiptDTO{
           ActiveBundlePublicationRequestDTO{
               NamedApplyPublicationTransactionDTO{
-                  ApplyId("apply.active"), ApplyGeneration(1U)},
+                  ApplyId(9U), ApplyGeneration(1U)},
               projection,
               projection.retained_bundle_id,
               projection.graph_revision,
@@ -207,9 +207,11 @@ public:
     return Presence(query, id);
   }
 
+  [[nodiscard]] std::uint64_t ProgressRequestMark() override { return 0U; }
+
   [[nodiscard]] std::optional<RuntimeUnitSourceReport>
   ObserveProgress(const RuntimeUnitConvergenceQueryDTO &query,
-                  const RuntimeEpoch &runtime_epoch) override {
+                  const RuntimeEpoch &runtime_epoch, std::uint64_t) override {
     const auto id = query.plan.runtime_unit_id.value();
     events.push_back("progress:" + id);
     const auto found = epochs.find(id);

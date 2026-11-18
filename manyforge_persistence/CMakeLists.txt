@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_persistence VERSION 0.2.1 LANGUAGES CXX)
+project(manyforge_persistence VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -8,16 +8,18 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 add_compile_options(-Wall -Wextra -Werror -pedantic)
 
 find_package(SQLite3 3.37 REQUIRED)
+find_package(Threads REQUIRED)
 
 add_library(manyforge_persistence
   src/sqlite_read_only_preflight.cpp
+  src/sqlite_record_writer.cpp
 )
 add_library(manyforge::persistence ALIAS manyforge_persistence)
 target_include_directories(manyforge_persistence PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
 )
-target_link_libraries(manyforge_persistence PUBLIC SQLite::SQLite3)
+target_link_libraries(manyforge_persistence PUBLIC SQLite::SQLite3 Threads::Threads)
 set_target_properties(
   manyforge_persistence PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
@@ -37,7 +39,8 @@ if(MANYFORGE_PERSISTENCE_BUILD_TESTING)
   include(GoogleTest)
 
   add_executable(test_manyforge_persistence
-    test/test_sqlite_read_only_preflight.cpp)
+    test/test_sqlite_read_only_preflight.cpp
+    test/test_sqlite_record_writer.cpp)
   target_link_libraries(test_manyforge_persistence PRIVATE
     manyforge::persistence
     GTest::gtest_main)

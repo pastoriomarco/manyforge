@@ -24,7 +24,7 @@ export function executionSelectionIsQuiescent(
  * - has an `effectful` capability requirement and issues a new command through
  *   a robot, tool or I/O owner: owner API `kernel.operation` (robot motion) or
  *   `kernel.command_target` (gripper and I/O commands); or
- * - controls robot operations through a Kernel control owner (stop, Full
+ * - controls robot operations through a Kernel control owner (stop, Cell
  *   Stop, reset): these change what the robots do, so they need a visible
  *   control just like a move (maintainer, 2026-10-02).
  * Gripper/I/O reads and waits are not hardware-acting.
@@ -33,7 +33,7 @@ export function executionSelectionIsQuiescent(
 export const HARDWARE_ACTING_NODE_IDS: ReadonlySet<string> = new Set([
   'gripper.command_position',
   'io.set_output',
-  'kernel.full_stop',
+  'kernel.cell_stop',
   'kernel.reset_operation',
   'kernel.stop_operation',
   'motion.follow_cartesian_path',

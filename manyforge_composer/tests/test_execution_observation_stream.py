@@ -20,12 +20,12 @@ from manyforge_composer.backend.security import SecurityConfig
 
 def _status(*, sequence: int = 7, position: float = 0.25) -> dict[str, Any]:
     return {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "command": "observation",
         "ok": True,
         "observation": {
-            "schema_version": "manyforge.execution_observation.v4",
-            "owner_epoch": "execution-owner.1",
+            "schema_version": "manyforge.execution_observation.v5",
+            "application_start_id": "execution-owner.1",
             "cell_id": "cell-1",
             "retained_bundle_id": "bundle-1",
             "graph_revision": "graph-1",
@@ -54,8 +54,8 @@ def test_project_execution_observation_is_exact_and_compact() -> None:
         _status(), received_at_monotonic_us=123_456
     )
     assert frame == {
-        "schema_version": "manyforge.execution_observation_frame.v4",
-        "owner_epoch": "execution-owner.1",
+        "schema_version": "manyforge.execution_observation_frame.v5",
+        "application_start_id": "execution-owner.1",
         "cell_id": "cell-1",
         "retained_bundle_id": "bundle-1",
         "graph_revision": "graph-1",
@@ -97,7 +97,7 @@ def test_project_execution_observation_is_exact_and_compact() -> None:
 
 def test_owner_error_response_keeps_its_typed_code_and_message() -> None:
     refused = {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "ok": False,
         "error": {
             "code": "execution_command_invalid",
@@ -130,7 +130,7 @@ def test_source_status_reports_the_owner_error_code() -> None:
             await _next_cursor(client)
             client.responses.put(
                 {
-                    "api_version": "manyforge.execution_command_response.v4",
+                    "api_version": "manyforge.execution_command_response.v6",
                     "ok": False,
                     "error": {
                         "code": "execution_owner_not_ready",
@@ -218,7 +218,8 @@ def test_encode_execution_observation_frame_is_one_canonical_payload() -> None:
 
     assert json.loads(encoded) == frame
     assert " " not in encoded
-    assert encoded.startswith('{"cell_id":"cell-1",')
+    # Sorted keys: `application_start_id` (replacing the owner epoch) is first.
+    assert encoded.startswith('{"application_start_id":')
 
 
 def test_failed_source_invalidates_every_subscriber_and_never_replays_cache() -> None:
@@ -383,7 +384,6 @@ def test_websocket_closes_failed_source_and_reconnect_captures_current_only():
                         "last_applied": {
                             key: frame[key]
                             for key in (
-                                "owner_epoch",
                                 "source_epoch",
                                 "source_sequence",
                                 "delivery_sequence",
@@ -444,7 +444,7 @@ def test_source_is_change_driven_credited_and_independent_per_browser() -> None:
 
         source.grant_credit(subscription, subscription.outstanding)
         assert await _next_cursor(client) == {
-            "owner_epoch": "execution-owner.1",
+            "application_start_id": "execution-owner.1",
             "source_epoch": "joint-source.1",
             "source_sequence": 1,
         }
@@ -507,7 +507,7 @@ def test_source_coalesces_visual_heartbeats_but_retains_the_latest_cursor() -> N
             fast.outstanding,
         )
         assert (await _next_cursor(client)) == {
-            "owner_epoch": "execution-owner.1",
+            "application_start_id": "execution-owner.1",
             "source_epoch": "joint-source.1",
             "source_sequence": 1,
         }
@@ -553,7 +553,7 @@ def test_source_keeps_credit_after_duplicate_identity_coalescing() -> None:
 
             source.grant_credit(subscription, subscription.outstanding)
             expected_cursor = {
-                "owner_epoch": "execution-owner.1",
+                "application_start_id": "execution-owner.1",
                 "source_epoch": "joint-source.1",
                 "source_sequence": 1,
             }
@@ -674,7 +674,7 @@ def test_static_visible_credit_over_24_hours_creates_no_periodic_source_work() -
         applied = subscription.outstanding
         source.grant_credit(subscription, applied)
         assert await _next_cursor(client) == {
-            "owner_epoch": "execution-owner.1",
+            "application_start_id": "execution-owner.1",
             "source_epoch": "joint-source.1",
             "source_sequence": 1,
         }
@@ -718,7 +718,7 @@ def test_source_bounds_clients_and_rejects_stale_acknowledgements() -> None:
         with pytest.raises(ValueError, match="stale"):
             source.grant_credit(
                 first,
-                ("execution-owner.1", "joint-source.1", 99, 99),
+                ("joint-source.1", 99, 99),
             )
 
         for subscription in subscriptions:
@@ -774,7 +774,7 @@ def test_source_accepts_a_fresh_restart_epoch_with_a_lower_sequence() -> None:
         )
         await _next_cursor(client)
         restarted = _status(sequence=1, position=0.2)
-        restarted["observation"]["owner_epoch"] = "execution-owner.2"
+        restarted["observation"]["application_start_id"] = "execution-owner.2"
         restarted["observation"]["source_epoch"] = "joint-source.2"
         client.responses.put(restarted)
         await asyncio.wait_for(subscription.wake.wait(), timeout=1.0)
@@ -782,7 +782,7 @@ def test_source_accepts_a_fresh_restart_epoch_with_a_lower_sequence() -> None:
         assert status["published_count"] == 2
         assert status["error_count"] == 0
         latest = json.loads(source.take_payload(subscription) or "null")
-        assert latest["owner_epoch"] == "execution-owner.2"
+        assert latest["application_start_id"] == "execution-owner.2"
         assert latest["source_epoch"] == "joint-source.2"
         assert latest["source_sequence"] == 1
         assert latest["targets"][0]["positions_si"] == [0.2, -0.2]

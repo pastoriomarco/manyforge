@@ -2,8 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api, ApiError, apiErrorCode, currentScenarioText, failedAuthoringRequest, isStaleWorkspaceError, KnownOutcomeError, refusedBeforeEffect, type AuthoringRequestIdentity } from '../api/client';
 import { parseManagerApplyAvailability } from '../api/parsers';
+import { displayApplyId, displayRequestKey } from '../api/applicationIdentity';
 import { authoringOperation, busyReason, type AuthoringCommand, type BusyOperation } from '../state/busyOperation';
-import { sameManagerApply, type ManagerApplyIdentity } from '../state/managerApply';
+import { newCanClearLatestFailedApply, sameManagerApply, type ManagerApplyIdentity } from '../state/managerApply';
 import { errorMessage } from '../state/structuralResource';
 import {
   authoringUnavailableReason,
@@ -17,6 +18,11 @@ import {
 import type { AuthoringWorkspaceProjectFacts, ManagerApplyStatus } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import { sameAuthoringWorkspaceIdentity, type ControlTransportStatus } from './useHeadlessState';
+
+/** An authoring request as shown: its display form (`3f9a/k1a2b3c4d`). */
+function requestText(request: AuthoringRequestIdentity): string {
+  return displayRequestKey(request.applicationStartId, request.requestKey);
+}
 
 /**
  * One shared authoring-workspace read for the whole workbench.
@@ -66,7 +72,7 @@ export function useAuthoringWorkspace(
   const manager = snapshot?.runtime.sections?.manager;
   const managerAdmission = useMemo(() => {
     if (!manager?.available || manager.freshness !== 'fresh') {
-      return { records: [], reason: 'Current Manager status is unavailable.', replaceReason: null, applying: null };
+      return { records: [], reason: 'Current Manager status is unavailable.', replaceReason: null, applying: null, failedApplyHoldsCell: false };
     }
     try {
       const apply = parseManagerApplyAvailability(manager.payload?.apply, 'manager.payload.apply');
@@ -78,9 +84,10 @@ export function useAuthoringWorkspace(
         // New and Load wait only for an Apply actually in flight.
         replaceReason: inFlight ? 'A Manager Apply is in progress.' : null,
         applying: inFlight,
+        failedApplyHoldsCell: newCanClearLatestFailedApply(apply.records),
       };
     } catch {
-      return { records: [], reason: 'Manager operation status is invalid.', replaceReason: null, applying: null };
+      return { records: [], reason: 'Manager operation status is invalid.', replaceReason: null, applying: null, failedApplyHoldsCell: false };
     }
   }, [manager]);
 
@@ -98,21 +105,20 @@ export function useAuthoringWorkspace(
 
   useEffect(() => {
     // A lost reply is not a lost operation. Every Manager-submitting route
-    // records this browser's own request id as the Apply's correlation id, so
-    // the exact record (never merely the latest one) identifies its Apply.
+    // names the Apply by this browser's own request key, so the exact record
+    // (never merely the latest one) identifies its Apply. Headless sets the
+    // key's first byte (class and part), so bytes 1-15 are compared.
     const request = unconfirmed.current?.request ?? null;
     if (request === null) return;
-    // An Apply sent with a shared correlation (Apply after Reset) is
-    // recorded under that correlation instead of its own request id.
     const record = managerAdmission.records.find(
-      (candidate) => candidate.request.correlationId === (request.correlationId ?? request.requestId),
+      (candidate) => candidate.request.requestKey.slice(2) === request.requestKey.slice(2),
     );
     if (record === undefined) return;
     const identity = { applyId: record.applyId, applyGeneration: record.applyGeneration };
     unconfirmed.current = null;
     setUnconfirmedState(null);
     setCorrelatedApply(identity);
-    setRecheckMessage(`Request ${request.requestId}: Manager recorded Apply ${identity.applyId} (${identity.applyGeneration}).`);
+    setRecheckMessage(`Request ${requestText(request)}: Manager recorded Apply ${displayApplyId(request.applicationStartId, identity.applyId)} (${identity.applyGeneration}).`);
   }, [managerAdmission, unconfirmedState]);
 
   const observed = snapshot === null ? null : snapshot.authoringWorkspace;
@@ -263,7 +269,7 @@ export function useAuthoringWorkspace(
       unconfirmed.current = { request };
       setUnconfirmedState(unconfirmed.current);
       setRecheckMessage(request === null ? null
-        : `Request ${request.requestId}${request.path ? ` (${request.path})` : ''}: outcome unconfirmed.`);
+        : `Request ${requestText(request)}${request.path ? ` (${request.path})` : ''}: outcome unconfirmed.`);
     }
   }, []);
   const recheckSubmission = useCallback(async () => {
@@ -306,14 +312,14 @@ export function useAuthoringWorkspace(
       // Successful readback settles only this browser's uncertainty. Current
       // workspace, Manager and Kernel admission still govern all new actions.
       const status = outcome.apply === null ? null : await api.manager.applyStatus(
-        outcome.apply.applyId, outcome.apply.applyGeneration,
+        outcome.apply.applyId, outcome.apply.applyGeneration, request.applicationStartId,
       );
       if (!mounted.current || unconfirmed.current !== pending) return;
       unconfirmed.current = null;
       setUnconfirmedState(null);
       setRecheckMessage(outcome.apply === null
-        ? `Request ${request.requestId}: the authoring change is confirmed settled.`
-        : `Request ${request.requestId}: Apply ${outcome.apply.applyId} (${outcome.apply.applyGeneration}) is ${status!.state}. Backend admission still applies.`);
+        ? `Request ${requestText(request)}: the authoring change is confirmed settled.`
+        : `Request ${requestText(request)}: Apply ${displayApplyId(request.applicationStartId, outcome.apply.applyId)} (${outcome.apply.applyGeneration}) is ${status!.state}. Backend admission still applies.`);
       await refresh();
     } catch (error) {
       if (mounted.current) setRecheckMessage(errorMessage(error, 'Submission status could not be verified.'));
@@ -344,6 +350,11 @@ export function useAuthoringWorkspace(
     editUnavailableReason,
     /** Why New, Load or Close is unavailable, or ``null``. */
     replaceUnavailableReason,
+    /**
+     * The newest Manager Apply ended failed or with unknown effect and still
+     * holds the cell; New (and Load, which starts with New) releases it.
+     */
+    failedApplyHoldsCell: managerAdmission.failedApplyHoldsCell,
     /** The Scenario project facts of the installed publication. */
     project: facts,
     reading,
@@ -361,7 +372,7 @@ export function useAuthoringWorkspace(
     rechecking,
     recheckMessage,
     recheckSubmission,
-  }), [current, error, facts, published, reading, refresh, operation, unavailableReason, editUnavailableReason, replaceUnavailableReason, beginMutation, finishMutation, observeApply, unconfirmedState, correlatedApply, rechecking, recheckMessage, recheckSubmission]);
+  }), [current, error, facts, managerAdmission.failedApplyHoldsCell, published, reading, refresh, operation, unavailableReason, editUnavailableReason, replaceUnavailableReason, beginMutation, finishMutation, observeApply, unconfirmedState, correlatedApply, rechecking, recheckMessage, recheckSubmission]);
 }
 
 export type AuthoringWorkspaceController = ReturnType<typeof useAuthoringWorkspace>;

@@ -66,6 +66,24 @@ using RobotTcp = core::ProgramRobotTcpBindingDTO;
     std::span<const QualifiedCapabilityDefinition> capabilities,
     const ICatalogArtifactSource& catalog_artifact_store);
 
+/// The row of a robot's TCP list that `entry` selects: the rule Program
+/// reference validation and run-time resolution share. The entry's frame
+/// must be a frame of its target, it must name one row (exactly, else by its
+/// frame alone), and that row's owner must be the robot or a tool the robot
+/// carries. Refusals carry the typed reasons `active_tcp_unknown`,
+/// `runtime_motion_endpoint_ambiguous` and `tcp_tool_not_mounted`.
+[[nodiscard]] core::Result<const RobotTcp*> select_robot_tcp(
+    const VerifiedRetainedModelMap& retained_model_map,
+    const core::ControllableComponentId& robot, std::span<const RobotTcp> rows,
+    const core::TcpEntryReferenceDTO& entry);
+
+/// Whether the owner of gripper `target` has no command state to report: a
+/// pneumatic gripper that is display-only (`output_mode: none`) or whose
+/// valves are separate mapped I/O writes (`pneumatic_io`). Its own command is
+/// then a logical one that completes without any valve effect.
+[[nodiscard]] bool gripper_status_unavailable(
+    const core::CellGraphDTO& graph, const core::ProgramTargetReferenceDTO& target);
+
 /// Candidate-side TCP inventory using the compiler's qualified catalog closure.
 [[nodiscard]] std::vector<RobotTcp> qualified_candidate_robot_tcps(
     const core::ProgramTargetReferenceDTO& target,

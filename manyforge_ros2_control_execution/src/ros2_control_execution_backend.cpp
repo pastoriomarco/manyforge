@@ -7,11 +7,9 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
-#include <iomanip>
 #include <limits>
 #include <map>
 #include <set>
-#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -34,12 +32,11 @@ ExecutionPortCommandResultDTO uncertain(std::string detail) {
 template <class Stamp> TimePoint nanoseconds(const Stamp &stamp) {
   return static_cast<TimePoint>(stamp.sec) * 1'000'000'000 + stamp.nanosec;
 }
-template <class Id> MechanismGoalId mechanism_id(const Id &id) {
-  std::ostringstream text;
-  text << std::hex << std::setfill('0');
-  for (const auto byte : id)
-    text << std::setw(2) << static_cast<unsigned>(byte);
-  return MechanismGoalId(text.str());
+// The ROS goal UUID kept as its 16 bytes: a copy, no text and no allocation
+// on the goal callbacks. The goal table (`State::goals`) maps each goal key to
+// the record that holds it; hex appears only in logs and the trace export.
+MechanismGoalId mechanism_id(const std::array<std::uint8_t, 16> &id) {
+  return MechanismGoalId{id};
 }
 std::optional<std::vector<std::size_t>>
 joint_mapping(const std::vector<std::string> &source,
@@ -154,9 +151,9 @@ struct Ros2ControlExecutionBackend::State {
     std::shared_ptr<CancelAttempt> cancel_attempt;
     std::shared_ptr<std::atomic<bool>> send_started;
     std::optional<std::uint64_t> execution_id;
-    std::optional<ExecutionGoalKey> successor;
+    std::optional<ControllerGoalId> successor;
     bool successor_accepted{false};
-    std::optional<ExecutionGoalKey> predecessor;
+    std::optional<ControllerGoalId> predecessor;
     std::optional<GoalHandle::WrappedResult> terminal;
     bool retired{false};
     bool cancel_requested{false};
@@ -190,7 +187,7 @@ struct Ros2ControlExecutionBackend::State {
   std::array<GoalHandle::SharedPtr, kExecutionGoalRecordCapacity>
       retired_handles{};
   struct LossCancel {
-    ExecutionGoalKey key;
+    ControllerGoalId key;
     GoalHandle::SharedPtr handle;
     std::shared_ptr<CancelAttempt> attempt;
   };
@@ -206,10 +203,10 @@ struct Ros2ControlExecutionBackend::State {
   bool closed{false};
   ExecutionReadinessDTO readiness;
   // Core owns cross-operation replay. These are only the two retained facts.
-  std::map<ExecutionGoalKey, Goal> goals;
-  std::deque<ExecutionGoalKey> goal_order;
-  std::optional<ExecutionGoalKey> current;
-  std::optional<ExecutionGoalKey> late_cancel_not_issued;
+  std::map<ControllerGoalId, Goal> goals;
+  std::deque<ControllerGoalId> goal_order;
+  std::optional<ControllerGoalId> current;
+  std::optional<ControllerGoalId> late_cancel_not_issued;
   std::optional<ExecutionControllerSampleDTO> sample;
   ExecutionTimingDTO timing;
   std::optional<TimePoint> previous_source_stamp;
@@ -289,7 +286,7 @@ struct Ros2ControlExecutionBackend::LateCancelItem final {
   rclcpp_action::Client<Action>::SharedPtr client;
   GoalHandle::SharedPtr handle;
   std::shared_ptr<CancelAttempt> attempt;
-  ExecutionGoalKey key;
+  ControllerGoalId key;
 };
 
 Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
@@ -319,7 +316,9 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
   // OD-66: controller state and the action client's goal response, feedback,
   // result and cancel responses run on the epoch's time-critical thread, one
   // group each. Their handlers take only the facts mutex and make non-waiting
-  // calls (scheduler admission, retain_entity). The subscription's matched
+  // calls (scheduler admission, retain_entity); they never take a leaf lock
+  // (OD-111): a cancel due on acceptance goes to the StopControl lane. The
+  // subscription's matched
   // event joins its group (rclcpp adds event handlers to the subscription's
   // group). Both entities live until this epoch's owner has joined.
   rclcpp::SubscriptionOptions options;
@@ -386,6 +385,7 @@ void Ros2ControlExecutionBackend::ObserveReadinessImpl(
       retired_handles{};
   std::size_t retired_count = 0;
   bool loss_pending = false;
+  std::size_t overflow_skips = 0;
   {
     std::lock_guard command_lock(state_->command_mutex);
     std::lock_guard facts_lock(state_->mutex);
@@ -414,9 +414,7 @@ void Ros2ControlExecutionBackend::ObserveReadinessImpl(
                 State::LossCancel{key, goal.handle, goal.cancel_attempt};
           } else {
             goal.cancel_attempt->attempted = true;
-            std::fprintf(
-                stderr,
-                "manyforge_loss_cancel status=skipped reason=overflow\n");
+            ++overflow_skips;
           }
         }
         if (goal.handle)
@@ -426,6 +424,9 @@ void Ros2ControlExecutionBackend::ObserveReadinessImpl(
       loss_pending = state_->loss_cancel_count != 0;
     }
   }
+  // OD-221: printed after the locks are released.
+  for (std::size_t index = 0; index < overflow_skips; ++index)
+    std::fprintf(stderr, "manyforge_loss_cancel status=skipped reason=overflow\n");
   // Loss cancels are scheduled directly from this thread, after every lock is
   // released: no hop through the epoch owner. A closed owner skips them, as
   // before.
@@ -517,6 +518,7 @@ void Ros2ControlExecutionBackend::close_admission_impl(
     const bool send_loss_cancels,
     std::chrono::steady_clock::time_point deadline) noexcept {
   state_->closed_admission.store(true, std::memory_order_release);
+  std::size_t overflow_skips = 0;
   {
     std::lock_guard command_lock(state_->command_mutex);
     std::lock_guard facts_lock(state_->mutex);
@@ -567,8 +569,7 @@ void Ros2ControlExecutionBackend::close_admission_impl(
               State::LossCancel{key, goal.handle, goal.cancel_attempt};
         else {
           goal.cancel_attempt->attempted = true;
-          std::fprintf(
-              stderr, "manyforge_loss_cancel status=skipped reason=overflow\n");
+          ++overflow_skips;
         }
       }
       if (goal.handle)
@@ -576,6 +577,9 @@ void Ros2ControlExecutionBackend::close_admission_impl(
     }
     state_->sample.reset();
   }
+  // OD-221: printed after the locks are released.
+  for (std::size_t index = 0; index < overflow_skips; ++index)
+    std::fprintf(stderr, "manyforge_loss_cancel status=skipped reason=overflow\n");
   if (send_loss_cancels)
     DrainLossCancels(state_);
   else {
@@ -639,23 +643,23 @@ void Ros2ControlExecutionBackend::ObserveReadiness(ExecutionReadinessDTO readine
   ObserveReadinessImpl(readiness);
 }
 ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::Submit(
-    const ExecutionGoalKey &key, const TrajectoryDTO &trajectory,
+    const ControllerGoalId &key, const TrajectoryDTO &trajectory,
     std::shared_ptr<ExecutionDispatchToken> token) {
   return SubmitImpl(key, trajectory, std::move(token));
 }
 ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::Replace(
-    const ExecutionGoalKey &active, const ExecutionGoalKey &next,
+    const ControllerGoalId &active, const ControllerGoalId &next,
     const TrajectoryDTO &trajectory, std::shared_ptr<ExecutionDispatchToken> token) {
   return ReplaceImpl(active, next, trajectory, std::move(token));
 }
 ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::ReplaceScheduled(
-    const ExecutionGoalKey &active, const ExecutionGoalKey &next,
+    const ControllerGoalId &active, const ControllerGoalId &next,
     const TrajectoryDTO &trajectory, const ExecutionReplacementStartDTO &start,
     std::shared_ptr<ExecutionDispatchToken> token) {
   return ReplaceScheduledImpl(active, next, trajectory, start, std::move(token));
 }
 ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::Cancel(
-    const ExecutionGoalKey &key, std::chrono::steady_clock::time_point deadline) {
+    const ControllerGoalId &key, std::chrono::steady_clock::time_point deadline) {
   return CancelImpl(key, deadline);
 }
 std::optional<bool> Ros2ControlExecutionBackend::ScaleInputListening() const noexcept {
@@ -679,15 +683,15 @@ core::ScaleSnapshot Ros2ControlExecutionBackend::SnapshotScaleAfterFence(
 }
 
 ExecutionPortCommandResultDTO
-Ros2ControlExecutionBackend::SubmitImpl(const ExecutionGoalKey &key,
+Ros2ControlExecutionBackend::SubmitImpl(const ControllerGoalId &key,
                                     const TrajectoryDTO &trajectory,
                                     std::shared_ptr<ExecutionDispatchToken> token) {
   VolatileMotionTrace::Garbage garbage;
   return SendGoal(key, trajectory, std::nullopt, garbage, std::nullopt, std::move(token));
 }
 ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::SendGoal(
-    const ExecutionGoalKey &key, const TrajectoryDTO &trajectory,
-    std::optional<ExecutionGoalKey> active_key,
+    const ControllerGoalId &key, const TrajectoryDTO &trajectory,
+    std::optional<ControllerGoalId> active_key,
     VolatileMotionTrace::Garbage &trace_garbage,
     std::optional<ExecutionReplacementStartDTO> start,
     std::shared_ptr<ExecutionDispatchToken> token) {
@@ -706,8 +710,7 @@ ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::SendGoal(
           "Scheduled replacement has no representable controller start stamp");
   }
   Action::Goal goal;
-  if (key.controller_goal_id.empty() ||
-      !key.controller_goal_generation.nonzero() ||
+  if (!key.nonzero() ||
       !make_goal(trajectory, state_->config.lane_facts, goal,
                  active_key.has_value()))
     return refused(ExecutionPortRefusal::kInvalidInput,
@@ -904,13 +907,13 @@ ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::SendGoal(
                          (experiment->start_allowance_override ? 1 : 0);
     const auto written = std::fprintf(
         stderr,
-        "manyforge_replacement_experiment goal=%.160s generation=%llu "
+        "manyforge_replacement_experiment goal=%llu/%u/%u "
         "producer_policy=%s release_policy=%s stamp_policy=%s payload_policy=%s "
         "release_hold=%s source_stamp_ns=%lld target_tick_ns=%lld stamp_ns=%lld "
         "planned_release_ns=%lld send_ns=%lld returned_ns=%lld "
         "expected_latency_ns=%lld start_allowance_ns=%lld allowance_override=%d factor=%.17g\n",
-        key.controller_goal_id.value().c_str(),
-        static_cast<unsigned long long>(key.controller_goal_generation.value()),
+        static_cast<unsigned long long>(key.operation_id.value()),
+        static_cast<unsigned>(key.ordinal), static_cast<unsigned>(key.generation),
         controls > 1 ? "combined" : "single", timer ? "timer" : "immediate",
         experiment->midtick_stamp ? "midtick" : "grid",
         experiment->spring_back_fast ? "spring_back_fast_v0"
@@ -934,8 +937,8 @@ ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::SendGoal(
   return sent();
 }
 ExecutionPortCommandResultDTO
-Ros2ControlExecutionBackend::ReplaceImpl(const ExecutionGoalKey &active_key,
-                                     const ExecutionGoalKey &next_key,
+Ros2ControlExecutionBackend::ReplaceImpl(const ControllerGoalId &active_key,
+                                     const ControllerGoalId &next_key,
                                      const TrajectoryDTO &trajectory,
                                      std::shared_ptr<ExecutionDispatchToken> token) {
   // Declared before the guard: retained payload garbage is released only
@@ -955,7 +958,7 @@ Ros2ControlExecutionBackend::ReplaceImpl(const ExecutionGoalKey &active_key,
   return SendGoal(next_key, trajectory, active_key, garbage, std::nullopt, std::move(token));
 }
 ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::ReplaceScheduledImpl(
-    const ExecutionGoalKey &active_key, const ExecutionGoalKey &next_key,
+    const ControllerGoalId &active_key, const ControllerGoalId &next_key,
     const TrajectoryDTO &trajectory,
     const ExecutionReplacementStartDTO &start,
     std::shared_ptr<ExecutionDispatchToken> token) {
@@ -975,7 +978,7 @@ ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::ReplaceScheduledImpl(
 }
 ExecutionPortCommandResultDTO
 Ros2ControlExecutionBackend::CancelImpl(
-    const ExecutionGoalKey &key, std::chrono::steady_clock::time_point deadline) {
+    const ControllerGoalId &key, std::chrono::steady_clock::time_point deadline) {
   GoalHandle::SharedPtr handle;
   std::shared_ptr<CancelAttempt> attempt;
   {
@@ -1030,7 +1033,7 @@ Ros2ControlExecutionBackend::CancelImpl(
 }
 ExecutionPortCommandResultDTO
 Ros2ControlExecutionBackend::SendCancel(const std::shared_ptr<State> &state,
-                                        const ExecutionGoalKey &key,
+                                        const ControllerGoalId &key,
                                         const GoalHandle::SharedPtr &handle,
                                         std::chrono::steady_clock::time_point deadline) {
   rclcpp_action::Client<Action>::SharedPtr client;
@@ -1184,7 +1187,7 @@ Ros2ControlExecutionBackend::SendCancel(const std::shared_ptr<State> &state,
   return sent(); // Send/ACK is not terminal completion or physical rest.
 }
 void Ros2ControlExecutionBackend::ReceiveCancelResponse(
-    const std::shared_ptr<State> &state, const ExecutionGoalKey &key,
+    const std::shared_ptr<State> &state, const ControllerGoalId &key,
     std::uint64_t cancel_sequence,
     const action_msgs::srv::CancelGoal::Response::SharedPtr &response) {
   std::lock_guard facts_lock(state->mutex);
@@ -1282,7 +1285,7 @@ Ros2ControlExecutionBackend::SetScaleImpl(double value, std::uint64_t sequence) 
 }
 
 void Ros2ControlExecutionBackend::SendAutomaticCancel(
-    const std::shared_ptr<State> &state, const ExecutionGoalKey &key,
+    const std::shared_ptr<State> &state, const ControllerGoalId &key,
     const GoalHandle::SharedPtr &handle,
     const std::shared_ptr<CancelAttempt> &attempt,
     const rclcpp_action::Client<Action>::SharedPtr &client) noexcept {
@@ -1340,6 +1343,11 @@ void Ros2ControlExecutionBackend::SendAutomaticCancel(
     {
       MANYFORGE_LEAF_DEFERRED_LOCK(leaf, state->action_send_mutex,
                                   detail::LeafEntity::kMotionAutomaticCancel);
+      // Runs only on the StopControl lane (QueueAutomaticCancel), never in a
+      // ROS callback (OD-111), so no rclcpp lock is held here. Every leaf
+      // holder makes one non-waiting SDK call, and the rclcpp locks it takes
+      // are held only by callbacks that never take a leaf: the wait is bounded
+      // by that call.
       if (deadline)
         expired = !leaf.try_lock_until(*deadline) ||
                   std::chrono::steady_clock::now() >= *deadline;
@@ -1378,15 +1386,18 @@ void Ros2ControlExecutionBackend::SendAutomaticCancel(
       return;
     }
     if (owner_failed || expired || stale_handle) {
-      std::lock_guard lock(state->mutex);
-      attempt->unresolved = (expired || stale_handle) ? LateCancelUnresolvedReason::kUnknown
-                                                       : LateCancelUnresolvedReason::kNotIssued;
-      state->late_cancel_not_issued = key;
-      if (attempt->shutdown_tracked) {
-        attempt->shutdown_done = true;
-        attempt->shutdown_failed = true;
-        state->shutdown_cv.notify_all();
+      {
+        std::lock_guard lock(state->mutex);
+        attempt->unresolved = (expired || stale_handle) ? LateCancelUnresolvedReason::kUnknown
+                                                         : LateCancelUnresolvedReason::kNotIssued;
+        state->late_cancel_not_issued = key;
+        if (attempt->shutdown_tracked) {
+          attempt->shutdown_done = true;
+          attempt->shutdown_failed = true;
+          state->shutdown_cv.notify_all();
+        }
       }
+      // OD-221: printed after the lock is released.
       std::fprintf(stderr, "manyforge_loss_cancel status=skipped reason=%s\n",
                    expired ? "deadline_expired" : stale_handle ? "handle_changed" : "owner_failed");
       return;
@@ -1418,7 +1429,7 @@ void Ros2ControlExecutionBackend::SendAutomaticCancel(
 }
 
 void Ros2ControlExecutionBackend::QueueAutomaticCancel(
-    const std::shared_ptr<State> &state, const ExecutionGoalKey &key,
+    const std::shared_ptr<State> &state, const ControllerGoalId &key,
     const GoalHandle::SharedPtr &handle,
     const std::shared_ptr<CancelAttempt> &attempt) noexcept {
   try {
@@ -1490,15 +1501,17 @@ void Ros2ControlExecutionBackend::DrainLossCancels(
 }
 
 void Ros2ControlExecutionBackend::ReceiveResponse(
-    const std::shared_ptr<State> &state, const ExecutionGoalKey &key,
+    const std::shared_ptr<State> &state, const ControllerGoalId &key,
     const GoalHandle::SharedPtr &handle,
     const std::shared_ptr<CancelAttempt> &attempt) {
-  // Claim a shared automatic attempt under facts and send outside the lock.
-  const auto response_id = handle ? mechanism_id(handle->get_goal_id()) : MechanismGoalId{std::string{}};
+  // Claim a shared automatic attempt under facts; it is sent on the
+  // StopControl lane, never from this callback.
+  const auto response_id = handle ? mechanism_id(handle->get_goal_id()) : MechanismGoalId{};
   auto retained_handle = handle ? state->epoch_resources->retain_entity(handle)
                                 : GoalHandle::SharedPtr{};
   GoalHandle::SharedPtr previous_handle;
   bool send_cancel = false;
+  bool owner_closed_skip = false;
   {
     std::lock_guard facts_lock(state->mutex);
     const auto found = state->goals.find(key);
@@ -1526,9 +1539,7 @@ void Ros2ControlExecutionBackend::ReceiveResponse(
         if (!state->closed || attempt->shutdown_tracked)
           send_cancel = true;
         else
-          std::fprintf(
-              stderr,
-              "manyforge_loss_cancel status=skipped reason=owner_closed\n");
+          owner_closed_skip = true;
       }
     } else {
       if (!state->ready() || found == state->goals.end() ||
@@ -1578,26 +1589,30 @@ void Ros2ControlExecutionBackend::ReceiveResponse(
       }
     }
   }
+  // OD-221: printed after the lock is released.
+  if (owner_closed_skip)
+    std::fprintf(
+        stderr,
+        "manyforge_loss_cancel status=skipped reason=owner_closed\n");
   if (!send_cancel)
     return;
-  // Cancel requested before acceptance: send the exact cancel now, from this
-  // callback, under the action leaf (one non-waiting SDK call, nothing else
-  // acquired under it). No scheduler hop. The owner is alive while it runs
-  // this callback; it is checked only so an unavailable owner or client keeps
-  // its not-issued report, which QueueAutomaticCancel records unchanged.
-  const auto client = attempt->client.lock();
-  if (!client || state->epoch_owner.expired()) {
-    QueueAutomaticCancel(state, key, retained_handle, attempt);
-    return;
-  }
-  SendAutomaticCancel(state, key, retained_handle, attempt, client);
+  // OD-111: a ROS callback never takes a leaf lock. rclcpp holds its
+  // goal-request lock while it runs this callback, and a goal send holds the
+  // action leaf while it takes that lock, so the exact cancel claimed above
+  // is handed to the StopControl lane, which may wait for the leaf. A refused
+  // schedule records this goal's late cancel as not issued.
+  QueueAutomaticCancel(state, key, retained_handle, attempt);
 }
 void Ros2ControlExecutionBackend::ReceiveFeedback(
-    const std::shared_ptr<State> &state, const ExecutionGoalKey &key,
+    const std::shared_ptr<State> &state, const ControllerGoalId &key,
     const GoalHandle::SharedPtr &handle, const Action::Feedback &feedback) {
   const auto id = mechanism_id(handle->get_goal_id());
   GoalHandle::SharedPtr previous_handle;
-  std::lock_guard lock(state->mutex);
+  bool first_feedback = false;
+  long long first_receipt_ns = 0;
+  long long first_source_ns = 0;
+  double first_cursor_s = 0.0;
+  std::unique_lock lock(state->mutex);
   if (!state->ready())
     return;
   const auto found = state->goals.find(key);
@@ -1627,15 +1642,10 @@ void Ros2ControlExecutionBackend::ReceiveFeedback(
   sample.cursor_s =
       static_cast<double>(nanoseconds(feedback.desired.time_from_start)) / 1e9;
   if (state->config.motion_trace && !goal.observation.latest_feedback) {
-    const auto written = std::fprintf(
-        stderr,
-        "manyforge_goal_feedback_first goal=%.160s generation=%llu "
-        "receipt_ns=%lld source_ns=%lld cursor_s=%.17g\n",
-        key.controller_goal_id.value().c_str(),
-        static_cast<unsigned long long>(key.controller_goal_generation.value()),
-        static_cast<long long>(sample.local_receipt_stamp_ns),
-        static_cast<long long>(sample.source_stamp_ns), sample.cursor_s);
-    static_cast<void>(written);
+    first_feedback = true;
+    first_receipt_ns = static_cast<long long>(sample.local_receipt_stamp_ns);
+    first_source_ns = static_cast<long long>(sample.source_stamp_ns);
+    first_cursor_s = sample.cursor_s;
   }
   goal.observation.latest_feedback = std::move(sample);
   if (!goal.handle || goal.handle.get() != handle.get()) {
@@ -1647,9 +1657,21 @@ void Ros2ControlExecutionBackend::ReceiveFeedback(
   goal.observation.phase = ExecutionGoalPhase::kExecuting;
   if (state->config.motion_trace)
     state->config.motion_trace->Observe(goal.trace_token, goal.observation);
+  lock.unlock();
+  // OD-221: the first-feedback line is printed after the facts lock.
+  if (first_feedback) {
+    const auto written = std::fprintf(
+        stderr,
+        "manyforge_goal_feedback_first goal=%llu/%u/%u "
+        "receipt_ns=%lld source_ns=%lld cursor_s=%.17g\n",
+        static_cast<unsigned long long>(key.operation_id.value()),
+        static_cast<unsigned>(key.ordinal), static_cast<unsigned>(key.generation),
+        first_receipt_ns, first_source_ns, first_cursor_s);
+    static_cast<void>(written);
+  }
 }
 void Ros2ControlExecutionBackend::ReceiveResult(
-    const std::shared_ptr<State> &state, const ExecutionGoalKey &key,
+    const std::shared_ptr<State> &state, const ControllerGoalId &key,
     const GoalHandle::WrappedResult &result) {
   GoalHandle::SharedPtr previous_handle;
   std::lock_guard lock(state->mutex);
@@ -1752,7 +1774,7 @@ void Ros2ControlExecutionBackend::ReceiveState(
   state->sample = std::move(sample);
 }
 std::optional<ExecutionGoalObservationDTO>
-Ros2ControlExecutionBackend::ReadGoal(const ExecutionGoalKey &key) const {
+Ros2ControlExecutionBackend::ReadGoal(const ControllerGoalId &key) const {
   std::lock_guard lock(state_->mutex);
   const auto found = state_->goals.find(key);
   if (found == state_->goals.end())

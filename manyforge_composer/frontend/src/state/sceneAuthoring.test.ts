@@ -75,9 +75,7 @@ function facts(): SceneOwnerFacts {
       },
     } satisfies SceneRuntimeProjection,
     sourceGeneration: 1,
-    sourceOwnerEpoch: 'scene-owner-1',
     runtimeSourceGeneration: 1,
-    runtimeSourceOwnerEpoch: 'runtime-owner-1',
   };
 }
 
@@ -86,6 +84,7 @@ describe('scene authoring intents', () => {
     const coherent = facts();
     const retained = {
       productIdentity: 'bundle-1\u0000graph-1',
+      applicationStartId: '3f9a0000000000a1',
       facts: coherent,
     };
 

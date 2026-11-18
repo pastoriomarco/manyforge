@@ -11,6 +11,8 @@ export interface BusyOperation {
   label: string;
   /** What the conflicting commands' tooltips name, e.g. "Apply". */
   name: string;
+  /** The step its published command row is in (OD-214), e.g. "disabling components". */
+  step?: string;
 }
 
 const AUTHORING_OPERATIONS = {
@@ -39,7 +41,10 @@ export function authoringOperation(command: AuthoringCommand): BusyOperation {
 
 /** The tooltip of a command disabled by `operation`, or null when none runs. */
 export function busyReason(operation: BusyOperation | null): string | null {
-  return operation ? `${operation.name} is in progress.` : null;
+  if (!operation) return null;
+  return operation.step === undefined
+    ? `${operation.name} is in progress.`
+    : `${operation.name} is in progress: ${operation.step}.`;
 }
 
 /** A button's text: its busy label while one of its own commands runs. */

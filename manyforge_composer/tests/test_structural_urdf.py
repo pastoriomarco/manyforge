@@ -119,7 +119,7 @@ class _FakeHeadlessClient:
 
 
 def _state(asset: ViewerModelAsset | None = None) -> ComposerState:
-    return ComposerState(
+    return ComposerState(application_start_id=0x3F9A0000000000A1,
         headless_client=(
             _FakeHeadlessClient(asset or _urdf_asset())
             if asset is not None
@@ -218,7 +218,7 @@ def _patch_model_loading(
 
 
 def test_state_has_no_v0_deployment_or_filesystem_model_authority() -> None:
-    state = ComposerState(headless_client=_FakeHeadlessClient(_urdf_asset()))
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=_FakeHeadlessClient(_urdf_asset()))
 
     assert not hasattr(state, "deployment")
     assert not hasattr(state, "deployment_source_path")
@@ -369,7 +369,7 @@ def test_manifest_model_keys_asset_urls_and_rejects_stale_model(
     _patch_model_loading(monkeypatch, FakeUrdf)
     monkeypatch.setattr(routes_urdf, "_render_visual_glb", lambda *_args: b"glb")
     headless = _FakeHeadlessClient(_urdf_asset())
-    state = ComposerState(headless_client=headless)
+    state = ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=headless)
     client = TestClient(create_app(state))
 
     first = client.get("/api/scene/urdf/manifest")
@@ -439,7 +439,7 @@ def test_mesh_route_reads_the_exact_retained_logical_resource_once(
     )
     headless = _FakeHeadlessClient(_urdf_asset())
     headless.resources[logical_uri] = b"solid retained"
-    client = TestClient(create_app(ComposerState(headless_client=headless)))
+    client = TestClient(create_app(ComposerState(application_start_id=0x3F9A0000000000A1, headless_client=headless)))
     manifest = client.get("/api/scene/urdf/manifest").json()
     mesh_url = manifest["links"][0]["visuals"][0]["mesh_url"]
 
@@ -537,7 +537,7 @@ def test_manifest_fails_closed_for_incomplete_or_invalid_retained_tree(
 
 
 def test_manifest_is_absent_without_headless_viewer_source() -> None:
-    response = TestClient(create_app(ComposerState())).get(
+    response = TestClient(create_app(ComposerState(application_start_id=0x3F9A0000000000A1))).get(
         "/api/scene/urdf/manifest"
     )
     assert response.status_code == 404

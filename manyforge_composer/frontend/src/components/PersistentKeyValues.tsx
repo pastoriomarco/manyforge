@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 
-import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
+import type { ApplicationStartId } from '../api/applicationIdentity';
+import { displayRunId, type ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import { errorMessage } from '../state/structuralResource';
 import type {
   JsonValue,
@@ -55,9 +56,13 @@ function keyFrameScope(
 
 export interface PersistentKeyValuesViewProps {
   values: PersistentKeyValues;
+  /** The current application start, for the display form of run numbers. */
+  applicationStartId: ApplicationStartId | null;
   sceneResourceIds: readonly string[];
   frameProgram?: PersistentKeyFrameProgram;
   pending: boolean;
+  /** Why value edits wait: another Program command is running (OD-144). */
+  runnerBusyReason?: string | null;
   error: string | null;
   onSet: (key: string, value: JsonValue) => Promise<boolean>;
   onReset: (key: string) => Promise<boolean>;
@@ -72,15 +77,19 @@ export interface PersistentKeyValuesViewProps {
  */
 export function PersistentKeyValuesView({
   values,
+  applicationStartId,
   sceneResourceIds,
   frameProgram,
   pending,
+  runnerBusyReason = null,
   error,
   onSet,
   onReset,
   onClear,
   onRefresh,
 }: PersistentKeyValuesViewProps) {
+  const busy = runnerBusyReason !== null;
+  const busyTitle = runnerBusyReason ?? undefined;
   const [confirmation, setConfirmation] = useState<Confirmation | null>(null);
   const liveRun = values.programRunId;
   // Clear is one Reset per writable key; a read key's stored value stays.
@@ -101,27 +110,10 @@ export function PersistentKeyValuesView({
       </div>
       {liveRun !== null && (
         <p className="hint">
-          Run <code>{liveRun}</code> holds these values; edits go through it.
+          Run <code>{displayRunId(applicationStartId, liveRun)}</code> holds these values; edits go through it.
         </p>
       )}
       {error !== null && <p className="inline-message severity-error" role="alert">{error}</p>}
-      {values.storageFault !== null && (
-        <p className="inline-message severity-error" role="alert">
-          Stored values could not follow the last committed Apply
-          ({values.storageFault.code}); none are shown or restored until they can.
-          {' '}{values.storageFault.message}
-        </p>
-      )}
-      {values.applyObservationFault !== null && (
-        <p className="inline-message severity-error" role="alert">
-          A committed Apply of this Scenario was never observed by the Program runner
-          ({values.applyObservationFault.code}): stored values were kept and checked against
-          the current Program. Find and fix the missed notification.
-          {values.applyObservationFault.recordDigests.map((digest) => (
-            <code key={digest}> {digest}</code>
-          ))}
-        </p>
-      )}
       {values.keys.map((row) => {
         const editing = confirmation?.kind === 'edit' && confirmation.key === row.key
           ? confirmation : null;
@@ -160,7 +152,8 @@ export function PersistentKeyValuesView({
                 <div className="runtime-control-actions">
                   <button
                     type="button"
-                    disabled={pending || issue !== null}
+                    disabled={pending || busy || issue !== null}
+                    title={busyTitle}
                     onClick={() => {
                       const value = parseBlackboardValueDraft(row.type, editing.draft, sceneResourceIds);
                       void onSet(row.key, value).then(finish);
@@ -175,7 +168,12 @@ export function PersistentKeyValuesView({
               <>
                 <p>Forget the stored value? The key starts again from {initialLabel(row)}.</p>
                 <div className="runtime-control-actions">
-                  <button type="button" disabled={pending} onClick={() => { void onReset(row.key).then(finish); }}>
+                  <button
+                    type="button"
+                    disabled={pending || busy}
+                    title={busyTitle}
+                    onClick={() => { void onReset(row.key).then(finish); }}
+                  >
                     Confirm reset
                   </button>
                   <button type="button" onClick={() => setConfirmation(null)}>Cancel</button>
@@ -225,7 +223,13 @@ export function PersistentKeyValuesView({
             are untouched.
           </p>
           <div className="runtime-control-actions">
-            <button type="button" className="danger-button" disabled={pending} onClick={() => { void onClear().then(finish); }}>
+            <button
+              type="button"
+              className="danger-button"
+              disabled={pending || busy}
+              title={busyTitle}
+              onClick={() => { void onClear().then(finish); }}
+            >
               Clear stored values
             </button>
             <button type="button" onClick={() => setConfirmation(null)}>Cancel</button>
@@ -255,7 +259,9 @@ export function PersistentKeyValuesView({
                 {edit.reason !== null && <> · <code>{edit.reason}</code></>}
                 {edit.detail !== null && <> · {edit.detail}</>}
                 {edit.nodeInstanceId !== null && <> · node <code>{edit.nodeInstanceId}</code></>}
-                {edit.programRunId !== null && <> · run <code>{edit.programRunId}</code></>}
+                {edit.programRunId !== null && (
+                  <> · run <code>{displayRunId(edit.applicationStartId, edit.programRunId)}</code></>
+                )}
               </li>
             ))}
           </ol>
@@ -330,10 +336,14 @@ export interface PersistentKeyValuesSectionProps {
   projectPath: string;
   /** Re-read when the Applied Program or the live run changes. */
   appliedRevision: string;
-  runId: string | null;
+  runId: number | null;
+  /** The current application start, for the display form of run numbers. */
+  applicationStartId: ApplicationStartId | null;
   sceneResourceIds: readonly string[];
   frameProgram?: PersistentKeyFrameProgram;
   client: ProgramRuntimeController['persistentValues'];
+  /** Why value edits wait: another Program command is running (OD-144). */
+  runnerBusyReason?: string | null;
 }
 
 /** Reads and edits the stored values through the Program runner. */
@@ -341,9 +351,11 @@ export function PersistentKeyValuesSection({
   projectPath,
   appliedRevision,
   runId,
+  applicationStartId,
   sceneResourceIds,
   frameProgram,
   client,
+  runnerBusyReason = null,
 }: PersistentKeyValuesSectionProps) {
   const [values, setValues] = useState<PersistentKeyValues | null>(null);
   const [pending, setPending] = useState(false);
@@ -395,9 +407,11 @@ export function PersistentKeyValuesSection({
   return (
     <PersistentKeyValuesView
       values={values}
+      applicationStartId={applicationStartId}
       sceneResourceIds={sceneResourceIds}
       frameProgram={frameProgram}
       pending={pending}
+      runnerBusyReason={runnerBusyReason}
       error={error}
       onSet={(key, value) => perform(
         () => client.edit(values, key, value),

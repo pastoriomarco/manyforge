@@ -42,11 +42,10 @@ def test_managed_preview_computes_on_the_current_scene_after_a_scene_edit(
         stale_revision = scene["payload"]["access"]["active_projection"]["scene_revision"]
         committed = headless.commit_scene_transaction(
             {
+                "application_start_id": stack.application_start_id,
                 "request_context": {
-                    "request_id": "motion-preview-scene.add",
-                    "request_owner_epoch": scene["source_owner_epoch"],
+                    "request_key": "5ce1" + "0" * 27 + "1",
                     "source_label": "motion_preview_scene_process_test",
-                    "correlation_id": None,
                 },
                 "expected_projection_revision": scene["payload"]["access"][
                     "active_projection"
@@ -79,16 +78,15 @@ def test_managed_preview_computes_on_the_current_scene_after_a_scene_edit(
         positions = [float(value) for value in observed["positions_rad"]]
         positions[0] += 0.03
         intent = {
+            "application_start_id": stack.application_start_id,
             "request_context": {
-                "request_id": "motion-preview-scene.lagging",
-                "request_owner_epoch": identity["owner_epoch"],
+                "request_key": "5ce1" + "0" * 27 + "2",
                 "source_label": "composer_ui",
-                "correlation_id": None,
             },
             "program_id": manual_control["program_id"],
             "program_revision": manual_control["program_revision"],
             "program_binding_id": manual_control["program_binding_id"],
-            "program_run_id": manual_control["program_run_id"],
+            "program_run_id": None,
             "expected_graph_revision": identity["graph_revision"],
             "expected_retained_bundle_id": identity["retained_bundle_id"],
             "expected_scene_revision": None,

@@ -181,9 +181,9 @@ validate_plan_binding(const core::PlanRequestDTO &request,
                  "Planning request crosses the retained projection lineage",
                  "native_planner_projection_binding_mismatch");
   }
-  if (request.operation_id.empty() || request.participant_id.empty() ||
+  if (!request.operation_id.nonzero() || !request.participant_id.nonzero() ||
       request.program_id.empty() || request.program_revision.empty() ||
-      request.program_binding_id.empty() || request.program_run_id.empty() ||
+      request.program_binding_id.empty() ||
       request.move_id.empty() || request.component_type_id.empty() ||
       request.component_type_revision.empty() ||
       request.capability_id.empty() ||

@@ -1,43 +1,25 @@
-"""Demand-scoped, change-driven viewer projection of Manager pose rows."""
+"""Demand-scoped, change-driven viewer projection of Manager pose rows.
+
+The scene-runtime payload and the pose sessions come from the native mirror
+of the Manager's status stream (OD-216); the stream's follower wakes every
+viewer connection when either changes or the Manager starts or stops
+answering. Nothing is shown while the Manager does not answer.
+"""
 
 from __future__ import annotations
 
 import asyncio
-from contextlib import aclosing, suppress
+from contextlib import suppress
 import json
-from pathlib import Path
 import time
 from typing import Any, Callable
 
 from fastapi import WebSocket, WebSocketDisconnect
-from watchfiles import awatch
 
 from .control_state import _drained_owner_read
+from .manager_status_stream import ManagerStatusChanges
 
 _MAX_SAFE_INTEGER = 9_007_199_254_740_991
-
-
-def _read_scene(path: Path, cell_id: str, freshness_budget_ns: int) -> tuple[dict[str, Any], str] | None:
-    from manyforge_headless_py import read_viewer_scene_source
-
-    observed = read_viewer_scene_source(str(path), cell_id)
-    if observed is None:
-        return None
-    raw, epoch, modified_ns = observed
-    now = time.time_ns()
-    if modified_ns > now or now - modified_ns > freshness_budget_ns:
-        return None
-    return json.loads(raw), epoch
-
-
-def _read_sessions(path: Path, cell_id: str) -> tuple[dict[str, Any], str] | None:
-    from manyforge_headless_py import read_viewer_pose_sessions
-
-    observed = read_viewer_pose_sessions(str(path), cell_id)
-    if observed is None:
-        return None
-    raw, epoch = observed
-    return json.loads(raw), epoch
 
 
 def _nanoseconds(value: Any) -> int:
@@ -110,9 +92,9 @@ def _project(payload: dict[str, Any] | None, sessions: dict[str, Any] | None) ->
 
 async def serve_viewer_pose_stream(
     websocket: WebSocket,
-    path: Path | None,
+    read_sources: Callable[[], tuple[str, str] | None] | None,
+    changes: ManagerStatusChanges | None,
     cell_id: str | None,
-    freshness_budget_ns: int,
     read_owner: Callable[[], dict[str, Any]] | None,
 ) -> None:
     """One pending credit and one latest source value; no Manager RPC per frame."""
@@ -121,26 +103,17 @@ async def serve_viewer_pose_stream(
     ready = asyncio.Event()
     latest: tuple[dict[str, Any], dict[str, Any]] | None = None
     generation = 0
-    verified_owner: tuple[str, str] | None = None
+    verified_owner: str | None = None
 
     async def capture() -> tuple[dict[str, Any], dict[str, Any]] | None:
         nonlocal verified_owner
-        assert path is not None and cell_id is not None and read_owner is not None
-        observed = await _drained_owner_read(
-            _read_scene, path=path, cell_id=cell_id, freshness_budget_ns=freshness_budget_ns
-        )
+        assert read_sources is not None and cell_id is not None and read_owner is not None
+        observed = await _drained_owner_read(read_sources)
         if observed is None:
             verified_owner = None
             return None
-        payload, epoch = observed
-        session_observation = await _drained_owner_read(
-            _read_sessions, path=path.parent / "viewer-pose-sessions.json", cell_id=cell_id
-        )
-        if session_observation is None:
-            return None
-        sessions, session_epoch = session_observation
-        if session_epoch != epoch:
-            return None
+        payload = json.loads(observed[0])
+        sessions = json.loads(observed[1])
         state = payload.get("state")
         if not isinstance(state, dict) or state.get("state") != "open":
             verified_owner = None
@@ -151,11 +124,10 @@ async def serve_viewer_pose_stream(
         if sessions.get("runtime_identity") != identity:
             return None
         identity_key = json.dumps(identity, allow_nan=False, sort_keys=True, separators=(",", ":"))
-        candidate = (epoch, identity_key)
+        candidate = identity_key
         if candidate != verified_owner:
             owner = await _drained_owner_read(read_owner)
             if (owner.get("cell_id") != cell_id
-                    or owner.get("scene_runtime_owner_epoch") != epoch
                     or owner.get("initialization_state") != "open"
                     or owner.get("runtime_identity") != identity):
                 verified_owner = None
@@ -165,32 +137,25 @@ async def serve_viewer_pose_stream(
 
     async def watch() -> None:
         nonlocal latest, generation
-        if path is None:
+        if read_sources is None or changes is None:
             ready.set()
             changed.set()
             await asyncio.Future()
             return
-        async with aclosing(awatch(
-            path.parent, rust_timeout=50, yield_on_timeout=True
-        )) as watcher:
-            # The first timeout or change is an observable registration barrier.
-            # Events that race this capture remain queued in the same watcher.
-            initial = await anext(watcher)
-            initial_paths = {Path(name) for _kind, name in initial}
-            if path.parent in initial_paths or any(p in path.parent.parents for p in initial_paths):
-                raise OSError("viewer Scene source watch root disappeared")
-            latest = await capture()
-            generation += 1
-            ready.set()
-            changed.set()
-            async for changes in watcher:
-                paths = {Path(name) for _kind, name in changes}
-                if path.parent in paths or any(p in path.parent.parents for p in paths):
-                    raise OSError("viewer Scene source watch root disappeared")
-                if path in paths or path.parent / "viewer-pose-sessions.json" in paths:
-                    latest = await capture()
-                    generation += 1
-                    changed.set()
+        # Registered before the first capture: a change that races it wakes
+        # one more capture.
+        source_changed = asyncio.Event()
+        unregister = changes.register(asyncio.get_running_loop(), source_changed)
+        try:
+            while True:
+                source_changed.clear()
+                latest = await capture()
+                generation += 1
+                ready.set()
+                changed.set()
+                await source_changed.wait()
+        finally:
+            unregister()
 
     async def send() -> None:
         await ready.wait()

@@ -5,14 +5,11 @@ from typing import Any
 import pytest
 
 from manyforge_composer.backend.apply_orchestration import (
-    DEFAULT_LIFECYCLE_TIMEOUT_S,
-    HOST_COMPONENT_STOP_GRACE_S,
     ApplyRefused,
     ApplyStepFailed,
     ComponentImpact,
     Preview,
     candidate_preview,
-    lifecycle_timeouts,
     one_apply_at_a_time,
     preview_view,
     run_apply,
@@ -33,9 +30,17 @@ class _FakeCell:
         fail: dict[tuple[str, str], str] | None = None,
         latched: bool = False,
         owners: dict[str, str] | None = None,
-        silent: frozenset[str] = frozenset(),
+        stalled: frozenset[str] = frozenset(),
+        faults: dict[str, str] | None = None,
+        faults_after_apply: dict[str, str] | None = None,
     ) -> None:
-        self.silent = silent  # components whose action result never comes back
+        # Components whose action never finishes: their owner stalls, so
+        # they report the owner-stall fault with the action still running.
+        self.stalled = stalled
+        # component -> fault code before the Apply, and after it (a component
+        # the Apply touches loses its fault unless listed after).
+        self.faults = dict(faults or {})
+        self.faults_after_apply = faults_after_apply or {}
         self.owners = owners or {}  # member -> owner (ComponentState.owner_id)
         self.lifecycles = dict(lifecycles)
         self.impact = impact
@@ -46,6 +51,7 @@ class _FakeCell:
         self.latched = latched  # never consulted: Apply is allowed during a latch
         self.calls: list[tuple[str, ...]] = []
         self._results: dict[str, dict[str, Any]] = {}
+        self._running: dict[str, str] = {}
 
     def cycle_state(self) -> str:
         return self.cycle
@@ -57,9 +63,6 @@ class _FakeCell:
         self.calls.append(("reset",))
         self.cycle = "idle_after_reset"
 
-    def lifecycle_timeout_s(self, component_id: str) -> float:
-        return 0.0 if component_id in self.silent else DEFAULT_LIFECYCLE_TIMEOUT_S
-
     def preview(self) -> Preview:
         self.calls.append(("preview",))
         return Preview(components=tuple(self.impact))
@@ -70,14 +73,23 @@ class _FakeCell:
             row: dict[str, Any] = {"component_id": component_id, "lifecycle": lifecycle}
             if component_id in self.owners:
                 row["owner_id"] = self.owners[component_id]
+            if component_id in self.faults:
+                row["fault"] = {
+                    "code": self.faults[component_id], "message": "exited",
+                    "clearable": True, "operator_action": "recover", "since_ns": 1,
+                }
             if component_id in self._results:
                 row["last_action"] = self._results[component_id]
+            if component_id in self._running:
+                row["action"] = {"action": self._running[component_id], "started_at_ns": 1}
             rows.append(row)
         return rows
 
     def component_action(self, component_id: str, action: str) -> None:
         self.calls.append((action, component_id))
-        if component_id in self.silent:
+        if component_id in self.stalled:
+            self._running[component_id] = action
+            self.faults[component_id] = "component_owner_stalled"
             return
         code = self.fail.get((component_id, action))
         result: dict[str, Any] = {
@@ -94,6 +106,9 @@ class _FakeCell:
 
     def apply(self) -> None:
         self.calls.append(("apply",))
+        for component_id in self.after_apply:
+            self.faults.pop(component_id, None)
+        self.faults.update(self.faults_after_apply)
         for component_id, lifecycle in self.after_apply.items():
             if lifecycle is None:
                 self.lifecycles.pop(component_id, None)
@@ -146,7 +161,7 @@ def test_dead_or_faulted_components_are_removed_without_disable() -> None:
 
 
 # `running` here is a run whose motion is executing (not held).
-@pytest.mark.parametrize("cycle", ["running", "starting", "stopping", "resetting"])
+@pytest.mark.parametrize("cycle", ["running", "starting", "resetting"])
 def test_refused_while_a_run_is_in_progress_before_any_effect(cycle: str) -> None:
     cell = _FakeCell({"robot": "enabled"}, _impact(robot="replace"), cycle_state=cycle)
     with pytest.raises(ApplyRefused) as refused:
@@ -210,43 +225,40 @@ def test_a_held_run_is_reset_by_the_apply_itself() -> None:
     ]
 
 
-def test_a_step_without_a_result_ends_unknown_after_its_lifecycle_timeout() -> None:
+def test_a_step_ends_on_the_owner_stall_fault_with_its_code() -> None:
+    # OD-214 (T34): a step has no limit of its own; an action whose owner
+    # stalled never finishes, and the step ends unknown with the stall's code.
     cell = _FakeCell(
-        {"robot": "enabled"}, _impact(robot="replace"), silent=frozenset({"robot"})
+        {"robot": "enabled"}, _impact(robot="replace"), stalled=frozenset({"robot"})
     )
     result = run_apply(cell)
     assert cell.calls == [("preview",), ("disable", "robot")]  # never resent
     assert result["outcome"] == "failed"
-    assert result["error"]["code"] == "component_action_outcome_unknown"
+    assert result["error"] == {"code": "component_owner_stalled", "message": "exited"}
+    assert result["components"][0]["error"]["code"] == "component_owner_stalled"
 
 
-def test_a_prepare_after_launch_is_bounded_like_the_host(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The host's Prepare of a just-launched component first waits for its
-    # launch to settle within the launch bound (the lifecycle timeouts of
-    # every added, replaced or removed component), then its own timeout; a
-    # disable before the Apply keeps its own timeout.
-    import manyforge_composer.backend.apply_orchestration as orchestration
+def test_a_step_ends_when_the_component_read_fails() -> None:
+    # OD-214 (T34): the host lost after the dispatch ends the step with the
+    # read's own error, mapped like every port error.
+    class _LostHost(Exception):
+        pass
 
-    bounds: list[tuple[str, str, float]] = []
-    real_wait = orchestration.wait_for_action
+    cell = _FakeCell({"robot": "enabled"}, _impact(robot="replace"))
+    dispatch = cell.component_action
 
-    def record(read_states, component_id, action, previous, *, timeout_s):  # type: ignore[no-untyped-def]
-        bounds.append((action, component_id, timeout_s))
-        return real_wait(read_states, component_id, action, previous, timeout_s=timeout_s)
+    def dispatch_then_lose(component_id: str, action: str) -> None:
+        dispatch(component_id, action)
 
-    monkeypatch.setattr(orchestration, "wait_for_action", record)
-    cell = _FakeCell(
-        {"arm": "enabled", "camera": "enabled"},
-        _impact(arm="replace", camera="retain", gripper="add", old="remove"),
-        after_apply={"arm": "not_prepared", "gripper": "not_prepared"},
-    )
-    assert run_apply(cell)["outcome"] == "succeeded"
-    launch = 3 * DEFAULT_LIFECYCLE_TIMEOUT_S  # arm, gripper, old; not camera
-    assert bounds == [
-        ("disable", "arm", DEFAULT_LIFECYCLE_TIMEOUT_S),
-        ("prepare", "arm", launch + DEFAULT_LIFECYCLE_TIMEOUT_S),
-        ("prepare", "gripper", launch + DEFAULT_LIFECYCLE_TIMEOUT_S),
-    ]
+        def lost() -> list[dict[str, Any]]:
+            raise _LostHost("the host is gone")
+
+        cell.components = lost  # type: ignore[method-assign]
+
+    cell.component_action = dispatch_then_lose  # type: ignore[method-assign]
+    with pytest.raises(_LostHost):
+        run_apply(cell)  # an unmapped port error propagates
+    assert cell.calls == [("preview",), ("disable", "robot")]
 
 
 def test_one_apply_at_a_time() -> None:
@@ -257,17 +269,6 @@ def test_one_apply_at_a_time() -> None:
     assert refused.value.code == "apply_in_progress"
     with one_apply_at_a_time():  # released again
         pass
-
-
-def test_lifecycle_timeouts_read_the_authored_component_budget() -> None:
-    deployment = {
-        "components": [
-            {"component_id": "plc", "configuration": {"lifecycle_command_timeout_s": 30}},
-            {"component_id": "robot", "configuration": {}},
-        ]
-    }
-    assert lifecycle_timeouts(deployment) == {"plc": 30.0}
-    assert lifecycle_timeouts(None) == {}
 
 
 def test_allowed_during_a_cell_latch() -> None:
@@ -355,6 +356,72 @@ def test_one_failing_prepare_among_three_the_others_are_still_prepared() -> None
     ]
 
 
+# Decided (OD-211, 1): a retained component whose process had exited is
+# rebuilt by the host's Apply with a new process; it is prepared afterwards,
+# as a replaced one is. Its prior state decides nothing.
+def test_a_retained_component_whose_process_the_apply_started_again_is_prepared() -> None:
+    cell = _FakeCell(
+        {"robot": "enabled", "plc": "fault", "camera": "prepared"},
+        _impact(robot="replace", plc="retain", camera="retain"),
+        after_apply={"robot": "not_prepared", "plc": "not_prepared"},
+        faults={"plc": "fault_process_exited"},
+    )
+    result = run_apply(cell)
+    assert cell.calls == [
+        ("preview",), ("disable", "robot"), ("apply",),
+        ("prepare", "robot"), ("prepare", "plc"),
+    ]
+    assert result["outcome"] == "succeeded"
+    rows = {row["component_id"]: row for row in result["components"]}
+    assert rows["plc"] == {"component_id": "plc", "disposition": "retain", "lifecycle_after": "prepared"}
+    assert rows["camera"]["lifecycle_after"] == "prepared"
+
+
+def test_a_retained_component_with_a_live_process_is_not_touched() -> None:
+    cell = _FakeCell(
+        {"plc": "not_prepared", "sensor": "fault", "camera": "offline"},
+        _impact(plc="retain", sensor="retain", camera="retain", tool="add"),
+        after_apply={"tool": "not_prepared"},
+        # A kept component still shows its exit (e.g. one whose adapter runs
+        # its own process): the Apply didn't start it again.
+        faults={"sensor": "fault_process_exited", "camera": "fault_communication"},
+    )
+    run_apply(cell)
+    assert cell.calls == [("preview",), ("apply",), ("prepare", "tool")]
+
+
+def test_a_failed_prepare_of_a_restarted_component_is_reported_as_for_a_replaced_one() -> None:
+    cell = _FakeCell(
+        {"plc": "fault", "robot": "prepared"},
+        _impact(plc="retain", robot="replace"),
+        after_apply={"plc": "not_prepared", "robot": "not_prepared"},
+        faults={"plc": "fault_process_exited"},
+        fail={("plc", "prepare"): "simulated_plc_not_ready", ("robot", "prepare"): "fault_communication"},
+    )
+    result = run_apply(cell)
+    assert result["outcome"] == "failed"
+    assert result["error"]["code"] == "simulated_plc_not_ready"
+    rows = {row["component_id"]: row for row in result["components"]}
+    assert rows["plc"] == {
+        "component_id": "plc", "disposition": "retain", "lifecycle_after": "not_prepared",
+        "error": {"code": "simulated_plc_not_ready", "message": "prepare failed"},
+    }
+    assert rows["robot"]["error"] == {"code": "fault_communication", "message": "prepare failed"}
+
+
+def test_a_restarted_component_whose_exit_is_shown_again_is_not_prepared() -> None:
+    cell = _FakeCell(
+        {"plc": "fault"},
+        _impact(plc="retain"),
+        after_apply={"plc": "fault"},
+        faults={"plc": "fault_process_exited"},
+        faults_after_apply={"plc": "fault_process_exited"},
+    )
+    result = run_apply(cell)
+    assert cell.calls == [("preview",), ("apply",)]
+    assert result["outcome"] == "succeeded"
+
+
 def test_members_of_an_owner_whose_prepare_failed_are_not_attempted() -> None:
     cell = _FakeCell(
         {},
@@ -364,18 +431,18 @@ def test_members_of_an_owner_whose_prepare_failed_are_not_attempted() -> None:
             "io": "not_prepared", "camera": "not_prepared",
         },
         owners={"arm": "machine", "io": "machine"},
-        fail={("machine", "prepare"): "fault_estop"},
+        fail={("machine", "prepare"): "fault_communication"},
     )
     result = run_apply(cell)
     assert cell.calls == [
         ("preview",), ("apply",), ("prepare", "machine"), ("prepare", "camera"),
     ]
     rows = {row["component_id"]: row for row in result["components"]}
-    assert rows["machine"]["error"]["code"] == "fault_estop"
+    assert rows["machine"]["error"]["code"] == "fault_communication"
     assert rows["arm"]["error"]["code"] == "owner_not_prepared"
     assert rows["io"]["error"]["code"] == "owner_not_prepared"
     assert "error" not in rows["camera"]
-    assert result["error"]["code"] == "fault_estop"
+    assert result["error"]["code"] == "fault_communication"
 
 
 def test_a_manager_failure_is_mapped_by_the_route() -> None:
@@ -516,20 +583,32 @@ def test_a_second_apply_route_is_refused_before_any_effect() -> None:
     }
 
 
+_RESET_KEY = "c" * 32
+_SUCCEEDED = {"outcome": "succeeded", "code": None, "details": None, "finished_at_ns": "2"}
+
+
+def _reset_row(step: str | None = "admitting", end: dict[str, Any] | None = None) -> dict[str, Any]:
+    # The runner's row of the Reset (OD-214); its key is the one Headless formed.
+    return {"kind": "reset", "request_key": _RESET_KEY, "step": step,
+            "accepted_at_ns": "1", "end": end}
+
+
 class _CycleClient:
-    """A Runner that finishes a Reset after one `resetting` read."""
+    """A Runner that accepts the Reset, shows it in progress once, then ended."""
 
     def components(self) -> list[dict[str, Any]]:
         return []  # an empty installed cell
 
-    def __init__(self, after_reset: dict[str, Any], *, first: dict[str, Any] | None = None) -> None:
+    def __init__(self, end: dict[str, Any], *, first: dict[str, Any] | None = None) -> None:
         self.reads = [
             first or {"state": "terminal_awaiting_reset", "cycle_generation": 4,
-                      "program_run_id": "run.1", "program_runner_owner_epoch": "runner.1",
-                      "cycle_claim_generation": 2,
+                      "program_run_id": "run.1", "cycle_claim_generation": 2,
                       "terminal_or_settlement_reference": "sha256:" + "a" * 64},
-            {"state": "resetting", "cycle_generation": 4},
-            after_reset,
+            {"state": "resetting", "cycle_generation": 4,
+             "runner_commands": {"in_progress": _reset_row("stopping"), "ended": []}},
+            {"state": "idle_after_reset", "cycle_generation": 5,
+             "runner_commands": {"in_progress": None,
+                                 "ended": [_reset_row("releasing", end)]}},
         ]
         self.resets: list[dict[str, Any]] = []
 
@@ -538,59 +617,27 @@ class _CycleClient:
 
     def program_cycle_reset(self, body: dict[str, Any]) -> dict[str, Any]:
         self.resets.append(body)
-        return {}
+        return {"schema_version": "manyforge.program_command_reply.v1",
+                "command": _reset_row()}
 
     def authoring_admission(self) -> dict[str, Any]:
         return {"authoring_allowed": True, "admission_generation": 7}
 
 
-def _ports(client: Any, deployment: dict[str, Any] | None = None):
+def _ports(client: Any):
     from types import SimpleNamespace
 
     from manyforge_composer.backend.routes_deployment_draft import HeadlessApplyPorts
 
     ports = HeadlessApplyPorts(
-        SimpleNamespace(headless_client=client, applied_deployment_document=None),  # type: ignore[arg-type]
-        deployment,
+        SimpleNamespace(
+            headless_client=client,
+            applied_deployment_document=None,
+            application_start_id=0x3F9A0000000000A1,
+        ),  # type: ignore[arg-type]
     )
     ports._POLL_SECONDS = 0.0
     return ports
-
-
-def test_the_apply_bound_counts_every_component_like_the_manager() -> None:
-    # New after a Scenario: the empty candidate removes every Applied
-    # component; each one without an authored timeout takes the default (the
-    # Manager's `HostApplyTimeout`, the host's stop grace per component).
-    from types import SimpleNamespace
-
-    from manyforge_composer.backend.routes_deployment_draft import HeadlessApplyPorts
-
-    class _Installed:
-        def __init__(self, ids: list[str]) -> None:
-            self.ids = ids
-
-        def components(self) -> list[dict[str, Any]]:
-            return [{"component_id": component_id} for component_id in self.ids]
-
-    applied = {"components": [
-        {"component_id": "plc", "configuration": {"lifecycle_command_timeout_s": 4.0}},
-    ]}
-    ports = HeadlessApplyPorts(
-        SimpleNamespace(headless_client=_Installed(["arm", "gripper", "plc"]),  # type: ignore[arg-type]
-                        applied_deployment_document=applied),
-        {"components": []},
-    )
-    # Each component also gets the host's stop grace (a hung launch).
-    grace = HOST_COMPONENT_STOP_GRACE_S
-    assert ports._apply_bound_s() == 2 * (DEFAULT_LIFECYCLE_TIMEOUT_S + grace) + 4.0 + grace
-    # The Applied document not verified yet: the installed cell still counts.
-    unverified = HeadlessApplyPorts(
-        SimpleNamespace(headless_client=_Installed(["arm", "gripper"]),  # type: ignore[arg-type]
-                        applied_deployment_document=None),
-        {"components": []},
-    )
-    assert unverified._apply_bound_s() == 2 * (DEFAULT_LIFECYCLE_TIMEOUT_S + grace)
-    assert _ports(_Installed([]))._apply_bound_s() == DEFAULT_LIFECYCLE_TIMEOUT_S
 
 
 def test_the_apply_leaves_the_admission_wait_to_the_preparation() -> None:
@@ -605,42 +652,25 @@ def test_the_apply_leaves_the_admission_wait_to_the_preparation() -> None:
     assert cell.calls[0] == ("preview",)
 
 
-def test_a_lone_hung_component_fits_the_apply_bound() -> None:
-    # New after a one-arm cell whose arm node hangs: the host waits its
-    # stop grace, then kills and reaps the group; the wait must cover it.
-    from types import SimpleNamespace
+def test_the_default_lifecycle_timeout_mirrors_the_generated_default() -> None:
+    # The Manager's component budgets use `kDefaultLifecycleBudgetNs`,
+    # generated from robot_defaults.tsv like this Composer table.
+    from manyforge_composer.backend.robot_defaults import COMPONENT_DEFAULTS
+    from manyforge_headless_api.component_model import DEFAULT_LIFECYCLE_TIMEOUT_S
 
-    from manyforge_composer.backend.routes_deployment_draft import HeadlessApplyPorts
-
-    class _Installed:
-        def components(self) -> list[dict[str, Any]]:
-            return [{"component_id": "arm"}]
-
-    ports = HeadlessApplyPorts(
-        SimpleNamespace(headless_client=_Installed(), applied_deployment_document=None),  # type: ignore[arg-type]
-        {"components": []},
-    )
-    assert ports._apply_bound_s() > HOST_COMPONENT_STOP_GRACE_S + 1.0
-
-
-def test_the_stop_grace_mirrors_the_hosts_constant() -> None:
-    # One source: manyforge::core::kControllerLaunchStopGrace.
-    import re
-    from pathlib import Path
-
-    header = Path(__file__).resolve().parents[2] / (
-        "manyforge_core/include/manyforge_core/types/controller_launch_group_drain.hpp")
-    match = re.search(r"kControllerLaunchStopGrace\{([0-9']+)\}", header.read_text())
-    assert match is not None
-    assert int(match.group(1).replace("'", "")) / 1000.0 == HOST_COMPONENT_STOP_GRACE_S
+    assert DEFAULT_LIFECYCLE_TIMEOUT_S == COMPONENT_DEFAULTS["lifecycle_command_timeout_s"]
 
 
 def test_the_server_resets_a_finished_run_like_the_program_tab() -> None:
-    client = _CycleClient({"state": "idle_after_reset", "cycle_generation": 5})
+    client = _CycleClient(_SUCCEEDED)
     _ports(client).reset_cycle()
     [reset] = client.resets
     assert reset["program_run_id"] == "run.1"
-    assert reset["expected_owner_epoch"] == "runner.1"
+    # A server-originated Reset: Composer's own `A` and a fresh key, no
+    # runner-epoch fence.
+    assert reset["application_start_id"] == "3f9a0000000000a1"
+    assert len(reset["request_key"]) == 32
+    assert "expected_owner_epoch" not in reset and "request_id" not in reset
     assert reset["expected_cycle_generation"] == 4
     assert reset["expected_claim_generation"] == 2
     assert reset["terminal_reference"] == "sha256:" + "a" * 64
@@ -649,13 +679,14 @@ def test_the_server_resets_a_finished_run_like_the_program_tab() -> None:
 
 def test_the_server_resets_a_held_run_like_the_program_tab() -> None:
     client = _CycleClient(
-        {"state": "idle_after_reset", "cycle_generation": 5},
+        _SUCCEEDED,
         first={"state": "running", "cycle_generation": 4, "program_run_id": "run.1",
-               "program_runner_owner_epoch": "runner.1", "cycle_claim_generation": 2,
+               "cycle_claim_generation": 2,
                "terminal_or_settlement_reference": None},
     )
-    # The Reset may still read `running` before `resetting`.
-    client.reads.insert(1, {"state": "running", "cycle_generation": 4})
+    # The cycle may still read `running` while the Reset row is admitted.
+    client.reads.insert(1, {"state": "running", "cycle_generation": 4,
+                            "runner_commands": {"in_progress": _reset_row(), "ended": []}})
     _ports(client).reset_cycle()
     [reset] = client.resets
     assert reset["program_run_id"] == "run.1"
@@ -663,14 +694,57 @@ def test_the_server_resets_a_held_run_like_the_program_tab() -> None:
     assert reset["terminal_reference"] is None
 
 
-def test_a_failed_reset_ends_the_apply_with_its_code() -> None:
-    client = _CycleClient({
-        "state": "recovery_required", "cycle_generation": 4,
-        "failure": {"code": "program_cycle_reset_failed", "message": "Reset failed"},
-    })
+@pytest.mark.parametrize("outcome,code", [
+    ("failed", "program_cycle_recovery_required"),
+    ("refused", "execution_control_ingress_busy"),
+    ("unknown", "program_cycle_reconciliation_required"),
+])
+def test_a_reset_that_did_not_succeed_ends_the_apply_with_its_rows_code(
+    outcome: str, code: str
+) -> None:
+    client = _CycleClient({"outcome": outcome, "code": code, "details": None,
+                           "finished_at_ns": "2"})
     with pytest.raises(ApplyStepFailed) as failed:
         _ports(client).reset_cycle()
-    assert failed.value.code == "program_cycle_reset_failed"
+    assert failed.value.code == code
+    assert client.reads == []
+
+
+def test_a_reset_that_ended_in_its_reply_reads_no_status() -> None:
+    # An idle Reset without effects ends before the reply is built.
+    class _EndedAtOnce(_CycleClient):
+        def program_cycle_reset(self, body: dict[str, Any]) -> dict[str, Any]:
+            self.resets.append(body)
+            return {"schema_version": "manyforge.program_command_reply.v1",
+                    "command": _reset_row("admitting", _SUCCEEDED)}
+
+    client = _EndedAtOnce(_SUCCEEDED)
+    _ports(client).reset_cycle()
+    assert len(client.reads) == 2  # only the cycle read before the Reset
+
+
+def test_the_reset_follows_the_row_the_headless_key_names() -> None:
+    # Another command's row (another key) is not this Reset's end.
+    client = _CycleClient(_SUCCEEDED)
+    client.reads.insert(1, {"state": "resetting", "cycle_generation": 4,
+                            "runner_commands": {"in_progress": _reset_row("stopping"),
+                                                "ended": [{**_reset_row("releasing", {
+                                                    "outcome": "failed",
+                                                    "code": "program_cycle_recovery_required",
+                                                    "details": None, "finished_at_ns": "1"}),
+                                                    "request_key": "d" * 32}]}})
+    _ports(client).reset_cycle()
+    assert client.reads == []
+
+
+def test_an_invalid_reset_reply_fails_the_step() -> None:
+    class _OldReply(_CycleClient):
+        def program_cycle_reset(self, body: dict[str, Any]) -> dict[str, Any]:
+            return {"schema_version": "manyforge.program_cycle_reset_result.v1"}
+
+    with pytest.raises(ApplyStepFailed) as failed:
+        _ports(_OldReply(_SUCCEEDED)).reset_cycle()
+    assert failed.value.code == "program_runner_response_invalid"
 
 
 def test_the_reset_returns_once_the_cycle_is_idle() -> None:
@@ -680,42 +754,73 @@ def test_the_reset_returns_once_the_cycle_is_idle() -> None:
         def authoring_admission(self) -> dict[str, Any]:
             raise AssertionError("the Reset reads no admission")
 
-    client = _NoAdmissionRead({"state": "idle_after_reset", "cycle_generation": 5})
+    client = _NoAdmissionRead(_SUCCEEDED)
     _ports(client).reset_cycle()
     assert client.reads == []
 
 
-def test_the_reset_wait_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    import manyforge_composer.backend.routes_deployment_draft as routes
-
-    class _NeverResets(_CycleClient):
-        def program_cycle_status(self) -> dict[str, Any]:
-            return dict(self.reads[0])  # the Reset is accepted, the cycle never moves
-
-    monkeypatch.setattr(routes, "DEFAULT_LIFECYCLE_TIMEOUT_S", 0.0)
-    client = _NeverResets({})
-    with pytest.raises(ApplyStepFailed) as failed:
-        _ports(client).reset_cycle()
-    assert failed.value.code == "program_cycle_reset_failed"
+def test_the_reset_wait_has_no_bound() -> None:
+    # OD-214 (T16): the Reset row is followed to its true end, however long
+    # its phases take; no Apply bound decides it.
+    client = _CycleClient(_SUCCEEDED)
+    for _ in range(50):
+        client.reads.insert(1, {"state": "resetting", "cycle_generation": 4,
+                                "runner_commands": {"in_progress": _reset_row("settling"),
+                                                    "ended": []}})
+    _ports(client).reset_cycle()
+    assert client.reads == []
     assert len(client.resets) == 1
 
 
-def test_the_manager_apply_wait_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_manager_apply_wait_has_no_bound() -> None:
+    # OD-214 (T32): a pending Manager Apply is followed to its terminal
+    # status, however long it takes; no Apply bound decides it.
     import manyforge_composer.backend.routes_deployment_draft as routes
 
-    class _Pending:
+    class _SlowManager:
+        reads = 0
+
         def components(self) -> list[dict[str, Any]]:
-            return []  # an empty installed cell
+            raise AssertionError("the wait reads no Apply bound")
 
-        def manager_apply_status(self, _apply_id: str, _generation: int) -> dict[str, Any]:
-            return {"ok": True, "state": "running"}
+        def manager_apply_status(
+            self, _apply_id: int, _generation: int, *, application_start_id: str
+        ) -> dict[str, Any]:
+            self.reads += 1
+            if self.reads < 50:
+                return {"ok": True, "state": "pending"}
+            return {"ok": True, "state": "succeeded"}
 
-    monkeypatch.setattr(routes, "DEFAULT_LIFECYCLE_TIMEOUT_S", 0.0)
-    with pytest.raises(ApplyStepFailed) as unknown:
-        _ports(_Pending()).wait_for_manager_apply(
-            {"status": "accepted", "apply_id": "a", "apply_generation": 1}
+    assert not hasattr(routes.HeadlessApplyPorts, "MANAGER_APPLY_WAIT_MARGIN_S")
+    manager = _SlowManager()
+    _ports(manager).wait_for_manager_apply(
+        {"status": "accepted", "apply_id": 1, "apply_generation": 1}
+    )
+    assert manager.reads == 50
+
+
+def test_a_failed_manager_apply_status_read_ends_the_wait() -> None:
+    # Peer loss: the status read's own error ends the wait, typed.
+    from manyforge_headless_api.client import HeadlessClientError
+
+    class _Lost:
+        reads = 0
+
+        def manager_apply_status(
+            self, _apply_id: int, _generation: int, *, application_start_id: str
+        ) -> dict[str, Any]:
+            self.reads += 1
+            if self.reads < 3:
+                return {"ok": True, "state": "pending"}
+            raise HeadlessClientError("manager_unavailable", "Manager is not reachable")
+
+    lost = _Lost()
+    with pytest.raises(HeadlessClientError) as error:
+        _ports(lost).wait_for_manager_apply(
+            {"status": "accepted", "apply_id": 1, "apply_generation": 1}
         )
-    assert unknown.value.code == "manager_apply_unknown_effect"
+    assert error.value.code == "manager_unavailable"
+    assert lost.reads == 3
 
 
 def test_a_terminal_manager_apply_reports_its_retained_failure() -> None:
@@ -723,15 +828,42 @@ def test_a_terminal_manager_apply_reports_its_retained_failure() -> None:
         def components(self) -> list[dict[str, Any]]:
             return []  # an empty installed cell
 
-        def manager_apply_status(self, _apply_id: str, _generation: int) -> dict[str, Any]:
+        def manager_apply_status(
+            self, _apply_id: int, _generation: int, *, application_start_id: str
+        ) -> dict[str, Any]:
             return {"ok": True, "state": "unknown_effect", "error": None,
                     "failure": {"code": "manager_apply_fence_failed", "message": "fence"}}
 
     with pytest.raises(ApplyStepFailed) as failed:
         _ports(_Failed()).wait_for_manager_apply(
-            {"status": "accepted", "apply_id": "a", "apply_generation": 1}
+            {"status": "accepted", "apply_id": 1, "apply_generation": 1}
         )
     assert failed.value.code == "manager_apply_fence_failed"
+
+
+@pytest.mark.parametrize("code", ["apply_progression_failed"])
+def test_a_manager_apply_ended_by_the_manager_is_an_unknown_effect_failure(code: str) -> None:
+    # OD-188 P1: the existing terminal state, the Manager's own typed code
+    # (the phase code and, without a deeper cause, the cause code too).
+    class _Ended:
+        def components(self) -> list[dict[str, Any]]:
+            return []
+
+        def manager_apply_status(
+            self, _apply_id: int, _generation: int, *, application_start_id: str
+        ) -> dict[str, Any]:
+            return {"ok": True, "state": "unknown_effect", "error": None,
+                    "failure": {"code": code, "cause_code": code, "cause_details": {},
+                                "effect_disposition": "unknown",
+                                "effect_boundary": "unknown",
+                                "message": "the Apply ended"}}
+
+    with pytest.raises(ApplyStepFailed) as failed:
+        _ports(_Ended()).wait_for_manager_apply(
+            {"status": "accepted", "apply_id": 1, "apply_generation": 1}
+        )
+    assert failed.value.code == code
+    assert failed.value.before_effect is False
 
 
 def test_a_host_refusal_reports_its_typed_cause_on_the_component() -> None:
@@ -754,12 +886,14 @@ def test_a_host_refusal_reports_its_typed_cause_on_the_component() -> None:
         def components(self) -> list[dict[str, Any]]:
             return []  # an empty installed cell
 
-        def manager_apply_status(self, _apply_id: str, _generation: int) -> dict[str, Any]:
+        def manager_apply_status(
+            self, _apply_id: int, _generation: int, *, application_start_id: str
+        ) -> dict[str, Any]:
             return {"ok": True, "state": "failed", "error": None, "failure": failure}
 
     with pytest.raises(ApplyStepFailed) as failed:
         _ports(_Refused()).wait_for_manager_apply(
-            {"status": "accepted", "apply_id": "a", "apply_generation": 1}
+            {"status": "accepted", "apply_id": 1, "apply_generation": 1}
         )
     assert failed.value.code == "site_settings_unavailable"
     assert failed.value.component_id == "lite6_robot"
@@ -786,7 +920,9 @@ def test_a_typed_manager_cause_wins_over_its_phase_code() -> None:
         def components(self) -> list[dict[str, Any]]:
             return []  # an empty installed cell
 
-        def manager_apply_status(self, _apply_id: str, _generation: int) -> dict[str, Any]:
+        def manager_apply_status(
+            self, _apply_id: int, _generation: int, *, application_start_id: str
+        ) -> dict[str, Any]:
             return {"ok": True, "state": "failed", "error": None, "failure": {
                 "code": "configuration_preservation_failed",
                 "cause_code": "apply_requires_inactive_component",
@@ -794,18 +930,18 @@ def test_a_typed_manager_cause_wins_over_its_phase_code() -> None:
 
     with pytest.raises(ApplyStepFailed) as failed:
         _ports(_Refused()).wait_for_manager_apply(
-            {"status": "accepted", "apply_id": "a", "apply_generation": 1}
+            {"status": "accepted", "apply_id": 1, "apply_generation": 1}
         )
     assert failed.value.code == "apply_requires_inactive_component"
     assert failed.value.component_id is None
 
 
-def test_each_step_uses_the_component_lifecycle_timeout() -> None:
-    ports = _ports(None, {"components": [
-        {"component_id": "plc", "configuration": {"lifecycle_command_timeout_s": 30}},
-    ]})
-    assert ports.lifecycle_timeout_s("plc") == 30.0
-    assert ports.lifecycle_timeout_s("robot") == DEFAULT_LIFECYCLE_TIMEOUT_S
+def test_the_apply_ports_carry_no_step_limit() -> None:
+    # OD-214 (T34): each step waits for its result, not a lifecycle timeout.
+    from manyforge_composer.backend.apply_orchestration import ApplyPorts
+
+    assert not hasattr(_ports(None), "lifecycle_timeout_s")
+    assert not hasattr(ApplyPorts, "lifecycle_timeout_s")
 
 
 class _SceneClearClient:
@@ -822,7 +958,7 @@ class _SceneClearClient:
 
 
 _ACCEPTED_EMPTY = {
-    "status": "accepted", "apply_id": "a", "apply_generation": 2,
+    "status": "accepted", "apply_id": 1, "apply_generation": 2,
     "manager_apply": {"ok": True, "state": "pending", "replay_status": "accepted_new"},
 }
 
@@ -832,14 +968,27 @@ def test_an_empty_cell_apply_returns_once_its_scene_clear_ended() -> None:
     # commit, holding the authoring admission; the Apply waits for this
     # Apply's clear to end, so the next Load's preparation is admitted.
     client = _SceneClearClient(
-        {"apply_id": "a", "apply_generation": 1, "state": "succeeded"},  # earlier Apply
+        {"apply_id": 1, "apply_generation": 1, "state": "succeeded"},  # earlier Apply
         None,
-        {"apply_id": "a", "apply_generation": 2, "state": "pending"},
-        {"apply_id": "a", "apply_generation": 2, "state": "partial"},
-        {"apply_id": "a", "apply_generation": 2, "state": "succeeded"},
+        {"apply_id": 1, "apply_generation": 2, "state": "pending"},
+        {"apply_id": 1, "apply_generation": 2, "state": "partial"},
+        {"apply_id": 1, "apply_generation": 2, "state": "succeeded"},
     )
     _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY)
     assert len(client.reads) == 1  # returned at the first ended clear
+
+
+def test_the_scene_clear_wait_ends_when_a_later_apply_replaced_its_status() -> None:
+    # OD-239: `scene_clear` holds one status; the Manager numbers Applies in
+    # increasing order, so a status naming a later Apply means this one's
+    # clear has ended (its own end may have been replaced unread).
+    client = _SceneClearClient(
+        {"apply_id": 1, "apply_generation": 2, "state": "pending"},
+        {"apply_id": 2, "apply_generation": 1, "state": "pending"},
+        {"apply_id": 2, "apply_generation": 1, "state": "succeeded"},
+    )
+    _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY)
+    assert len(client.reads) == 1
 
 
 @pytest.mark.parametrize("state,details,logged", [
@@ -851,16 +1000,16 @@ def test_scene_clear_cause_warning_does_not_change_wait(
     state: str, details: dict[str, Any], logged: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    clear = {"apply_id": "a", "apply_generation": 2, "state": state,
+    clear = {"apply_id": 1, "apply_generation": 2, "state": state,
              "reason": {"details": details}}
-    client = _SceneClearClient(clear, {"apply_id": "a", "apply_generation": 2, "state": "pending"})
+    client = _SceneClearClient(clear, {"apply_id": 1, "apply_generation": 2, "state": "pending"})
     assert _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY) is None
     assert len(client.reads) == 1
     messages = [record.getMessage() for record in caplog.records
                 if record.name == "manyforge_composer.backend.routes_deployment_draft"]
     if logged:
         assert messages == [
-            "Scene clear after Apply a/2 outcome unknown: "
+            "Scene clear after Apply 1/2 outcome unknown: "
             "cause_code=manager_command_unavailable cause_details={'reason': 'timeout'}"
         ]
     else:
@@ -876,18 +1025,29 @@ def test_no_scene_clear_wait_without_a_newly_accepted_apply(result: dict[str, An
     _ports(client).wait_for_scene_clear(result)  # no read at all
 
 
-def test_the_scene_clear_wait_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
-    import manyforge_composer.backend.routes_deployment_draft as routes
+def test_the_scene_clear_wait_has_no_time_limit() -> None:
+    # OD-239: Headless publishes an end for every accepted empty Apply; the
+    # wait follows it however long the clear takes.
+    client = _SceneClearClient(
+        *([{"apply_id": 1, "apply_generation": 2, "state": "pending"}] * 500),
+        {"apply_id": 1, "apply_generation": 2, "state": "failed"},
+        None,
+    )
+    _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY)
+    assert len(client.reads) == 1
 
-    class _Pending:
-        def components(self) -> list[dict[str, Any]]:
-            return []  # an empty installed cell
 
-        def program_cycle_status(self) -> dict[str, Any]:
-            return {"scene_clear": {"apply_id": "a", "apply_generation": 2, "state": "pending"}}
-
-    monkeypatch.setattr(routes, "DEFAULT_LIFECYCLE_TIMEOUT_S", 0.0)
-    _ports(_Pending()).wait_for_scene_clear(_ACCEPTED_EMPTY)  # returns as it is
+def test_the_scene_clear_wait_ends_when_a_direct_clear_replaced_its_status() -> None:
+    # A direct clear's status names no Apply: this Apply's status was
+    # replaced (or its clear has not begun; accepted, OD-239).
+    client = _SceneClearClient(
+        None,
+        {"apply_id": 1, "apply_generation": 2, "state": "pending"},
+        {"request_key": "c3" * 16, "state": "succeeded", "remaining": [], "reason": None},
+        {"apply_id": 1, "apply_generation": 2, "state": "succeeded"},
+    )
+    _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY)
+    assert len(client.reads) == 1
 
 
 # History of Apply terminals (Headless `apply_finished`) ------------------------
@@ -960,3 +1120,251 @@ def test_a_lost_history_record_never_changes_the_apply_result() -> None:
         "outcome": "succeeded", "components": []}
     assert recorded_apply(None, "scenario_new", lambda: {"outcome": "succeeded"}) == {
         "outcome": "succeeded"}
+
+
+# Apply-level rows (OD-214): answered at acceptance, the end in the row ------
+
+
+_KEY = "a" * 32
+
+
+def _commands():
+    from manyforge_composer.backend.apply_orchestration import ApplyCommands
+
+    return ApplyCommands()
+
+
+def test_an_apply_answers_at_acceptance_and_its_row_carries_the_steps() -> None:
+    import threading
+
+    from manyforge_composer.backend.apply_orchestration import APPLY_COMMAND_REPLY_SCHEMA
+
+    commands = _commands()
+    release = threading.Event()
+    cell = _FakeCell({"arm": "enabled"}, _impact(arm="replace"),
+                     after_apply={"arm": "unprepared"})
+    original_apply = cell.apply
+
+    def held_apply() -> None:
+        release.wait()  # the Manager Apply is still running when the reply comes
+        original_apply()
+
+    cell.apply = held_apply  # type: ignore[method-assign]
+    history = _HistoryClient()
+    results: list[dict[str, Any]] = []
+
+    def run() -> dict[str, Any]:
+        results.append(run_apply(cell))
+        return results[-1]
+
+    reply = commands.run(history, "deployment_apply", _KEY, run)
+    assert reply["schema_version"] == APPLY_COMMAND_REPLY_SCHEMA
+    row = reply["command"]
+    assert (row["kind"], row["request_key"], row["end"]) == ("deployment_apply", _KEY, None)
+    assert row["accepted_at_ns"] is not None
+    assert commands.snapshot()["in_progress"]["request_key"] == _KEY
+    assert history.recorded == []  # History is written at the end, once
+    release.set()
+    ended = commands.ended_row(_KEY)
+    assert ended["end"]["outcome"] == "succeeded"
+    # A succeeded row keeps its component rows (the panel's success text).
+    assert ended["end"]["code"] is None
+    assert ended["end"]["details"] == {"components": results[0]["components"]}
+    assert results[0]["components"]
+    assert ended["step"] == "preparing_components"
+    assert ended["step_source"] == {"status": "component_action", "component_id": "arm"}
+    assert commands.snapshot() == {"in_progress": None, "ended": [ended]}
+    assert [r["outcome"] for r in history.recorded] == ["succeeded"]
+
+
+def test_the_same_key_again_returns_its_row_and_runs_nothing() -> None:
+    commands = _commands()
+    runs: list[int] = []
+
+    def run() -> dict[str, Any]:
+        runs.append(1)
+        return {"outcome": "succeeded", "components": []}
+
+    commands.run(_HistoryClient(), "scenario_new", _KEY, run)
+    commands.ended_row(_KEY)
+    replay = commands.run(_HistoryClient(), "scenario_new", _KEY, run)
+    assert runs == [1]
+    assert replay["command"]["end"]["outcome"] == "succeeded"
+
+
+def test_a_refusal_at_once_keeps_its_reply_and_is_a_refused_row_replayed_as_is() -> None:
+    from fastapi import HTTPException
+
+    commands = _commands()
+    history = _HistoryClient()
+    refusal = HTTPException(409, {"code": "scenario_discard_confirmation_required",
+                                  "message": "unsaved"})
+
+    def run() -> dict[str, Any]:
+        raise refusal
+
+    with pytest.raises(HTTPException) as first:
+        commands.run(history, "scenario_load", _KEY, run)
+    assert first.value is refusal
+    [row] = commands.snapshot()["ended"]
+    assert (row["accepted_at_ns"], row["step"]) == (None, None)
+    assert (row["end"]["outcome"], row["end"]["code"]) == (
+        "refused", "scenario_discard_confirmation_required")
+    with pytest.raises(HTTPException) as again:
+        commands.run(history, "scenario_load", _KEY, lambda: pytest.fail("ran again"))
+    assert again.value is refusal
+    assert [r["outcome"] for r in history.recorded] == ["refused"]
+
+
+def test_a_run_in_progress_refuses_a_second_apply_at_once() -> None:
+    from manyforge_composer.backend.apply_orchestration import ApplyRefused as Refused
+
+    commands = _commands()
+    with one_apply_at_a_time():
+        def run() -> dict[str, Any]:
+            with one_apply_at_a_time():
+                return {"outcome": "succeeded", "components": []}
+
+        with pytest.raises(Refused):
+            commands.run(_HistoryClient(), "deployment_apply", _KEY, run)
+    assert commands.snapshot()["ended"][0]["end"]["code"] == "apply_in_progress"
+
+
+@pytest.mark.parametrize("code,outcome", [
+    ("component_launch_not_settled", "failed"),
+    ("component_action_interrupted_by_stop", "interrupted"),
+    ("manager_apply_unknown_effect", "unknown"),
+])
+def test_a_failed_apply_result_ends_its_row(code: str, outcome: str) -> None:
+    commands = _commands()
+    components = [{"component_id": "arm", "disposition": "add",
+                   "error": {"code": code, "message": "m"}}]
+    commands.run(_HistoryClient(), "deployment_apply", _KEY, lambda: {
+        "outcome": "failed", "components": components,
+        "error": {"code": code, "message": "m"}})
+    end = commands.ended_row(_KEY)["end"]
+    assert (end["outcome"], end["code"]) == (outcome, code)
+    assert end["details"] == {"components": components}
+
+
+def test_a_manager_apply_ended_unknown_effect_ends_the_row_unknown() -> None:
+    from manyforge_composer.backend.apply_orchestration import apply_effect_unknown
+
+    commands = _commands()
+
+    def run() -> dict[str, Any]:
+        cell = _FakeCell({"arm": "enabled"}, _impact(arm="retain"))
+        run_apply(cell)  # accepts the command
+        apply_effect_unknown()
+        return {"outcome": "failed", "components": [],
+                "error": {"code": "host_apply_failed", "message": "m"}}
+
+    commands.run(_HistoryClient(), "scenario_new", _KEY, run)
+    end = commands.ended_row(_KEY)["end"]
+    assert (end["outcome"], end["code"]) == ("unknown", "host_apply_failed")
+
+
+def test_a_failure_after_acceptance_ends_the_row_and_is_not_raised_to_the_caller() -> None:
+    from fastapi import HTTPException
+
+    commands = _commands()
+
+    def run() -> dict[str, Any]:
+        run_apply(_FakeCell({"arm": "enabled"}, _impact(arm="retain")))
+        raise HTTPException(503, {"code": "execution_owner_unavailable", "message": "gone",
+                                  "details": {"owner": "host"}})
+
+    reply = commands.run(_HistoryClient(), "deployment_revert", _KEY, run)
+    assert reply["command"]["accepted_at_ns"] is not None
+    end = commands.ended_row(_KEY)["end"]
+    assert (end["outcome"], end["code"], end["details"]) == (
+        "failed", "execution_owner_unavailable", {"owner": "host"})
+
+
+def test_a_load_shows_emptying_until_its_new_ended() -> None:
+    from manyforge_composer.backend.apply_orchestration import (
+        apply_command,
+        apply_steps_hidden,
+    )
+
+    commands = _commands()
+    seen: list[Any] = []
+
+    def run() -> dict[str, Any]:
+        apply_command().accept_step = "emptying"  # type: ignore[union-attr]
+        with apply_steps_hidden():
+            run_apply(_FakeCell({"arm": "enabled"}, _impact(arm="remove"),
+                                after_apply={"arm": None}))
+            seen.append(commands.snapshot()["in_progress"]["step"])
+        run_apply(_FakeCell({}, _impact(arm="add"), after_apply={"arm": "unprepared"}))
+        return {"outcome": "succeeded", "components": []}
+
+    commands.run(_HistoryClient(), "scenario_load", _KEY, run)
+    ended = commands.ended_row(_KEY)
+    assert seen == ["emptying"]
+    assert ended["step"] == "preparing_components"
+
+
+def test_an_untyped_failure_after_acceptance_ends_the_row_unknown() -> None:
+    commands = _commands()
+
+    def run() -> dict[str, Any]:
+        run_apply(_FakeCell({"arm": "enabled"}, _impact(arm="retain")))
+        raise KeyError("lost")
+
+    reply = commands.run(_HistoryClient(), "deployment_apply", _KEY, run)
+    assert reply["command"]["accepted_at_ns"] is not None
+    end = commands.ended_row(_KEY)["end"]
+    assert (end["outcome"], end["code"], end["details"]) == (
+        "unknown", "program_runtime_control_outcome_unknown",
+        {"command_kind": "deployment_apply", "cause_code": "KeyError"})
+
+
+def test_an_untyped_failure_before_acceptance_is_raised_and_ends_unknown() -> None:
+    commands = _commands()
+    failure = KeyError("lost")
+
+    def run() -> dict[str, Any]:
+        raise failure
+
+    with pytest.raises(KeyError) as raised:
+        commands.run(_HistoryClient(), "scenario_new", _KEY, run)
+    assert raised.value is failure
+    [row] = commands.snapshot()["ended"]
+    assert (row["accepted_at_ns"], row["step"]) == (None, None)
+    assert (row["end"]["outcome"], row["end"]["code"]) == (
+        "unknown", "program_runtime_control_outcome_unknown")
+
+
+@pytest.mark.parametrize("status", ["accepted", "applied"])
+def test_a_program_apply_ends_succeeded_once_the_manager_accepted(status: str) -> None:
+    """Program Apply/Revert reply as before only to the row: the row ends
+    when the Manager accepted (History `accepted`) or it was already applied;
+    the ended row names the Manager Apply it started."""
+
+    from manyforge_composer.backend.apply_orchestration import (
+        apply_accepted,
+        apply_step,
+        apply_step_source,
+    )
+
+    commands = _commands()
+    history = _HistoryClient()
+
+    def run() -> dict[str, Any]:
+        apply_accepted()
+        apply_step("previewing")
+        apply_step("applying")
+        apply_step_source("applying", {"status": "manager_apply", "apply_id": 4,
+                                       "apply_generation": 2})
+        return {"status": status, "headless": {}}
+
+    commands.run(history, "program_apply", _KEY, run)
+    ended = commands.ended_row(_KEY)
+    assert (ended["end"]["outcome"], ended["end"]["code"], ended["end"]["details"]) == (
+        "succeeded", None, None)
+    assert ended["step"] == "applying"
+    assert ended["step_source"] == {"status": "manager_apply", "apply_id": 4,
+                                    "apply_generation": 2}
+    assert [r["outcome"] for r in history.recorded] == [
+        "accepted" if status == "accepted" else "succeeded"]

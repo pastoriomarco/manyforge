@@ -1,13 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
-  api, apiErrorCode, authoringRefusalMessage, isStaleWorkspaceError, preparationCauseCode,
+  api, apiErrorCode, authoringRefusalMessage, incompleteScenarioText, isStaleWorkspaceError,
+  preparationCauseCode,
 } from '../api/client';
 import { applyResultText } from '../components/ApplyImpact';
 import type { AuthoringCommand } from '../state/busyOperation';
 import { codedErrorText } from '../state/componentPresentation';
 import { errorMessage } from '../state/structuralResource';
-import type { ApplyPreview, ApplyResult } from '../types/components';
+import type { ApplyPreview } from '../types/components';
+import {
+  applyRowPreparationCause, applyRowRefusal, awaitCommandEnd, withApplyStep,
+} from '../state/commandRows';
+import { applyResultOfRow } from '../api/parsers/commandRows';
+import { useCommandRowWaiter } from './useCommandRowWaiter';
 import {
   deploymentComparisonsStale,
   deploymentLocalFence,
@@ -16,6 +22,7 @@ import {
   withSharedDeploymentAuthoring,
 } from '../state/authoringWorkspace';
 import type {
+  ApplyCommandRow,
   DeploymentWorkspaceResponse,
   DeploymentControlledStopUpdate,
   JsonValue,
@@ -23,22 +30,20 @@ import type {
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
-import { browserStableIdentity } from './useHeadlessState';
+import { newRequestKey, type ApplicationStartId } from '../api/applicationIdentity';
 import { deploymentActionUnavailableReason } from '../state/documentStates';
 
 /**
  * The text of a refused Preview/Apply/Load/New: the
- * catalogue's text for its code, e.g. `apply_refused_run_in_progress`.
+ * catalogue's text for its code, e.g. `apply_refused_run_in_progress`; an
+ * incomplete Scenario document also names its cause.
  */
 export function cellApplyErrorText(reason: unknown, fallback: string): string {
+  const incomplete = incompleteScenarioText(reason);
+  if (incomplete !== null) return incomplete;
   const message = errorMessage(reason, fallback);
   const code = apiErrorCode(reason);
   return code === null ? message : codedErrorText({ code, message });
-}
-
-function requestId(): string {
-  return `composer-deployment.${globalThis.crypto?.randomUUID?.()
-    ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`}`;
 }
 
 export function useDeploymentWorkspace(
@@ -52,8 +57,9 @@ export function useDeploymentWorkspace(
   const [loading, setLoading] = useState(enabled);
   const [busy, setBusy] = useState(false);
   const [applying, setApplying] = useState(false);
+  const [applyEnd, setApplyEnd] = useState<{ succeeded: boolean } | null>(null);
   const [completedAdmission, setCompletedAdmission] = useState<{
-    receiverEpoch: string;
+    applicationStartId: ApplicationStartId;
     generation: number;
   } | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -78,10 +84,7 @@ export function useDeploymentWorkspace(
   const mounted = useRef(true);
   const inFlight = useRef(false);
   const refreshSequence = useRef(0);
-  const ownerEpoch = useRef(browserStableIdentity(
-    'manyforge.composer.deployment_request_owner_epoch',
-    'composer-deployment-owner',
-  ));
+  const applyRows = useCommandRowWaiter(snapshot?.applyCommands ?? null, snapshot?.applicationStartId ?? null);
 
   const refresh = useCallback(async () => {
     if (!enabled) return null;
@@ -135,12 +138,18 @@ export function useDeploymentWorkspace(
     ?? authoring.editUnavailableReason
     ?? (workspace === null ? 'Deployment workspace is not loaded.' : null);
   const mutationAvailable = mutationUnavailableReason === null;
+  const awaitingAdmission = unavailableBefore === null
+    && completedAdmission?.applicationStartId === snapshot!.applicationStartId
+    && snapshot!.authoringAdmission.admissionGeneration <= completedAdmission.generation
+    ? 'Waiting for updated backend authoring permissions.'
+    : null;
   const documentUnavailableReason = unavailableBefore
-    ?? (completedAdmission?.receiverEpoch === snapshot!.receiverEpoch
-      && snapshot!.authoringAdmission.admissionGeneration <= completedAdmission.generation
-      ? 'Waiting for updated backend authoring permissions.'
-      : authoring.unavailableReason
-        ?? (workspace === null ? 'Deployment workspace is not loaded.' : null));
+    ?? awaitingAdmission
+    ?? authoring.unavailableReason
+    ?? (workspace === null ? 'Deployment workspace is not loaded.' : null);
+  // Revert previews like Apply (also while a run is held: Reset and Revert),
+  // once the generation a claim consumed has been replaced.
+  const revertPreviewUnavailableReason = awaitingAdmission ?? mutationUnavailableReason;
   // While the owner is read again after a publication, its comparisons are
   // unknown, so no Scenario action is offered; a failed read says so until a
   // later read succeeds. Draft edits stay available.
@@ -183,12 +192,7 @@ export function useDeploymentWorkspace(
       || published === null
       || workspace === null
     ) return null;
-    return deploymentLocalFence(
-      published,
-      snapshot,
-      ownerEpoch.current,
-      requestId(),
-    );
+    return deploymentLocalFence(published, snapshot, newRequestKey());
   }, [documentUnavailableReason, mutationUnavailableReason, published, snapshot, workspace]);
 
   const run = useCallback(async (
@@ -216,7 +220,7 @@ export function useDeploymentWorkspace(
         // admission fence (a Draft edit takes no claim and consumes none).
         if (kind === 'document') {
           setCompletedAdmission({
-            receiverEpoch: snapshot.receiverEpoch,
+            applicationStartId: snapshot.applicationStartId,
             generation: requestFence.expectedAdmissionGeneration,
           });
         }
@@ -260,7 +264,7 @@ export function useDeploymentWorkspace(
    * Program run is in progress; allowed during a cell latch.
    */
   const sendApply = useCallback(async (
-    operation: () => Promise<ApplyResult>,
+    operation: () => Promise<ApplyCommandRow>,
     failure: string,
     command: 'apply' | 'revert',
   ) => {
@@ -275,9 +279,25 @@ export function useDeploymentWorkspace(
     setFeedback(null);
     // The workspace is read again before the outcome is shown: the read
     // clears the error it last showed.
+    let succeeded = false;
     try {
-      const result = await operation();
+      // Answered at acceptance; the outcome is the row's end (OD-214).
+      const ended = await awaitCommandEnd(await operation(), applyRows);
       const refreshed = await refresh();
+      // A new application start keeps no row of this Apply: the page
+      // shows the state it reads again.
+      if (ended === null) return null;
+      // Refused after acceptance (no effect): shown as a refusal before it was.
+      const refusal = applyRowRefusal(ended);
+      if (refusal !== null) {
+        if (mounted.current) {
+          setError(codedErrorText(refusal));
+          setErrorCauseCode(applyRowPreparationCause(ended));
+        }
+        return null;
+      }
+      const result = applyResultOfRow(ended);
+      succeeded = result.outcome === 'succeeded';
       if (mounted.current) {
         if (result.outcome === 'failed') setError(applyResultText(result));
         else setFeedback(applyResultText(result));
@@ -301,9 +321,10 @@ export function useDeploymentWorkspace(
       if (mounted.current) {
         setBusy(false);
         setApplying(false);
+        setApplyEnd({ succeeded });
       }
     }
-  }, [authoring, refresh]);
+  }, [applyRows, authoring, refresh]);
 
   /** An effect-free Preview, held as one operation like any other. */
   const preview = useCallback(async (
@@ -435,8 +456,9 @@ export function useDeploymentWorkspace(
      * Revert on the one Apply path: Preview the Saved Scenario's impact,
      * then the operator confirms it (`confirmApply`), which applies it.
      */
+    // Effect-free, so also while a run is held (Reset and Revert), as Apply.
     revert: () => (
-      deploymentActionUnavailableReason(workspace, 'revert', documentUnavailableReason) !== null
+      deploymentActionUnavailableReason(workspace, 'revert', revertPreviewUnavailableReason) !== null
         ? Promise.resolve(null)
         : showPreview('revert')
     ),
@@ -453,6 +475,10 @@ export function useDeploymentWorkspace(
     applyConfirmedScope: (scope: ApplyPreview['scope']) => (
       sendApply(() => api.cellApply.apply(scope), 'Deployment Apply request failed.', 'apply')
     ),
+    /** The Revert of a Preview confirmed earlier, sent by Reset and Revert. */
+    revertConfirmedScope: (scope: ApplyPreview['scope']) => (
+      sendApply(() => api.cellApply.revert(scope), 'Deployment Revert request failed.', 'revert')
+    ),
     /**
      * Send the Apply (or Revert) the operator confirmed, bound to the Preview
      * shown: the server refuses it when the input changed since.
@@ -466,7 +492,7 @@ export function useDeploymentWorkspace(
         : sendApply(() => api.cellApply.apply(scope), 'Deployment Apply request failed.', 'apply');
     },
     cancelApplyConfirmation: () => openConfirmation(false),
-  }), [applyPreview, applyPreviewKind, documentUnavailableReason, mutationUnavailableReason, openConfirmation, preview, run, sendApply, showPreview, workspace]);
+  }), [applyPreview, applyPreviewKind, mutationUnavailableReason, openConfirmation, revertPreviewUnavailableReason, preview, run, sendApply, showPreview, workspace]);
 
   return {
     workspace,
@@ -479,8 +505,10 @@ export function useDeploymentWorkspace(
     errorCauseCode,
     feedback,
     /** The authoring operation in progress (busy label and tooltip), or null. */
-    busyOperation: authoring.operation,
+    busyOperation: withApplyStep(authoring.operation, snapshot?.applyCommands),
     applyConfirmationOpen,
+    /** The last Apply or Revert command's end: `succeeded` when it is Applied. */
+    applyEnd,
     applyPreview,
     applyPreviewKind,
     mutationAvailable,

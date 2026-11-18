@@ -1,8 +1,8 @@
-"""History records of component actions and Apply terminals.
+"""History records of component actions, Apply and Program Reset terminals.
 
-One event per finished component action (whoever asked for it) and one per
+One event per finished component action (whoever asked for it), one per
 Scenario Load / New, Deployment Apply / Revert and Program Apply / Revert
-terminal. Each record carries the typed outcome and error code; ``message``
+terminal, and one per Program Reset terminal (OD-305). Each record carries the typed outcome and error code; ``message``
 is the History list's display line, built here from those typed fields. The
 native historian validates the record and stores it in the existing bounded
 History (no store of its own).
@@ -19,6 +19,12 @@ APPLY_KINDS: Final = frozenset({
     "scenario_load", "scenario_new", "deployment_apply", "deployment_revert",
     "program_apply", "program_revert",
 })
+PROGRAM_RESET_OUTCOMES: Final = frozenset({"succeeded", "refused", "failed", "unknown"})
+PROGRAM_RESET_FIELDS: Final = (
+    "reload_initial_scene", "reset_robot_position", "program_run_id",
+    "program_revision", "applied_record_digest", "scene_revision_id",
+    "scene_content_hash", "cause_code",
+)
 # The host's `component_action_interrupted_by_stop` failure reads as interrupted.
 INTERRUPTED_CODE: Final = "component_action_interrupted_by_stop"
 _ERROR_FIELDS: Final = ("code", "message", "vendor_code", "vendor_text")
@@ -115,6 +121,38 @@ def apply_record(
     }
 
 
+def program_reset_record(
+    outcome: str, error: Any, reset: Mapping[str, Any]
+) -> dict[str, Any]:
+    """One Program Reset terminal: its options, the run it reset, the Applied
+    Program it used and the scene revision its verified readback left."""
+
+    typed = _error(error)
+    facts = {name: reset.get(name) for name in PROGRAM_RESET_FIELDS}
+    parts = [_line("Program reset", outcome, typed)]
+    if facts["program_run_id"] is not None:
+        parts.append(f"run {facts['program_run_id']}")
+    if facts["scene_revision_id"] is not None:
+        parts.append(f"reloaded initial scene (scene revision {facts['scene_revision_id']})")
+    elif facts["reload_initial_scene"]:
+        parts.append("reload initial scene")
+    if facts["reset_robot_position"]:
+        parts.append("reset robot position")
+    if facts["cause_code"] is not None:
+        parts.append(f"cause {facts['cause_code']}")
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "kind": "program_reset",
+        "subject": "program_reset",
+        "action": None,
+        "outcome": outcome,
+        "error": typed,
+        "components": [],
+        "message": _bounded(" · ".join(parts), 4096),
+        "reset": facts,
+    }
+
+
 def record_activity(core: Any, record: dict[str, Any]) -> None:
     """Hand one record to the historian; History is never the action's result."""
 
@@ -130,8 +168,11 @@ def record_activity(core: Any, record: dict[str, Any]) -> None:
 
 __all__ = [
     "APPLY_KINDS",
+    "PROGRAM_RESET_FIELDS",
+    "PROGRAM_RESET_OUTCOMES",
     "SCHEMA_VERSION",
     "apply_record",
     "component_action_record",
+    "program_reset_record",
     "record_activity",
 ]

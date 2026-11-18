@@ -2,11 +2,8 @@ import { readFileSync } from 'node:fs';
 
 import { describe, expect, it } from 'vitest';
 
-import type {
-  ProgramWorkspaceResponse,
-  ProgramWorkspaceTransitionResponse,
-} from '../types/api';
-import { programWorkspaceTransitionResult } from '../hooks/useProgramWorkspace';
+import type { ApplyCommandRow, ApplyStepSource, ProgramWorkspaceResponse } from '../types/api';
+import { programApplyCommandResult } from '../hooks/useProgramWorkspace';
 
 function workspace(draftId: string, revision: number): ProgramWorkspaceResponse {
   return {
@@ -48,11 +45,13 @@ function workspace(draftId: string, revision: number): ProgramWorkspaceResponse 
   };
 }
 
-function transition(
-  status: ProgramWorkspaceTransitionResponse['status'],
-  ownerWorkspace: ProgramWorkspaceResponse,
-): ProgramWorkspaceTransitionResponse {
-  return { status, headless: {}, workspace: ownerWorkspace };
+// A Program Apply/Revert row that ended succeeded (OD-214); its `applying`
+// step names the Manager Apply it started, if any.
+function ended(kind: 'program_apply' | 'program_revert', stepSource: ApplyStepSource | null): ApplyCommandRow {
+  return {
+    kind, requestKey: 'a'.repeat(32), step: stepSource === null ? 'previewing' : 'applying',
+    stepSource, acceptedAtNs: '1', end: { outcome: 'succeeded', code: null, details: null, finishedAtNs: '2' },
+  };
 }
 
 describe('Program workspace lifecycle controls', () => {
@@ -125,9 +124,7 @@ describe('Program workspace lifecycle controls', () => {
     expect(admissionSource).toContain("snapshot.programCycle.state !== 'idle_after_reset'");
     expect(source).not.toContain('const revert = useCallback((\\n    scenarioId');
     expect(source).toContain("type: 'request_failed'");
-    expect(source).toContain(
-      'Revert completed through authoritative Apply; Draft now matches Saved.',
-    );
+    expect(source).toContain('programApplyCommand(\'revert\', () => api.programWorkspace.revert(requestFence)');
     expect(source).not.toContain('pending deployment');
   });
 
@@ -142,38 +139,30 @@ describe('Program workspace lifecycle controls', () => {
     expect(source).not.toContain('JSON.stringify(state.applied');
   });
 
-  it('preserves Revert status truth and the exact owner-returned workspace', () => {
+  it('reports a Revert that started a Manager Apply with its exact identity', () => {
     const revertedWorkspace = workspace('owner-reverted', 9);
-    const reverted = programWorkspaceTransitionResult(
-      'revert',
-      transition('reverted', revertedWorkspace),
-    );
+    const reverted = programApplyCommandResult('revert', ended('program_revert',
+      { status: 'manager_apply', applyId: 42, applyGeneration: 3 }), revertedWorkspace, '3f9a0123456789ab');
 
     expect(reverted.workspace).toBe(revertedWorkspace);
-    expect(reverted.transitionStatus).toBe('reverted');
-    expect(reverted.message).toContain('Draft now matches Saved');
-    expect(reverted.message).not.toContain('pending deployment');
+    expect(reverted.transitionStatus).toBe('accepted');
+    expect(reverted.acceptedApply).toEqual({ applyId: 42, applyGeneration: 3 });
+    expect(reverted.message).toContain('Revert accepted (3f9a/apply42)');
   });
 
   it('reports a no-effect Revert without fabricating an Apply', () => {
     const ownerWorkspace = workspace('owner-no-effect', 4);
-    const result = programWorkspaceTransitionResult('revert', {
-      status: 'reverted',
-      headless: null,
-      workspace: ownerWorkspace,
-    });
+    const result = programApplyCommandResult('revert', ended('program_revert', null), ownerWorkspace);
 
     expect(result.workspace).toBe(ownerWorkspace);
+    expect(result.transitionStatus).toBe('reverted');
     expect(result.message).toContain('No owner Apply was issued');
-    expect(result.message).not.toContain('through authoritative Apply');
+    expect(result.acceptedApply).toBeUndefined();
   });
 
-  it('reports Apply only after the backend completed it', () => {
+  it('reports an Apply with no Manager Apply as already applied', () => {
     const ownerWorkspace = workspace('apply-complete', 11);
-    const result = programWorkspaceTransitionResult(
-      'apply',
-      transition('applied', ownerWorkspace),
-    );
+    const result = programApplyCommandResult('apply', ended('program_apply', null), ownerWorkspace);
 
     expect(result.workspace).toBe(ownerWorkspace);
     expect(result.transitionStatus).toBe('applied');
@@ -181,13 +170,11 @@ describe('Program workspace lifecycle controls', () => {
   });
 
   it('reports an accepted Apply as pending with its exact identity', () => {
-    const result = programWorkspaceTransitionResult('apply', {
-      status: 'accepted',
-      headless: { apply_id: 'apply-42' },
-      workspace: workspace('pending-apply', 12),
-    });
+    const result = programApplyCommandResult('apply', ended('program_apply',
+      { status: 'manager_apply', applyId: 42, applyGeneration: 1 }), workspace('pending-apply', 12), '3f9a0123456789ab');
     expect(result.transitionStatus).toBe('accepted');
-    expect(result.message).toContain('apply-42');
+    expect(result.acceptedApply).toEqual({ applyId: 42, applyGeneration: 1 });
+    expect(result.message).toContain('(3f9a/apply42)');
     expect(result.message).not.toContain('completed');
   });
 

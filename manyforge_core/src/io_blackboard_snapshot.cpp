@@ -37,13 +37,11 @@ bool kind_valid(IoConditionValueKind kind) {
   return false;
 }
 bool scope_valid(const IoProgramBlackboardScopeDTO& scope) {
-  return text_valid(scope.request_owner_epoch.value()) &&
-         text_valid(scope.program_runner_owner_epoch.value()) &&
-         text_valid(scope.program_binding_id.value()) && scope.cycle_generation != 0U &&
+  return text_valid(scope.program_binding_id.value()) && scope.cycle_generation != 0U &&
          scope.active_publication_generation.nonzero() &&
          scope.claim_generation.has_value() == scope.program_run_id.has_value() &&
          (!scope.claim_generation || scope.claim_generation->nonzero()) &&
-         (!scope.program_run_id || text_valid(scope.program_run_id->value()));
+         (!scope.program_run_id || scope.program_run_id->nonzero());
 }
 
 bool consume(std::size_t amount, std::size_t maximum, std::size_t& used) {

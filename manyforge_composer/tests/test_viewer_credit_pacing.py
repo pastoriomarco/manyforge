@@ -77,7 +77,7 @@ def test_credit_rate_paces_and_coalesces_the_next_viewer_frame() -> None:
             await socket.incoming.put(json.dumps(initial))
             first_time, first = await asyncio.wait_for(socket.outgoing.get(), 1)
             assert first == "A"
-            cursor = {"owner_epoch": "owner", "source_epoch": "source", "source_sequence": 1, "delivery_sequence": 1}
+            cursor = {"source_epoch": "source", "source_sequence": 1, "delivery_sequence": 1}
             await socket.incoming.put(json.dumps({**initial, "last_applied": cursor}))
             source.latest = "B"
             await asyncio.sleep(0.05)

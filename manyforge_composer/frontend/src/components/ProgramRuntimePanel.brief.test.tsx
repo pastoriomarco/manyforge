@@ -59,24 +59,24 @@ it('shows a brief warning for each new automatic retry, and never re-shows one i
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   const host = stubDom();
   let shown = null as WorkbenchNotice | null;
-  function Probe({ runId, audit }: { runId: string | null; audit: RuntimeControlAuditEvent[] | null }) {
+  function Probe({ runId, audit }: { runId: number | null; audit: RuntimeControlAuditEvent[] | null }) {
     const notice = useBriefAutomaticRetry(runId, audit);
     useEffect(() => { shown = notice; });
     return null;
   }
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(host as unknown as Element);
-  const render = (runId: string | null, audit: RuntimeControlAuditEvent[] | null) => act(() => {
+  const render = (runId: number | null, audit: RuntimeControlAuditEvent[] | null) => act(() => {
     root.render(<Probe runId={runId} audit={audit} />);
   });
 
   // Events already in the history when the panel starts show nothing.
   const history = [retry(2, 2, 'collision_stop_nominal')];
-  await render('run.1', history);
+  await render(1,history);
   expect(shown).toBeNull();
 
   // A new retry shows one warning (amber, no acknowledgement) for BRIEF_NOTICE_MS.
-  await render('run.1', [...history, retry(3, 3, 'planning_no_effect')]);
+  await render(1,[...history, retry(3, 3, 'planning_no_effect')]);
   expect(shown).toMatchObject({
     severity: 'warning',
     domain: 'runtime',
@@ -88,11 +88,11 @@ it('shows a brief warning for each new automatic retry, and never re-shows one i
   expect(shown).toBeNull();
 
   // The same events again, as a fresh snapshot: nothing re-shows.
-  await render('run.1', [...history, retry(3, 3, 'planning_no_effect')]);
+  await render(1,[...history, retry(3, 3, 'planning_no_effect')]);
   expect(shown).toBeNull();
 
   // A newer retry re-triggers, and restarts the timer.
-  await render('run.1', [...history, retry(3, 3, 'planning_no_effect'), retry(4, 4, 'collision_stop_nominal')]);
+  await render(1,[...history, retry(3, 3, 'planning_no_effect'), retry(4, 4, 'collision_stop_nominal')]);
   expect(shown?.title).toBe('Collision Stop on move · attempt 4 of 4');
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS - 1); });
   expect(shown?.title).toBe('Collision Stop on move · attempt 4 of 4');
@@ -100,7 +100,7 @@ it('shows a brief warning for each new automatic retry, and never re-shows one i
   expect(shown).toBeNull();
 
   // The first retry of a new run is new too.
-  await render('run.2', [retry(2, 2, 'collision_stop_nominal')]);
+  await render(2,[retry(2, 2, 'collision_stop_nominal')]);
   expect(shown?.title).toBe('Collision Stop on move · attempt 2 of 4');
   await act(() => root.unmount());
 });
@@ -109,25 +109,25 @@ it('shows the first retry of a run that started with none, and nothing before th
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
   const host = stubDom();
   let shown = null as WorkbenchNotice | null;
-  function Probe({ runId, audit }: { runId: string | null; audit: RuntimeControlAuditEvent[] | null }) {
+  function Probe({ runId, audit }: { runId: number | null; audit: RuntimeControlAuditEvent[] | null }) {
     const notice = useBriefAutomaticRetry(runId, audit);
     useEffect(() => { shown = notice; });
     return null;
   }
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(host as unknown as Element);
-  const render = (runId: string | null, audit: RuntimeControlAuditEvent[] | null) => act(() => {
+  const render = (runId: number | null, audit: RuntimeControlAuditEvent[] | null) => act(() => {
     root.render(<Probe runId={runId} audit={audit} />);
   });
 
   // Controls not loaded yet: nothing to announce, and nothing to baseline.
-  await render('run.1', null);
+  await render(1,null);
   expect(shown).toBeNull();
   // The first loaded audit has no retry: it is the baseline.
-  await render('run.1', []);
+  await render(1,[]);
   expect(shown).toBeNull();
   // The first retry of the run is new, and is announced.
-  await render('run.1', [retry(2, 2, 'planning_no_effect')]);
+  await render(1,[retry(2, 2, 'planning_no_effect')]);
   expect(shown?.title).toBe('Planning failed on move · attempt 2 of 4');
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
   expect(shown).toBeNull();
@@ -139,7 +139,7 @@ it('shows a brief warning when an io wait source becomes unavailable, not when i
   const host = stubDom();
   let shown = null as WorkbenchNotice | null;
   function Probe({ audit }: { audit: RuntimeControlAuditEvent[] | null }) {
-    const notice = useBriefIoSourceUnavailable('run.1', audit);
+    const notice = useBriefIoSourceUnavailable(1, audit);
     useEffect(() => { shown = notice; });
     return null;
   }
@@ -173,7 +173,7 @@ it('shows a brief warning for a new takeover fallback on either path', async () 
   const host = stubDom();
   let shown = null as WorkbenchNotice | null;
   function Probe({ audit }: { audit: RuntimeControlAuditEvent[] | null }) {
-    const notice = useBriefTakeoverFallback('run.1', audit);
+    const notice = useBriefTakeoverFallback(1, audit);
     useEffect(() => { shown = notice; });
     return null;
   }
@@ -186,7 +186,7 @@ it('shows a brief warning for a new takeover fallback on either path', async () 
     eventRevision,
     kind: 'program_node_takeover_fallback',
     facts: {
-      nodeInstanceId: 'move', incumbentOperationId: 'op.1', path,
+      nodeInstanceId: 'move', incumbentOperationId: 1, path,
       code, message: code === null ? null : 'late', failureStage, preparationMs: 40.5, budgetMs: 30,
       planningCapMs: 24,
     },

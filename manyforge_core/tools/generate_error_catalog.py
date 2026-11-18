@@ -5,7 +5,10 @@ The one source is `manyforge_core/resources/error_catalog.tsv` (`code`,
 `compact text`, `full text`). The outputs are generated, checked in and kept
 fresh by `--check` in CI; nothing reads the TSV at runtime.
 
-- C++: `manyforge::core::error_codes::k<CamelCode>` code constants.
+- C++: `manyforge::core::error_codes::k<CamelCode>` code constants, plus the
+  sorted code array `kSortedCodes` and `error_catalog_code_index`,
+  which maps a code to 1 + its position (0 when not catalogued) without
+  allocating; Stop event records store that index (stop state model §2.4).
 - Python: `manyforge_headless_api.error_codes.<UPPER_CODE>` code constants.
 - TypeScript: `ERROR_CATALOG` (code -> [compact, full]) for the GUI.
 """
@@ -54,6 +57,9 @@ def render_cpp(rows: list[tuple[str, str, str]]) -> str:
         f"// {_HEADER}",
         "#pragma once",
         "",
+        "#include <algorithm>",
+        "#include <array>",
+        "#include <cstdint>",
         "#include <string_view>",
         "",
         "namespace manyforge::core::error_codes {",
@@ -65,7 +71,29 @@ def render_cpp(rows: list[tuple[str, str, str]]) -> str:
             raise SystemExit(f"codes {names[name]} and {code} share the C++ name {name}")
         names[name] = code
         lines.append(f'inline constexpr std::string_view {name}{{"{code}"}};')
-    lines += ["", "}  // namespace manyforge::core::error_codes", ""]
+    if len(rows) >= 0xFFFF:
+        raise SystemExit("error catalog index no longer fits uint16 below 0xFFFF")
+    lines += [
+        "",
+        "/// Every catalogued code, sorted by code text (byte order).",
+        f"inline constexpr std::array<std::string_view, {len(rows)}> kSortedCodes{{",
+    ]
+    lines += [f"    {_camel(code)}," for code, _compact, _full in rows]
+    lines += [
+        "};",
+        "",
+        "/// 1 + the position of `code` in `kSortedCodes`; 0 when the",
+        "/// code is not catalogued. Binary search; no allocation.",
+        "[[nodiscard]] constexpr std::uint16_t error_catalog_code_index(std::string_view code) noexcept {",
+        "  const auto found = std::lower_bound(kSortedCodes.begin(),",
+        "                                      kSortedCodes.end(), code);",
+        "  if (found == kSortedCodes.end() || *found != code) return 0U;",
+        "  return static_cast<std::uint16_t>(1 + (found - kSortedCodes.begin()));",
+        "}",
+        "",
+        "}  // namespace manyforge::core::error_codes",
+        "",
+    ]
     return "\n".join(lines)
 
 

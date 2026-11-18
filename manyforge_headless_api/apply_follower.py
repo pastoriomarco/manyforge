@@ -4,10 +4,13 @@ Manager's command socket only answers requests and its published source is
 read on demand, so no push reaches Headless when an Apply commits. Headless
 forwards every named Apply, so it follows each one it forwarded: it asks
 Manager for that Apply's status until the outcome is final, then waits until
-its own committed-activation projection names that Apply among its committed
-history (Manager publishes its source just after recording the outcome) and
-wakes the Program runner once. The history names each committed Apply by its
-identity, so an Apply a later one already superseded is found there as well.
+its own committed-activation projection names that Apply or a later one as
+the active configuration's Apply (Manager publishes its source just after
+recording the outcome; Apply numbers count up within one start) and wakes the
+Program runner once. Neither wait has a limit of its own (OD-214): Manager
+ends every Apply (at the latest after its own Apply bound), a succeeded Apply
+always carries its publication, and closing the service ends both. An Apply a
+later one already superseded is covered by that later one.
 A failed or unknown-effect Apply never published anything and wakes nothing.
 The wake carries nothing: the runner reads the committed activation itself,
 so a late or repeated wake is harmless.
@@ -18,7 +21,6 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 import logging
 from threading import Event, Lock, Thread
-import time
 from typing import Any, Final
 
 
@@ -34,24 +36,18 @@ class CommittedApplyFollower:
         committed_activation: Callable[[], Mapping[str, Any]],
         wake: Callable[[], None],
         poll_seconds: float = 0.25,
-        maximum_apply_seconds: float = 3_600.0,
-        maximum_publication_seconds: float = 30.0,
-        clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        if not 0 < poll_seconds <= 5 or maximum_apply_seconds <= 0:
-            raise ValueError("Apply follower bounds are invalid")
+        if not 0 < poll_seconds <= 5:
+            raise ValueError("Apply follower poll period is invalid")
         self._observe_apply = observe_apply
         self._committed_activation = committed_activation
         self._wake = wake
         self._poll = poll_seconds
-        self._maximum_apply = maximum_apply_seconds
-        self._maximum_publication = maximum_publication_seconds
-        self._clock = clock
         self._stop = Event()
         self._lock = Lock()
         self._followed: dict[tuple[str, int], Thread] = {}
 
-    def follow(self, apply_id: str, apply_generation: int) -> None:
+    def follow(self, apply_id: int, apply_generation: int) -> None:
         """Follow one forwarded Apply; a repeated identity is followed once."""
 
         identity = (apply_id, apply_generation)
@@ -84,10 +80,10 @@ class CommittedApplyFollower:
         for thread in threads:
             thread.join(timeout_seconds)
 
-    def _run(self, apply_id: str, apply_generation: int) -> None:
+    def _run(self, apply_id: int, apply_generation: int) -> None:
         try:
             if self._committed(apply_id, apply_generation):
-                self._await_publication(apply_id, apply_generation)
+                self._await_publication(apply_id)
                 if not self._stop.is_set():
                     self._wake()
         except Exception:  # A follower never takes the process down.
@@ -98,8 +94,7 @@ class CommittedApplyFollower:
             with self._lock:
                 self._followed.pop((apply_id, apply_generation), None)
 
-    def _committed(self, apply_id: str, apply_generation: int) -> bool:
-        deadline = self._clock() + self._maximum_apply
+    def _committed(self, apply_id: int, apply_generation: int) -> bool:
         while not self._stop.is_set():
             try:
                 status = self._observe_apply(apply_id, apply_generation)
@@ -111,39 +106,19 @@ class CommittedApplyFollower:
                 return True
             if state in {"failed", "unknown_effect"}:
                 return False
-            if self._clock() >= deadline:
-                _LOGGER.warning(
-                    "stopped following Apply %s/%s before its outcome was final",
-                    apply_id,
-                    apply_generation,
-                )
-                return False
             self._stop.wait(self._poll)
         return False
 
-    def _projected(self, apply_id: str, apply_generation: int) -> bool:
+    def _projected(self, apply_id: int) -> bool:
         try:
-            committed = self._committed_activation()["committed_applies"]
+            active = self._committed_activation()["apply_id"]
         except Exception:
             return False
-        return any(
-            row["apply_id"] == apply_id and row["apply_generation"] == apply_generation
-            for row in committed
-        )
+        return active >= apply_id
 
-    def _await_publication(self, apply_id: str, apply_generation: int) -> None:
-        deadline = self._clock() + self._maximum_publication
+    def _await_publication(self, apply_id: int) -> None:
         while not self._stop.is_set():
-            if self._projected(apply_id, apply_generation):
-                return
-            if self._clock() >= deadline:
-                # Wake anyway: the runner reads what is current and reports a
-                # committed Apply it could not observe.
-                _LOGGER.warning(
-                    "committed Apply %s/%s was not projected in time",
-                    apply_id,
-                    apply_generation,
-                )
+            if self._projected(apply_id):
                 return
             self._stop.wait(self._poll)
 

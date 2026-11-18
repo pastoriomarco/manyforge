@@ -3,8 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdio>
-#include <filesystem>
-#include <fstream>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -26,12 +25,23 @@ KernelEvent make_event(std::uint64_t execution_id,
   return event;
 }
 
-std::vector<std::string> read_lines(const std::string& path) {
-  std::ifstream in(path);
+// The dump's lines, read from stderr between its BEGIN and END markers.
+std::vector<std::string> dump_lines(KernelFlightRecorder& recorder,
+                                    const char* reason) {
+  testing::internal::CaptureStderr();
+  recorder.dump_now(reason);
+  std::istringstream in(testing::internal::GetCapturedStderr());
   std::vector<std::string> lines;
   std::string line;
+  bool inside = false;
   while (std::getline(in, line)) {
-    lines.push_back(line);
+    if (line == "MANYFORGE_KERNEL_FLIGHT_DUMP_BEGIN") {
+      inside = true;
+    } else if (line == "MANYFORGE_KERNEL_FLIGHT_DUMP_END") {
+      inside = false;
+    } else if (inside) {
+      lines.push_back(line);
+    }
   }
   return lines;
 }
@@ -50,6 +60,11 @@ TEST(KernelFlightRecorderTest, ContactPolicyViolationTypeNameIsStable) {
                "contact_policy_violation");
 }
 
+TEST(KernelFlightRecorderTest, ParticipantDispatchOutcomeTypeNameIsStable) {
+  EXPECT_STREQ(kernel_event_type_name(KernelEventType::kParticipantDispatchOutcome),
+               "participant_dispatch_outcome");
+}
+
 TEST(KernelFlightRecorderTest, RingWrapsKeepingNewestRecords) {
   KernelFlightRecorder recorder;
   const auto total = KernelFlightRecorder::kCapacity + 88;
@@ -59,14 +74,7 @@ TEST(KernelFlightRecorderTest, RingWrapsKeepingNewestRecords) {
   }
   EXPECT_EQ(recorder.recorded_total(), total);
 
-  const auto dir = std::filesystem::temp_directory_path() /
-                   "manyforge_flight_wrap_test";
-  std::filesystem::create_directories(dir);
-  recorder.set_dump_directory(dir.string());
-  const auto path = recorder.dump_now("unit_test");
-  ASSERT_FALSE(path.empty());
-
-  const auto lines = read_lines(path);
+  const auto lines = dump_lines(recorder, "unit_test");
   // header + kCapacity records (no snapshot note in this test)
   ASSERT_EQ(lines.size(), 1 + KernelFlightRecorder::kCapacity);
   for (const auto& line : lines) {
@@ -78,7 +86,6 @@ TEST(KernelFlightRecorderTest, RingWrapsKeepingNewestRecords) {
             std::string::npos);
   EXPECT_NE(lines.back().find("\"seq\":" + std::to_string(total)),
             std::string::npos);
-  std::filesystem::remove_all(dir);
 }
 
 TEST(KernelFlightRecorderTest, DumpCarriesErrorCodeAndSnapshotNote) {
@@ -88,14 +95,7 @@ TEST(KernelFlightRecorderTest, DumpCarriesErrorCodeAndSnapshotNote) {
       ErrorDTO{"planning_failed", "boom", {}}));
   recorder.note_published_snapshot(41, 456, 7, ExecutionState::kFailed);
 
-  const auto dir = std::filesystem::temp_directory_path() /
-                   "manyforge_flight_error_test";
-  std::filesystem::create_directories(dir);
-  recorder.set_dump_directory(dir.string());
-  const auto path = recorder.dump_now("unit_test");
-  ASSERT_FALSE(path.empty());
-
-  const auto lines = read_lines(path);
+  const auto lines = dump_lines(recorder, "unit_test");
   ASSERT_EQ(lines.size(), 3u);  // header + record + snapshot note
   EXPECT_NE(lines[0].find("\"schema_version\":\"manyforge.kernel_flight.v1\""),
             std::string::npos);
@@ -105,7 +105,6 @@ TEST(KernelFlightRecorderTest, DumpCarriesErrorCodeAndSnapshotNote) {
             std::string::npos);
   EXPECT_NE(lines[2].find("\"snapshot\":"), std::string::npos);
   EXPECT_NE(lines[2].find("\"sequence_number\":41"), std::string::npos);
-  std::filesystem::remove_all(dir);
 }
 
 TEST(KernelFlightRecorderTest, ErrorCodeIsTruncatedNotOverrun) {
@@ -113,33 +112,16 @@ TEST(KernelFlightRecorderTest, ErrorCodeIsTruncatedNotOverrun) {
   const std::string long_code(200, 'x');
   recorder.record(make_event(1, KernelEventType::kErrorRaised, 1,
                              ErrorDTO{long_code, "m", {}}));
-  const auto dir = std::filesystem::temp_directory_path() /
-                   "manyforge_flight_trunc_test";
-  std::filesystem::create_directories(dir);
-  recorder.set_dump_directory(dir.string());
-  const auto path = recorder.dump_now("unit_test");
-  const auto lines = read_lines(path);
+  const auto lines = dump_lines(recorder, "unit_test");
   ASSERT_EQ(lines.size(), 2u);
   expect_line_valid(lines[1]);
   // Truncated to the fixed inline buffer (23 chars + NUL).
   EXPECT_NE(lines[1].find("\"error_code\":\"" + std::string(23, 'x') + "\""),
             std::string::npos);
-  std::filesystem::remove_all(dir);
-}
-
-TEST(KernelFlightRecorderTest, UnconfiguredDirectoryFallsBackToStderr) {
-  KernelFlightRecorder recorder;
-  recorder.record(make_event(1, KernelEventType::kStopRequested, 1));
-  // Must not crash and must return empty (stderr fallback).
-  EXPECT_TRUE(recorder.dump_now("unit_test").empty());
 }
 
 TEST(KernelFlightRecorderTest, DumpUnderConcurrentEmissionStaysLineValid) {
   KernelFlightRecorder recorder;
-  const auto dir = std::filesystem::temp_directory_path() /
-                   "manyforge_flight_concurrent_test";
-  std::filesystem::create_directories(dir);
-  recorder.set_dump_directory(dir.string());
 
   std::atomic<bool> stop{false};
   std::vector<std::jthread> writers;
@@ -153,25 +135,21 @@ TEST(KernelFlightRecorderTest, DumpUnderConcurrentEmissionStaysLineValid) {
       }
     });
   }
-  std::vector<std::string> paths;
+  std::vector<std::vector<std::string>> dumps;
   for (int d = 0; d < 20; ++d) {
-    paths.push_back(recorder.dump_now("concurrent_test"));
+    dumps.push_back(dump_lines(recorder, "concurrent_test"));
   }
   stop.store(true);
   writers.clear();
 
-  for (const auto& path : paths) {
+  for (const auto& lines : dumps) {
     // A busy recorder lock is an intentional crash-context fallback: dump_now
-    // emits a minimal line-valid torn marker to stderr and returns no path.
-    // Any file-backed snapshots that did acquire the lock must remain valid.
-    if (path.empty()) {
-      continue;
-    }
-    for (const auto& line : read_lines(path)) {
+    // emits a minimal line-valid torn marker. Dumps that did acquire the lock
+    // must remain valid too.
+    for (const auto& line : lines) {
       expect_line_valid(line);
     }
   }
-  std::filesystem::remove_all(dir);
 }
 
 TEST(KernelFlightRecorderTest, OutOfOrderKernelSequencesDoNotRegressTotals) {
@@ -186,16 +164,10 @@ TEST(KernelFlightRecorderTest, OutOfOrderKernelSequencesDoNotRegressTotals) {
   recorder.record(first);
   EXPECT_EQ(recorder.recorded_total(), 2u);
 
-  const auto dir = std::filesystem::temp_directory_path() /
-                   "manyforge_flight_ooo_test";
-  std::filesystem::create_directories(dir);
-  recorder.set_dump_directory(dir.string());
-  const auto path = recorder.dump_now("unit_test");
-  const auto lines = read_lines(path);
+  const auto lines = dump_lines(recorder, "unit_test");
   ASSERT_EQ(lines.size(), 3u);  // header + 2 records
   EXPECT_NE(lines[1].find("\"seq\":1"), std::string::npos);
   EXPECT_NE(lines[2].find("\"seq\":2"), std::string::npos);
-  std::filesystem::remove_all(dir);
 }
 
 }  // namespace

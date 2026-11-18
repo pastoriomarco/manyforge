@@ -7,8 +7,9 @@ from typing import Annotated, Any, Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, HTTPException, Path, Query, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.execution import (
@@ -16,7 +17,7 @@ from manyforge_headless_api.execution import (
     _canonical_json,
     _motion_path_preview_valid,
 )
-from manyforge_headless_api.native import HeadlessApiError
+from manyforge_headless_api.native import HeadlessApiError, strict_json_object
 from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlClient,
@@ -34,8 +35,6 @@ from manyforge_headless_api.models import (
     SetOutputRequest,
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
-    FullStopIntentRequest,
-    HistorianReconcileRequest,
     IoSignalReadRequest,
     MockIoInputRequest,
     OperationControlRequest,
@@ -49,14 +48,13 @@ from manyforge_headless_api.models import (
     decode_runtime_scale_selector_query,
     SceneTransactionRequest,
     StopIntentRequest,
+    FullStopIntentRequest,
     ProgramRunStartRequest,
     ProgramScenePreparationRequest,
-    ProgramRunStopRequest,
     ProgramSelectionStartRequest,
-    ProgramSelectionStopRequest,
     ProgramSelectionResumeRequest,
-    ProgramFullStopResetRequest,
-    ProgramFullStopResumeRequest,
+    ProgramHaltDiscardRequest,
+    ProgramHaltResumeRequest,
     ProgramCycleResetRequest,
     ProgramNodeCorrectionPreviewRequest,
     CycleRecoveryActionRequest,
@@ -99,8 +97,7 @@ _SCENE_RESULT_FIELDS = {
     "ok",
     "projection_status",
     "replay_status",
-    "request_id",
-    "request_owner_epoch",
+    "request_key",
     "transaction_sequence",
     "update_status",
 }
@@ -182,6 +179,66 @@ def _call(callback):
         return callback()
     except HeadlessClientError as error:
         raise _translate(error) from error
+
+
+def _start_params(application_start_id: str | None) -> tuple[tuple[str, str], ...]:
+    """The browser's `A` query parameter, forwarded unchanged (Headless checks it)."""
+
+    return () if application_start_id is None else (
+        ("application_start_id", application_start_id),
+    )
+
+
+def _forwarded(body: BaseModel, **dump: Any) -> dict[str, Any]:
+    """A validated Headless request body as JSON, with the browser's `A`.
+
+    The Headless request models never serialize `application_start_id`
+    (Headless checks it once at its edge, contract 1.6), so a plain
+    `model_dump` would drop it; Composer forwards to that edge and carries
+    the value the browser sent, unchanged.
+    """
+
+    payload = body.model_dump(mode="json", **dump)
+    start = getattr(body, "application_start_id", None)
+    if start is not None:
+        payload["application_start_id"] = start
+    return payload
+
+
+def _json_object_or_empty(raw: bytes) -> dict[str, Any]:
+    """The request body as one JSON object, or `{}` when it is not one.
+
+    A Stop body is forwarded as this unchanged: Composer never validates or
+    refuses a Stop, Headless promotes an invalid one (OD-120 (6)).
+    """
+
+    try:
+        return strict_json_object(
+            raw.decode("utf-8"), label="Composer forwarded request"
+        )
+    except (RuntimeError, UnicodeError):
+        return {}
+
+
+def _documented_body(model: type[BaseModel]) -> dict[str, Any]:
+    """The OpenAPI body of a forwarded route: documented, never validated here.
+
+    The schema is one self-contained resource (its own ``$id``), so its local
+    ``#/$defs/...`` references resolve inside it.
+    """
+
+    schema = model.model_json_schema()
+    schema["$id"] = f"urn:manyforge:composer:body:{model.__name__}"
+    return {
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": schema}},
+        }
+    }
+
+
+def _run_path(program_run_id: str | int, suffix: str = "") -> str:
+    return f"/api/program/runs/{quote(str(program_run_id), safe='')}{suffix}"
 
 
 # Every recovery action except Reset resumes the run (Retry, continue).
@@ -271,10 +328,9 @@ def _call_scene(callback, body: SceneTransactionRequest):
             error.status_code is not None
             and isinstance(response, dict)
             and set(response) == _SCENE_RESULT_FIELDS
-            and response.get("api_version") == "manyforge.manager_command_response.v2"
+            and response.get("api_version") == "manyforge.manager_command_response.v3"
             and response.get("ok") is False
-            and response.get("request_id") == context.request_id
-            and response.get("request_owner_epoch") == context.request_owner_epoch
+            and response.get("request_key") == context.request_key
             and isinstance(response.get("error"), dict)
             and response["error"].get("code") == error.code
         ):
@@ -304,13 +360,14 @@ def create_headless_router(
 
     router = APIRouter(lifespan=lifespan)
 
-    async def control_call(callback, *, stop: bool = False):
+    async def control_call(callback):
         try:
-            lane = execution_controls.stop if stop else execution_controls.ordinary
             # Encode in the same bounded worker as the synchronous owner call.
             # A plain mapping would be walked and encoded on the shared ASGI
             # loop, where a large read response could delay an accepted Stop.
-            return await lane(lambda: JSONResponse(content=callback()))
+            return await execution_controls.ordinary(
+                lambda: JSONResponse(content=callback())
+            )
         except HeadlessClientError as error:
             raise _translate(error) from error
         except ExecutionControlBusyError as error:
@@ -325,6 +382,24 @@ def create_headless_router(
                     },
                 },
             ) from error
+
+    async def stop_call(request: Request, path: str) -> JSONResponse:
+        """Forward one Stop body unchanged on the Stop lane; never busy, never 4xx.
+
+        The Stop lane has no admission limit (contract 1.10): a Stop waits
+        only behind Stops. A refusal from Headless is relayed as it is.
+        """
+
+        body = _json_object_or_empty(await request.body())
+        try:
+            response = await execution_controls.stop(
+                lambda: JSONResponse(content=client.request("POST", path, body=body))
+            )
+        except HeadlessClientError as error:
+            raise _translate(error) from error
+        if getattr(request.state, "recognized_stop_close_connection", False):
+            response.headers["Connection"] = "close"
+        return response
 
     @router.get("/api/runtime")
     def runtime() -> dict[str, Any]:
@@ -365,13 +440,13 @@ def create_headless_router(
         body: RecoveryPreflightConfirmation,
     ) -> dict[str, Any]:
         return _call(lambda: client.component_recover_enable(
-            component_id, body.model_dump(mode="json")
+            component_id, _forwarded(body)
         ))
 
     @router.post("/api/components/recover-enable", status_code=202)
     def component_recover_enable_group(body: RecoveryGroupRequest) -> dict[str, Any]:
-        return _call(lambda: client.component_recover_enable_group(
-            body.model_dump(mode="json")["targets"]
+        return _call(lambda: client.request(
+            "POST", "/api/components/recover-enable", body=_forwarded(body)
         ))
 
     @router.get("/api/cell/latch")
@@ -436,7 +511,7 @@ def create_headless_router(
 
     @router.post("/api/program/scene-preparations")
     async def program_scene_prepare(body: ProgramScenePreparationRequest) -> JSONResponse:
-        return await control_call(lambda: client.program_scene_prepare(body.model_dump(mode="json")))
+        return await control_call(lambda: client.program_scene_prepare(_forwarded(body)))
 
     @router.get("/api/program/runs")
     def program_runs(
@@ -464,7 +539,7 @@ def create_headless_router(
                 )
             _require_applied_authoring_drafts(state)
             _require_no_assistant_turn(state)
-            return client.program_run_start(body.model_dump(mode="json"))
+            return client.program_run_start(_forwarded(body))
 
         assert state.authoring_admission is not None
         return await control_call(
@@ -480,16 +555,21 @@ def create_headless_router(
         body: ProgramCycleResetRequest,
     ) -> dict[str, Any]:
         return await control_call(
-            lambda: client.program_cycle_reset(body.model_dump(mode="json"))
+            lambda: client.program_cycle_reset(_forwarded(body))
         )
 
     @router.get("/api/program/runs/{program_run_id}/runtime-controls")
     def program_runtime_controls(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        application_start_id: str | None = None,
     ) -> dict[str, Any]:
-        return _call(lambda: client.program_runtime_controls(program_run_id))
+        return _call(lambda: client.request(
+            "GET",
+            _run_path(program_run_id, "/runtime-controls"),
+            params=_start_params(application_start_id),
+        ))
 
-    def require_control_path(program_run_id: str, body: Any) -> None:
+    def require_control_path(program_run_id: int, body: Any) -> None:
         if body.program_run_id != program_run_id:
             raise HTTPException(
                 status_code=400,
@@ -501,28 +581,30 @@ def create_headless_router(
 
     @router.post("/api/program/runs/{program_run_id}/node-correction-previews")
     def program_node_correction_preview(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: ProgramNodeCorrectionPreviewRequest,
     ) -> dict[str, Any]:
         """Advisory preview only: not an execution command or Draft change."""
         require_control_path(program_run_id, body)
         return _call(
-            lambda: client.program_node_correction_preview(
-                program_run_id, body.model_dump(mode="json")
+            lambda: client.request(
+                "POST",
+                _run_path(program_run_id, "/node-correction-previews"),
+                body=_forwarded(body),
             )
         )
 
     @router.post("/api/program/runs/{program_run_id}/blackboard-values")
     async def write_runtime_blackboard(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: RuntimeBlackboardWriteRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, body)
         return await control_call(
-            lambda: client.program_runtime_control_action(
-                program_run_id,
-                "blackboard-values",
-                body.model_dump(mode="json"),
+            lambda: client.request(
+                "POST",
+                _run_path(program_run_id, "/blackboard-values"),
+                body=_forwarded(body),
             )
         )
 
@@ -537,7 +619,7 @@ def create_headless_router(
         body: PersistentKeyValueSetRequest,
     ) -> dict[str, Any]:
         return _call(lambda: client.program_persistent_value_action(
-            "set", body.model_dump(mode="json")
+            "set", _forwarded(body)
         ))
 
     @router.post("/api/program/persistent-values/reset")
@@ -545,7 +627,7 @@ def create_headless_router(
         body: PersistentKeyValueResetRequest,
     ) -> dict[str, Any]:
         return _call(lambda: client.program_persistent_value_action(
-            "reset", body.model_dump(mode="json")
+            "reset", _forwarded(body)
         ))
 
     @router.post("/api/program/persistent-values/clear")
@@ -553,18 +635,20 @@ def create_headless_router(
         body: PersistentKeyValuesClearRequest,
     ) -> dict[str, Any]:
         return _call(lambda: client.program_persistent_value_action(
-            "clear", body.model_dump(mode="json")
+            "clear", _forwarded(body)
         ))
 
     @router.post("/api/program/runs/{program_run_id}/manual-result")
     async def stage_manual_result(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: ManualResultStageRequest,
     ) -> dict[str, Any]:
         require_control_path(program_run_id, body)
         return await control_call(
-            lambda: client.program_runtime_control_action(
-                program_run_id, "manual-result", body.model_dump(mode="json")
+            lambda: client.request(
+                "POST",
+                _run_path(program_run_id, "/manual-result"),
+                body=_forwarded(body),
             )
         )
 
@@ -572,7 +656,7 @@ def create_headless_router(
     async def cycle_recovery_action(
         body: CycleRecoveryActionRequest,
     ) -> dict[str, Any]:
-        payload = body.model_dump(mode="json")
+        payload = _forwarded(body)
 
         def submit():
             if _resumes_execution("execution_recovery", payload):
@@ -587,55 +671,25 @@ def create_headless_router(
 
     @router.get("/api/program/runs/{program_run_id}")
     def program_run_read(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        application_start_id: str | None = None,
     ) -> dict[str, Any]:
-        return _call(lambda: client.program_run(program_run_id))
+        return _call(lambda: client.request(
+            "GET",
+            _run_path(program_run_id),
+            params=_start_params(application_start_id),
+        ))
 
-    @router.post("/api/program/runs/{program_run_id}/stop")
-    async def program_run_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: ProgramRunStopRequest,
-    ) -> dict[str, Any]:
-        if body.program_run_id != program_run_id:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "program_run_path_invalid",
-                    "message": ("Program-run identity in path and body must match"),
-                },
-            )
-        return await control_call(
-            lambda: client.program_run_stop(
-                program_run_id,
-                body.model_dump(mode="json"),
-            ),
-            stop=True,
-        )
-
+    # Stop routes: the path segment and the body are forwarded unchanged.
     @router.post("/api/program/runs/{program_run_id}/motion-stop")
     async def program_run_motion_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: ProgramSelectionStopRequest,
-    ) -> dict[str, Any]:
-        if body.program_run_id != program_run_id:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "program_run_path_invalid",
-                    "message": ("Program-run identity in path and body must match"),
-                },
-            )
-        return await control_call(
-            lambda: client.program_run_motion_stop(
-                program_run_id,
-                body.model_dump(mode="json"),
-            ),
-            stop=True,
-        )
+        program_run_id: str, request: Request
+    ) -> JSONResponse:
+        return await stop_call(request, _run_path(program_run_id, "/motion-stop"))
 
     @router.post("/api/program/runs/{program_run_id}/motion-start")
     async def program_run_motion_start(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: ProgramSelectionStartRequest,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
@@ -649,8 +703,10 @@ def create_headless_router(
         def submit():
             _require_applied_authoring_drafts(state)
             _require_no_assistant_turn(state)
-            return client.program_run_motion_start(
-                program_run_id, body.model_dump(mode="json")
+            return client.request(
+                "POST",
+                _run_path(program_run_id, "/motion-start"),
+                body=_forwarded(body),
             )
 
         assert state.authoring_admission is not None
@@ -660,7 +716,7 @@ def create_headless_router(
 
     @router.post("/api/program/runs/{program_run_id}/resume-motion")
     async def program_run_motion_resume(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: ProgramSelectionResumeRequest,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
@@ -674,8 +730,10 @@ def create_headless_router(
         def submit():
             _require_applied_authoring_drafts(state)
             _require_no_assistant_turn(state)
-            return client.program_run_motion_resume(
-                program_run_id, body.model_dump(mode="json")
+            return client.request(
+                "POST",
+                _run_path(program_run_id, "/resume-motion"),
+                body=_forwarded(body),
             )
 
         assert state.authoring_admission is not None
@@ -683,31 +741,10 @@ def create_headless_router(
             lambda: state.authoring_admission.submit_workspace_fenced(submit)
         )
 
-    @router.post("/api/program/runs/{program_run_id}/full-stop")
-    async def program_run_full_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: ProgramRunStopRequest,
-    ) -> dict[str, Any]:
-        if body.program_run_id != program_run_id:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "code": "program_run_path_invalid",
-                    "message": ("Program-run identity in path and body must match"),
-                },
-            )
-        return await control_call(
-            lambda: client.program_run_full_stop(
-                program_run_id,
-                body.model_dump(mode="json"),
-            ),
-            stop=True,
-        )
-
-    @router.post("/api/program/runs/{program_run_id}/resume-full-stop")
-    async def program_run_resume_full_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: ProgramFullStopResumeRequest,
+    @router.post("/api/program/runs/{program_run_id}/resume-halt")
+    async def program_run_resume_halt(
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        body: ProgramHaltResumeRequest,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
             raise HTTPException(
@@ -720,8 +757,10 @@ def create_headless_router(
         def submit():
             _require_applied_authoring_drafts(state)
             _require_no_assistant_turn(state)
-            return client.program_run_resume_full_stop(
-                program_run_id, body.model_dump(mode="json")
+            return client.request(
+                "POST",
+                _run_path(program_run_id, "/resume-halt"),
+                body=_forwarded(body),
             )
 
         assert state.authoring_admission is not None
@@ -730,9 +769,9 @@ def create_headless_router(
         )
 
     @router.post("/api/program/runs/{program_run_id}/reset")
-    async def program_run_reset_full_stop(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=256)],
-        body: ProgramFullStopResetRequest,
+    async def program_run_discard_halt(
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        body: ProgramHaltDiscardRequest,
     ) -> dict[str, Any]:
         if body.program_run_id != program_run_id:
             raise HTTPException(
@@ -743,9 +782,10 @@ def create_headless_router(
                 },
             )
         return await control_call(
-            lambda: client.program_run_reset_full_stop(
-                program_run_id,
-                body.model_dump(mode="json"),
+            lambda: client.request(
+                "POST",
+                _run_path(program_run_id, "/reset"),
+                body=_forwarded(body),
             )
         )
 
@@ -764,24 +804,33 @@ def create_headless_router(
 
     @router.get("/api/manager/apply/status")
     def manager_apply_status(
-        apply_id: Annotated[str, Query(min_length=1, max_length=256)],
+        apply_id: Annotated[int, Query(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         apply_generation: Annotated[int, Query(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        application_start_id: str | None = None,
     ) -> dict[str, Any]:
-        return _call(lambda: client.manager_apply_status(apply_id, apply_generation))
+        return _call(lambda: client.request(
+            "GET",
+            "/api/manager/apply/status",
+            params=(
+                ("apply_id", apply_id),
+                ("apply_generation", apply_generation),
+                *_start_params(application_start_id),
+            ),
+        ))
 
     @router.post("/api/manager/apply/acknowledge")
     def manager_apply_acknowledge(
-        apply_id: Annotated[str, Query(min_length=1, max_length=256)],
+        apply_id: Annotated[int, Query(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         apply_generation: Annotated[int, Query(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: ManagerApplyAcknowledgementRequest,
     ) -> dict[str, Any]:
-        return _call(
-            lambda: client.manager_apply_acknowledge(
-                apply_id,
-                apply_generation,
-                body.request_context.model_dump(mode="json", exclude_none=True),
-            )
-        )
+        # The validated body (its request context and `A`) is forwarded as it is.
+        return _call(lambda: client.request(
+            "POST",
+            "/api/manager/apply/acknowledge",
+            params=(("apply_id", apply_id), ("apply_generation", apply_generation)),
+            body=_forwarded(body, exclude_none=True),
+        ))
 
     @router.get("/api/execution/diagnostics")
     def execution_diagnostics() -> dict[str, Any]:
@@ -801,33 +850,44 @@ def create_headless_router(
 
     @router.post("/api/execution/io-signals/read")
     def execution_read_io_signal(body: IoSignalReadRequest) -> dict[str, Any]:
-        return _call(lambda: client.read_io_signal(body.model_dump(mode="json")))
+        return _call(lambda: client.read_io_signal(_forwarded(body)))
 
     @router.post("/api/execution/io-signals/mock-input")
     def execution_set_mock_io_input(body: MockIoInputRequest) -> dict[str, Any]:
         # Simulation of a Mock source: no Draft fence, no motion admission.
-        return _call(lambda: client.set_mock_io_input(body.model_dump(mode="json")))
+        return _call(lambda: client.set_mock_io_input(_forwarded(body)))
 
     @router.get("/api/control/state")
     def control_projection() -> dict[str, Any]:
         return _call(client.control_projection)
 
-    @router.post("/api/control/commands")
-    async def submit_control_command(
-        body: ExecutionCommandRequestDTO,
-    ) -> JSONResponse:
+    @router.post(
+        "/api/control/commands",
+        openapi_extra=_documented_body(ExecutionCommandRequestDTO),
+    )
+    async def submit_control_command(request: Request) -> JSONResponse:
+        received = _json_object_or_empty(await request.body())
+        envelope = received.get("command_envelope")
+        kind = envelope.get("command_kind") if isinstance(envelope, dict) else None
+        if isinstance(kind, str) and is_stop_command(kind):
+            # A Stop kind is forwarded unchanged, valid or not (D11).
+            return await stop_call(request, "/api/control/commands")
+        try:
+            body = ExecutionCommandRequestDTO.model_validate(received)
+        except ValidationError as error:
+            raise RequestValidationError(error.errors(include_url=False)) from error
         kind = body.command_envelope.command_kind
         start = kind in {
             "program_run", "program_motion_start", "program_motion_resume",
-            "program_resume_full_stop", "operation_start", "execution_recovery",
+            "program_resume_halt", "operation_start", "execution_recovery",
         }
-        request = body.model_dump(mode="json")
+        command = _forwarded(body)
 
         def submit():
-            if start and _resumes_execution(kind, request.get("payload")):
+            if start and _resumes_execution(kind, command.get("payload")):
                 _require_applied_authoring_drafts(state)
                 _require_no_assistant_turn(state)
-            return client.submit_control_command(request)
+            return client.submit_control_command(command)
 
         assert state.authoring_admission is not None
         return await control_call(
@@ -835,7 +895,6 @@ def create_headless_router(
                 state.authoring_admission.submit_workspace_fenced(submit)
                 if start else submit()
             ),
-            stop=is_stop_command(kind),
         )
 
     @router.post("/api/execution/operations")
@@ -843,7 +902,7 @@ def create_headless_router(
         def submit():
             # Manual requests address the active runtime, never the Draft.
             # Keep the shared admission serialization and Kernel checks below.
-            return client.execute(body.model_dump(mode="json"))
+            return client.execute(_forwarded(body))
 
         assert state.authoring_admission is not None
         return await control_call(
@@ -854,7 +913,7 @@ def create_headless_router(
     def execution_preview_motion(
         body: OperationIntentRequest,
     ) -> dict[str, Any]:
-        operation = body.model_dump(mode="json")
+        operation = _forwarded(body)
         try:
             return client.preview_motion(operation)
         except HeadlessClientError as error:
@@ -882,37 +941,62 @@ def create_headless_router(
     def execution_read_manual_handover(
         body: OperationIntentRequest,
     ) -> dict[str, Any]:
-        return _call(lambda: client.read_manual_handover(body.model_dump(mode="json")))
+        return _call(lambda: client.read_manual_handover(_forwarded(body)))
 
     @router.post("/api/execution/capability-command-previews")
     def execution_preview_capability_command(
         body: OperationIntentRequest,
     ) -> dict[str, Any]:
         return _call(
-            lambda: client.preview_capability_command(body.model_dump(mode="json"))
+            lambda: client.preview_capability_command(_forwarded(body))
         )
 
     @router.get("/api/execution/operations/{operation_id}")
     def execution_read(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        operation_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        application_start_id: str | None = None,
     ) -> dict[str, Any]:
-        return _call(lambda: client.operation(operation_id))
+        return _call(lambda: client.request(
+            "GET",
+            f"/api/execution/operations/{operation_id}",
+            params=_start_params(application_start_id),
+        ))
 
     @router.post("/api/execution/pick-place/plans/pick")
     def execution_plan_pick(
         body: PickSequencePlanningRequest,
     ) -> dict[str, Any]:
-        return _call(lambda: client.plan_pick(body.model_dump(mode="json")))
+        return _call(lambda: client.plan_pick(_forwarded(body)))
 
     @router.post("/api/execution/pick-place/plans/place")
     def execution_plan_place(
         body: PlaceSequencePlanningRequest,
     ) -> dict[str, Any]:
-        return _call(lambda: client.plan_place(body.model_dump(mode="json")))
+        return _call(lambda: client.plan_place(_forwarded(body)))
+
+    # Pick/place planning jobs (OD-213 (1)): state, result once done, cancel,
+    # release; each answered at once.
+    @router.get("/api/execution/pick-place/plans/{job_id}")
+    def execution_read_planning_job(
+        job_id: Annotated[str, Path(min_length=1, max_length=96)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.read_planning_job(job_id))
+
+    @router.post("/api/execution/pick-place/plans/{job_id}/cancel")
+    def execution_cancel_planning_job(
+        job_id: Annotated[str, Path(min_length=1, max_length=96)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.cancel_planning_job(job_id))
+
+    @router.post("/api/execution/pick-place/plans/{job_id}/release")
+    def execution_release_planning_job(
+        job_id: Annotated[str, Path(min_length=1, max_length=96)],
+    ) -> dict[str, Any]:
+        return _call(lambda: client.release_planning_job(job_id))
 
     def require_matching_operation(
-        path_operation_id: str,
-        body_operation_id: str,
+        path_operation_id: int,
+        body_operation_id: int,
     ) -> None:
         if path_operation_id != body_operation_id:
             raise HTTPException(
@@ -927,50 +1011,58 @@ def create_headless_router(
 
     @router.post("/api/execution/operations/{operation_id}/reset")
     async def execution_reset(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        operation_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: OperationResetRequest,
     ) -> dict[str, Any]:
         require_matching_operation(operation_id, body.operation_id)
         return await control_call(
-            lambda: client.reset_operation(operation_id, body.model_dump())
+            lambda: client.request(
+                "POST",
+                f"/api/execution/operations/{operation_id}/reset",
+                body=_forwarded(body),
+            )
         )
 
     @router.post("/api/execution/operations/{operation_id}/acknowledge-completed")
     async def execution_acknowledge_completed(
-        operation_id: Annotated[str, Path(min_length=1, max_length=256)],
+        operation_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
         body: OperationControlRequest,
     ) -> dict[str, Any]:
         require_matching_operation(operation_id, body.operation_id)
         return await control_call(
-            lambda: client.acknowledge_completed_operation(
-                operation_id, body.model_dump()
+            lambda: client.request(
+                "POST",
+                f"/api/execution/operations/{operation_id}/acknowledge-completed",
+                body=_forwarded(body),
             )
         )
 
-    @router.post("/api/execution/stops")
-    async def execution_stop(body: StopIntentRequest) -> dict[str, Any]:
-        return await control_call(
-            lambda: client.stop_operations(
-                body.model_dump(mode="json", exclude_unset=True)
-            ),
-            stop=True,
-        )
+    @router.post(
+        "/api/execution/stops", openapi_extra=_documented_body(StopIntentRequest)
+    )
+    async def execution_stop(request: Request) -> JSONResponse:
+        return await stop_call(request, "/api/execution/stops")
 
-    @router.post("/api/execution/full-stop")
-    async def execution_full_stop(
-        body: FullStopIntentRequest,
-    ) -> dict[str, Any]:
-        return await control_call(
-            lambda: client.full_stop(body.model_dump()),
-            stop=True,
-        )
+    @router.post(
+        "/api/execution/stop-all",
+        openapi_extra=_documented_body(FullStopIntentRequest),
+    )
+    async def execution_stop_all(request: Request) -> JSONResponse:
+        return await stop_call(request, "/api/execution/stop-all")
+
+    @router.post(
+        "/api/execution/halt",
+        openapi_extra=_documented_body(FullStopIntentRequest),
+    )
+    async def execution_halt(request: Request) -> JSONResponse:
+        return await stop_call(request, "/api/execution/halt")
 
     @router.post("/api/execution/runtime-scale-control")
     async def execution_set_runtime_scale_control(
         body: RuntimeScaleControlRequest,
     ) -> dict[str, Any]:
         return await control_call(
-            lambda: client.set_runtime_scale_control(body.model_dump(mode="json"))
+            lambda: client.set_runtime_scale_control(_forwarded(body))
         )
 
     @router.get("/api/execution/runtime-scale-control")
@@ -1030,8 +1122,8 @@ def create_headless_router(
     @router.post("/api/scene/transactions")
     def scene_commit(body: ComposerSceneTransactionRequest):
         owner_request = SceneTransactionRequest.model_validate(
-            body.model_dump(
-                mode="json",
+            _forwarded(
+                body,
                 exclude={"expected_draft_id", "expected_draft_revision", "expected_authoring_workspace"},
             )
         )
@@ -1039,8 +1131,8 @@ def create_headless_router(
         def commit_owner_scene():
             return _call_scene(
                 lambda: client.commit_scene_transaction(
-                    owner_request.model_dump(
-                        mode="json",
+                    _forwarded(
+                        owner_request,
                         exclude={"program_reset_scene_authorization"},
                     )
                 ),
@@ -1101,11 +1193,11 @@ def create_headless_router(
         condition_id: Annotated[str, Path(pattern=r"^condition-[0-9a-f]{24}$")],
         body: AcknowledgeAlarmRequest,
     ) -> dict[str, Any]:
-        return _call(lambda: client.acknowledge_alarm(condition_id, body.model_dump()))
+        return _call(lambda: client.acknowledge_alarm(condition_id, _forwarded(body)))
 
     @router.post("/api/execution/alarms/acknowledge-all")
     def acknowledge_all(body: AcknowledgeAllAlarmsRequest) -> dict[str, Any]:
-        return _call(lambda: client.acknowledge_all(body.model_dump()))
+        return _call(lambda: client.acknowledge_all(_forwarded(body)))
 
     @router.get("/api/execution/history")
     def history(
@@ -1152,7 +1244,8 @@ def create_headless_router(
         return Response(
             content=_call(
                 lambda: client.get_json_payload(
-                    "/api/execution/history/discovery", params=query.model_dump()
+                    "/api/execution/history/discovery",
+                    params=query.model_dump(exclude_none=True),
                 )
             ),
             media_type="application/json",
@@ -1195,11 +1288,13 @@ def create_headless_router(
 
     @router.get("/api/execution/program-runs/{program_run_id}/admitted-speeds")
     def program_run_admitted_speeds(
-        program_run_id: Annotated[str, Path(min_length=1, max_length=1024)],
+        program_run_id: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
+        application_start_id: str | None = None,
     ) -> dict[str, Any]:
         return _call(lambda: client.request(
             "GET",
-            f"/api/execution/program-runs/{quote(program_run_id, safe='')}/admitted-speeds",
+            f"/api/execution/program-runs/{program_run_id}/admitted-speeds",
+            params=_start_params(application_start_id),
         ))
 
     @router.get("/api/skills")
@@ -1221,10 +1316,6 @@ def create_headless_router(
         sequence: Annotated[int, Path(ge=1, le=9_007_199_254_740_991)],
     ) -> dict[str, Any]:
         return _call(lambda: client.history_detail(sequence))
-
-    @router.post("/api/execution/history/reconcile")
-    def historian_reconcile(body: HistorianReconcileRequest) -> dict[str, Any]:
-        return _call(lambda: client.reconcile_historian(body.model_dump()))
 
     return router
 

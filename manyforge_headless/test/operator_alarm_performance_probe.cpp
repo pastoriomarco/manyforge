@@ -126,10 +126,11 @@ AlarmConditionUpdate Update(const std::uint64_t sequence) {
 }
 
 std::unique_ptr<AlarmLifecycleOwner>
-MakeOwner(const OperatorAlarmCatalog &catalog, const std::string &owner_epoch) {
+MakeOwner(const OperatorAlarmCatalog &catalog,
+          const std::string &application_start_id) {
   auto owner = std::make_unique<AlarmLifecycleOwner>(
       catalog, "cell.performance", "alarm.performance",
-      owner_epoch, manyforge::core::HostBootStamp{"boot.performance", 1U},
+      application_start_id, "boot.performance",
       [] { return MonotonicNowNs(); },
       [] { return std::string("2026-08-05T00:00:00Z"); },
       std::set<std::string>{"runtime_health"});

@@ -124,6 +124,57 @@ class RosTsanClassifierTest(unittest.TestCase):
             "    #1 manyforge::core::Worker::lock() /source/manyforge_core/src/worker.cpp:7\n"
         ))
 
+    def test_fastdds_internal_lock_order_cycles_do_not_fail(self):
+        # Three real reports (Thor, 2026-11-11), frames compacted: every mutex
+        # is taken in libfastdds; ManyForge appears only as a deeper caller.
+        text = (ROOT / "tests/fixtures/ros_tsan_fastdds_lock_order.txt").read_text()
+        reports = [r for r in text.split("WARNING: ThreadSanitizer:")[1:]]
+        self.assertEqual(len(reports), 3)
+        for body in reports:
+            self.assertFalse(classifier.report_fails("WARNING: ThreadSanitizer:" + body))
+
+    def test_manyforge_leaf_acquisition_in_a_cycle_fails(self):
+        # The OD-111 shape: the leaf is taken through libstdc++ wrappers in a
+        # ManyForge module while rclcpp holds its goal-request lock.
+        inversion = (
+            "WARNING: ThreadSanitizer: lock-order-inversion (potential deadlock)\n"
+            "  Cycle in lock order graph: M0 => M1 => M0\n\n"
+            "  Mutex M1 acquired here while holding mutex M0 in thread T1:\n"
+            "    #0 pthread_mutex_lock /src/libsanitizer/interceptor.cpp:1 (libtsan.so.2+0x1)\n"
+            "    #1 __gthread_mutex_lock /usr/include/c++/13/gthr-default.h:749"
+            " (libmanyforge_ros2_control_execution.so+0x2)\n"
+            "    #2 std::timed_mutex::lock() /usr/include/c++/13/mutex:250"
+            " (libmanyforge_ros2_control_execution.so+0x3)\n"
+            "    #3 std::unique_lock::lock() /usr/include/c++/13/bits/unique_lock.h:141"
+            " (libmanyforge_ros2_control_execution.so+0x4)\n"
+            "    #4 manyforge::ros2_control_execution::Ros2ControlExecutionBackend::SendAutomaticCancel()"
+            " /source/manyforge_ros2_control_execution/src/ros2_control_execution_backend.cpp:1347"
+            " (libmanyforge_ros2_control_execution.so+0x5)\n\n"
+            "  Mutex M0 previously acquired by the same thread here:\n"
+            "    #0 pthread_mutex_lock /src/libsanitizer/interceptor.cpp:1 (libtsan.so.2+0x1)\n"
+            "    #1 rclcpp_action::ClientBase::handle_goal_response() <null> (librclcpp_action.so+0x6)\n\n"
+            "  Mutex M0 acquired here while holding mutex M1 in thread T2:\n"
+            "    #0 pthread_mutex_lock /src/libsanitizer/interceptor.cpp:1 (libtsan.so.2+0x1)\n"
+            "    #1 rclcpp_action::ClientBase::send_goal_request() <null> (librclcpp_action.so+0x7)\n\n"
+            "SUMMARY: ThreadSanitizer: lock-order-inversion (potential deadlock)\n"
+        )
+        self.assertTrue(classifier.report_fails(inversion))
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tsan.1"
+            path.write_text(inversion)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertTrue(classifier.classify(path))
+            self.assertIn("ManyForge ThreadSanitizer report 1", output.getvalue())
+
+    def test_sdk_only_lock_order_inversion_stays_to_classify(self):
+        inversion = (
+            "WARNING: ThreadSanitizer: lock-order-inversion (potential deadlock)\n"
+            "  Mutex M1 acquired here while holding mutex M0 in thread T1:\n"
+            "    #0 pthread_mutex_lock /src/libsanitizer/interceptor.cpp:1\n"
+            "    #1 sdk::lock() /opt/sdk/lock.cpp:3\n"
+        )
+        self.assertFalse(classifier.report_fails(inversion))
 
 if __name__ == "__main__":
     unittest.main()

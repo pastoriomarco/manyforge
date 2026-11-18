@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <manyforge_core/execution_recovery_support.hpp>
+#include <manyforge_core/testing/request_key_fixture.hpp>
 #include <manyforge_core/types/reason_codes.hpp>
 
 namespace manyforge::core {
@@ -247,15 +248,21 @@ TEST(ObservedStateEvidenceTest, PreservesPublicationAuthorityClassAndProfile) {
   EXPECT_EQ(measured_evidence->authority_profile, "ros2_control_measured_v1");
 }
 
-/// A certified operator Stop whose cleanup finished: retry-ready.
+/// The Kernel's addressed Stop evidence: the event whose attempt settled
+/// this execution (K20).
+AddressedMotionStopRecoveryEvidenceDTO stop_evidence(std::uint64_t execution_id,
+                                                     std::uint64_t event_id,
+                                                     bool confirmed = true) {
+  return AddressedMotionStopRecoveryEvidenceDTO{execution_id, StopEventId(event_id), confirmed};
+}
+
+/// An operator Stop settled by its event whose cleanup finished: retry-ready.
 RecoveryAuthorityCapture make_stopped_capture() {
   RecoveryAuthorityCapture capture;
   capture.control_command_epoch = 3;
   capture.execution_id = 42;
   capture.execution_state = ExecutionState::kStopped;
-  capture.operator_stop_owner_generation = 5;
-  capture.operator_stop_certificate =
-      make_certificate(StopOwnerKind::kOperatorStopWorker, 5, 42);
+  capture.addressed_motion_stop_evidence = stop_evidence(42, 5);
   capture.terminal_cleanup_complete = true;
   return capture;
 }
@@ -268,7 +275,46 @@ RecoveryAuthorityCapture make_automatic_planning_capture(const std::string& code
   capture.failed_validation_code = code;
   capture.failed_execution_effect = ParticipantEffectKnowledge::kNoEffect;
   capture.failed_preparation_never_dispatched = true;
+  capture.terminal_cleanup_complete = true;
   return capture;
+}
+
+// OD-257: a failed execution, retryable or not, is not decided while its
+// terminal cleanup runs; a stronger wait of its branch still comes first.
+TEST(RecoveryAssessmentTest, FailedExecutionWaitsForTerminalCleanupBehindItsStrongerWaits) {
+  for (const bool retryable : {true, false}) {
+    SCOPED_TRACE(retryable);
+    RecoveryAuthorityCapture capture;
+    capture.execution_id = 42;
+    capture.execution_state = ExecutionState::kFailed;
+    capture.failed_validation_retryable = retryable;
+    capture.terminal_effect = ParticipantEffectKnowledge::kNoEffect;
+    const auto pending = build_recovery_assessment(capture, 0);
+    EXPECT_EQ(pending.status, RecoveryAssessmentStatus::kWaiting);
+    EXPECT_EQ(pending.reason_code, reason_codes::kRecoveryTerminalCleanupPending);
+    EXPECT_EQ(pending.recovery_class,
+              retryable ? RecoveryClass::kFailedValidation : RecoveryClass::kUnknownFault);
+    EXPECT_EQ(pending.allowed_actions, std::vector<RecoveryAction>{RecoveryAction::kResetCycle});
+    EXPECT_FALSE(pending.retry_admissible);
+    EXPECT_FALSE(pending.eligible_close);
+    EXPECT_FALSE(stopped_awaiting_terminal_cleanup(pending));
+    // A retryable failure awaiting its cleanup is not a non-retryable one.
+    EXPECT_EQ(failed_not_retry_admissible(pending), !retryable);
+
+    capture.stronger_authority_active = true;
+    EXPECT_EQ(build_recovery_assessment(capture, 0).reason_code,
+              retryable ? std::string(reason_codes::kRecoveryStrongerAuthorityActive)
+                        : std::string(reason_codes::kRecoveryTerminalCleanupPending));
+    capture.stronger_authority_active = false;
+
+    capture.terminal_cleanup_complete = true;
+    const auto decided = build_recovery_assessment(capture, 0);
+    EXPECT_EQ(decided.status, retryable ? RecoveryAssessmentStatus::kRetryReady
+                                        : RecoveryAssessmentStatus::kResetRequired);
+    EXPECT_EQ(decided.retry_admissible, retryable);
+    EXPECT_TRUE(decided.eligible_close);
+    EXPECT_EQ(failed_not_retry_admissible(decided), !retryable);
+  }
 }
 
 TEST(RecoveryAssessmentTest, AutomaticPlanningRetryRequiresClosedCauseAndExactNoEffectProof) {
@@ -456,7 +502,7 @@ TEST(RecoveryAssessmentTest, EquallySafeFactsDoNotChurnRevision) {
 TEST(RecoveryAssessmentTest, AuthorityIdentityChangesAdvanceRevision) {
   auto first_capture = make_stopped_capture();
   auto second_capture = first_capture;
-  second_capture.operator_stop_certificate->certificate_id = "changed_certificate";
+  second_capture.addressed_motion_stop_evidence->stop_event_id = StopEventId(6U);
   const auto first = build_recovery_assessment(first_capture, 0);
   const auto second = build_recovery_assessment(second_capture, 1);
   EXPECT_TRUE(recovery_assessment_semantically_differs(first, second));
@@ -464,15 +510,13 @@ TEST(RecoveryAssessmentTest, AuthorityIdentityChangesAdvanceRevision) {
 
 KernelRecoveryActionRequestDTO make_bound_request(const KernelRecoveryAssessmentDTO& assessment) {
   KernelRecoveryActionRequestDTO request;
-  request.request_id = "req-1";
+  request.request_key = TestRequestKey("req-1");
   request.action = assessment.allowed_actions.empty() ? RecoveryAction::kRetryMotionFromCurrentState
                                                       : assessment.allowed_actions.front();
   request.principal_id = "operator_test";
   request.expected_assessment_revision = assessment.assessment_revision;
   request.expected_control_command_epoch = assessment.control_command_epoch;
   request.expected_execution_id = assessment.execution_id;
-  request.expected_stop_certificate_id = assessment.stop_certificate_id;
-  request.expected_stop_owner_generation = assessment.stop_owner_generation;
   return request;
 }
 
@@ -493,16 +537,6 @@ TEST(RecoveryAdmissionTest, BoundRequestAdmitsAndStaleFieldsReject) {
   EXPECT_EQ(evaluate_recovery_admission(stale_epoch, capture, assessment).rejection_reason,
             reason_codes::kRecoveryStaleEpoch);
 
-  auto wrong_certificate = request;
-  wrong_certificate.expected_stop_certificate_id = "cert-old";
-  EXPECT_EQ(evaluate_recovery_admission(wrong_certificate, capture, assessment).rejection_reason,
-            reason_codes::kRecoveryStopCertificateChanged);
-
-  auto wrong_generation = request;
-  wrong_generation.expected_stop_owner_generation += 1;
-  EXPECT_EQ(evaluate_recovery_admission(wrong_generation, capture, assessment).rejection_reason,
-            reason_codes::kRecoveryStopOwnerGenerationChanged);
-
   auto no_principal = request;
   no_principal.principal_id.clear();
   EXPECT_EQ(evaluate_recovery_admission(no_principal, capture, assessment).rejection_reason,
@@ -511,7 +545,7 @@ TEST(RecoveryAdmissionTest, BoundRequestAdmitsAndStaleFieldsReject) {
 
 TEST(RecoveryAdmissionTest, WaitingAssessmentRejectsAction) {
   auto capture = make_stopped_capture();
-  capture.operator_stop_certificate.reset();
+  capture.addressed_motion_stop_evidence.reset();
   const auto assessment = build_recovery_assessment(capture, 0);
   auto request = make_bound_request(assessment);
   request.action = RecoveryAction::kReplanFromStoppedState;
@@ -520,14 +554,12 @@ TEST(RecoveryAdmissionTest, WaitingAssessmentRejectsAction) {
   EXPECT_EQ(decision.rejection_reason, reason_codes::kRecoveryStopNotCertified);
 }
 
-TEST(RecoveryAssessmentTest, StoppedWithCertificateOffersReplan) {
+TEST(RecoveryAssessmentTest, StoppedWithStopEventEvidenceOffersReplan) {
   RecoveryAuthorityCapture capture;
   capture.control_command_epoch = 2;
   capture.execution_id = 7;
   capture.execution_state = ExecutionState::kStopped;
-  capture.operator_stop_certificate =
-      make_certificate(StopOwnerKind::kOperatorStopWorker, 3, 7);
-  capture.operator_stop_owner_generation = 3;
+  capture.addressed_motion_stop_evidence = stop_evidence(7, 3);
   capture.terminal_cleanup_complete = true;
   const auto assessment = build_recovery_assessment(capture, 0);
   EXPECT_EQ(assessment.recovery_class, RecoveryClass::kOrdinaryOperatorStop);
@@ -536,18 +568,12 @@ TEST(RecoveryAssessmentTest, StoppedWithCertificateOffersReplan) {
   EXPECT_EQ(assessment.allowed_actions[0], RecoveryAction::kReplanFromStoppedState);
 }
 
-TEST(RecoveryAssessmentTest,
-     StoppedWithExactAddressedSettlementOffersReplanWithoutLocalCertificate) {
+TEST(RecoveryAssessmentTest, StoppedWithExactAddressedSettlementCarriesItsStopEvent) {
   RecoveryAuthorityCapture capture;
   capture.control_command_epoch = 2;
   capture.execution_id = 7;
   capture.execution_state = ExecutionState::kStopped;
-  capture.operator_stop_owner_generation = 3;
-  capture.addressed_motion_stop_evidence = AddressedMotionStopRecoveryEvidenceDTO{
-      7, 3,
-      StopCertificateRefDTO{StopCertificateId("aggregate-certificate.1"),
-                            StopCertificateRevision(1U), StopId("stop.1"), StopGeneration(4U)},
-      true};
+  capture.addressed_motion_stop_evidence = stop_evidence(7, 4);
   capture.terminal_cleanup_complete = true;
 
   const auto assessment = build_recovery_assessment(capture, 0);
@@ -556,17 +582,15 @@ TEST(RecoveryAssessmentTest,
   EXPECT_EQ(assessment.status, RecoveryAssessmentStatus::kRetryReady);
   EXPECT_TRUE(assessment.retry_admissible);
   EXPECT_TRUE(assessment.backend_stop_confirmed);
-  EXPECT_EQ(assessment.stop_certificate_id, "aggregate-certificate.1");
-  EXPECT_EQ(assessment.stop_certificate_revision, 1U);
-  EXPECT_EQ(assessment.stop_owner_generation, 3U);
+  EXPECT_EQ(assessment.stop_event_id, 4U);
   ASSERT_EQ(assessment.evidence_refs.size(), 1U);
-  EXPECT_EQ(assessment.evidence_refs.front(), "aggregate-certificate.1");
+  EXPECT_EQ(assessment.evidence_refs.front(), "4");
   ASSERT_EQ(assessment.allowed_actions.size(), 2U);
   EXPECT_EQ(assessment.allowed_actions[0], RecoveryAction::kReplanFromStoppedState);
 }
 
-// F-6a (W): a certified Stop whose execute worker's terminal cleanup is still
-// pending is not yet decided: waiting, with its certificate, neither retry nor
+// F-6a (W): a settled Stop whose execute worker's terminal cleanup is still
+// pending is not yet decided: waiting, with its event, neither retry nor
 // close. Cleanup completion republishes retry_ready with close permission.
 TEST(RecoveryAssessmentTest, StoppedWaitsForTerminalCleanupBeforeRetryOrClose) {
   RecoveryAuthorityCapture capture;
@@ -574,12 +598,7 @@ TEST(RecoveryAssessmentTest, StoppedWaitsForTerminalCleanupBeforeRetryOrClose) {
   capture.execution_id = 7;
   capture.execution_state = ExecutionState::kStopped;
   capture.terminal_effect = ParticipantEffectKnowledge::kEffectSettled;
-  capture.operator_stop_owner_generation = 3;
-  capture.addressed_motion_stop_evidence = AddressedMotionStopRecoveryEvidenceDTO{
-      7, 3,
-      StopCertificateRefDTO{StopCertificateId("aggregate-certificate.1"),
-                            StopCertificateRevision(1U), StopId("stop.1"), StopGeneration(4U)},
-      true};
+  capture.addressed_motion_stop_evidence = stop_evidence(7, 4);
 
   const auto pending = build_recovery_assessment(capture, 0);
   EXPECT_EQ(pending.recovery_class, RecoveryClass::kOrdinaryOperatorStop);
@@ -588,7 +607,7 @@ TEST(RecoveryAssessmentTest, StoppedWaitsForTerminalCleanupBeforeRetryOrClose) {
   EXPECT_FALSE(pending.retry_admissible);
   EXPECT_FALSE(pending.eligible_close);
   EXPECT_TRUE(pending.backend_stop_confirmed);
-  EXPECT_EQ(pending.stop_certificate_id, "aggregate-certificate.1");
+  EXPECT_EQ(pending.stop_event_id, 4U);
   ASSERT_EQ(pending.allowed_actions.size(), 1U);
   EXPECT_EQ(pending.allowed_actions.front(), RecoveryAction::kResetCycle);
   EXPECT_TRUE(stopped_awaiting_terminal_cleanup(pending));
@@ -606,16 +625,11 @@ TEST(RecoveryAssessmentTest, StoppedWaitsForTerminalCleanupBeforeRetryOrClose) {
   EXPECT_TRUE(recovery_assessment_semantically_differs(pending, ready));
 }
 
-TEST(RecoveryAssessmentTest, StoppedRejectsAddressedSettlementFromAnotherLocalStopOwnerGeneration) {
+TEST(RecoveryAssessmentTest, StoppedRejectsAddressedSettlementOfAnotherExecution) {
   RecoveryAuthorityCapture capture;
   capture.execution_id = 7;
   capture.execution_state = ExecutionState::kStopped;
-  capture.operator_stop_owner_generation = 3;
-  capture.addressed_motion_stop_evidence = AddressedMotionStopRecoveryEvidenceDTO{
-      7, 2,
-      StopCertificateRefDTO{StopCertificateId("aggregate-certificate.1"),
-                            StopCertificateRevision(1U), StopId("stop.1"), StopGeneration(4U)},
-      true};
+  capture.addressed_motion_stop_evidence = stop_evidence(8, 4);
 
   const auto assessment = build_recovery_assessment(capture, 0);
 
@@ -625,15 +639,11 @@ TEST(RecoveryAssessmentTest, StoppedRejectsAddressedSettlementFromAnotherLocalSt
   EXPECT_FALSE(assessment.retry_admissible);
 }
 
-TEST(RecoveryAssessmentTest, StoppedWithUnconfirmedCertificateRemainsFailClosed) {
+TEST(RecoveryAssessmentTest, StoppedWithUnconfirmedStopEvidenceRemainsFailClosed) {
   RecoveryAuthorityCapture capture;
   capture.execution_id = 7;
   capture.execution_state = ExecutionState::kStopped;
-  auto certificate = make_certificate(StopOwnerKind::kOperatorStopWorker, 3, 7);
-  certificate.completion_result = StopCertificateOutcome::kPartial;
-  certificate.backend_stop_confirmed = false;
-  capture.operator_stop_certificate = std::move(certificate);
-  capture.operator_stop_owner_generation = 3;
+  capture.addressed_motion_stop_evidence = stop_evidence(7, 3, false);
 
   const auto assessment = build_recovery_assessment(capture, 0);
   EXPECT_EQ(assessment.recovery_class, RecoveryClass::kOrdinaryOperatorStop);
@@ -648,9 +658,7 @@ TEST(RecoveryAssessmentTest, StrongerAuthorityRevokesStoppedAndFailedOffers) {
   RecoveryAuthorityCapture stopped;
   stopped.execution_id = 7;
   stopped.execution_state = ExecutionState::kStopped;
-  stopped.operator_stop_owner_generation = 3;
-  stopped.operator_stop_certificate =
-      make_certificate(StopOwnerKind::kOperatorStopWorker, 3, 7);
+  stopped.addressed_motion_stop_evidence = stop_evidence(7, 3);
   stopped.stronger_authority_active = true;
   const auto stopped_assessment = build_recovery_assessment(stopped, 0);
   EXPECT_EQ(stopped_assessment.status, RecoveryAssessmentStatus::kWaiting);

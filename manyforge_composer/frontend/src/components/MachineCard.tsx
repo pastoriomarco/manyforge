@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
+import type { ApplicationStartId } from '../api/applicationIdentity';
 import type { JsonValue } from '../types/api';
 import type { ComponentProfileFacts, MachineCatalogEntry } from '../types/componentCatalog';
 import type { ComponentState } from '../types/components';
@@ -39,7 +40,10 @@ function object(value: JsonValue | undefined): Row | null {
  */
 export function MachineCard({
   owner, members, machine, profiles, controller, states, enabled, selectedId, onSelect, onRemoved,
+  applicationStartId = null,
 }: {
+  /** The current application start; recover-enable names it (null: unknown). */
+  applicationStartId?: ApplicationStartId | null;
   owner: ComponentManagerRow;
   members: readonly ComponentManagerRow[];
   /** The machine model's catalog entry (lanes, member slots); undefined until read. */
@@ -118,7 +122,8 @@ export function MachineCard({
       )}
       {ownerState === null
         ? <p className="muted">{missingComponentStateText(states !== null)}</p>
-        : <ComponentStatePanel state={ownerState} enabled={enabled} states={cell} embedded />}
+        : <ComponentStatePanel state={ownerState} enabled={enabled} states={cell} embedded
+          applicationStartId={applicationStartId} />}
       {ownerState !== null && (ownerState.details ?? []).length > 0 && (
         <div className="component-state-rows" role="group" aria-label={`${owner.componentId} controller status`}>
           <h4 className="settings-subheading">Controller status</h4>
@@ -137,7 +142,7 @@ export function MachineCard({
         {members.map((member) => (
           <MemberRow key={member.componentId} member={member} index={indexOf(member.componentId)}
             controller={controller} state={stateOf(member.componentId)} states={cell}
-            statesKnown={states !== null} enabled={enabled}
+            statesKnown={states !== null} enabled={enabled} applicationStartId={applicationStartId}
             disabled={disabled} selected={member.componentId === selectedId} onSelect={onSelect} />
         ))}
       </div>
@@ -196,8 +201,9 @@ function AddressField({ ownerId, address, disabled, onCommit }: {
  */
 function MemberRow({
   member, index, controller, state, states, statesKnown, enabled, disabled, selected,
-  onSelect,
+  onSelect, applicationStartId,
 }: {
+  applicationStartId: ApplicationStartId | null;
   member: ComponentManagerRow;
   index: number;
   controller: DeploymentWorkspaceController;
@@ -242,7 +248,7 @@ function MemberRow({
         ) : shown === null ? (
           <p className="inline-message severity-info">{missingComponentStateText(statesKnown)}</p>
         ) : (
-          <MemberStatus state={shown} states={states} enabled={enabled} />
+          <MemberStatus state={shown} states={states} enabled={enabled} applicationStartId={applicationStartId} />
         )}
       </div>
     </div>
@@ -250,7 +256,8 @@ function MemberRow({
 }
 
 /** A member's state as inline messages, then its actions (the same as its status card's). */
-function MemberStatus({ state, states, enabled }: {
+function MemberStatus({ state, states, enabled, applicationStartId }: {
+  applicationStartId: ApplicationStartId | null;
   state: ComponentState;
   states: readonly ComponentState[];
   enabled: boolean;
@@ -300,7 +307,8 @@ function MemberStatus({ state, states, enabled }: {
           {details.map((detail) => `${detail.name} ${detail.value}`).join(' · ')}
         </p>
       )}
-      <ComponentActions state={state} enabled={enabled} states={states} className="dactions machine-member-actions" />
+      <ComponentActions state={state} enabled={enabled} states={states} className="dactions machine-member-actions"
+        applicationStartId={applicationStartId} />
     </>
   );
 }

@@ -249,8 +249,9 @@ The owner offers Prepare, Recover and its capabilities (Power off, Reboot);
 it has no Enable. Its members offer Prepare, Enable, Disable and Recover,
 refused (`owner_not_prepared`) while the owner isn't prepared. While the owner
 is offline, not prepared or faulted, its members show `offline` with the
-reason `owner_unavailable`. A fault of the machine's controller (an e-stop, a
-controller error) is the owner's fault; it names the members it concerns.
+reason `owner_unavailable`. An error of the machine's controller is the
+owner's fault; it names the members it concerns. An e-stop reported by the
+controller is the owner's stop, not a fault.
 
 ## Add an I/O device
 
@@ -276,6 +277,9 @@ controller error) is the owner's fault; it names the members it concerns.
 The per-instance fields of a Deployment signal (`controllable_component_id`,
 `command_target_id`, `resource_role_id`, `source_id`) are not part of the
 descriptor. Apply checks each provider's own fields.
+
+A `mock` input can be set by hand from the viewer's Tool & I/O panel while
+the cell runs; see [Setting a Mock input](INTERRUPTS.md#signals).
 
 **Health of a provider-form device.** Its ROS inputs (`ros_bool`,
 `ros2_control_gpio`) are watched for their senders: once an input topic has
@@ -614,6 +618,10 @@ long a robot may take to come up after activation. An Apply that installs or
 replaces the component also waits for it.
 
 - **Default.** 10 s, for every component kind and lane.
+- **AI assistant.** Its Enable and Disable have no time limit: they wait until
+  the host reports the bridge serving or stopped, the host exits, or a Stop
+  interrupts them, and stay visible as running meanwhile. An Enable that does
+  not complete stops the bridge again.
 - **Override.** Set `lifecycle_command_timeout_s` (seconds, above 0, at most
   3600) in the component's `configuration`, or on its Components page
   ("Lifecycle command time limit"; blank keeps the default). An I/O device
@@ -626,6 +634,10 @@ replaces the component also waits for it.
   does not is reported as an unresponsive component. A call's own wait (for
   example the few seconds a Real xArm takes to settle after arming) never
   runs past the step's budget.
+- The component's adapter keeps to the budget. Group actions (**Enable all**,
+  **Prepare all**) and an Apply's Disable and Prepare steps wait for each
+  action's own result; a component that reports `component_owner_stalled`
+  ends its step at once with that code.
 
 A changed budget, like any other component setting, stays in the Draft and
 takes effect at the confirmed Apply, which replaces that component.

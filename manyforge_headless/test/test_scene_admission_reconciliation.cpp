@@ -11,10 +11,11 @@ namespace {
 namespace core = manyforge::core;
 
 const std::string kDigest = "sha256:" + std::string(64U, 'a');
+const core::RequestKey kRequestKey = core::RequestKey::Make(
+    core::RequestKeyClass::kHttpClient, 0U, 1U, 1U);
 
 core::SceneTransactionRequestDTO Request() {
-  return {{core::RequestId("scene-request"),
-           core::RequestOwnerEpoch("scene-owner"), "test", std::nullopt},
+  return {{kRequestKey, "test"},
           {},
           {core::RetainedBundleId(kDigest),
            core::GraphRevision(kDigest),
@@ -29,7 +30,7 @@ struct SceneOwner final {
     bool projection_leases_open{true};
   } access;
   core::SceneCommitResultDTO result{
-      core::RequestId("scene-request"),
+      kRequestKey,
       core::RequestReplayStatusDTO::kAcceptedNew,
       false,
       core::ErrorDTO{"stale_revision", "revision changed", {}},

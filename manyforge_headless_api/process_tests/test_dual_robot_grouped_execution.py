@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
+import signal
+import os
 import shutil
 import sys
 from tempfile import TemporaryDirectory
@@ -25,11 +27,16 @@ from manyforge_headless_api.models import OperationIntentRequest, TargetObservat
 from manyforge_headless_api.process_tests.test_process_stack import (
     keep_failure_evidence,
     ProcessStack,
+    _apply_command,
     _composer_fence,
     _composer_snapshot_stream,
     _matching_composer_snapshot,
     _read_only_tree,
+    _request_key,
     _required_path,
+    _runner_command_end,
+    _runner_command_succeeded,
+    _started_run,
 )
 
 
@@ -38,13 +45,20 @@ ADMISSION_FILENAME = f"canonical-empty-admission.{CELL_ID}.json"
 GROUPED_SCENARIO = "mock_dual_arm_shared_group"
 ISOLATION_SCENARIO = "mock_dual_arm_separate_groups"
 # Orin (4 CPUs) measured Load max: 28.438s; 60s is >2x for this test only,
-# not a product deadline.
+# not a product deadline. Load answers at acceptance (OD-214): this bounds the
+# request and, separately, following its row to its end.
 LOAD_HTTP_TIMEOUT_SECONDS = 60.0
 # Near the wall the UR5e start keeps about 9 cm of clearance, while its
 # Program goal reaches about 6 cm through the wall.
 MOVED_UR5E_ROOT_POSITION_M = [-0.2, 0.68, 0.0]
 # The gripper component mounted on each arm (its own Mock launch).
 MOUNTED_GRIPPER = {"lite6_robot": "lite_gripper", "ur5e_robot": "robotiq_2f_85"}
+
+
+def _application_start_id(client: HeadlessHttpClient) -> str:
+    """This start's ``A`` as the control projection names it (contract 1.6)."""
+
+    return client.request("GET", "/api/control/state")["application_start_id"]
 
 
 @contextmanager
@@ -117,6 +131,18 @@ def _load_request_client(
 def test_load_request_client_uses_injected_timeout_and_standard_http_mapping() -> None:
     # MockTransport returns immediately, so no real 60-second wait is involved.
     observed_timeouts: list[dict[str, float]] = []
+    # Load answers at acceptance with its row (OD-214).
+    accepted = {
+        "schema_version": "manyforge.apply_command_reply.v1",
+        "command": {
+            "kind": "scenario_load",
+            "request_key": "0" * 31 + "1",
+            "step": None,
+            "accepted_at_ns": "1",
+            "end": None,
+            "step_source": None,
+        },
+    }
     refusal = {
         "detail": {
             "code": "stale_generation",
@@ -130,7 +156,7 @@ def test_load_request_client_uses_injected_timeout_and_standard_http_mapping() -
         observed_timeouts.append(request.extensions["timeout"])
         if request.url.path == "/api/load-refusal":
             return httpx.Response(409, json=refusal)
-        return httpx.Response(200, json={"outcome": "succeeded"})
+        return httpx.Response(200, json=accepted)
 
     http_transport = httpx.MockTransport(respond)
     with _load_request_client(
@@ -141,7 +167,7 @@ def test_load_request_client_uses_injected_timeout_and_standard_http_mapping() -
         assert composer._timeout_seconds == 30.0
         assert composer.request(
             "POST", "/api/scenario/load", body={"path": "/fixture.scenario"}
-        ) == {"outcome": "succeeded"}
+        ) == accepted
         with pytest.raises(HeadlessClientError) as raised:
             composer.request("POST", "/api/load-refusal", body={})
 
@@ -243,14 +269,14 @@ def observe_applied_activation_projection(
     """Read the accepted Apply's exact projection before any activation effect."""
     assert status["state"] == "succeeded" and status["ok"] is True, status
     expected = status["candidate_projection_revision"]
-    owner = status["request_owner_epoch"]
+    request_key = status["request_key"]
+    start = _application_start_id(headless)
     apply_identity = (status["apply_id"], status["apply_generation"])
     deployment_revision = status["prepared_activation"]["deployment_revision"]
     program_binding_id = status["prepared_activation"]["program_binding_id"]
     prior_publication, prior_selected, prior_program = None, None, None
     if predecessor is not None:
         prior_source = predecessor["source"]
-        assert prior_source["source_owner_epoch"] == owner, predecessor
         assert (prior_source["available"] is True and prior_source["freshness"] == "fresh"
                 and prior_source["known_gaps"] == []), predecessor
         prior_publication = predecessor["publication"]
@@ -265,8 +291,6 @@ def observe_applied_activation_projection(
             assert (prior_apply["apply_id"], prior_apply["apply_generation"]) == (
                 transaction["apply_id"], transaction["apply_generation"]
             ), predecessor
-            # This immutable prior request may belong to a previous Manager
-            # epoch; the publication transaction carries no owner epoch.
             assert prior_apply["state"] == "succeeded" and prior_apply["ok"] is True, predecessor
             assert prior_apply["candidate_projection_revision"] == prior_publication["projection_revision"], predecessor
             assert prior_program is not None, predecessor
@@ -289,15 +313,14 @@ def observe_applied_activation_projection(
             assert prior_order["graphRevision"] == prior_program["graph_revision"], predecessor
     deadline = monotonic() + timeout_seconds
     while True:
-        current = headless.manager_apply_status(*apply_identity)
+        current = headless.manager_apply_status(*apply_identity, application_start_id=start)
         assert (current["apply_id"], current["apply_generation"]) == apply_identity, current
         assert current["state"] == "succeeded" and current["ok"] is True, current
         assert current["candidate_projection_revision"] == expected, current
-        assert current["request_owner_epoch"] == owner, current
+        assert current["request_key"] == request_key, current
         assert current["prepared_activation"] == status["prepared_activation"], current
         manager = headless.manager_status()
         source, payload = manager["source"], manager["status"]
-        assert source.get("source_owner_epoch") == owner, source
         publication = payload["active"].get("publication")
         publication_is_prior = publication is not None and publication == prior_publication
         if publication is not None and not publication_is_prior:
@@ -373,6 +396,21 @@ def observe_applied_activation_projection(
         sleep(0.02)
 
 
+def _load_document(stack: ProcessStack, path: str) -> dict[str, Any]:
+    """One Load (OD-214: answered at acceptance), its row followed to its end
+    within the measured Load deadline."""
+
+    with _load_request_client(stack.composer_url) as loader:
+        return _apply_command(
+            loader, "/api/scenario/load", {"path": path},
+            timeout_seconds=LOAD_HTTP_TIMEOUT_SECONDS,
+        )
+
+
+def _loaded_document_path(composer: HeadlessHttpClient) -> str:
+    return composer.request("GET", "/api/authoring/workspace")["project"]["document_path"]
+
+
 def _load_scenario(
     stack: ProcessStack,
     scenario_id: str,
@@ -394,7 +432,8 @@ def _load_scenario(
                     and previous_publication["transaction"]["kind"] == "named_apply"):
                 transaction = previous_publication["transaction"]
                 previous_apply = previous.manager_apply_status(
-                    transaction["apply_id"], transaction["apply_generation"]
+                    transaction["apply_id"], transaction["apply_generation"],
+                    application_start_id=stack.application_start_id,
                 )
             try:
                 previous_program = previous.program_applied_status()
@@ -409,16 +448,18 @@ def _load_scenario(
             "managerApplied": composer.request("GET", "/api/deployment/workspace")["managerApplied"],
             "applied_status": previous_program,
         })
-        # Load waits for the whole Apply; components end prepared.
-        with _load_request_client(stack.composer_url) as loader:
-            loaded = loader.request("POST", "/api/scenario/load", body={"path": path})
-        assert loaded["outcome"] == "succeeded", f"{scenario_id}: Load failed: {loaded!r}"
-        assert loaded["path"] == str(Path(path).resolve()), loaded
+        # Load's row is followed to the end of the whole Apply; components
+        # end prepared.
+        loaded = _load_document(stack, path)
+        assert loaded["end"]["outcome"] == "succeeded", f"{scenario_id}: Load failed: {loaded!r}"
+        # The loaded document's path, as the Load once replied it.
+        assert _loaded_document_path(composer) == str(Path(path).resolve()), loaded
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             transaction = headless.manager_status()["status"]["active"]["publication"]["transaction"]
             assert transaction["kind"] == "named_apply", transaction
             status = headless.manager_apply_status(
-                transaction["apply_id"], transaction["apply_generation"]
+                transaction["apply_id"], transaction["apply_generation"],
+                application_start_id=stack.application_start_id,
             )
             observe_applied_activation_projection(
                 headless, composer, status, scenario_id, predecessor=predecessor,
@@ -470,6 +511,7 @@ def _save_and_reopen_current_scenario(
                     body={
                         **_composer_fence(
                             snapshot,
+                            application_start_id=stack.application_start_id,
                             request_id=(
                                 f"dual-robot.{scenario_id}.save.{save_identity}.{attempt}"
                             ),
@@ -513,12 +555,9 @@ def _save_and_reopen_current_scenario(
         assert len(saved_rows) == 1
         assert saved_rows[0]["path"] == str(target.resolve())
 
-        with _load_request_client(stack.composer_url) as loader:
-            reopened = loader.request(
-                "POST", "/api/scenario/load", body={"path": str(target)}
-            )
-        assert reopened["outcome"] == "succeeded", reopened
-        assert reopened["path"] == str(target.resolve())
+        reopened = _load_document(stack, str(target))
+        assert reopened["end"]["outcome"] == "succeeded", reopened
+        assert _loaded_document_path(composer) == str(target.resolve())
         # Load closes first: the unchanged cell is retained and
         # its components end prepared; Enable stays the operator's action.
         manager_after = composer.manager_status()["status"]["active"]
@@ -543,21 +582,27 @@ def _start_run(
     source_document_digest: str,
     applied: dict[str, Any],
 ) -> dict[str, Any]:
+    """Execute: the started run, read from the cycle status once the
+    command's row ended ``succeeded`` (OD-214)."""
+
+    retried = {
+        "authoring_not_ready",
+        "program_node_availability_stale",
+        "stale_generation",
+    }
     with HeadlessHttpClient(stack.composer_url, timeout_seconds=20.0) as composer:
         draft = composer.request("GET", "/api/program/draft")["program"]
         # One Scenario may be run several times in a test (e.g. after a
-        # Program-only reload); a reused request id with a different payload
-        # is a request_id_conflict.
-        run_identity = uuid.uuid4().hex
+        # Program-only reload); each attempt is its own request with its own
+        # key (a reused key with a different payload is request_id_conflict).
+        # The same refusals may come before acceptance (HTTP) or as the row's end.
         for attempt in range(8):
             try:
                 stack.wait_authoring_admission(expected_allowed=True)
-                return composer.program_run_start(
+                reply = composer.program_run_start(
                     {
-                        "request_id": f"dual-robot.{scenario_id}.run.{run_identity}.{attempt}",
-                        "request_owner_epoch": "dual-robot.grouped.process-test",
+                        "request_key": _request_key(),
                         "source_label": "dual_robot_grouped_process_test",
-                        "correlation_id": f"dual-robot.{scenario_id}.run",
                         "scenario_id": scenario_id,
                         "source_document_digest": source_document_digest,
                         "expected_applied_record_digest": applied["source"][
@@ -567,30 +612,39 @@ def _start_run(
                     }
                 )
             except HeadlessClientError as error:
-                if (
-                    error.code
-                    not in {
-                        "authoring_not_ready",
-                        "program_node_availability_stale",
-                        "stale_generation",
-                    }
-                    or attempt == 7
-                ):
+                if error.code not in retried or attempt == 7:
                     raise
+                continue
+            row, cycle = _runner_command_end(composer, reply, timeout_seconds=20.0)
+            if row["end"]["code"] in retried and attempt < 7:
+                continue
+            return _started_run(row, cycle)
         raise AssertionError("unreachable")
 
 
 def _native_events(stack: ProcessStack) -> list[dict[str, Any]]:
     native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=2.0)
-    owner_epoch = native.identity()["identity"]["owner_epoch"]
     result: list[dict[str, Any]] = []
     after = 0
     while True:
-        page = native.events(owner_epoch, after, limit=16)
+        page = native.events(after, limit=16)
         result.extend(page["events"])
         if not page["has_more"]:
             return result
         after = page["next_after_sequence"]
+
+
+def _native_events_when(
+    stack: ProcessStack, ready: Callable[[list[dict[str, Any]]], bool]
+) -> list[dict[str, Any]]:
+    """The journal writer writes rows shortly after the actions: read until
+    `ready` holds or the bound passes, and return the last read."""
+    deadline = time.monotonic() + 5.0
+    events = _native_events(stack)
+    while not ready(events) and time.monotonic() < deadline:
+        time.sleep(0.01)
+        events = _native_events(stack)
+    return events
 
 
 def _start_motion(
@@ -599,6 +653,9 @@ def _start_motion(
     *,
     request_id: str,
 ) -> dict[str, Any]:
+    """``request_id`` labels the call site; the request carries a fresh key."""
+
+    del request_id
     program_run_id = started["capture"]["program_run_id"]
     deadline = time.monotonic() + 5.0
     while True:
@@ -615,24 +672,25 @@ def _start_motion(
                 f"current motion controls were not published for {program_run_id}: {cycle!r}"
             )
         time.sleep(0.01)
-    return client.program_run_motion_start(
+    reply = client.program_run_motion_start(
         program_run_id,
         {
-            "request_id": request_id,
-            "request_owner_epoch": "dual-robot.grouped.process-test",
+            "request_key": _request_key(),
+            "application_start_id": _application_start_id(client),
             "source_label": "dual_robot_grouped_process_test",
-            "correlation_id": request_id,
             "program_run_id": program_run_id,
-            "expected_owner_epoch": cycle["program_runner_owner_epoch"],
-            "expected_selection_revision": selections["selection_revision"],
+            "expected_hold_revision": selections["hold_revision"],
             "reason": "initial operator motion Run",
             "group_ids": ["all"],
         },
     )
+    # Answered at acceptance (OD-214): its row is followed to `succeeded`.
+    row, _ = _runner_command_succeeded(client, reply)
+    return row
 
 
 def _operation_acceptances(
-    stack: ProcessStack, program_run_id: str, *, minimum: int = 2
+    stack: ProcessStack, program_run_id: int, *, minimum: int = 2
 ) -> list[dict[str, Any]]:
     deadline = time.monotonic() + 20.0
     accepted: list[dict[str, Any]] = []
@@ -647,7 +705,9 @@ def _operation_acceptances(
             return accepted
         time.sleep(0.01)
     with HeadlessHttpClient(stack.composer_url, timeout_seconds=5.0) as client:
-        run = client.program_run(program_run_id)
+        run = client.program_run(
+            program_run_id, application_start_id=stack.application_start_id
+        )
         cycle = client.program_cycle_status()
     raise RuntimeError(
         "two robot operations were not accepted: "
@@ -657,15 +717,16 @@ def _operation_acceptances(
 
 def _wait_run_state(
     client: HeadlessHttpClient,
-    program_run_id: str,
+    program_run_id: int,
     expected: set[str],
     *,
     timeout_seconds: float = 40.0,
 ) -> dict[str, Any]:
     deadline = time.monotonic() + timeout_seconds
+    start = _application_start_id(client)
     last: dict[str, Any] = {}
     while time.monotonic() < deadline:
-        last = client.program_run(program_run_id)
+        last = client.program_run(program_run_id, application_start_id=start)
         if last["state"] in expected:
             return last
         time.sleep(0.01)
@@ -673,7 +734,7 @@ def _wait_run_state(
 
 
 def _wait_group_held(
-    client: HeadlessHttpClient, program_run_id: str, group_id: str
+    client: HeadlessHttpClient, program_run_id: int, group_id: str
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     deadline = time.monotonic() + 20.0
     last: dict[str, Any] = {}
@@ -716,17 +777,16 @@ def _participant_target(participant: dict[str, Any]) -> tuple[str, str]:
 def _set_scale(
     client: HeadlessHttpClient, selector: dict[str, Any], scale: float, request_id: str
 ) -> dict[str, Any]:
+    """``request_id`` labels the call site; the request carries a fresh key."""
+
+    del request_id
     current = client.runtime_scale_control(selector)["runtime_scale_control"]
-    owner_epoch = client.execution_diagnostics()["status"]["identity"][
-        "owner_epoch"
-    ]
     accepted = client.set_runtime_scale_control(
         {
+            "application_start_id": _application_start_id(client),
             "request_context": {
-                "request_id": request_id,
-                "request_owner_epoch": owner_epoch,
+                "request_key": _request_key(),
                 "source_label": "dual_robot_grouped_process_test",
-                "correlation_id": request_id,
             },
             "selector": selector,
             "expected_control_generation": current["control_generation"],
@@ -756,23 +816,23 @@ def _wait_scale_applied(
     raise RuntimeError(f"runtime scale did not become effective: {last!r}")
 
 
-def _reset_cycle(client: HeadlessHttpClient, program_run_id: str) -> None:
+def _reset_cycle(client: HeadlessHttpClient, program_run_id: int) -> None:
     cycle = client.program_cycle_status()
     reference = cycle["terminal_or_settlement_reference"]
-    client.program_cycle_reset(
+    reply = client.program_cycle_reset(
         {
-            "request_id": f"dual-robot.{program_run_id}.reset",
-            "request_owner_epoch": "dual-robot.grouped.process-test",
+            "request_key": _request_key(),
+            "application_start_id": _application_start_id(client),
             "source_label": "dual_robot_grouped_process_test",
-            "correlation_id": f"dual-robot.{program_run_id}",
             "program_run_id": program_run_id,
-            "expected_owner_epoch": cycle["program_runner_owner_epoch"],
             "expected_cycle_generation": cycle["cycle_generation"],
             "expected_claim_generation": cycle["cycle_claim_generation"],
             "terminal_reference": reference,
             "settlement_evidence_digest": reference,
         }
     )
+    # Answered at acceptance (OD-214): its row is followed to `succeeded`.
+    _runner_command_succeeded(client, reply)
     assert client.program_cycle_status()["state"] == "idle_after_reset"
 
 
@@ -828,11 +888,10 @@ def test_reload_works_whatever_was_enabled(enabled: str) -> None:
         path = rows[GROUPED_SCENARIO]["path"]
 
         def load() -> dict[str, Any]:
-            with _load_request_client(stack.composer_url) as loader:
-                return loader.request("POST", "/api/scenario/load", body={"path": path})
+            return _load_document(stack, path)
 
         first = load()
-        assert first["outcome"] == "succeeded", first
+        assert first["end"]["outcome"] == "succeeded", first
         if enabled == "all":
             _activate_loaded_components(stack)
         elif enabled == "some":
@@ -843,7 +902,7 @@ def test_reload_works_whatever_was_enabled(enabled: str) -> None:
         stack.wait_authoring_admission(expected_allowed=True)
 
         reloaded = load()
-        assert reloaded["outcome"] == "succeeded", reloaded
+        assert reloaded["end"]["outcome"] == "succeeded", reloaded
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             states = _component_states(headless)
         assert states and all(row["lifecycle"] == "prepared" for row in states.values()), states
@@ -1045,13 +1104,19 @@ def test_retained_robot_plans_in_the_candidate_cell_planning_model() -> None:
                 {"succeeded", "failed", "intervention_required", "stopped"},
             )
         assert terminal["state"] != "succeeded", terminal
-        ur5e_operations = {
-            event["operation_id"]
-            for event in _native_events(stack)
-            if event["record_kind"] == "operation_accepted"
-            and _participant_target(event["payload"]["intent"]["participants"][0])
-            == ("ur5e_robot", "arm")
-        }
+
+        def ur5e_accepted(events: list[dict[str, Any]]) -> set[int]:
+            return {
+                event["operation_id"]
+                for event in events
+                if event["record_kind"] == "operation_accepted"
+                and _participant_target(event["payload"]["intent"]["participants"][0])
+                == ("ur5e_robot", "arm")
+            }
+
+        ur5e_operations = ur5e_accepted(
+            _native_events_when(stack, lambda events: len(ur5e_accepted(events)) >= 4)
+        )
         # The move node retries a failed plan `automatic_retries` times
         # (node catalog default 3, 1 s apart): four attempts, each refused by
         # the planner for the moved cell.
@@ -1084,7 +1149,6 @@ def _kernel_attention_reconciled(
         and isinstance(bundle, str)
         and isinstance(graph, str)
         and held.get("reconciled") is True
-        and held.get("owner_epoch") == snapshot.get("owner_epoch")
         and held.get("generation", -1) >= minimum_generation
         and held.get("active_configuration")
         == {"graph_revision": graph, "retained_bundle_id": bundle}
@@ -1136,13 +1200,11 @@ def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
         assert any(row["capability_id"] == "model.kinematics.fk"
                    for row in arm_binding["capability_bindings"])
         native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
-        owner_epoch = native.identity()["identity"]["owner_epoch"]
         # The robot-role `tcp` frame alias is gone (CHANGELOG 0.2.0, Program
         # changes); the arm's target role declares only `base`.
         for frame_role in ("base",):
             response = native.query_target(TargetObservationQuery.model_validate({
-                "schema_version": "manyforge.target_observation_query.v2",
-                "owner_epoch": owner_epoch,
+                "schema_version": "manyforge.target_observation_query.v3",
                 "program_binding_id": applied["program_binding_id"],
                 "target": {"component_id": "lite6_robot", "command_target_id": "arm"},
                 "kind": "frame_pose", "frame": {"component_id": "lite6_robot", "frame_id": frame_role},
@@ -1261,13 +1323,24 @@ def test_mixed_apply_preserves_survivor_and_observations_during_publication() ->
             initial_diagnostics = native.diagnostics()
             assert initial_diagnostics.get("ok") is True, initial_diagnostics
             initial_status = initial_diagnostics["status"]
-            assert initial_status["schema_version"] == "manyforge.execution_status.v3"
-            host_epoch = initial_status["identity"]["owner_epoch"]
+            assert initial_status["schema_version"] == "manyforge.execution_status.v4"
+            host_start = initial_status["identity"]["application_start_id"]
             dual_inventory = inventory_keys(initial_status["targets"])
             dual_supported = target_keys(initial_status)
             single_inventory = {key for key in dual_inventory if key[0] not in peer}
             single_supported = {key for key in dual_supported if key[0] not in peer}
             assert {"lite6_robot", "ur5e_robot"} <= {key[0] for key in dual_inventory}
+            # OD-217: one collision-check row per robot engine.
+            check_rows = {
+                row["controllable_component_id"]: row
+                for row in initial_status["runtime_collision_checks"]
+            }
+            assert {"lite6_robot", "ur5e_robot"} <= set(check_rows), check_rows
+            assert all(
+                row["check_period_ns"] > 0 and 0 <= row["checks_late"] <= row["checks_run"]
+                and row["periods_skipped"] >= row["checks_late"]
+                for row in check_rows.values()
+            ), check_rows
 
             initial_response = native.observation()
             assert initial_response.get("ok") is True, initial_response
@@ -1312,8 +1385,8 @@ def test_mixed_apply_preserves_survivor_and_observations_during_publication() ->
             ) -> set[tuple[str, str, str]]:
                 assert response.get("ok") is True, response
                 observation = response["observation"]
-                assert observation["schema_version"] == "manyforge.execution_observation.v4"
-                assert observation["owner_epoch"] == host_epoch
+                assert observation["schema_version"] == "manyforge.execution_observation.v5"
+                assert observation["application_start_id"] == host_start
                 assert observation["source_epoch"] == wake_epoch
                 rows = keyed_observations(observation["targets"])
                 keys = set(rows)
@@ -1336,7 +1409,7 @@ def test_mixed_apply_preserves_survivor_and_observations_during_publication() ->
             def assert_settled_control_state(
                 control_state: dict[str, Any], expected: set[tuple[str, str, str]],
             ) -> None:
-                assert control_state["schema_version"] == "manyforge.execution_control_state.v7"
+                assert control_state["schema_version"] == "manyforge.execution_control_state.v8"
                 rows = keyed_observations(control_state["observed_targets"])
                 assert set(rows) == expected, control_state
                 for key in single_render:
@@ -1366,17 +1439,17 @@ def test_mixed_apply_preserves_survivor_and_observations_during_publication() ->
                         diagnostics = native.diagnostics()
                         assert diagnostics.get("ok") is True, diagnostics
                         status = diagnostics["status"]
-                        assert status["schema_version"] == "manyforge.execution_status.v3"
-                        assert status["identity"]["owner_epoch"] == host_epoch
+                        assert status["schema_version"] == "manyforge.execution_status.v4"
+                        assert status["identity"]["application_start_id"] == host_start
                         assert inventory_keys(status["targets"]) == expected_inventory
                         assert target_keys(status) == expected_supported
                         assert_settled_control_state(status["control_state"], expected_supported)
                         identity = native.identity()
                         assert identity.get("ok") is True, identity
-                        assert identity["identity"]["owner_epoch"] == host_epoch
+                        assert identity["identity"]["application_start_id"] == host_start
                         targets = native.targets()
                         assert targets.get("ok") is True, targets
-                        assert targets["targets"]["schema_version"] == "manyforge.execution_targets.v4"
+                        assert targets["targets"]["schema_version"] == "manyforge.execution_targets.v5"
                         assert inventory_keys(targets["targets"]) == expected_inventory
                         control_state = native.control_state()
                         assert control_state.get("ok") is True, control_state
@@ -1427,37 +1500,42 @@ def test_grouped_dual_robot_run_scales_stops_and_resumes() -> None:
             assert scale_status["effective_scale"] == 0.2
             assert len(scale_status["group_members"]) == 2
 
+            start = _application_start_id(client)
             stop = client.program_run_motion_stop(
                 program_run_id,
                 {
-                    "request_id": "dual-robot.group.stop",
-                    "request_owner_epoch": "dual-robot.grouped.process-test",
+                    "request_key": _request_key(),
+                    "application_start_id": start,
                     "source_label": "dual_robot_grouped_process_test",
-                    "correlation_id": "dual-robot.group.stop",
                     "program_run_id": program_run_id,
-                    "expected_owner_epoch": started["owner_epoch"],
                     "reason": "qualify grouped ordinary Stop",
                     "group_ids": ["robot_group"],
                 },
             )
-            assert stop["state"] == "running"
+            # Kernel-first: the selection Stop's reply is the Kernel's
+            # acceptance, named by its Stop event id (contracts 1.8, 1.5).
+            assert stop["ok"] is True, stop
+            assert stop["display"] == (
+                f"{start[:4]}/stop{stop['accepted']['stop']['event_id']}"
+            )
             cycle, selections = _wait_group_held(client, program_run_id, "robot_group")
             held_run = cycle["run"]
             assert held_run is not None
-            resumed = client.program_run_motion_resume(
+            reply = client.program_run_motion_resume(
                 program_run_id,
                 {
-                    "request_id": "dual-robot.group.resume",
-                    "request_owner_epoch": "dual-robot.grouped.process-test",
+                    "request_key": _request_key(),
+                    "application_start_id": start,
                     "source_label": "dual_robot_grouped_process_test",
-                    "correlation_id": "dual-robot.group.resume",
                     "program_run_id": program_run_id,
-                    "expected_owner_epoch": cycle["program_runner_owner_epoch"],
-                    "expected_selection_revision": selections["selection_revision"],
+                    "expected_hold_revision": selections["hold_revision"],
                     "reason": "resume both robots from current observations",
                     "group_ids": ["robot_group"],
                 },
             )
+            # Answered at acceptance (OD-214): the run as the cycle status
+            # showed it when the resume's row ended `succeeded`.
+            resumed = _runner_command_succeeded(client, reply)[1]["run"]
             assert resumed["state"] == "running"
             # Both motions resume at scale 0.2: the ur5e's 11.1 s smooth-timed
             # trajectory takes about 56 s.
@@ -1467,7 +1545,7 @@ def test_grouped_dual_robot_run_scales_stops_and_resumes() -> None:
             _reset_cycle(client, program_run_id)
 
 
-def test_runner_loss_during_admitted_motion_alarms_contains_and_keeps_admission_closed() -> None:
+def test_runner_loss_during_admitted_motion_alarms_stops_the_program_run_and_keeps_admission_closed() -> None:
     # This fixture has no production Workbench supervisor: it keeps the API
     # alive to inspect the process chain, not browser visibility during teardown.
     with _dual_robot_stack() as stack:
@@ -1489,11 +1567,11 @@ def test_runner_loss_during_admitted_motion_alarms_contains_and_keeps_admission_
             original_ids = {event["operation_id"] for event in accepted}
             assert len(original_ids) == 2
             # Reuse the genuine fixture's runtime scale control to keep the
-            # authored motions active across the existing lease/Stop interval.
+            # authored motions active well past the former 1 s lease.
             _set_scale(composer, selector, 0.05, "r5.runner-loss.slow-active-motion")
             _wait_scale_applied(composer, selector, 0.05)
             native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
-            native_epoch = native.identity()["identity"]["owner_epoch"]
+            native_start = native.identity()["identity"]["application_start_id"]
             deadline = time.monotonic() + 20.0
             while True:
                 before_loss = {operation_id: native.read(operation_id)["operation"]
@@ -1532,66 +1610,66 @@ def test_runner_loss_during_admitted_motion_alarms_contains_and_keeps_admission_
             assert first_alarm["acknowledgement_required"] is True
             assert first_alarm["priority"] == "high"
             assert first_alarm["activation_count"] == 1
-            assert first_alarm["correlations"]["source_owner_epoch"] == native_epoch
+            # History files the alarm under its start; no correlation repeats it.
+            assert "source_owner_epoch" not in first_alarm["correlations"]
             established = first_alarm["details"]["established_cycle"]
             assert established["program_run_id"] == program_run_id
-            for key in ("program_runner_owner_epoch", "cycle_generation", "cycle_claim_generation"):
+            # The cycle status names no runner owner epoch (1.16.4).
+            for key in ("cycle_generation", "cycle_claim_generation"):
                 assert established[key] == cycle_before[key], (first_alarm, cycle_before)
             assert first_alarm["details"]["failure_predicate"] in {
                 "program_runner_liveness_probe", "program_runner_liveness_renewal",
                 "program_runner_reconciliation_renewal",
             }
-            # Do not issue Stop here. The already-configured Manager-presence
-            # lease owns containment; the alarm itself is not proof of rest.
+            # OD-296 (a): a lost contact is typed end to end.
+            assert first_alarm["details"]["fault_code"] == "program_runner_contact_lost"
+            # With the Runner silent, the Kernel stops this Program run's
+            # motion once (one `runner_loss` Stop event, no operator level)
+            # when it latches the Runner loss.
             containment_deadline = time.monotonic() + 20.0
             while True:
                 events = _native_events(stack)
-                lease_stops = [event for event in events
-                               if event["record_kind"] == "stop_acceptance_projected"
-                               and event["payload"]["intent"]["intent_kind"] == "full_stop"
-                               and event["payload"]["intent"]["value"]["request_context"][
-                                   "source_label"] == "kernel.manager_liveness"]
+                run_stops = [event for event in events
+                             if event["record_kind"] == "stop_event_accepted"
+                             and event["payload"]["requested"] == "runner_loss"
+                             and event["payload"]["source_label"]
+                             == "kernel.program_runner_loss"]
                 terminals = []
-                if lease_stops:
-                    assert len(lease_stops) == 1, lease_stops
-                    stop_id = lease_stops[0]["payload"]["acceptance"]["stop_id"]
+                if run_stops:
+                    assert len(run_stops) == 1, run_stops
+                    event_id = run_stops[0]["payload"]["event_id"]
                     terminals = [event for event in events
-                                 if event["record_kind"] == "stop_terminal_projected"
-                                 and event["payload"]["stop_id"] == stop_id]
+                                 if event["record_kind"] == "stop_event_completed"
+                                 and event["payload"]["event_id"] == event_id]
                 if terminals:
                     break
                 assert time.monotonic() < containment_deadline, events
                 time.sleep(0.01)
-            stop = lease_stops[0]["payload"]
-            assert executing_ids <= {operation["operation_id"]
-                                     for operation in stop["affected_state"]["operations"]}
-            assert len(terminals) == 1, terminals
+            assert not [event for event in events
+                        if event["record_kind"] == "stop_event_accepted"
+                        and event["payload"]["requested"] in {"stop_all", "halt", "cell_stop"}
+                        ], events
+            stop = run_stops[0]["payload"]
+            assert stop["reason"] == "program_runner_loss", stop
+            assert executing_ids <= {entry["operation_id"] for entry in stop["covered"]}
             terminal = terminals[0]["payload"]
-            assert terminal["state"] == "succeeded", terminal
-            assert terminal["result"] in {"succeeded_nominal", "succeeded_escalated"}, terminal
-            assert terminal["stop_generation"] == stop["acceptance"]["stop_generation"]
-            assert terminal["stop_certificate_id"]
-            assert terminal["failed_count"] == terminal["unsettled_count"] == 0
-            assert terminal["dispatched_stopped_count"] >= len(executing_ids)
-            if not terminal["details_truncated"]:
-                stopped_ids = {entry["subject"]["operation_id"]
-                               for entry in terminal["dispatched_stopped"]
-                               if entry["subject"]["kind"] == "participant"}
-                assert executing_ids <= stopped_ids, terminal
+            assert terminal["result"] == "stopped", terminal
             for operation_id in executing_ids:
                 contained = native.read(operation_id)["operation"]
                 assert contained["state"] == "stopped", contained
-                assert contained["active_stop_id"] == terminal["stop_id"]
-                assert contained["active_stop_generation"] == terminal["stop_generation"]
+                assert contained["stop_event_id"] == terminal["event_id"]
+            # No host exit: the same execution owner still answers.
+            assert native.identity()["identity"]["application_start_id"] == native_start
 
             assert headless.authoring_admission()["authoring_allowed"] is False
-            # A distinct valid Execute must reach the authoritative host lease
-            # gate, not merely fail against the retained operation's engine.
+            # A distinct valid Execute is refused by readiness (Runner loss),
+            # not by a Manager lease.
             refused_intent = deepcopy(accepted[0]["payload"]["intent"])
             refused_intent.pop("request_attribution")  # Journal-only provenance.
-            refused_intent["program_run_id"] = "r5.runner-loss.manual-refusal-run"
-            refused_intent["request_context"]["request_id"] = "r5.runner-loss.refused-execute"
-            refused_intent["request_context"]["correlation_id"] = "r5.runner-loss.refused-execute"
+            refused_run_id = 9_000_001
+            refused_key = _request_key()
+            refused_intent["program_run_id"] = refused_run_id
+            refused_intent["request_context"]["request_key"] = refused_key
             for participant in refused_intent["participants"]:
                 participant.pop("execution_scope", None)
                 participant.pop("automatic_retry_context", None)
@@ -1599,13 +1677,12 @@ def test_runner_loss_during_admitted_motion_alarms_contains_and_keeps_admission_
             refused = native.submit(OperationIntentRequest.model_validate(refused_intent),
                                     trusted_principal_id=None)
             assert refused["ok"] is False, refused
-            assert refused["error"]["code"] == "manager_liveness_not_current", refused
+            assert refused["error"]["code"] != "manager_liveness_not_current", refused
             after_events = _native_events(stack)
             assert not any(
                 event["record_kind"] == "operation_accepted"
-                and (event["request_id"] == "r5.runner-loss.refused-execute"
-                     or event["payload"]["intent"]["program_run_id"]
-                     == "r5.runner-loss.manual-refusal-run")
+                and (event["request_key"] == refused_key
+                     or event["payload"]["intent"]["program_run_id"] == refused_run_id)
                 for event in after_events
             )
             assert {event["operation_id"] for event in after_events
@@ -1617,11 +1694,144 @@ def test_runner_loss_during_admitted_motion_alarms_contains_and_keeps_admission_
             for key in ("condition_id", "activation_id", "activation_count", "lifecycle_state"):
                 assert retained[0][key] == first_alarm[key]
             print(json.dumps({"runner_loss_alarm_observed_after_s": alarm_observed_after_s,
-                              "contained_operation_ids": sorted(executing_ids),
-                              "stop_id": terminal["stop_id"],
-                              "stop_certificate_id": terminal["stop_certificate_id"]}, sort_keys=True))
+                              "stopped_operation_ids": sorted(executing_ids),
+                              "stop_event_id": terminal["event_id"],
+                              "refused_code": refused["error"]["code"]}, sort_keys=True))
             # No ACK, Reset, replacement Runner or recovery: this sticky fault
             # requires Workbench restart. Fixture teardown owns process cleanup.
+
+
+def _executing_operation_ids(native: ExecutionCommandClient, operation_ids: set[int]) -> set[int]:
+    deadline = time.monotonic() + 20.0
+    while True:
+        executing = {operation_id for operation_id in operation_ids
+                     if native.read(operation_id)["operation"]["state"] == "executing"}
+        if executing:
+            return executing
+        assert time.monotonic() < deadline, {
+            operation_id: native.read(operation_id)["operation"]["state"]
+            for operation_id in operation_ids}
+        time.sleep(0.01)
+
+
+def _wait_operations_stopped(native: ExecutionCommandClient, operation_ids: set[int]) -> None:
+    deadline = time.monotonic() + 20.0
+    while True:
+        states = {operation_id: native.read(operation_id)["operation"]["state"]
+                  for operation_id in operation_ids}
+        if all(state == "stopped" for state in states.values()):
+            return
+        assert time.monotonic() < deadline, states
+        time.sleep(0.01)
+
+
+def test_a_frozen_manager_never_gates_a_users_stop() -> None:
+    # The Manager is not in the motion or Stop path: with it frozen (SIGSTOP)
+    # for longer than any former lease or status freshness, a Program motion
+    # Stop, an operation Stop and a Program Full Stop sent by a client still
+    # reach the Kernel and stop the motion. The client uses the run identity
+    # it already holds, as the operator's screen does: status reads that ask
+    # the Manager for the Scene revision (identity, status, targets, control
+    # state) wait for it and are not used while it is frozen.
+    with _dual_robot_stack() as stack:
+        _load_scenario(stack, GROUPED_SCENARIO)
+        applied = _save_and_reopen_current_scenario(stack, GROUPED_SCENARIO)
+        selector = _group_selector(applied["program_binding_id"])
+        assert stack.manager is not None
+        manager_pid = stack.manager.pid
+        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer:
+            started = _start_run(
+                stack, scenario_id=applied["scenario_id"],
+                source_document_digest=applied["source_document_digest"], applied=applied,
+            )
+            program_run_id = started["capture"]["program_run_id"]
+            _wait_kernel_attention_reconciled(stack)
+            _start_motion(composer, started, request_id="frozen-manager.motion-start")
+            first_ids = {event["operation_id"]
+                         for event in _operation_acceptances(stack, program_run_id)}
+            _set_scale(composer, selector, 0.05, "frozen-manager.slow-motion")
+            _wait_scale_applied(composer, selector, 0.05)
+            native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
+            native_start = native.identity()["identity"]["application_start_id"]
+            executing = _executing_operation_ids(native, first_ids)
+            # Read before the freeze: the client holds the start it built
+            # its requests against, as the operator's screen does.
+            start = _application_start_id(composer)
+
+            def control() -> dict[str, Any]:
+                return {
+                    "request_key": _request_key(),
+                    "application_start_id": start,
+                    "source_label": "dual_robot_grouped_process_test",
+                    "program_run_id": program_run_id,
+                }
+
+            # 1. Program motion Stop with the Manager frozen.
+            os.kill(manager_pid, signal.SIGSTOP)
+            try:
+                time.sleep(3.0)
+                composer.program_run_motion_stop(program_run_id, {
+                    **control(),
+                    "reason": "Stop with the Manager frozen",
+                    "group_ids": ["robot_group"],
+                })
+                _wait_operations_stopped(native, executing)
+            finally:
+                os.kill(manager_pid, signal.SIGCONT)
+
+            cycle, selections = _wait_group_held(composer, program_run_id, "robot_group")
+            # Answered at acceptance (OD-214): followed to `succeeded`.
+            _runner_command_succeeded(composer, composer.program_run_motion_resume(program_run_id, {
+                **control(),
+                "expected_hold_revision": selections["hold_revision"],
+                "reason": "resume before the next frozen-Manager Stops",
+                "group_ids": ["robot_group"],
+            }))
+            resumed_ids = {event["operation_id"]
+                           for event in _operation_acceptances(
+                               stack, program_run_id, minimum=len(first_ids) + 2)} - first_ids
+            resumed = _executing_operation_ids(native, resumed_ids)
+
+            # 2. Operation Stop and 3. Halt with the Manager frozen.
+            os.kill(manager_pid, signal.SIGSTOP)
+            try:
+                time.sleep(3.0)
+                target = sorted(resumed)[0]
+                operation = native.read(target)["operation"]
+                composer.stop_operations({
+                    "application_start_id": start,
+                    "request_context": {
+                        "request_key": _request_key(),
+                        "source_label": "dual_robot_grouped_process_test",
+                    },
+                    "operations": [{
+                        "operation_id": target,
+                        "expected_operation_revision": operation["operation_revision"],
+                    }],
+                    "reason": "operation Stop with the Manager frozen",
+                })
+                _wait_operations_stopped(native, {target})
+                # Halt names no run: every operation stops, the Program freezes.
+                composer.halt({
+                    "request_context": {
+                        "request_key": _request_key(),
+                        "source_label": "dual_robot_grouped_process_test",
+                    },
+                })
+                _wait_operations_stopped(native, resumed_ids)
+            finally:
+                os.kill(manager_pid, signal.SIGCONT)
+            # Three Stops were accepted by the Kernel while the Manager was frozen.
+            def accepted_stops(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                return [event for event in events
+                        if event["record_kind"] == "stop_event_accepted"]
+
+            stops = accepted_stops(_native_events_when(
+                stack, lambda events: len(accepted_stops(events)) >= 3))
+            assert len(stops) >= 3, stops
+            # Nothing exited and the same execution owner still answers.
+            assert stack.manager.poll() is None
+            assert native.identity()["identity"]["application_start_id"] == native_start
 
 
 def test_separate_group_stop_does_not_stop_the_other_robot() -> None:
@@ -1658,35 +1868,38 @@ def test_separate_group_stop_does_not_stop_the_other_robot() -> None:
             assert scale_status["requested_scale"] == 0.1
             assert scale_status["effective_scale"] == 0.1
 
-            client.program_run_motion_stop(
+            start = _application_start_id(client)
+            stop = client.program_run_motion_stop(
                 program_run_id,
                 {
-                    "request_id": "dual-robot.isolation.stop-lite6",
-                    "request_owner_epoch": "dual-robot.grouped.process-test",
+                    "request_key": _request_key(),
+                    "application_start_id": start,
                     "source_label": "dual_robot_grouped_process_test",
-                    "correlation_id": "dual-robot.isolation.stop-lite6",
                     "program_run_id": program_run_id,
-                    "expected_owner_epoch": started["owner_epoch"],
                     "reason": "qualify separate-group isolation",
                     "group_ids": ["lite6_arm"],
                 },
             )
+            assert stop["ok"] is True, stop
             _wait_group_held(client, program_run_id, "lite6_arm")
 
-            native_events = _native_events(stack)
+            native_events = _native_events_when(stack, lambda events: any(
+                event["record_kind"] == "stop_event_accepted"
+                and event["payload"]["event_id"] == stop["accepted"]["stop"]["event_id"]
+                for event in events
+            ))
             stop_events = [
                 event
                 for event in native_events
-                if event["record_kind"] == "stop_acceptance_projected"
-                and event["request_id"].startswith("motion:control-receiver.")
-                and event["request_id"].endswith(":dual-robot.isolation.stop-lite6")
+                if event["record_kind"] == "stop_event_accepted"
+                and event["payload"]["event_id"] == stop["accepted"]["stop"]["event_id"]
             ]
             assert len(stop_events) == 1, [
-                (event["request_id"], event["payload"])
+                event["payload"]
                 for event in native_events
-                if event["record_kind"] == "stop_acceptance_projected"
+                if event["record_kind"] == "stop_event_accepted"
             ]
-            affected = stop_events[0]["payload"]["affected_state"]["operations"]
+            affected = stop_events[0]["payload"]["covered"]
             assert len(affected) == 1
             assert affected[0]["operation_id"] == (
                 accepted_by_target[("lite6_robot", "arm")]["operation_id"]
@@ -1704,20 +1917,21 @@ def test_separate_group_stop_does_not_stop_the_other_robot() -> None:
 
             cycle = client.program_cycle_status()
             selections = cycle["runtime_controls"]["execution_selections"]
-            resumed = client.program_run_motion_resume(
+            reply = client.program_run_motion_resume(
                 program_run_id,
                 {
-                    "request_id": "dual-robot.isolation.resume-lite6",
-                    "request_owner_epoch": "dual-robot.grouped.process-test",
+                    "request_key": _request_key(),
+                    "application_start_id": start,
                     "source_label": "dual_robot_grouped_process_test",
-                    "correlation_id": "dual-robot.isolation.resume-lite6",
                     "program_run_id": program_run_id,
-                    "expected_owner_epoch": cycle["program_runner_owner_epoch"],
-                    "expected_selection_revision": selections["selection_revision"],
+                    "expected_hold_revision": selections["hold_revision"],
                     "reason": "resume only the selected robot",
                     "group_ids": ["lite6_arm"],
                 },
             )
+            # Answered at acceptance (OD-214): the run as the cycle status
+            # showed it when the resume's row ended `succeeded`.
+            resumed = _runner_command_succeeded(client, reply)[1]["run"]
             assert resumed["state"] == "running"
             terminal = _wait_run_state(client, program_run_id, {"succeeded"})
             assert terminal["state"] == "succeeded"
@@ -1741,17 +1955,18 @@ def _assert_stored_authoring_apply_without_linked_children(
         assert connection.execute(
             "SELECT schema_id,schema_version,cell_id FROM apply_journal_metadata WHERE singleton=1"
         ).fetchone() == (
-            "manyforge.internal.component-manager.apply-journal.h1a.v22", 22, stack.cell_id
+            "manyforge.internal.component-manager.apply-journal.h1a.v24", 24, stack.cell_id
         )
         key = (status["apply_id"], status["apply_generation"])
         rows = connection.execute(
-            "SELECT request_id,request_owner_epoch,candidate_retained_bundle_id,candidate_graph_revision,"
+            "SELECT request_key,candidate_retained_bundle_id,candidate_graph_revision,"
             "parent_authoring_claim,expected_admission_generation FROM manager_apply_intents "
             "WHERE apply_id=? AND apply_generation=?", key,
         ).fetchall()
         assert len(rows) == 1, (key, rows)
-        request_id, owner_epoch, bundle, graph, parent, direct_generation = rows[0]
-        assert (request_id, owner_epoch) == (status["request_id"], status["request_owner_epoch"])
+        request_key, bundle, graph, parent, direct_generation = rows[0]
+        # 16-byte key column instead of (owner epoch, request id) (contract 1.7).
+        assert request_key == bytes.fromhex(status["request_key"])
         assert (bundle, graph) == (revision["retained_bundle_id"], revision["graph_revision"])
         assert isinstance(parent, bytes) and parent, rows
         assert direct_generation is None, rows
@@ -1797,11 +2012,10 @@ def _commit_authoring_scene_object(
     with HeadlessHttpClient(stack.base_url, timeout_seconds=20.0) as headless:
         scene = headless.scene()["logical_scene"]
         request = {
+            "application_start_id": stack.application_start_id,
             "request_context": {
-                "request_id": f"dual-robot.authoring-scene.{label}.{uuid.uuid4().hex}",
-                "request_owner_epoch": scene["source_owner_epoch"],
+                "request_key": _request_key(),
                 "source_label": "dual_robot_authoring_apply_fixture",
-                "correlation_id": None,
             },
             "expected_projection_revision": scene["payload"]["access"]["active_projection"],
             "operation": operation,
@@ -1992,10 +2206,11 @@ def _deployment_apply_retention_case(stack: ProcessStack, kind: str) -> None:
         positions = list(observed["positions_rad"])
         positions[0] += 0.03
         intent = {
-            "request_context": {"request_id": "retained-apply.baseline", "request_owner_epoch": identity["owner_epoch"],
-                                "source_label": "composer_ui", "correlation_id": None},
+            "application_start_id": stack.application_start_id,
+            "request_context": {"request_key": _request_key(), "source_label": "composer_ui"},
             "program_id": manual["program_id"], "program_revision": manual["program_revision"],
-            "program_binding_id": manual["program_binding_id"], "program_run_id": manual["program_run_id"],
+            # Manual work names no Program run (it has none).
+            "program_binding_id": manual["program_binding_id"],
             "expected_graph_revision": identity["graph_revision"],
             "expected_retained_bundle_id": identity["retained_bundle_id"], "expected_scene_revision": None,
             "participants": [{"target": command["target"], "required_capability_id": target["operation_capability_id"],
@@ -2021,7 +2236,9 @@ def _deployment_apply_retention_case(stack: ProcessStack, kind: str) -> None:
         with _composer_snapshot_stream(stack, client_id=f"retained-apply-{kind}") as snapshots:
             program = composer.request("GET", "/api/program/draft")
             snapshot = _matching_composer_snapshot(snapshots, program)
-            fence = _composer_fence(snapshot, request_id=f"retained-apply.{kind}.edit")
+            fence = _composer_fence(
+                snapshot, application_start_id=stack.application_start_id,
+                request_id=f"retained-apply.{kind}.edit")
             fence.update({"draftId": draft["id"], "expectedDraftRevision": draft["revision"]})
             composer.request("POST", "/api/deployment/draft/mutations", body={**fence, "path": path, "value": value})
         preview = composer.request("POST", "/api/deployment/preview", body={})
@@ -2036,15 +2253,20 @@ def _deployment_apply_retention_case(stack: ProcessStack, kind: str) -> None:
         with ThreadPoolExecutor(max_workers=1) as pool:
             reader = pool.submit(read_during_apply)
             try:
-                applied_result = composer.request("POST", "/api/deployment/apply", body={"scope": preview["scope"]})
+                # Answered at acceptance (OD-214): read during the whole Apply,
+                # until its row ended.
+                applied_result = _apply_command(
+                    composer, "/api/deployment/apply", {"scope": preview["scope"]},
+                    timeout_seconds=30.0,
+                )
             finally:
                 stop.set()
                 reader.result(timeout=10.0)
-        assert applied_result["outcome"] == "succeeded", applied_result
+        assert applied_result["end"]["outcome"] == "succeeded", applied_result
         assert headless.manager_status()["status"]["active"]["publication"] != publication
         assert headless.runtime()["active_retained_bundle_id"] != before_bundle
         after = native.diagnostics()["status"]
-        assert after["identity"]["owner_epoch"] == identity["owner_epoch"]
+        assert after["identity"]["application_start_id"] == identity["application_start_id"]
         after_state = _component_states(headless)["lite6_robot"]
         assert after_state["lifecycle"] == "enabled" and after_state.get("last_action") == before_state["last_action"]
         rows.append(retained_row())
@@ -2056,7 +2278,9 @@ def _deployment_apply_retention_case(stack: ProcessStack, kind: str) -> None:
             assert row["source_sequence"] >= before_row["source_sequence"], row
             assert row["source_joint_names"] == before_row["source_joint_names"], row
             assert row["compiled_joint_names"] == before_row["compiled_joint_names"], row
-        replaced = [row["component_id"] for row in applied_result["components"]
+        # The Apply's component rows are no longer replied: the confirmed
+        # Preview names the same dispositions.
+        replaced = [row["component_id"] for row in preview["components"]
                     if row["disposition"] in {"replace", "add"}]
         if replaced:
             states = _component_states(headless)
@@ -2078,9 +2302,13 @@ def _deployment_apply_retention_case(stack: ProcessStack, kind: str) -> None:
             _reset_cycle(composer, run)
         else:
             assert terminal["state"] != "succeeded", terminal
-            operations = {event["operation_id"] for event in _native_events(stack)
-                          if event["record_kind"] == "operation_accepted" and
-                          _participant_target(event["payload"]["intent"]["participants"][0]) == ("ur5e_robot", "arm")}
+            def ur5e_accepted(events: list[dict[str, Any]]) -> set[int]:
+                return {event["operation_id"] for event in events
+                        if event["record_kind"] == "operation_accepted" and
+                        _participant_target(event["payload"]["intent"]["participants"][0]) == ("ur5e_robot", "arm")}
+
+            operations = ur5e_accepted(_native_events_when(
+                stack, lambda events: len(ur5e_accepted(events)) >= 4))
             assert len(operations) == 4, operations
             for operation in operations:
                 evidence = json.dumps(native.read(operation), sort_keys=True)

@@ -18,14 +18,13 @@ namespace manyforge::core {
 /// the current control revision. Every other addressed identity remains exact.
 /// Live rule admission validates the exact prepared execution separately.
 [[nodiscard]] Result<void> ValidateIoRuleOutcomeParticipant(
-    const OperationId& operation_id, OperationRevision operation_revision,
+    const OperationNumber& operation_id, OperationRevision operation_revision,
     const OperationParticipantId& participant_id,
     const ControllableComponentId& controllable_component_id,
     const CommandTargetId& command_target_id, const ControllerGoalId& controller_goal_id,
-    ControllerGoalGeneration controller_goal_generation,
     std::span<const IoMotionRuleOutcomeDTO> outcomes);
 [[nodiscard]] Result<void> ValidateIoRuleOutcomeParticipant(
-    const OperationId& operation_id, OperationRevision operation_revision,
+    const OperationNumber& operation_id, OperationRevision operation_revision,
     const OperationParticipantStateDTO& participant);
 
 }  // namespace manyforge::core

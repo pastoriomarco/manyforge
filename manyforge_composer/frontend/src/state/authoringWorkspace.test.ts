@@ -88,7 +88,8 @@ function headlessState(
   state: Partial<ComposerHeadlessState> = {},
 ): ComposerHeadlessState {
   return {
-    schemaVersion: 'manyforge.composer_headless_state.v2',
+    schemaVersion: 'manyforge.composer_headless_state.v4',
+    applyCommands: { inProgress: null, ended: [] },
     complete: true,
     executionControlStatus: null,
     componentOverview: {} as never,
@@ -106,7 +107,7 @@ function headlessState(
       ...overrides,
     },
     authoringWorkspaceContainment: null,
-    receiverEpoch: 'receiver.epoch.1',
+    applicationStartId: '3f9a0000000000a1',
     snapshotSequence: workspaceRevision,
     ...state,
     runtime: state.runtime ?? ({} as ComposerHeadlessState['runtime']),
@@ -290,6 +291,18 @@ describe('authoringWorkspace', () => {
     state.authoringAdmission.authoringAllowed = true;
     expect(authoringUnavailableCause(installed, state)).toBeNull();
     expect(requiredComponentFaultNotices(state)).toHaveLength(1);
+    // OD-281: a Manager section too large to send shows its typed cause.
+    state.componentOverview = {
+      components: [{
+        id: 'manager', label: 'Manager', required: true, status: 'offline',
+        detail: 'Manager graph or runtime convergence is not current',
+        reasonCode: 'manager_status_section_oversized',
+      }],
+    } as never;
+    expect(requiredComponentFaultNotices(state)).toEqual([expect.objectContaining({
+      title: 'Manager unavailable',
+      message: expect.stringContaining('status connection'),
+    })]);
   });
 
   it('shows a published containment as one persistent error, with and without a saved file', () => {
@@ -364,28 +377,33 @@ describe('authoringWorkspace', () => {
     })]);
   });
 
+  // One 32-hex request key per authoring request (one per user action).
+  const KEY_1 = '1'.repeat(32);
+  const KEY_2 = '2'.repeat(32);
+  const KEY_3 = '3'.repeat(32);
+
   it('builds the one local fence and its Scenario extension from the publication', () => {
     const snapshot = workspaceSnapshot(5, 3, 4);
     const installed = published(snapshot);
     const state = headlessState(5);
 
-    expect(programLocalFence(installed, state, 'owner.1', 'request.1')).toEqual({
+    expect(programLocalFence(installed, state, KEY_1)).toEqual({
       draftId: 'draft.1',
       expectedDraftRevision: 3,
       expectedWorkspaceEpoch: 'workspace.epoch.1',
       expectedWorkspaceRevision: 5,
       expectedAdmissionGeneration: 7,
-      requestOwnerEpoch: 'owner.1',
-      requestId: 'request.1',
+      applicationStartId: '3f9a0000000000a1',
+      requestKey: KEY_1,
     });
-    expect(scenarioLocalFence(installed, state, 'owner.1', 'request.2')).toEqual({
+    expect(scenarioLocalFence(installed, state, KEY_2)).toEqual({
       draftId: 'draft.1',
       expectedDraftRevision: 3,
       expectedWorkspaceEpoch: 'workspace.epoch.1',
       expectedWorkspaceRevision: 5,
       expectedAdmissionGeneration: 7,
-      requestOwnerEpoch: 'owner.1',
-      requestId: 'request.2',
+      applicationStartId: '3f9a0000000000a1',
+      requestKey: KEY_2,
       deploymentDraftId: 'deployment-draft.1',
       expectedDeploymentDraftRevision: 4,
     });
@@ -398,14 +416,14 @@ describe('authoringWorkspace', () => {
     const installed = published(workspaceSnapshot(5, 1, 1));
     const state = headlessState(5);
     expect(installed.identity.programDraftId).not.toBe(installed.identity.deploymentDraftId);
-    expect(deploymentLocalFence(installed, state, 'owner.1', 'request.3')).toEqual({
+    expect(deploymentLocalFence(installed, state, KEY_3)).toEqual({
       draftId: 'deployment-draft.1',
       expectedDraftRevision: 1,
       expectedWorkspaceEpoch: 'workspace.epoch.1',
       expectedWorkspaceRevision: 5,
       expectedAdmissionGeneration: 7,
-      requestOwnerEpoch: 'owner.1',
-      requestId: 'request.3',
+      applicationStartId: '3f9a0000000000a1',
+      requestKey: KEY_3,
     });
   });
 
@@ -468,7 +486,8 @@ describe('authoringWorkspace', () => {
     expect(mergedProgram.applicability).toBe(program.applicability);
 
     const deployment = {
-      schemaVersion: 'manyforge.composer_deployment_workspace.v1',
+      schemaVersion: 'manyforge.composer_deployment_workspace.v2',
+      applyCommands: { inProgress: null, ended: [] },
       authoringWorkspace: {
         workspaceEpoch: 'workspace.epoch.1', workspaceRevision: 7,
         programDraftId: 'draft.1', programDraftRevision: 2,

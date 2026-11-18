@@ -4,13 +4,6 @@
     "keys": [
       {
         "access": "read_write",
-        "description": "Intentionally simulated gripper closed/open state.",
-        "key": "gripper_closed",
-        "persistence": "run",
-        "type": "bool"
-      },
-      {
-        "access": "read_write",
         "fields": [
           {
             "field": "approach_pose",
@@ -137,10 +130,17 @@
         {
           "children": [],
           "instance_id": "close_gripper",
-          "node_id": "logic.set_value",
+          "node_id": "gripper.command_position",
           "parameters": {
-            "key": "gripper_closed",
-            "value": true
+            "position": {
+              "kind": "named_preset",
+              "name": "closed"
+            },
+            "target": {
+              "command_target_id": "gripper",
+              "component_id": "robotiq_2f_85"
+            },
+            "completion_timeout_s": 15.0
           }
         },
         {
@@ -177,7 +177,7 @@
             "target_reference": {
               "type": "component_frame",
               "frame": {
-                "component_id": "ur5_robot",
+                "component_id": "robotiq_2f_85",
                 "frame_id": "tcp"
               }
             },
@@ -234,10 +234,17 @@
         {
           "children": [],
           "instance_id": "open_gripper",
-          "node_id": "logic.set_value",
+          "node_id": "gripper.command_position",
           "parameters": {
-            "key": "gripper_closed",
-            "value": false
+            "position": {
+              "kind": "named_preset",
+              "name": "open"
+            },
+            "target": {
+              "command_target_id": "gripper",
+              "component_id": "robotiq_2f_85"
+            },
+            "completion_timeout_s": 15.0
           }
         }
       ],

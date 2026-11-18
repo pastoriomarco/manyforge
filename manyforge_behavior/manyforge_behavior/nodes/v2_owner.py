@@ -6,12 +6,15 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from enum import Enum
 import math
-import time
 from typing import Any, Final
 
 import py_trees
 
-from manyforge_behavior.kernel_client import KernelOperationAdmissionRejectedError
+from manyforge_behavior.kernel_client import (
+    PLANNING_JOB_FINAL_STATES,
+    KernelOperationAdmissionRejectedError,
+    KernelOperationObservationUnavailableError,
+)
 from manyforge_behavior.failure_details import (
     NodeFailureOrigin,
     exception_failure_details,
@@ -35,17 +38,18 @@ from manyforge_behavior.orchestration_ports import (
     PoseSourceLatchError,
     ProgramInterventionPort,
     is_ordinary_operator_stop,
-    request_identity,
     describe_owner_failure,
 )
+from manyforge_behavior.request_keys import Phase, program_key
 from manyforge_behavior.interrupt_outcome import (
     InterruptNodeResult,
-    contained_stages_from_stop_terminal,
+    interrupt_stop_pending,
     map_interrupt_result,
 )
-from manyforge_behavior.nodes.interruption import InterruptedOutcome
+from manyforge_behavior.nodes.interruption import NODE_INTERRUPTED_REASON, InterruptedOutcome
 from manyforge_behavior.nodes.stop_policy import OperatorMotionStopState
 from manyforge_behavior.program_clock import AttemptTime, ProgramClock
+from manyforge_behavior.run_sender import RunRequest, RunSender
 from manyforge_behavior.orchestration_values import (
     NodeAttemptInputResolver,
     ProgramValueError,
@@ -380,7 +384,7 @@ class _OwnerAdapter(InterruptedOutcome, py_trees.behaviour.Behaviour):
         state = self._operator_stop_state
         scope = None if state is None else state.snapshot()
         if (scope is None or state.observation_error() is not None
-            or scope.selection_revision <= self._held_before_admission
+            or scope.hold_revision <= self._held_before_admission
             or self._node_instance_id in scope.held_nodes):
             return True
         # Proven-unstarted work, fresh attempt after owner release.
@@ -388,7 +392,7 @@ class _OwnerAdapter(InterruptedOutcome, py_trees.behaviour.Behaviour):
         return False
 
     def _hold_before_admission(self, error: OwnerInvocationHeldError) -> None:
-        self._held_before_admission = error.selection_revision
+        self._held_before_admission = error.hold_revision
         self.feedback_message = str(error)
         if self._operator_stop_state is not None:
             try:
@@ -531,22 +535,13 @@ def _close_decidable(task: OwnerTaskSnapshot) -> bool:
     )
 
 
-# Exact rereads (one per tick) of a normal failed resident whose current
-# assessment stays unavailable, before its identity is retained for the
-# existing intervention handling instead. A stopped operation
-# is reread without this bound: its result waits for the component's activity
-# to leave `unknown`.
-_ASSESSMENT_REREAD_LIMIT: Final = 100
-# A stopped operation whose state reads keep failing fails after the Runner's
-# execution transport timeout (`transport_timeout_s`) instead of waiting
-# forever (`stopped_node_state_unreadable`). Wall time: the Program clock stands still while a Stop holds the run.
-_monotonic = time.monotonic
 # A run's failure message bound (`FailureRecord`).
 _MAX_FAILURE_MESSAGE_BYTES: Final = 4_096
 
 
 def _terminal_cleanup_pending(task: OwnerTaskSnapshot) -> bool:
-    """The certified Stop's terminal cleanup still runs: not yet decided."""
+    """The ended (failed or stopped) execution's terminal cleanup still runs:
+    not yet decided."""
 
     assessment = task.metadata.get("recovery_assessment")
     return (
@@ -579,22 +574,21 @@ class OwnerTaskAdapter(_OwnerAdapter):
         port: OwnerTaskPort,
         owner_port_name: str = "unspecified",
         intervention_port: ProgramInterventionPort | None = None,
-        transport_timeout_s: float,
         require_initial_running: bool = False,
         operator_stop_state: OperatorMotionStopState | None = None,
+        run_sender: RunSender | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        if (
-            isinstance(transport_timeout_s, bool)
-            or not isinstance(transport_timeout_s, (int, float))
-            or not transport_timeout_s > 0
-        ):
-            raise ValueError("transport_timeout_s must be a positive number of seconds")
+        # The run's sender for this node's start (OD-213: Set TCP): the start
+        # leaves the tick and the node is RUNNING until its answer. None: the
+        # start is made inside the tick.
+        self._sender = run_sender
+        # This attempt's request on the run's sender (its start; the
+        # pneumatic gripper's valve write), and a sent one the tree stopped.
+        self._request: RunRequest | None = None
+        self._abandoned: RunRequest | None = None
         self._port = port
-        # The Runner's execution transport timeout: the bound on consecutive
-        # failed reads of a stopped operation.
-        self._transport_timeout_s = float(transport_timeout_s)
         self._owner_port_name = owner_port_name
         self._intervention_port = intervention_port
         self._require_initial_running = require_initial_running
@@ -603,11 +597,6 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self._phase = _TaskPhase.SUBMIT
         # An abandoned attempt's task still to close, with its identity.
         self._drain: tuple[OwnerTaskSnapshot, NodeAttemptIdentity] | None = None
-        self._drain_rereads = 0
-        # Exact rereads of this attempt's unavailable failure assessment.
-        self._assessment_rereads = 0
-        # Wall time of the first of consecutive failed reads of a stopped task.
-        self._read_failing_since: float | None = None
         self._holds_failure = False
         # The failed operation's own facts when its failure reached the tree.
         self._operation_failure: Mapping[str, Any] | None = None
@@ -627,7 +616,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
 
         state = self._operator_stop_state
         scope = None if state is None else state.snapshot()
-        self._held_before_admission = 0 if scope is None else scope.selection_revision
+        self._held_before_admission = 0 if scope is None else scope.hold_revision
         self.feedback_message = str(error)
         self.simulation_stop_pending = True
         attempt = None if self._identity is None else self._identity.node_attempt_id
@@ -669,12 +658,14 @@ class OwnerTaskAdapter(_OwnerAdapter):
                     }
                 )
         super()._begin_attempt(restart_series=restart_series)
+        if self._request is not None:
+            self._request.withdraw()
+        self._request = None
+        self._abandoned = None
         self._task = None
         self._phase = _TaskPhase.SUBMIT
         self._operation_failure = None
         self.simulation_stop_pending = False
-        self._assessment_rereads = 0
-        self._read_failing_since = None
 
     @property
     def operation_failure(self) -> Mapping[str, Any] | None:
@@ -698,11 +689,11 @@ class OwnerTaskAdapter(_OwnerAdapter):
         """The port closes operations, and (when given) this task is one the
         Kernel admitted; an unknown admission stays for Reset."""
         return callable(getattr(self._port, "close", None)) and (
-            task is None or isinstance(task.metadata.get("operation_id"), str)
+            task is None or type(task.metadata.get("operation_id")) is int
         )
 
-    def _close_request_id(self, identity: NodeAttemptIdentity) -> str:
-        return request_identity("program-close", identity.program_run_id, identity.node_attempt_id)
+    def _close_request_key(self, identity: NodeAttemptIdentity) -> bytes:
+        return program_key(identity.program_run_id, identity.node_attempt_id, Phase.PROGRAM_CLOSE)
 
     def _record_pose_source_latch_failure(self, error: PoseSourceLatchError) -> None:
         self._phase = _TaskPhase.DONE
@@ -715,12 +706,13 @@ class OwnerTaskAdapter(_OwnerAdapter):
     def _await_settled_assessment(
         self, task: OwnerTaskSnapshot
     ) -> tuple[py_trees.common.Status | None, OwnerTaskSnapshot]:
-        """A failure can arrive before its assessment is readable. Reread the
+        """A failure can arrive before its assessment is decided. Reread the
         exact current operation, read-only, once per tick: (RUNNING, task)
-        while it is not yet decidable (a stopped operation also after a failed
-        read, `_failed_read`), (FAILURE, task) for any other failed read,
-        and (None, task) once the read decides its closure (`_close_decidable`)
-        or the bounded rereads are spent (then it is retained)."""
+        while it is not yet decidable, failed and stopped alike (a stopped
+        operation also after a failed read, `_failed_read`), (FAILURE, task)
+        for any other failed read, and (None, task) once the read decides its
+        closure (`_close_decidable`). No time limit (OD-214): the Kernel
+        republishes when the execution's terminal cleanup ends."""
 
         if _close_decidable(task):
             return None, task
@@ -729,7 +721,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
         except OwnerTaskObservationUnavailableError:
             if task.state is OwnerTaskState.INTERRUPTED:
                 return self._failed_read(task), task
-            return self._reread_pending(task)
+            return py_trees.common.Status.RUNNING, task
         except Exception as exc:
             self._record_owner_error("owner_request_failed", exc)
             return self._failed_read(task), task
@@ -742,7 +734,6 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self._task = observed
         if _close_decidable(observed):
             # A decidable fact wins over any read problem beside it.
-            self._read_failing_since = None
             return None, observed
         read_failure = observed.metadata.get("recovery_assessment_failure")
         if isinstance(read_failure, Mapping):
@@ -751,8 +742,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
             # node's reason, the read problem is named in its message.
             self._record_operation_failure_with_read_problem(observed, read_failure)
             return self._failed_read(observed), observed
-        self._read_failing_since = None
-        return self._reread_pending(observed)
+        return py_trees.common.Status.RUNNING, observed
 
     def _record_operation_failure_with_read_problem(
         self, task: OwnerTaskSnapshot, read_failure: Mapping[str, Any]
@@ -771,17 +761,6 @@ class OwnerTaskAdapter(_OwnerAdapter):
             message = task.message
         self._record_owner_failure(task.reason_code, message, task.details)
         self._note_operation_failure(task)
-
-    def _reread_pending(
-        self, task: OwnerTaskSnapshot
-    ) -> tuple[py_trees.common.Status | None, OwnerTaskSnapshot]:
-        self._assessment_rereads += 1
-        if (
-            task.state is OwnerTaskState.INTERRUPTED
-            or self._assessment_rereads < _ASSESSMENT_REREAD_LIMIT
-        ):
-            return py_trees.common.Status.RUNNING, task
-        return None, task  # Still unavailable: retained, never waited on.
 
     def _note_operation_failure(self, task: OwnerTaskSnapshot) -> None:
         fact = task.metadata.get("operation_failure")
@@ -802,6 +781,11 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self._record_owner_failure(task.reason_code, task.message, task.details)
         self._note_operation_failure(task)
         if self._holds_failure or not self._closable(task):
+            if self._holds_failure and not _close_eligible(task) and _retired(task):
+                # Retirement already completed: nothing is left to hold, so
+                # the hold has no owner task and its offers follow the
+                # node's policy (OD-263), as `_advance_close` drops it.
+                self._task = None
             self._phase = _TaskPhase.DONE
             return py_trees.common.Status.FAILURE
         self._phase = _TaskPhase.CLOSING
@@ -813,8 +797,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
         The exact current close permission decides first. Without it, an
         operation already retired (resident false) leaves nothing to close;
         otherwise (no permission, uncertain effects, an unresolved
-        intervention, a refused or impossible close, or an assessment still
-        unavailable after the bounded rereads) the operation stays retained
+        intervention, a refused or impossible close) the operation stays retained
         (Reset releases it; its alarm stands) and the failure is returned.
         An unknown close outcome keeps the node RUNNING; the same request
         replays.
@@ -831,7 +814,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
             return self._after_close(closed=False)
         try:
             closed = self._port.close(
-                task.task_id, self._identity, request_id=self._close_request_id(self._identity)
+                task.task_id, self._identity, request_key=self._close_request_key(self._identity)
             )
         except OwnerTaskSettlementPendingError:
             return py_trees.common.Status.RUNNING
@@ -849,30 +832,14 @@ class OwnerTaskAdapter(_OwnerAdapter):
         """A failed read of a stopped operation leaves it undecided: never
         advance the tree past it (a Fallback could move that robot). It waits
         (RUNNING; the next tick rereads) until the component's activity leaves
-        `unknown` and the Stop's normal result is readable. Reads that keep
-        failing for the Runner's transport timeout fail the node with
-        `stopped_node_state_unreadable`; it never waits forever. Any other
+        `unknown` and the Stop's normal result is readable. No time limit
+        (OD-214): a lost event stream makes reads fail until it is back; a
+        host exit ends the application; a Reset ends the run. Any other
         failed read fails as before."""
 
         if task.state is not OwnerTaskState.INTERRUPTED:
             return py_trees.common.Status.FAILURE
-        return self._stopped_read_failed()
-
-    def _stopped_read_failed(self) -> py_trees.common.Status:
-        """One more failed read of a stopped operation: RUNNING within the
-        bound, then the node fails with `stopped_node_state_unreadable`."""
-
-        now = _monotonic()
-        if self._read_failing_since is None:
-            self._read_failing_since = now
-        if now - self._read_failing_since < self._transport_timeout_s:
-            return py_trees.common.Status.RUNNING
-        self._record_owner_failure(
-            "stopped_node_state_unreadable",
-            f"The stopped node's state could not be read for "
-            f"{self._transport_timeout_s:g} s",
-        )
-        return py_trees.common.Status.FAILURE
+        return py_trees.common.Status.RUNNING
 
     def _settle(self, task: OwnerTaskSnapshot) -> py_trees.common.Status:
         if self._phase is _TaskPhase.CLOSING:
@@ -887,14 +854,12 @@ class OwnerTaskAdapter(_OwnerAdapter):
         self._held_after_operator_stop = is_ordinary_operator_stop(task)
         if operator_stop and self._operator_stop_state is not None:
             if (
-                not isinstance(task.metadata.get("active_stop_id"), str)
-                or not task.metadata["active_stop_id"]
-                or type(task.metadata.get("active_stop_generation")) is not int
-                or task.metadata["active_stop_generation"] < 1
+                type(task.metadata.get("stop_event_id")) is not int
+                or task.metadata["stop_event_id"] < 1
             ):
                 self._record_owner_failure(
                     "owner_stop_identity_missing",
-                    "ordinary operator Stop omitted its exact Stop identity",
+                    "ordinary operator Stop omitted its Stop event",
                 )
                 return py_trees.common.Status.FAILURE
             if not holding:
@@ -1003,9 +968,9 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 # An operator Stop's interruption is not a failure; any
                 # other paused owner result is the owner's failure.
                 stop_interruption = parameter == "operator_stop_policy"
-                if stop_interruption and _terminal_cleanup_pending(task):
-                    # Hold on the decided assessment (its Resume and Reset
-                    # offers), not on the brief cleanup wait (bounded).
+                if _terminal_cleanup_pending(task):
+                    # Hold on the decided assessment (its Resume, Retry,
+                    # Continue and Reset offers), not on the cleanup wait.
                     pending, task = self._await_settled_assessment(task)
                     if pending is not None:
                         return pending
@@ -1050,7 +1015,48 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 # scheduler removes the run from automatic ticking, so neither
                 # a retry nor a stale output write can occur.
                 return py_trees.common.Status.RUNNING
+        if self._hold_stopped_unstarted(task):
+            return py_trees.common.Status.RUNNING
         return self._fail_to_tree(task)
+
+    def _hold_stopped_unstarted(self, task: OwnerTaskSnapshot) -> bool:
+        """A Stop that holds this node ended its operation and the Kernel
+        already retired it (a take-over newcomer). With no effect nothing
+        started (OD-264); with its effect settled the Kernel kept its rest
+        (OD-269). Either way the node holds exactly as a Stop-fence refusal at
+        admission does, and Resume's next attempt plans the rest (or a fresh
+        attempt when nothing started). An uncertain effect still fails."""
+
+        state = self._operator_stop_state
+        fact = task.metadata.get("operation_failure")
+        facts = fact.get("terminal_facts") if isinstance(fact, Mapping) else None
+        if (
+            state is None
+            or task.state is not OwnerTaskState.INTERRUPTED
+            or not _retired(task)
+            or type(task.metadata.get("stop_event_id")) is not int
+            or task.metadata["stop_event_id"] < 1
+            or not isinstance(facts, (list, tuple))
+            or not facts
+            or any(
+                not isinstance(item, Mapping)
+                or item.get("effect") not in ("no_effect", "effect_settled")
+                for item in facts
+            )
+        ):
+            return False
+        try:
+            state.refresh()
+        except Exception:
+            pass  # The last published scope decides, as in `_hold_before_admission`.
+        scope = state.snapshot()
+        if self._node_instance_id not in scope.held_nodes:
+            return False
+        self._task = None
+        self._phase = _TaskPhase.SUBMIT
+        self._held_before_admission = scope.hold_revision
+        self.feedback_message = task.message
+        return True
 
     def _on_priority_refusal(
         self, error: OwnerInvocationRefusedByPriorityError
@@ -1075,6 +1081,72 @@ class OwnerTaskAdapter(_OwnerAdapter):
         assert self._identity is not None and self._owner_inputs is not None
         return self._port.start(self._node_id, self._identity, self._owner_inputs)
 
+    def _sent_start(self) -> OwnerTaskSnapshot | None:
+        """The start, made inside the tick or (with the run's sender) sent
+        and read on a later tick: None while it is not answered. What the
+        start raised is raised here, on the tick that reads it."""
+
+        if self._sender is None:
+            return self._start_task()
+        request = self._request
+        if request is None or request.withdrawn:
+            assert self._identity is not None and self._owner_inputs is not None
+            port, node_id = self._port, self._node_id
+            identity, inputs = self._identity, self._owner_inputs
+            self._request = self._sender.submit(lambda: port.start(node_id, identity, inputs))
+            return None
+        if not request.answered:
+            return None
+        self._request = None
+        return request.result()
+
+    def _consume_answer(self) -> py_trees.common.Status:
+        """Held: the node's answered request gives its real result."""
+
+        return self._finish(self._update())
+
+    def _abandoned_result(self, request: RunRequest) -> py_trees.common.Status | None:
+        """The real result of a sent start the tree stopped (Set TCP)."""
+
+        try:
+            task = request.result()
+        except (OwnerInvocationHeldError, OwnerInvocationRefusedByPriorityError):
+            return None  # Not admitted: nothing started.
+        except Exception as exc:
+            if isinstance(exc, KernelOperationAdmissionRejectedError):
+                if exc.code == "simulation_not_playing":
+                    return None  # Not admitted: nothing started.
+                code = exc.code
+            else:
+                code = "owner_request_failed"
+            self._record_owner_error(code, exc)
+            return py_trees.common.Status.FAILURE
+        if task.settlement_proven and self._identity is not None:
+            try:
+                self._port.acknowledge(task.task_id, self._identity)
+            except Exception:
+                pass  # The port keeps it for Reset, as for any refused acknowledgement.
+        if task.state is OwnerTaskState.SUCCEEDED:
+            return py_trees.common.Status.SUCCESS
+        self._record_owner_failure(task.reason_code, task.message, task.details)
+        return py_trees.common.Status.FAILURE
+
+    def settle_abandoned_request(self) -> bool:
+        """Forced Program End: the sent request of the stopped attempt ends
+        it with its real result, never `interrupted`. True once nothing sent
+        is outstanding."""
+
+        request = self._abandoned
+        if request is None:
+            return True
+        if not request.answered:
+            return False
+        self._abandoned = None
+        status = self._abandoned_result(request)
+        if status is not None:
+            self.status = status
+        return True
+
     def _update(self) -> py_trees.common.Status:
         if self._drain is not None and not self.drain_invalidated():
             # The abandoned attempt's operation still settles; a new Execute
@@ -1084,13 +1156,16 @@ class OwnerTaskAdapter(_OwnerAdapter):
             return py_trees.common.Status.RUNNING
         if self._input_error is not None or self._identity is None or self._owner_inputs is None:
             return py_trees.common.Status.FAILURE
-        if self._phase is _TaskPhase.SUBMIT:
+        if self._phase is _TaskPhase.SUBMIT and self._request is None:
             gate = self._mock_simulation_ready()
             if gate is not None:
                 return gate
         try:
             if self._phase is _TaskPhase.SUBMIT:
-                self._task = self._start_task()
+                started = self._sent_start()
+                if started is None:
+                    return py_trees.common.Status.RUNNING
+                self._task = started
                 self._phase = _TaskPhase.OBSERVE
                 if self._require_initial_running:
                     return py_trees.common.Status.RUNNING
@@ -1148,9 +1223,30 @@ class OwnerTaskAdapter(_OwnerAdapter):
             return py_trees.common.Status.FAILURE
         return self._settle(self._task)
 
+    def _settle_request_while_stopped(self) -> bool:
+        """An operator Stop holds the node, or a Halt froze the run: a
+        request not sent yet is withdrawn (the node stays where it is and
+        sends it when it is ticked again); a sent one completes. True while
+        the node still has a request: then nothing else is observed."""
+
+        request = self._request
+        if request is None:
+            return False
+        if request.withdraw():
+            self._request = None
+            return False
+        return True
+
     def observe_while_operator_stop_held(self) -> None:
         """Refresh only an already accepted task while its subtree is held."""
 
+        if self._settle_request_while_stopped():
+            assert self._request is not None
+            if self._request.answered:
+                status = self._consume_answer()
+                if status is not py_trees.common.Status.RUNNING:
+                    self.stop(status)
+            return
         if self._task is None or self._identity is None or self.status in {
             py_trees.common.Status.SUCCESS, py_trees.common.Status.FAILURE}:
             return
@@ -1180,14 +1276,25 @@ class OwnerTaskAdapter(_OwnerAdapter):
         except Exception as exc:
             self._record_owner_error("owner_request_failed", exc)
 
-    def reconcile_full_stop_task(self, *, selected_resume: bool = False) -> str:
+    def reconcile_halt_task(self, *, selected_resume: bool = False) -> str:
         """Observe accepted Program-scope work without ticking the tree.
 
-        Full Stop observes only physical tasks in its existing scope. Selected
+        Halt observes only physical tasks in its existing scope. Selected
         Resume also waits for other accepted owners' work; it does not cancel
         them or pretend the Kernel stopped them.
         """
 
+        if self._settle_request_while_stopped():
+            assert self._request is not None
+            if not self._request.answered:
+                # Sent: the run stays Halting (or the selection held) until
+                # its answer.
+                return "active"
+            if not selected_resume:
+                # Answered: the node returns it on its first tick after Execute.
+                return "unaffected"
+            self.observe_while_operator_stop_held()
+            return self._control_state(self._task)
         if not selected_resume and self._owner_port_name != "kernel_operations":
             return "unaffected"
         if self._drain is not None:
@@ -1223,8 +1330,9 @@ class OwnerTaskAdapter(_OwnerAdapter):
         return self._control_state(self._task)
 
     def _control_state(self, task: OwnerTaskSnapshot | None) -> str:
-        if self._drain is not None:
-            # An abandoned attempt's operation is still being drained.
+        if self._drain is not None or self._request is not None:
+            # An abandoned attempt's operation is still being drained, or
+            # a request is on the run's sender.
             return "active"
         if task is None:
             return "inactive"
@@ -1279,7 +1387,7 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 self._port.acknowledge(observed.task_id, identity)
             elif _close_eligible(observed):
                 self._port.close(
-                    observed.task_id, identity, request_id=self._close_request_id(identity)
+                    observed.task_id, identity, request_key=self._close_request_key(identity)
                 )
             elif not _close_decidable(observed):
                 return self._drain_pending(observed, identity)
@@ -1292,17 +1400,20 @@ class OwnerTaskAdapter(_OwnerAdapter):
         return True
 
     def _drain_pending(self, task: OwnerTaskSnapshot, identity: NodeAttemptIdentity) -> bool:
-        """The drained operation's assessment is still unavailable: reread it
-        on later ticks, then leave it retained for Reset (bounded)."""
+        """The drained operation's assessment is not yet decidable: reread it
+        on later ticks (the same wait as `_await_settled_assessment`)."""
 
-        self._drain_rereads += 1
-        if self._drain_rereads < _ASSESSMENT_REREAD_LIMIT:
-            self._drain = (task, identity)
-            return False
-        self._drain = None
-        return True
+        self._drain = (task, identity)
+        return False
 
     def terminate(self, new_status: py_trees.common.Status) -> None:
+        request, self._request = self._request, None
+        if request is not None and not request.withdraw():
+            # Sent on the run's sender: the atomic step completes and its
+            # real result ends this attempt, never `interrupted` (OD-213).
+            if new_status is py_trees.common.Status.INVALID:
+                self._abandoned = request
+            return
         # Halt, Stop or cancel of a running attempt: a cancellable node
         # reports `interrupted`, including a held or not yet admitted one,
         # once the stop is confirmed.
@@ -1328,8 +1439,344 @@ class OwnerTaskAdapter(_OwnerAdapter):
                 return
         if self._closable(task):
             self._drain = (task, identity)
-            self._drain_rereads = 0
             self._phase = _TaskPhase.DONE
+
+
+class _InlineRequest:
+    """A request made at once inside the tick, read like a sent one (a node
+    built without its run's sender)."""
+
+    withdrawn = False
+    answered = True
+
+    def __init__(self, call: Callable[[], Any]) -> None:
+        self._result: Any = None
+        self._error: Exception | None = None
+        try:
+            self._result = call()
+        except Exception as error:
+            self._error = error
+
+    def withdraw(self) -> bool:
+        return False
+
+    def result(self) -> Any:
+        if self._error is not None:
+            raise self._error
+        return self._result
+
+
+class PickPlacePlanningAdapter(OwnerTaskAdapter):
+    """Pick/place planning as a planning job on the execution host
+    (OD-213 (1)).
+
+    The node sends the plan on its run's sender and is RUNNING: the host
+    answers at once with the job. On every tick it reads the job's state
+    from the pushed stream copy (memory only; RUNNING while the copy is
+    unavailable or does not list the job yet). Once the job is done, failed
+    or cancelled it reads the job once and releases it (again on the
+    sender), and the result ends the node as before: SUCCESS with the plan,
+    FAILURE `no_feasible_candidate`, or FAILURE with the host's typed code.
+
+    A Halt, a hold of this node by a Stop, a branch halt and Forced Program
+    End cancel this node's job only (straight to the host's control socket);
+    a request still queued on the sender is withdrawn instead. A stopped
+    node reports `interrupted`. A frozen or held node plans again, from the
+    start, when it is ticked after Execute or Run.
+
+    What a stopped attempt leaves (its sent request, its job) is followed to
+    its end by the run's tick (`drain_invalidated`): the job is cancelled
+    when its acceptance arrives and released once it ended, and a read the
+    host answered is acknowledged, so neither the host's job table nor the
+    port keeps it. One such follow-up per node: the next attempt sends its
+    plan only once the follow-up is empty, so the node holds at most one job
+    on the host.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        # The sent job, the step of `_request` ("send" or "finish"), and the
+        # job this node cancelled (it plans again after it).
+        self._job: Any = None
+        self._step: str | None = None
+        self._cancelled_job_id: str | None = None
+        # A stopped attempt's follow-up: its request ("send", "finish" or
+        # "release") with the attempt identity, and its job still to release.
+        self._follow_request: Any = None
+        self._follow_step: str | None = None
+        self._follow_identity: NodeAttemptIdentity | None = None
+        self._follow_job: Any = None
+
+    # ---- the job's steps -------------------------------------------------
+    def _submit(self, step: str, call: Callable[[], Any]) -> None:
+        self._step = step
+        self._request = (
+            _InlineRequest(call) if self._sender is None else self._sender.submit(call)
+        )
+
+    def _submit_send(self) -> None:
+        assert self._identity is not None and self._owner_inputs is not None
+        port, node_id = self._port, self._node_id
+        identity, inputs = self._identity, self._owner_inputs
+        # A job this attempt cancelled (Halt, hold) ended: it is released
+        # first, which frees its name for the new plan.
+        stale, self._cancelled_job_id = self._cancelled_job_id, None
+
+        def send() -> Any:
+            if stale is not None:
+                port.release_planning(stale)  # type: ignore[attr-defined]
+            return port.send_planning(node_id, identity, inputs)  # type: ignore[attr-defined]
+
+        self._submit("send", send)
+
+    def _sent_start(self) -> OwnerTaskSnapshot | None:
+        request = self._request
+        if request is not None and request.withdrawn:
+            # A Halt or Stop withdrew it before it was sent: it is made
+            # again below (a send while no job is known, else the read).
+            self._request = request = None
+        if request is not None:
+            if not request.answered:
+                return None
+            self._request = None
+            answer = request.result()  # What the step raised fails the node.
+            if self._step == "send":
+                self._job = answer
+            else:
+                self._job = None
+                if answer is not None:
+                    return answer
+                # Cancelled by this node's own cancel: plan again.
+                self._submit_send()
+                return None
+        if self._job is None:
+            if self.has_pending_drain:
+                # The previous attempt's job is still on the host: one job
+                # per node, so this plan waits until it is released.
+                return None
+            self._submit_send()
+            return None
+        try:
+            state = self._port.planning_job_state(self._job.job_id)  # type: ignore[attr-defined]
+        except KernelOperationObservationUnavailableError:
+            return None  # The stream copy is unavailable: RUNNING.
+        if state not in PLANNING_JOB_FINAL_STATES:
+            return None
+        if self._cancelled_job_id == self._job.job_id:
+            # This node cancelled it (Halt, hold): plan again from the start.
+            self._job = None
+            self._submit_send()
+            return None
+        assert self._identity is not None and self._owner_inputs is not None
+        port, job = self._port, self._job
+        identity, inputs = self._identity, self._owner_inputs
+        self._submit(
+            "finish",
+            lambda: port.finish_planning(job, identity, inputs),  # type: ignore[attr-defined]
+        )
+        return None
+
+    def _sent_job(self) -> Any:
+        """The job this attempt has sent, also from an answered send not yet
+        read by a tick; None when none is known."""
+
+        if self._job is not None:
+            return self._job
+        request = self._request
+        if self._step == "send" and request is not None and request.answered:
+            try:
+                return request.result()
+            except Exception:
+                return None  # The tick reads the failure.
+        return None
+
+    def _cancel_job(self, job: Any) -> bool:
+        """Cancel this node's job only, on the control socket. True once the
+        host took the cancel (or the job was cancelled before)."""
+
+        if job is None or self._cancelled_job_id == job.job_id:
+            return True
+        # Asked once: the node plans again after this job ends either way.
+        self._cancelled_job_id = job.job_id
+        try:
+            self._port.cancel_planning(job.job_id)  # type: ignore[attr-defined]
+        except Exception as exc:
+            self.feedback_message = f"planning cancel failed: {exc}"
+            return False
+        return True
+
+    def _stop_planning(self) -> str:
+        """A Halt froze the run or a Stop holds this node: a queued request
+        is withdrawn, the job is cancelled. "active" only while a sent
+        request is unanswered (its job is not known yet)."""
+
+        request = self._request
+        if request is not None and request.withdraw():
+            self._request = None
+            request = None
+        if request is not None and not request.answered:
+            return "active"
+        if self._phase is _TaskPhase.SUBMIT:
+            self._cancel_job(self._sent_job())
+        return "unaffected"
+
+    # ---- a stopped attempt's follow-up -----------------------------------
+    @property
+    def has_pending_drain(self) -> bool:
+        return (
+            super().has_pending_drain
+            or self._follow_request is not None
+            or self._follow_job is not None
+        )
+
+    def drain_invalidated(self) -> bool:
+        """The run's tick (and the node's own): follow what a stopped
+        attempt left, memory only apart from the cancel. True when nothing
+        is left."""
+
+        drained = super().drain_invalidated()
+        return self._follow_up(run_ended=False) and drained
+
+    def _follow_up(self, *, run_ended: bool) -> bool:
+        request = self._follow_request
+        if request is not None:
+            if request.withdrawn:
+                # A queued release a Halt withdrew: made again below.
+                self._follow_request = None
+            elif not request.answered:
+                return False
+            else:
+                self._follow_request = None
+                step, identity = self._follow_step, self._follow_identity
+                try:
+                    answer = request.result()
+                except Exception:
+                    # Not accepted (send), or the read failed (finish: the
+                    # job is still to release), or the release failed.
+                    answer = None
+                    if step == "release":
+                        self._follow_job = None  # Program Reset releases it.
+                else:
+                    if step == "send" and answer is not None:
+                        # Its own job only; the current attempt's cancel
+                        # mark is not touched.
+                        try:
+                            self._port.cancel_planning(answer.job_id)  # type: ignore[attr-defined]
+                        except Exception as exc:
+                            # Not cancelled: it plans to its end, then is
+                            # released below.
+                            self.feedback_message = f"planning cancel failed: {exc}"
+                        self._follow_job = answer
+                    elif step == "finish":
+                        # The read released the job; its task leaves the port.
+                        self._follow_job = None
+                        if answer is not None and identity is not None:
+                            try:
+                                self._port.acknowledge(answer.task_id, identity)
+                            except Exception:
+                                pass  # Not retained (already gone).
+                    elif step == "release":
+                        self._follow_job = None
+        job = self._follow_job
+        if job is None:
+            return True
+        if run_ended:
+            # The run's sender is closed: the Program Reset releases the job.
+            self._follow_job = None
+            return True
+        try:
+            state = self._port.planning_job_state(job.job_id)  # type: ignore[attr-defined]
+        except KernelOperationObservationUnavailableError:
+            return False
+        if state not in PLANNING_JOB_FINAL_STATES:
+            return False  # Its cancel still ends it (or it is not pushed yet).
+        if self._sender is None:
+            self._port.release_planning(job.job_id)  # type: ignore[attr-defined]
+            self._follow_job = None
+            return True
+        port = self._port
+        self._follow_step = "release"
+        self._follow_request = self._sender.submit(
+            lambda: port.release_planning(job.job_id)  # type: ignore[attr-defined]
+        )
+        return False
+
+    def _leave_follow_up(self, request: Any, step: str | None, job: Any) -> None:
+        """The attempt stops: what it left goes to the follow-up (empty now:
+        a new attempt sends nothing while it is not)."""
+
+        self._follow_request = request
+        self._follow_step = step
+        self._follow_identity = self._identity
+        self._follow_job = job
+
+    # ---- Halt, hold, branch halt, Forced Program End --------------------
+    def reconcile_halt_task(self, *, selected_resume: bool = False) -> str:
+        if self._phase is not _TaskPhase.SUBMIT:
+            return super().reconcile_halt_task(selected_resume=selected_resume)
+        return self._stop_planning()
+
+    def observe_while_operator_stop_held(self) -> None:
+        if self._phase is not _TaskPhase.SUBMIT:
+            super().observe_while_operator_stop_held()
+            return
+        self._stop_planning()
+
+    def _begin_attempt(self, *, restart_series: bool) -> None:
+        super()._begin_attempt(restart_series=restart_series)
+        self._job = None
+        self._step = None
+        self._cancelled_job_id = None
+
+    def settle_abandoned_request(self) -> bool:
+        """Forced Program End: a stopped attempt's sent request completes
+        (its job is cancelled); its job is released by the Program Reset.
+        True once nothing sent is outstanding."""
+
+        return self._follow_up(run_ended=True)
+
+    def terminate(self, new_status: py_trees.common.Status) -> None:
+        if self._phase is not _TaskPhase.SUBMIT:
+            super().terminate(new_status)
+            return
+        request, self._request = self._request, None
+        job = self._job
+        # A read queued for a job that ended: nothing to cancel, only to release.
+        ended = self._step == "finish"
+        if request is not None and not request.withdraw():
+            if not request.answered:
+                # Sent: followed until its answer (then its job is
+                # cancelled, or its read acknowledged).
+                self._leave_follow_up(request, self._step, job)
+                self._job = None
+                self._record_interruption(new_status)
+                return
+            if self._step == "send":
+                try:
+                    job = request.result()
+                except Exception:
+                    job = None  # Not accepted: nothing plans.
+            elif self._step == "finish":
+                # Answered, not read by a tick: its task leaves the port.
+                self._leave_follow_up(request, "finish", None)
+                self._job = None
+                self._record_interruption(new_status)
+                return
+        self._job = None
+        if job is None:
+            self._record_interruption(new_status)
+            return
+        cancelled = ended or self._cancel_job(job)
+        # Released by the follow-up once it ended (finished or cancelled).
+        self._leave_follow_up(None, None, job)
+        if not cancelled:
+            # The host did not take the cancel: the stop is not confirmed.
+            self._record_stop_failure()
+            self._record_node_failure(
+                "owner_cancellation_failed", self.feedback_message or "planning cancel failed"
+            )
+            return
+        self._record_interruption(new_status)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1414,15 +1861,15 @@ class MotionTaskAdapter(OwnerTaskAdapter):
         assert retry is not None and identity is not None  # Set with BACKOFF.
         if self._retry_time.elapsed() < retry.delay_s:
             return py_trees.common.Status.RUNNING
-        request_id = request_identity(
-            "program-automatic-retry", identity.program_run_id, identity.node_attempt_id
+        request_key = program_key(
+            identity.program_run_id, identity.node_attempt_id, Phase.AUTOMATIC_RETRY
         )
         try:
             if self._motion_attention is None:
                 raise RuntimeError("automatic motion retry has no motion attention check")
             # The check an operator Retry runs before any motion effect. The
             # Kernel's refusal keeps its own code.
-            self._motion_attention(identity.node_instance_id, request_id)
+            self._motion_attention(identity.node_instance_id, request_key)
         except Exception as error:
             self._phase = _TaskPhase.DONE
             self._record_owner_failure(
@@ -1688,48 +2135,54 @@ class InterruptMotionTaskAdapter(MotionTaskAdapter):
     the operation projection with its participants' `io_rule_outcomes`) is
     mapped by `interrupt_outcome.map_interrupt_result` to the node result, the
     node outcome (`signal_trip` / `no_signal_trip` / `failed`) and one history
-    row. The containing Stop stage, needed only for an escalated trip, comes
-    from the robot's qualified Stop chain (`interrupt_stop_chain`, per
-    participant: the Targets motion command's `stop_response` stages of the
-    binding the operation used) and the detailed Stop terminal
-    projection of the row's Stop and certificate (`interrupt_stop_terminal`,
-    the `stop_terminal_projected` row the Runner's existing events reader
-    retains; `contained_stages_from_stop_terminal`, per participant); when either is
-    absent the stage is unproven and the node fails. An ordinary
-    Stop (no interrupt terminal) keeps the existing motion handling.
+    row. Each covered participant's `stop` object in that operation read
+    names the stage that contained it and the mode of the Stop plan that
+    ran (an interrupt plan is judged by the rule's threshold); the robot's
+    qualified Stop chain is
+    `interrupt_stop_chain` (per participant: the Targets motion command's
+    `stop_response` stages of the binding the operation used). While a
+    covered participant is still stopping the node waits. An ordinary Stop
+    (no interrupt terminal) or an operator-attributed Stop keeps the existing
+    motion handling.
     """
 
     def __init__(self, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._interrupt: InterruptNodeResult | None = None
-        self._stop_terminal_waiting = False
+        self._stop_waiting = False
 
     def _begin_attempt(self, *, restart_series: bool) -> None:
         super()._begin_attempt(restart_series=restart_series)
         self._interrupt = None
-        self._stop_terminal_waiting = False
+        self._stop_waiting = False
 
     def _retry_limit(self) -> int:
         # Search and contact moves have no automatic retry;
         # a source loss is never retried either.
         return 0
 
-    def _await_stop_terminal(
+    @staticmethod
+    def _stop_pending(task: OwnerTaskSnapshot) -> bool:
+        operation = task.metadata.get("interrupt_operation")
+        return isinstance(operation, Mapping) and interrupt_stop_pending(operation)
+
+    def _await_participant_stops(
         self, task: OwnerTaskSnapshot
     ) -> tuple[py_trees.common.Status | None, OwnerTaskSnapshot]:
-        """The Stop terminal record may follow the operation's
-        terminal state. While the port reports it pending, the node stays
-        RUNNING and re-observes the terminal task once per later tick (one
-        read_stop each); the wait ends with the record or unproven evidence
-        (Failure), or when the node is halted."""
+        """A covered participant may still be stopping when the operation is
+        terminal. While one is, the node stays RUNNING and re-observes the
+        terminal task once per later tick (one operation read each); the
+        wait ends when every covered participant is stopped or failed, or
+        when the node is halted."""
 
-        if task.metadata.get("interrupt_stop_terminal_pending") is not True:
+        if not self._stop_pending(task):
             return None, task
-        if self._stop_terminal_waiting:
+        if self._stop_waiting:
             try:
                 observed = self._port.observe(task.task_id)
             except OwnerTaskObservationUnavailableError:
-                return self._stopped_read_failed(), task
+                # Stopped and unreadable: it waits, as in `_failed_read`.
+                return py_trees.common.Status.RUNNING, task
             except Exception as exc:
                 self._record_owner_error("owner_request_failed", exc)
                 return py_trees.common.Status.FAILURE, task
@@ -1738,11 +2191,10 @@ class InterruptMotionTaskAdapter(MotionTaskAdapter):
                     "owner_task_identity_changed", "owner observation selected another task"
                 )
                 return py_trees.common.Status.FAILURE, task
-            self._read_failing_since = None
             self._task = task = observed
-            if task.metadata.get("interrupt_stop_terminal_pending") is not True:
+            if not self._stop_pending(task):
                 return None, task
-        self._stop_terminal_waiting = True
+        self._stop_waiting = True
         return py_trees.common.Status.RUNNING, task
 
     def _map_interrupt(self, task: OwnerTaskSnapshot) -> InterruptNodeResult | None:
@@ -1754,26 +2206,11 @@ class InterruptMotionTaskAdapter(MotionTaskAdapter):
             chain = {key: tuple(value) for key, value in chain.items() if isinstance(value, (list, tuple))}
         else:
             chain = tuple(chain) if isinstance(chain, (list, tuple)) else ()
-        terminal = task.metadata.get("interrupt_stop_terminal")
-        contained = None
-        if isinstance(terminal, Mapping):
-            rows = [
-                row
-                for participant in operation.get("participants") or ()
-                if isinstance(participant, Mapping)
-                for row in participant.get("io_rule_outcomes") or ()
-                if isinstance(row, Mapping)
-            ]
-            if len(rows) == 1 and isinstance(operation.get("operation_id"), str):
-                contained = contained_stages_from_stop_terminal(
-                    rows[0], terminal, operation_id=operation["operation_id"]
-                )
         return map_interrupt_result(
             self._node_id,
             self._inputs or {},
             operation,
             stop_chain=chain,
-            contained_stage_id=contained,
         )
 
     def _settle(self, task: OwnerTaskSnapshot) -> py_trees.common.Status:
@@ -1785,12 +2222,12 @@ class InterruptMotionTaskAdapter(MotionTaskAdapter):
             or isinstance(task.metadata.get("preemption"), Mapping)
         ):
             return super()._settle(task)
-        waiting, task = self._await_stop_terminal(task)
+        waiting, task = self._await_participant_stops(task)
         if waiting is not None:
             return waiting
         if _terminal_cleanup_pending(task):
             # Decide (close, hold or fail) on the settled assessment: a held
-            # failure keeps its Retry and Continue offers (bounded rereads).
+            # failure keeps its Retry and Continue offers.
             waiting, task = self._await_settled_assessment(task)
             if waiting is not None:
                 return waiting
@@ -1868,9 +2305,13 @@ class GripperCommandAdapter(OwnerTaskAdapter):
         operator_stop_hold_scope: str | None = None,
         io_watches: OwnerTaskPort | None = None,
         io_signals: OwnerInvocationPort | None = None,
+        valve_sender: RunSender | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(operator_stop_state=operator_stop_state, **kwargs)
+        # The run's sender for the valve writes (OD-213): each write leaves
+        # the tick like `io.set_output`. None: written inside the tick.
+        self._valve_sender = valve_sender
         self._dwell_time = AttemptTime(
             program_clock,
             operator_stop_state=(operator_stop_state if operator_stop_hold_scope is not None else None),
@@ -1920,14 +2361,15 @@ class GripperCommandAdapter(OwnerTaskAdapter):
         self._pneumatic_watch = None
         return True
 
-    def _close_request_id(self, identity: NodeAttemptIdentity) -> str:
+    def _close_request_key(self, identity: NodeAttemptIdentity) -> bytes:
         task = self._drain[0] if self._drain is not None else self._task
         if task is not None and (
             self._pneumatic_route is not None or task.task_id == self._pneumatic_drain_id
         ):
-            return request_identity("program-pneumatic-close", identity.program_run_id,
-                                    identity.node_attempt_id, task.task_id)
-        return super()._close_request_id(identity)
+            return program_key(
+                identity.program_run_id, identity.node_attempt_id, Phase.PNEUMATIC_CLOSE
+            )
+        return super()._close_request_key(identity)
 
     def _start_task(self) -> OwnerTaskSnapshot:
         if self._pneumatic_route is not None:
@@ -1975,6 +2417,23 @@ class GripperCommandAdapter(OwnerTaskAdapter):
         outputs = self._pneumatic_route["outputs"]
         while self._pneumatic_output_index < len(outputs):
             row = outputs[self._pneumatic_output_index]
+            if self._valve_sender is not None:
+                # One write at a time on the run's sender, read on a later tick.
+                request = self._request
+                if request is None or request.withdrawn:
+                    signals, identity = self._io_signals, self._identity
+                    try:
+                        self._request = self._valve_sender.submit(
+                            lambda: signals.invoke("io.set_output", identity, OwnerNodeInputs(row))
+                        )
+                    except Exception as exc:
+                        self._record_owner_error(_io_reason(exc), exc)
+                        return py_trees.common.Status.FAILURE
+                    return py_trees.common.Status.RUNNING
+                status = self._valve_answer()
+                if status is not py_trees.common.Status.SUCCESS:
+                    return status
+                continue
             self._pneumatic_output_index += 1
             try:
                 result = self._io_signals.invoke("io.set_output", self._identity, OwnerNodeInputs(row))
@@ -1987,6 +2446,51 @@ class GripperCommandAdapter(OwnerTaskAdapter):
         self._dwell_time.start(exclude_held=(self._inputs or {}).get("dwell_while_held", "pause") == "pause")
         self._pneumatic_stage = "watch" if self._pneumatic_route["inputs"] else "dwell"
         return py_trees.common.Status.RUNNING
+
+    def _valve_answer(self) -> py_trees.common.Status:
+        """The sent valve write's answer: RUNNING while unanswered, SUCCESS
+        when the write succeeded (the next row follows), else FAILURE with
+        its code. A failed write is never resent."""
+
+        request = self._request
+        assert request is not None
+        if not request.answered:
+            return py_trees.common.Status.RUNNING
+        self._request = None
+        self._pneumatic_output_index += 1
+        try:
+            result = request.result()
+        except Exception as exc:
+            self._record_owner_error(_io_reason(exc), exc)
+            return py_trees.common.Status.FAILURE
+        if not result.succeeded:
+            self._record_owner_failure(result.reason_code, result.message, result.details)
+            return py_trees.common.Status.FAILURE
+        return py_trees.common.Status.SUCCESS
+
+    def _consume_answer(self) -> py_trees.common.Status:
+        # Held: a written valve keeps the node where it is (the next write
+        # waits for Run/Resume); a failed one ends it with its code.
+        status = self._valve_answer()
+        return py_trees.common.Status.RUNNING if status is py_trees.common.Status.SUCCESS else status
+
+    def _abandoned_result(self, request: RunRequest) -> py_trees.common.Status | None:
+        # Forced Program End after a valve write was sent: a failed write
+        # ends the node with its code; a written one leaves the gripper
+        # command stopped between its steps (`interrupted`).
+        try:
+            result = request.result()
+        except Exception as exc:
+            self._record_owner_error(_io_reason(exc), exc)
+            return py_trees.common.Status.FAILURE
+        if not result.succeeded:
+            self._record_owner_failure(result.reason_code, result.message, result.details)
+            return py_trees.common.Status.FAILURE
+        if self.cancellable:
+            # As `_record_interruption` records it when a running attempt stops.
+            self._interrupted_reason_code = NODE_INTERRUPTED_REASON
+            self._interrupted_message = "the running attempt was stopped"
+        return None
 
     def _finish(self, status: py_trees.common.Status) -> py_trees.common.Status:
         # A required grasp confirmation (the owner names its read on the
@@ -2128,32 +2632,81 @@ class GripperCommandAdapter(OwnerTaskAdapter):
 
 
 class OwnerInvocationAdapter(_OwnerAdapter):
-    """Issue one bounded synchronous owner request per node attempt."""
+    """Issue one owner request per node attempt.
+
+    With the run's sender (OD-213: Scene nodes, the output write) the
+    request leaves the tick: the node is RUNNING until its answer and reads
+    it on a later tick. The request is an atomic action. A Halt, or an
+    operator Stop that holds the node, withdraws it while it is not sent: it
+    is never sent, and the node stays RUNNING where it is and sends it when
+    it is ticked again. Once sent it completes: the node returns its real
+    result, never `interrupted`, and a Halt or Forced Program End settles only
+    after that answer. Without a sender the call is made inside the tick.
+    """
 
     def __init__(self, *, port: OwnerInvocationPort,
-                 operator_stop_state: OperatorMotionStopState | None = None, **kwargs: Any) -> None:
+                 operator_stop_state: OperatorMotionStopState | None = None,
+                 run_sender: RunSender | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self._port = port
         self._invoked = False
         self._status = py_trees.common.Status.INVALID
         self._pending_observation = None
         self._operator_stop_state = operator_stop_state
+        self._sender = run_sender
+        # The request on the run's sender: the node's effect, or a read of
+        # its unconfirmed outcome (``_request_effect`` False).
+        self._request: RunRequest | None = None
+        self._request_effect = False
+        # A sent effect of an attempt the tree stopped: its real result
+        # still ends that attempt (Forced Program End).
+        self._abandoned: RunRequest | None = None
 
     def _begin_attempt(self, *, restart_series: bool) -> None:
         super()._begin_attempt(restart_series=restart_series)
         self._invoked = False
         self._status = py_trees.common.Status.INVALID
         self._pending_observation = None
+        if self._request is not None:
+            self._request.withdraw()
+        self._request = None
+        self._request_effect = False
+        self._abandoned = None
+
+    def _send(self, call: Callable[[], Any], *, effect: bool) -> py_trees.common.Status:
+        assert self._sender is not None
+        self._request = self._sender.submit(call)
+        self._request_effect = effect
+        return py_trees.common.Status.RUNNING
+
+    def _forget_withdrawn(self) -> None:
+        """The request was withdrawn before it was sent: as if never made."""
+        if self._request_effect:
+            self._invoked = False
+        self._request = None
+        self._request_effect = False
 
     def update(self) -> py_trees.common.Status:
         if self._wait_for_admission_release():
             return py_trees.common.Status.RUNNING
         if self._input_error is not None or self._identity is None or self._owner_inputs is None:
             return py_trees.common.Status.FAILURE
-        if self._invoked and self._pending_observation is None:
+        if self._request is not None and self._request.withdrawn:
+            self._forget_withdrawn()
+        if self._invoked and self._pending_observation is None and self._request is None:
             return self._status
         try:
-            if self._pending_observation is not None:
+            if self._request is not None:
+                if not self._request.answered:
+                    return py_trees.common.Status.RUNNING
+                request, self._request = self._request, None
+                result = request.result()
+                if result is None:
+                    # The read found the outcome still unconfirmed: read again.
+                    return self._send(self._pending_observation, effect=False)
+            elif self._pending_observation is not None:
+                if self._sender is not None:
+                    return self._send(self._pending_observation, effect=False)
                 result = self._pending_observation()
                 if result is None:
                     return py_trees.common.Status.RUNNING
@@ -2164,6 +2717,12 @@ class OwnerInvocationAdapter(_OwnerAdapter):
                     self._status = gate
                     return gate
                 self._invoked = True
+                if self._sender is not None:
+                    port, node_id = self._port, self._node_id
+                    identity, inputs = self._identity, self._owner_inputs
+                    return self._send(
+                        lambda: port.invoke(node_id, identity, inputs), effect=True
+                    )
                 result = self._port.invoke(self._node_id, self._identity, self._owner_inputs)
         except OwnerInvocationHeldError as error:
             self._pending_observation = None
@@ -2203,7 +2762,7 @@ class OwnerInvocationAdapter(_OwnerAdapter):
 
     @property
     def has_active_task(self) -> bool:
-        return self._pending_observation is not None
+        return self._pending_observation is not None or self._request is not None
 
     def observe_control_state(self) -> str:
         return "active" if self.has_active_task else "settled" if self._invoked else "inactive"
@@ -2211,20 +2770,79 @@ class OwnerInvocationAdapter(_OwnerAdapter):
     def cached_control_state(self) -> str:
         return self.observe_control_state()
 
-    def reconcile_full_stop_task(self, *, selected_resume: bool = False) -> str:
+    def _sent_effect_unanswered(self) -> bool:
+        request = self._request
+        return (
+            request is not None and self._request_effect
+            and request.sent and not request.answered
+        )
+
+    def reconcile_halt_task(self, *, selected_resume: bool = False) -> str:
         # A selected Resume must not reopen admission while a previously sent
         # transaction is still in flight. Full tree Stop uses the permanent
         # run fence and the owner's child claim; it does not cancel this call.
         if not selected_resume:
-            return "unaffected"
+            # Halt: a request not sent is withdrawn (the node sends it after
+            # Execute); a sent effect keeps the run Halting until its answer,
+            # which the node returns on its first tick after Execute.
+            if self._request is not None and self._request.withdraw():
+                self._forget_withdrawn()
+            return "active" if self._sent_effect_unanswered() else "unaffected"
         self.observe_while_operator_stop_held()
         return self.observe_control_state()
 
     def observe_while_operator_stop_held(self) -> None:
-        if self._pending_observation is not None:
+        request = self._request
+        if request is not None:
+            if self._request_effect and request.withdraw():
+                # Not sent before the Stop: it is not sent; the node stays
+                # where it is and sends it when it is ticked again.
+                self._forget_withdrawn()
+                return
+            if not request.answered and not request.withdrawn:
+                return
+        if self._request is not None or self._pending_observation is not None:
             status = self.update()
             if status is not py_trees.common.Status.RUNNING:
                 self.stop(status)
+
+    def terminate(self, new_status: py_trees.common.Status) -> None:
+        request, effect = self._request, self._request_effect
+        if request is None:
+            return
+        self._request = None
+        self._request_effect = False
+        if request.withdraw():
+            if effect:
+                self._invoked = False
+        elif effect and new_status is py_trees.common.Status.INVALID:
+            # Sent: the atomic action completes on its owner (OD-213).
+            self._abandoned = request
+
+    def settle_abandoned_request(self) -> bool:
+        """Forced Program End: the sent effect of the stopped attempt ends
+        it with its real result. True once nothing sent is outstanding."""
+        request = self._abandoned
+        if request is None:
+            return True
+        if not request.answered:
+            return False
+        self._abandoned = None
+        try:
+            result = request.result()
+        except (OwnerInvocationHeldError, OwnerInvocationPendingError):
+            # Not admitted, or its outcome is unconfirmed: nothing to return.
+            return True
+        except Exception as exc:
+            self._record_owner_error("owner_request_failed", exc)
+            self.status = py_trees.common.Status.FAILURE
+            return True
+        if result.succeeded:
+            self.status = py_trees.common.Status.SUCCESS
+        else:
+            self._record_owner_failure(result.reason_code, result.message, result.details)
+            self.status = py_trees.common.Status.FAILURE
+        return True
 
 
 class GripperStatusWaitAdapter(_OwnerAdapter):
@@ -2499,7 +3117,7 @@ class IoInputWaitAdapter(_OwnerAdapter):
     def cached_control_state(self) -> str:
         return "inactive"
 
-    def reconcile_full_stop_task(self, *, selected_resume: bool = False) -> str:
+    def reconcile_halt_task(self, *, selected_resume: bool = False) -> str:
         return "unaffected"
 
     def observe_while_operator_stop_held(self) -> None:
@@ -2514,4 +3132,5 @@ __all__ = [
     "InterruptMotionTaskAdapter",
     "GripperCommandAdapter",
     "GripperStatusWaitAdapter",
+    "PickPlacePlanningAdapter",
 ]

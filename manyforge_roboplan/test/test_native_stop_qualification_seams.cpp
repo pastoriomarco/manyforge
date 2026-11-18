@@ -26,9 +26,9 @@ namespace {
 namespace fixture = qualification_fixture;
 
 [[nodiscard]] core::ResolvedParticipantStopStageDTO direct_stage_fixture() {
-  const core::OperationId operation_id("operation.direct");
+  const core::OperationNumber operation_id(905U);
   const core::OperationRevision operation_revision(1U);
-  const core::OperationParticipantId participant_id("participant.direct");
+  const core::OperationParticipantId participant_id{core::OperationNumber(905U), 1U};
   const auto binding = fixture::make_binding();
   const auto &value = binding.value();
   const auto &path = *value.control_path;
@@ -88,13 +88,11 @@ namespace fixture = qualification_fixture;
               core::StopEvidenceSourceKind::kControllerGoalStatus, target,
               std::nullopt, std::nullopt, std::nullopt}}}};
   return core::ResolvedParticipantStopStageDTO{
-      core::StopId("stop.direct"),
-      core::StopGeneration(1U),
+      core::StopEventId(1000U),
       operation_id,
       operation_revision,
       participant_id,
-      core::ControllerGoalId("goal.direct"),
-      core::ControllerGoalGeneration(1U),
+      core::ControllerGoalId{core::OperationNumber(901U), 1U, 1U},
       value.controllable_component_id,
       value.command_target_id,
       value.capability_id,
@@ -123,7 +121,7 @@ namespace fixture = qualification_fixture;
           value.program_id,
           value.program_revision,
           value.program_binding_id,
-          core::ProgramRunId("program.run"),
+          core::ProgramRunNumber(106U),
           std::nullopt,
           core::ParticipantStopProfilePurposeDTO::kOrdinary,
           std::nullopt,
@@ -208,8 +206,7 @@ controlled_stage_fixture(double jerk_limit = 1'000'000.0) {
 /// controlled stage carries its own profile deadline, nothing else is shared.
 [[nodiscard]] core::RemainingStopBudgetDTO
 remaining_budget(const core::ResolvedParticipantStopStageDTO &stage) {
-  core::RemainingStopBudgetDTO budget{stage.stop_id, stage.stop_generation, 0,
-                                      std::nullopt};
+  core::RemainingStopBudgetDTO budget{stage.stop_event_id, 0, std::nullopt};
   const auto &command =
       stage.participant_stop_plan.stage_commands.at(stage.stage_index);
   if (command.resolved_stage.containment_command.command_kind ==
@@ -310,18 +307,18 @@ public:
       on_tick();
   }
 
-  static core::ExecutionGoalKey
+  static core::ControllerGoalId
   Key(const core::ResolvedParticipantStopStageDTO &stage) {
-    return {stage.controller_goal_id, stage.controller_goal_generation};
+    return {stage.controller_goal_id};
   }
 
-  void Executing(const core::ExecutionGoalKey &key) {
+  void Executing(const core::ControllerGoalId &key) {
     core::ExecutionGoalObservationDTO observation;
     observation.key = key;
     observation.binding_epoch = core::ExecutionBindingEpoch(1U);
     observation.phase = core::ExecutionGoalPhase::kExecuting;
-    observation.mechanism_goal_id = core::MechanismGoalId(
-        "core-seam-" + std::to_string(key.controller_goal_generation.value()));
+    observation.mechanism_goal_id =
+        core::testing::TestMechanismGoalId(key.generation);
     core::ExecutionGoalFeedbackDTO feedback;
     feedback.source_stamp_ns = clock.now() - 1;
     feedback.local_receipt_stamp_ns = clock.now() - 1;
@@ -609,8 +606,7 @@ public:
     if (result.state != core::PrepareParticipantResultStateDTO::kPrepared)
       throw std::logic_error(result.error ? result.error->message
                                           : "Core Prepare rejected");
-    auto handle = participant->Dispatch(prepared, stage.controller_goal_id,
-                                        stage.controller_goal_generation);
+    auto handle = participant->Dispatch(prepared, stage.controller_goal_id);
     if (handle.get_snapshot().state == core::ExecutionState::kFailed)
       throw std::logic_error(handle.get_snapshot().error->message);
     world.Executing(CoreStopSeam::Key(stage));
@@ -701,8 +697,8 @@ TEST(CoreStopQualificationSeamTest,
     EXPECT_EQ(after.joint_positions_rad, before.joint_positions_rad);
     ASSERT_TRUE(seam.participant->RetirePreparedExecution(1U).ok());
     auto newer = stage;
-    newer.controller_goal_id = core::ControllerGoalId("goal.newer");
-    newer.controller_goal_generation = core::ControllerGoalGeneration(2U);
+    newer.controller_goal_id = core::ControllerGoalId{core::OperationNumber(902U), 1U, 1U};
+    newer.controller_goal_id.generation = 2U;
     auto newer_handle = seam.Start(newer, 2U);
     const auto before_stale = world.port->commands().size();
     world.Bind(newer);
@@ -846,7 +842,7 @@ TEST(CoreStopQualificationSeamTest,
                            world.clock.now());
     if (end == 3) {
       auto newer = stage;
-      newer.controller_goal_generation = core::ControllerGoalGeneration(2U);
+      newer.controller_goal_id.generation = 2U;
       world.Bind(newer);
     }
     const auto before = world.port->ReadGoal(CoreStopSeam::Key(stage));
@@ -945,7 +941,7 @@ TEST(CoreStopQualificationSeamTest,
   EXPECT_EQ(cancels.front().key, CoreStopSeam::Key(stage));
   ASSERT_TRUE(seam.participant->RetirePreparedExecution(1U).ok());
   auto newer = stage;
-  newer.controller_goal_id = core::ControllerGoalId("goal.newer-cancel");
+  newer.controller_goal_id = core::ControllerGoalId{core::OperationNumber(903U), 1U, 1U};
   auto newer_handle = seam.Start(newer, 2U);
   const auto before = world.port->commands().size();
   world.Bind(newer);
@@ -1181,7 +1177,7 @@ TEST(CoreStopQualificationSeamTest,
   // Actual surviving participant releases publication at next Dispatch.
   ASSERT_TRUE(seam.participant->RetirePreparedExecution(1U).ok());
   auto next = stage;
-  next.controller_goal_id = core::ControllerGoalId("goal.next-scale");
+  next.controller_goal_id = core::ControllerGoalId{core::OperationNumber(904U), 1U, 1U};
   auto next_handle = seam.Start(next, 2U);
   world.clock.advance(10'000'000);
   world.scheduler.advance_to(world.clock.now());

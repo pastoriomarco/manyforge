@@ -142,7 +142,7 @@ public:
           ErrorDTO{"invalid_request", "fixture requires motion", {}});
     }
     auto request = testing::make_test_execute_request(
-        {"joint1", "joint2"}, operation.program_run_id.value());
+        {"joint1", "joint2"}, operation.program_run_id);
     request.move_id = motion->move_id.value();
     request.tolerances = motion->tolerances;
     request.speed_profile = motion->speed_profile;
@@ -373,7 +373,7 @@ public:
             predecessor_.projection_binding.projection_revision ||
         last_preview_->prior_projection_revision !=
             request.expected_projection_revision) {
-      return {request.request_context.request_id,
+      return {request.request_context.request_key,
               RequestReplayStatusDTO::kAcceptedNew,
               false,
               ErrorDTO{"scene_commit_failed",
@@ -390,7 +390,7 @@ public:
     predecessor_.bundle.policy = last_preview_->effective_collision_policy;
     const auto committed = last_preview_->proposed_projection_revision;
     last_preview_.reset();
-    return {request.request_context.request_id,
+    return {request.request_context.request_key,
             RequestReplayStatusDTO::kAcceptedNew,
             true,
             std::nullopt,
@@ -398,10 +398,6 @@ public:
             committed,
             SceneProjectionCommitStatusDTO::kCommitted,
             SceneUpdateStatusDTO::kGeometryChanged};
-  }
-
-  RequestOwnerEpoch CurrentRequestOwnerEpoch() const override {
-    return RequestOwnerEpoch("scene.owner.epoch:test");
   }
 
   ProjectionRevisionDTO CurrentProjectionRevision() const override {

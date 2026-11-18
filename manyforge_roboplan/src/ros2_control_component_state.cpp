@@ -29,14 +29,19 @@ core::ComponentState ros2_control_component_state(const Ros2ControlObservation &
       observation.streams.begin(), observation.streams.end(),
       [](const auto &stream) { return stream.freshness == core::StreamFreshness::kStale; });
 
+  // An owner stall offers no action: it clears by itself when the owner's
+  // task finishes.
   if (observation.owner_stalled) {
     state.fault = fault(core::FaultCode::kOwnerStalled, *observation.owner_stalled,
-                        Action::kRecover, now_ns);
+                        Action::kNone, now_ns);
     state.lifecycle = Lifecycle::kFault;
     state.activity = core::ComponentActivity::kUnknown;
     return state;
   }
-  if (observation.process_fault) {
+  if (observation.transport_fault) {
+    state.fault = fault(core::FaultCode::kRosTransportFailed, *observation.transport_fault,
+                        Action::kRecover, now_ns);
+  } else if (observation.process_fault) {
     state.fault = fault(core::FaultCode::kProcessExited, *observation.process_fault,
                         Action::kRecover, now_ns);
   } else if (observation.guard_fault) {
@@ -80,7 +85,8 @@ core::ComponentState ros2_control_component_state(const Ros2ControlObservation &
                               observation.goal_result_bound_ns &&
                               *observation.goal_past_end_ns > *observation.goal_result_bound_ns;
   if (observation.goal_outcome_unknown || (observation.goal_running &&
-      (!reachable || observation.process_fault || result_overdue))) {
+      (!reachable || observation.process_fault || observation.transport_fault ||
+       result_overdue))) {
     state.activity = core::ComponentActivity::kUnknown;
   } else if (observation.goal_running || observation.decelerating ||
              observation.reset_in_progress) {

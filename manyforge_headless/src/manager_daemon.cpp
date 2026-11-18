@@ -1,10 +1,12 @@
+#include "application_process_supervisor.hpp"
 #include "manyforge_headless/cell_admission_readiness_reducer.hpp"
 #include "manyforge_headless/manager_package_generation.hpp"
 #include "manyforge_headless/owner_publication.hpp"
 #include "manyforge_headless/scene_runtime_pose_projector.hpp"
 #include "manyforge_headless/scene_runtime_state_owner.hpp"
-#include "manyforge_headless/source_snapshot.hpp"
+#include "manager_local_exchange_internal.hpp"
 #include "manager_response_transport_internal.hpp"
+#include "manager_status_stream.hpp"
 #include "program_runner_publisher_fault_internal.hpp"
 #include "scene_admission_reconciliation_internal.hpp"
 #include <manyforge_deployment/execution_runtime_contract.hpp>
@@ -24,10 +26,10 @@
 #include <manyforge_deployment/program_binding_outcome.hpp>
 #include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
 #include <manyforge_component_manager/retained_execution_host_unit_adapter.hpp>
-#include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
-#include <manyforge_component_manager/runtime_unit_adapter_router.hpp>
 #include <manyforge_component_manager/site_settings.hpp>
+#include <manyforge_core/types/application_identity.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
+#include <manyforge_core/types/request_key.hpp>
 #include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
@@ -36,6 +38,7 @@
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
+#include <manyforge_persistence/sqlite_record_writer.hpp>
 #include <manyforge_scene/logical_scene_owner.hpp>
 #include <manyforge_scene/logical_scene_value_codec.hpp>
 #include <manyforge_scene/scene_transaction_codec.hpp>
@@ -44,6 +47,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/eventfd.h>
 #include <sys/file.h>
 #include <sys/random.h>
 #include <sys/socket.h>
@@ -91,7 +95,7 @@ namespace scene = manyforge::scene;
 using content_identity::CanonicalValue;
 
 constexpr std::string_view kManagerCommandApiVersion =
-    "manyforge.manager_command.v1";
+    "manyforge.manager_command.v2";
 
 // Preserve the scene-runtime operation's existing refusal code while keeping
 // a typed lower-level cause and its producer for diagnosis.
@@ -108,25 +112,17 @@ core::ErrorDTO SceneRuntimeFailureFromException(
   return {std::move(code), error.what(), std::move(details)};
 }
 constexpr std::string_view kManagerCommandResponseApiVersion =
-    "manyforge.manager_command_response.v2";
+    "manyforge.manager_command_response.v3";
 // The owner named by a Manager response error unless a typed cause names
 // another producer (for example a forwarded Kernel refusal).
 constexpr std::string_view kManagerProducer = "component_manager";
-constexpr std::string_view kManagerSourceFileName = "manager-source.json";
-constexpr std::string_view kLogicalSceneSourceFileName =
-    "logical-scene-source.json";
-constexpr std::string_view kSceneRuntimeSourceFileName =
-    "scene-runtime-source.json";
 constexpr std::string_view kManagerSocketFileName = "manager-command.sock";
 constexpr std::string_view kManagerDaemonLockFileName = ".manager-daemon.lock";
 constexpr std::string_view kProgramRunnerLivenessApiVersion =
-    "manyforge.program_runner_liveness.v1";
+    "manyforge.program_runner_liveness.v2";
 constexpr std::string_view kProgramRunnerLivenessPolicyId =
     "manyforge.program-runner.manager-presence.v1";
 constexpr std::string_view kProgramRunnerLivenessPolicyRevision = "1";
-constexpr std::string_view kProgramRunnerLocalSafeStateContractId =
-    "manyforge.program-runner.manager-loss-containment.v1";
-constexpr std::string_view kProgramRunnerLocalSafeStateContractRevision = "1";
 constexpr std::size_t kMaximumProgramRunnerLivenessPacketBytes = 16U * 1024U;
 constexpr std::size_t kMaximumKernelStopResponseBytes = 1024U * 1024U;
 constexpr std::size_t kMaximumCommandBytes =
@@ -139,14 +135,57 @@ constexpr std::uint64_t kMaximumPoseObservationLifetimeNs =
     60ULL * 1000ULL * 1000ULL * 1000ULL;
 constexpr std::size_t kMaximumPoseObserverSessions =
     kDefaultMaximumPoseObservationKeys;
-constexpr std::size_t kOwnerEpochRandomBytes = 16U;
+constexpr std::size_t kRandomTokenBytes = 16U;
 constexpr std::size_t kSocketBacklog = 16U;
-constexpr int kClientReadTimeoutMilliseconds = 250;
+/// The main loop's status tick (OD-216): each one shows the status stream's
+/// readers that the loop runs. Fixed, independent of the reconcile period, so
+/// a long reconcile period never reads as a Manager that does not answer.
+constexpr std::chrono::milliseconds kStatusTickPeriod{500};
 constexpr int kMaximumBootstrapAdvances = 8;
 
 volatile sig_atomic_t g_stop_requested = 0;
+/// Every SIGTERM/SIGINT is one stop request (OD-187). The first starts the
+/// orderly stop; a later one, while the stop sequence runs, forces it. A
+/// lock-free atomic: its update is async-signal-safe.
+std::atomic<unsigned> g_stop_signal_count{0U};
+static_assert(std::atomic<unsigned>::is_always_lock_free);
+/// Written only by the main thread: the stop sequence runs, and whether a
+/// `shutdown_runtime` request started it (that request is the first stop
+/// request). Atomics because the execution host adapter reads them through
+/// StopForceRequested.
+std::atomic<bool> g_stop_sequence_running{false};
+std::atomic<bool> g_stop_started_by_command{false};
 
-void HandleStopSignal(int) { g_stop_requested = 1; }
+/// The execution host adapter's abandon eventfd while the daemon lives, -1
+/// otherwise. A stop signal writes it, so the stop ends every host wait at
+/// once, on any thread: also the main thread's own (launch, scene commit,
+/// Apply acceptance), which cannot reach the stop sequence while it waits.
+std::atomic<int> g_abandon_signal_fd{-1};
+static_assert(std::atomic<int>::is_always_lock_free);
+
+void HandleStopSignal(int) {
+  const int saved_errno = errno;
+  g_stop_requested = 1;
+  g_stop_signal_count.fetch_add(1U, std::memory_order_relaxed);
+  // One eventfd write: async-signal-safe. A later signal only adds to the
+  // counter; the waits see it as already written.
+  if (const int fd = g_abandon_signal_fd.load(std::memory_order_acquire);
+      fd >= 0) {
+    const std::uint64_t one = 1U;
+    [[maybe_unused]] const auto io_result = ::write(fd, &one, sizeof(one));
+  }
+  errno = saved_errno;
+}
+
+/// True once a second stop request came while the stop sequence runs: the
+/// remaining processes are then ended (OD-187 (1)). Memory reads only.
+[[nodiscard]] bool StopForceRequested() noexcept {
+  if (!g_stop_sequence_running.load(std::memory_order_acquire)) return false;
+  const auto requests =
+      g_stop_signal_count.load(std::memory_order_relaxed) +
+      (g_stop_started_by_command.load(std::memory_order_relaxed) ? 1U : 0U);
+  return requests >= 2U;
+}
 
 class FileDescriptor final {
 public:
@@ -302,7 +341,7 @@ std::filesystem::path InstalledTargetRoot() {
 }
 
 std::string RandomToken(const std::string_view prefix) {
-  std::array<unsigned char, kOwnerEpochRandomBytes> bytes{};
+  std::array<unsigned char, kRandomTokenBytes> bytes{};
   std::size_t offset = 0U;
   while (offset < bytes.size()) {
     const auto count =
@@ -324,6 +363,43 @@ std::string RandomToken(const std::string_view prefix) {
   }
   return result;
 }
+
+/// Mints the application-start identity `A`: 64 random bits, never 0
+/// (contract 1.1). Called once, in the Manager constructor, before any child
+/// exists.
+core::ApplicationStartId MintApplicationStartId() {
+  for (;;) {
+    std::uint64_t value = 0U;
+    auto *bytes = reinterpret_cast<unsigned char *>(&value);
+    std::size_t offset = 0U;
+    while (offset < sizeof(value)) {
+      const auto count =
+          ::getrandom(bytes + offset, sizeof(value) - offset, 0);
+      if (count < 0 && errno == EINTR) continue;
+      if (count <= 0) FailErrno("mint application-start identity");
+      offset += static_cast<std::size_t>(count);
+    }
+    if (value != 0U) return core::ApplicationStartId{value};
+  }
+}
+
+std::string ApplicationStartText(const core::ApplicationStartId id) {
+  const auto text = core::FormatApplicationStartId(id);
+  return std::string(text.data(), text.size());
+}
+
+/// The refusal of a Manager state that holds a previous run: a typed start-up
+/// error, written by `main` as the state-marker errors are.
+class ManagerPreviousRunError final : public std::runtime_error {
+public:
+  explicit ManagerPreviousRunError(core::ErrorDTO error)
+      : std::runtime_error(error.message), error_(std::move(error)) {}
+
+  [[nodiscard]] const core::ErrorDTO &error() const noexcept { return error_; }
+
+private:
+  core::ErrorDTO error_;
+};
 
 class DaemonLock final {
 public:
@@ -353,10 +429,14 @@ private:
   FileDescriptor descriptor_;
 };
 
+/// One of the Manager's listening sockets in its run root: the command
+/// socket, or the status stream's own socket (OD-216).
 class CommandSocket final {
 public:
-  explicit CommandSocket(const std::filesystem::path &state_root)
-      : path_(state_root / std::string(kManagerSocketFileName)) {
+  explicit CommandSocket(
+      const std::filesystem::path &state_root,
+      const std::string_view file_name = kManagerSocketFileName)
+      : path_(state_root / std::string(file_name)) {
     const auto spelling = path_.string();
     Require(spelling.size() < sizeof(sockaddr_un::sun_path),
             "Manager command socket path is too long");
@@ -429,14 +509,14 @@ struct DaemonConfig final {
   std::filesystem::path execution_state_root;
   std::filesystem::path execution_run_root;
   std::filesystem::path logical_scene_database;
-  std::filesystem::path program_cycle_journal;
-  std::filesystem::path projection_root;
   std::filesystem::path program_runner_liveness_socket;
   /// Optional approved root for relative Program scene meshes. The execution
   /// host adapter opens it once; empty means relative meshes fail closed.
   std::filesystem::path scene_asset_root;
   /// Optional generic machine site document (`manyforge.site.v1`).
   std::optional<std::filesystem::path> site_settings_path;
+  /// `manyforge.application_processes.v1`, written by the launcher.
+  std::filesystem::path application_processes_path;
   std::chrono::milliseconds reconciliation_period{500};
 };
 
@@ -476,9 +556,6 @@ enum class CommandKind {
   kApplyStatus,
   kApplyAcknowledge,
   kApplyReleaseForNew,
-  kStopComponentProcess,
-  kComponentProcessStopResult,
-  kComponentProcessStopOffer,
   kSceneCommit,
   kSceneTransactionStatus,
   kSceneOwnerRead,
@@ -489,7 +566,6 @@ enum class CommandKind {
   kSceneRuntimeObserve,
   kSceneRuntimeLatchBeforePlanning,
   kSceneRuntimeLatchBetweenNodes,
-  kReconcile,
   kShutdownRuntime,
 };
 
@@ -503,7 +579,6 @@ RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
   case CommandKind::kSceneRuntimeObserve:
   case CommandKind::kSceneRuntimeLatchBeforePlanning:
   case CommandKind::kSceneRuntimeLatchBetweenNodes:
-  case CommandKind::kReconcile:
     return true;
   case CommandKind::kSceneOwnerRead:
   case CommandKind::kSceneTransactionStatus:
@@ -511,9 +586,6 @@ RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
   case CommandKind::kApplyStatus:
   case CommandKind::kApplyAcknowledge:
   case CommandKind::kApplyReleaseForNew:
-  case CommandKind::kStopComponentProcess:
-  case CommandKind::kComponentProcessStopResult:
-  case CommandKind::kComponentProcessStopOffer:
   case CommandKind::kScenePoseQuery:
   case CommandKind::kSceneRuntimeOwnerRead:
   case CommandKind::kShutdownRuntime:
@@ -531,7 +603,6 @@ struct DeploymentCandidateReceipt final {
   core::RetainedBundleId expected_current_retained_bundle_id;
   core::GraphRevision expected_current_graph_revision;
   core::AdmissionGeneration expected_admission_generation;
-  std::string manager_owner_epoch;
   /// Digest of the authoritative impact shown with this preview. Apply
   /// is refused if the recomputed impact differs, and a destructive impact
   /// must be explicitly accepted by echoing this digest.
@@ -561,10 +632,8 @@ struct PoseObserverBinding final {
 
 struct ManagerCommand final {
   CommandKind kind;
-  std::optional<std::string> request_id{};
-  std::optional<std::string> request_owner_epoch{};
+  std::optional<core::RequestKey> request_key{};
   std::optional<std::string> source_label{};
-  std::optional<std::string> correlation_id{};
   std::optional<core::SceneTransactionRequestDTO> scene_transaction{};
   std::optional<core::DeploymentArtifactId> deployment_artifact_id{};
   std::optional<core::DeploymentRevision> deployment_revision{};
@@ -598,8 +667,6 @@ struct ManagerCommand final {
   std::optional<core::ContentDigest> accepted_impact_digest{};
   std::optional<core::ApplyId> apply_id{};
   std::optional<core::ApplyGeneration> apply_generation{};
-  std::optional<component_manager::ManagerComponentProcessStopRequestDTO> component_process_stop{};
-  std::optional<core::ControllableComponentId> process_stop_offer_component{};
 };
 
 const CanonicalValue &RequiredMember(const CanonicalValue &root,
@@ -657,11 +724,10 @@ DeploymentCandidateReceiptPayload(const DeploymentCandidateReceipt &receipt) {
        })},
       {"destructive_impact", CanonicalValue(receipt.destructive_impact)},
       {"impact_digest", CanonicalValue(receipt.impact_digest.value())},
-      {"manager_owner_epoch", CanonicalValue(receipt.manager_owner_epoch)},
       {"prepared_activation_id",
        CanonicalValue(receipt.prepared_activation_id.value())},
       {"schema_version",
-       CanonicalValue("manyforge.manager_deployment_candidate_receipt.v2")},
+       CanonicalValue("manyforge.manager_deployment_candidate_receipt.v3")},
   });
 }
 
@@ -683,9 +749,9 @@ DeploymentCandidateReceiptValue(const DeploymentCandidateReceipt &receipt) {
 
 DeploymentCandidateReceipt
 RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
-  RequireExactObjectSize(value, 12U, "deployment candidate receipt");
+  RequireExactObjectSize(value, 11U, "deployment candidate receipt");
   Require(RequiredString(value, "schema_version") ==
-              "manyforge.manager_deployment_candidate_receipt.v2",
+              "manyforge.manager_deployment_candidate_receipt.v3",
           "deployment candidate receipt schema is unsupported");
   const auto &expected = RequiredMember(value, "expected_current");
   RequireExactObjectSize(expected, 2U, "deployment candidate expected current");
@@ -702,7 +768,6 @@ RequiredDeploymentCandidateReceipt(const CanonicalValue &value) {
       core::AdmissionGeneration(RequiredUnsigned(
           RequiredMember(value, "expected_admission_generation"),
           "deployment candidate admission generation")),
-      RequiredString(value, "manager_owner_epoch"),
       core::ContentDigest(RequiredString(value, "impact_digest")),
       RequiredBool(value, "destructive_impact"),
       core::ContentDigest(RequiredString(value, "receipt_digest")),
@@ -863,6 +928,27 @@ void RequireExactObjectSize(const CanonicalValue &value, const std::size_t size,
           std::string(label) + " has an unknown or missing field");
 }
 
+/// A request key (contract 1.4): exactly 32 hex characters.
+core::RequestKey RequiredRequestKey(const CanonicalValue &root,
+                                    const std::string_view name) {
+  const auto *text = std::get_if<std::string>(&RequiredMember(root, name).storage());
+  const auto key = text != nullptr ? core::ParseRequestKey(*text) : std::nullopt;
+  Require(key.has_value(), "command field " + std::string(name) + " must be a request key");
+  return *key;
+}
+
+/// The request context `{request_key, source_label}` (contract 1.4).
+core::PublicRequestContextDTO RequiredRequestContext(const CanonicalValue &context,
+                                                     const std::string_view label) {
+  RequireExactObjectSize(context, 2U, label);
+  return {RequiredRequestKey(context, "request_key"),
+          RequiredString(context, "source_label")};
+}
+
+CanonicalValue RequestKeyValue(const core::RequestKey &key) {
+  return CanonicalValue(core::RequestKeyText(key));
+}
+
 std::uint64_t RequiredUnsigned(const CanonicalValue &value,
                                std::string_view label);
 std::uint64_t RequiredNonnegativeUnsigned(const CanonicalValue &value,
@@ -881,7 +967,7 @@ struct ProgramRunnerLivenessRenewal final {
 
 core::ProgramCycleStatusDTO
 RequiredProgramCycleStatus(const CanonicalValue &value) {
-  RequireExactObjectSize(value, 7U, "Program Runner cycle status");
+  RequireExactObjectSize(value, 6U, "Program Runner cycle status");
   const auto state_name = RequiredString(value, "state");
   core::ProgramCycleStateDTO state;
   if (state_name == "idle_after_reset") {
@@ -903,7 +989,7 @@ RequiredProgramCycleStatus(const CanonicalValue &value) {
   } else {
     Fail("Program Runner cycle status has an unsupported state");
   }
-  const auto run_id = OptionalString(value, "program_run_id");
+  const auto &run_id = RequiredMember(value, "program_run_id");
   const auto claim_generation =
       std::holds_alternative<std::nullptr_t>(
           RequiredMember(value, "cycle_claim_generation").storage())
@@ -913,26 +999,22 @@ RequiredProgramCycleStatus(const CanonicalValue &value) {
                 "Program Runner cycle claim generation"));
   const auto terminal =
       OptionalString(value, "terminal_or_settlement_reference");
-  core::ProgramCycleStatusDTO result{
-      core::RequestOwnerEpoch(
-          RequiredString(value, "program_runner_owner_epoch")),
-      RequiredUnsigned(RequiredMember(value, "cycle_generation"),
-                       "Program Runner cycle generation"),
-      state,
-      run_id.has_value()
-          ? std::optional<core::ProgramRunId>(core::ProgramRunId(*run_id))
-          : std::nullopt,
-      claim_generation,
-      terminal.has_value()
-          ? std::optional<core::ContentDigest>(core::ContentDigest(*terminal))
-          : std::nullopt};
+  core::ProgramCycleStatusDTO result;
+  result.cycle_generation = RequiredUnsigned(
+      RequiredMember(value, "cycle_generation"), "Program Runner cycle generation");
+  result.state = state;
+  if (!run_id.is_null())
+    result.program_run_id = core::ProgramRunNumber(
+        RequiredUnsigned(run_id, "Program Runner run number"));
+  result.cycle_claim_generation = claim_generation;
+  if (terminal.has_value())
+    result.terminal_or_settlement_reference = core::ContentDigest(*terminal);
   const auto& accepted_reset = RequiredMember(value, "accepted_reset");
   if (!std::holds_alternative<std::nullptr_t>(accepted_reset.storage())) {
-    RequireExactObjectSize(accepted_reset, 6U, "accepted Program Reset");
+    RequireExactObjectSize(accepted_reset, 5U, "accepted Program Reset");
     const auto& reset_claim = RequiredMember(accepted_reset, "reset_claim_generation");
     result.accepted_reset = core::AcceptedProgramResetDTO{
-        core::RequestOwnerEpoch(RequiredString(accepted_reset, "request_owner_epoch")),
-        core::RequestId(RequiredString(accepted_reset, "request_id")),
+        RequiredRequestKey(accepted_reset, "request_key"),
         core::ContentDigest(RequiredString(accepted_reset, "request_payload_digest")),
         RequiredBool(accepted_reset, "reload_initial_scene"),
         RequiredBool(accepted_reset, "reset_robot_position"),
@@ -946,22 +1028,124 @@ RequiredProgramCycleStatus(const CanonicalValue &value) {
   return result;
 }
 
-// One request and one reply over an exact same-user SEQPACKET socket.
+/// A local exchange (Program Runner, Kernel Stop control) ended by its
+/// caller's application stop (OD-296 (a), OD-306 (a)): not a lost contact,
+/// so it is never reported as one.
+class LocalExchangeStopped final : public std::runtime_error {
+public:
+  explicit LocalExchangeStopped(const std::string &peer_name)
+      : std::runtime_error(peer_name +
+                           " exchange ended by the application stop") {}
+};
+
+/// The Program Runner exchanges outstanding now (OD-296 (a)), read by the
+/// Manager's status tick as information only: nothing ends, halts or faults
+/// on it. A leaf lock held for memory work only; a full table only skips the
+/// record.
+class ProgramRunnerExchangeBoard final {
+public:
+  struct Row final {
+    /// The exchange's number; 0 = free slot. A new value is a new exchange.
+    std::uint64_t episode{};
+    /// "probe" or "heartbeat" (static strings).
+    const char *exchange{};
+    std::chrono::steady_clock::time_point since{};
+  };
+
+  [[nodiscard]] std::uint64_t Begin(const char *exchange) noexcept {
+    std::lock_guard lock(mutex_);
+    for (auto &slot : slots_) {
+      if (slot.episode == 0U) {
+        slot = Row{++next_episode_, exchange, std::chrono::steady_clock::now()};
+        return slot.episode;
+      }
+    }
+    return 0U;
+  }
+
+  void End(const std::uint64_t episode) noexcept {
+    if (episode == 0U) return;
+    std::lock_guard lock(mutex_);
+    for (auto &slot : slots_)
+      if (slot.episode == episode) slot = Row{};
+  }
+
+  /// The oldest outstanding exchange, if any.
+  [[nodiscard]] std::optional<Row> Oldest() const noexcept {
+    std::lock_guard lock(mutex_);
+    const Row *oldest = nullptr;
+    for (const auto &slot : slots_)
+      if (slot.episode != 0U &&
+          (oldest == nullptr || slot.episode < oldest->episode))
+        oldest = &slot;
+    return oldest != nullptr ? std::optional<Row>(*oldest) : std::nullopt;
+  }
+
+private:
+  mutable std::mutex mutex_;
+  std::uint64_t next_episode_{};
+  // The Runner lane, the Apply lane and the command lane at most.
+  std::array<Row, 4U> slots_{};
+};
+
+/// How a local exchange ends besides its reply (OD-296 (a), OD-306 (a)):
+/// the peer refusing or closing the connection (a lost contact), or its
+/// caller's application stop (`LocalExchangeStopped`). There is no time
+/// limit: a slow Program Runner or execution host is waited for.
+struct LocalExchangeEnd final {
+  /// An eventfd that stays readable once the caller's stop came: the Runner
+  /// lane's own stop, or the execution host adapter's abandon signal (the
+  /// application stop) for the other lanes.
+  int stop_fd{-1};
+  /// Program Runner exchanges only: the outstanding-exchange board.
+  ProgramRunnerExchangeBoard *board{};
+  const char *exchange{};
+  /// In place of `stop_fd` where the abandon signal is already written for
+  /// the whole stop (the application-stop Halt): true once the stop is
+  /// forced, checked between short poll slices.
+  bool (*stop_requested)() noexcept = nullptr;
+};
+
+// One request and one reply over an exact same-user SEQPACKET socket, with no
+// time limit (OD-296 (a), OD-306 (a)): each wait ends on its event, on the
+// peer refusing or closing the connection, or on `end`'s stop, which throws
+// LocalExchangeStopped.
 CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
                                    const CanonicalValue &request,
                                    const std::string_view peer_name,
                                    const content_identity::CanonicalJsonParseLimits
-                                       &limits) {
+                                       &limits,
+                                   const LocalExchangeEnd &end) {
   const std::string label(peer_name);
+  // Information only: the exchange is outstanding until this returns.
+  struct Outstanding final {
+    ProgramRunnerExchangeBoard *board;
+    std::uint64_t episode;
+    ~Outstanding() {
+      if (board != nullptr) board->End(episode);
+    }
+  } const outstanding{
+      end.board,
+      end.board != nullptr ? end.board->Begin(end.exchange) : 0U};
+  // True when `events` are ready; false when the peer closed the connection.
+  const auto wait = [&](const int fd, const short events) {
+    const auto ended =
+        detail::WaitForLocalPeer(fd, events, end.stop_fd, end.stop_requested);
+    if (ended == detail::LocalPeerWaitEnd::kStopped)
+      throw LocalExchangeStopped(label);
+    return ended == detail::LocalPeerWaitEnd::kReady;
+  };
   const auto maximum_bytes = limits.maximum_bytes;
   const auto spelling = path.string();
   Require(!spelling.empty() && spelling.size() < sizeof(sockaddr_un::sun_path),
           label + " socket path is invalid");
   struct stat path_status {};
-  Require(::lstat(path.c_str(), &path_status) == 0 &&
-              S_ISSOCK(path_status.st_mode) &&
+  const bool present = ::lstat(path.c_str(), &path_status) == 0;
+  Require(present || errno != ENOENT,
+          label + " socket does not exist yet (the process has not started or is not ready)");
+  Require(present && S_ISSOCK(path_status.st_mode) &&
               path_status.st_uid == ::geteuid(),
-          label + " socket is not an exact same-user socket");
+          label + " socket is not a socket owned by this user");
   FileDescriptor connection(
       ::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC | SOCK_NONBLOCK, 0));
   if (!connection) {
@@ -975,13 +1159,7 @@ CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
       errno != EINPROGRESS) {
     FailErrno("connect " + label + " socket");
   }
-  pollfd ready{connection.get(), POLLOUT, 0};
-  int polled = -1;
-  do {
-    polled = ::poll(&ready, 1, kClientReadTimeoutMilliseconds);
-  } while (polled < 0 && errno == EINTR);
-  Require(polled == 1 && (ready.revents & POLLOUT) != 0,
-          label + " connection timed out");
+  Require(wait(connection.get(), POLLOUT), label + " connection was closed");
   int socket_error = 0;
   socklen_t socket_error_size = sizeof(socket_error);
   Require(::getsockopt(connection.get(), SOL_SOCKET, SO_ERROR, &socket_error,
@@ -1002,12 +1180,8 @@ CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
       ::send(connection.get(), encoded.data(), encoded.size(), MSG_NOSIGNAL);
   Require(sent == static_cast<ssize_t>(encoded.size()),
           label + " request was not sent exactly");
-  ready = pollfd{connection.get(), POLLIN, 0};
-  do {
-    polled = ::poll(&ready, 1, kClientReadTimeoutMilliseconds);
-  } while (polled < 0 && errno == EINTR);
-  Require(polled == 1 && (ready.revents & POLLIN) != 0,
-          label + " acknowledgement timed out");
+  Require(wait(connection.get(), POLLIN),
+          label + " connection was closed before the acknowledgement");
   std::vector<char> response(maximum_bytes + 1U);
   iovec vector{response.data(), response.size()};
   msghdr message{};
@@ -1032,37 +1206,36 @@ CanonicalValue ExchangeLocalPacket(const std::filesystem::path &path,
   return decoded;
 }
 
+/// One Program Runner liveness exchange (OD-296 (a)): it ends on the reply,
+/// on the Runner refusing or closing the connection (a lost contact) or on
+/// `end`'s stop; no time limit on either side.
 CanonicalValue
 ExchangeProgramRunnerLivenessPacket(const std::filesystem::path &path,
-                                    const CanonicalValue &request) {
+                                    const CanonicalValue &request,
+                                    LocalExchangeEnd end,
+                                    const char *exchange) {
+  end.exchange = exchange;
   return ExchangeLocalPacket(
       path, request, "Program Runner liveness",
-      {kMaximumProgramRunnerLivenessPacketBytes, 4U, 64U});
+      {kMaximumProgramRunnerLivenessPacketBytes, 4U, 64U}, end);
 }
 
 ProgramRunnerLivenessIdentity
 ProbeProgramRunnerLiveness(const std::filesystem::path &path,
-                           const core::CellId &cell_id) {
+                           const core::CellId &cell_id,
+                           const LocalExchangeEnd &end) {
   const auto response = ExchangeProgramRunnerLivenessPacket(
       path, CanonicalValue(CanonicalValue::Object{
                 {"api_version",
                  CanonicalValue(std::string(kProgramRunnerLivenessApiVersion))},
                 {"cell_id", CanonicalValue(cell_id.value())},
                 {"kind", CanonicalValue("probe")},
-            }));
-  RequireExactObjectSize(response, 10U, "Program Runner liveness probe");
+            }),
+      end, "probe");
+  RequireExactObjectSize(response, 8U, "Program Runner liveness probe");
   Require(RequiredString(response, "api_version") ==
                   kProgramRunnerLivenessApiVersion &&
-              RequiredString(response, "kind") == "probe_ack" &&
-              RequiredString(response, "cell_id") == cell_id.value() &&
-              RequiredString(response, "runtime_policy_id") ==
-                  kProgramRunnerLivenessPolicyId &&
-              RequiredString(response, "runtime_policy_revision") ==
-                  kProgramRunnerLivenessPolicyRevision &&
-              RequiredString(response, "local_safe_state_contract_id") ==
-                  kProgramRunnerLocalSafeStateContractId &&
-              RequiredString(response, "local_safe_state_contract_revision") ==
-                  kProgramRunnerLocalSafeStateContractRevision,
+              RequiredString(response, "kind") == "probe_ack",
           "Program Runner liveness probe returned a foreign identity");
   return {
       core::RuntimeUnitId(RequiredString(response, "receiver_runtime_unit_id")),
@@ -1076,7 +1249,8 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
     const ProgramRunnerLivenessIdentity &receiver,
     const core::ManagerLivenessRequiredSetDTO &required_set,
     const std::uint64_t sequence,
-    const std::optional<core::ContentDigest> &reconciliation_digest) {
+    const std::optional<core::ContentDigest> &reconciliation_digest,
+    const LocalExchangeEnd &end) {
   const auto response = ExchangeProgramRunnerLivenessPacket(
       path,
       CanonicalValue(CanonicalValue::Object{
@@ -1087,10 +1261,6 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
           {"cell_id", CanonicalValue(required_set.cell_id.value())},
           {"heartbeat_sequence", CanonicalValue(static_cast<double>(sequence))},
           {"kind", CanonicalValue("heartbeat")},
-          {"manager_owner_epoch",
-           CanonicalValue(required_set.manager_owner_epoch.value())},
-          {"manager_runtime_epoch",
-           CanonicalValue(required_set.manager_runtime_epoch.value())},
           {"manager_runtime_unit_id",
            CanonicalValue(required_set.manager_runtime_unit_id.value())},
           {"receiver_runtime_epoch",
@@ -1107,11 +1277,9 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
            CanonicalValue(std::string(kProgramRunnerLivenessPolicyId))},
           {"runtime_policy_revision",
            CanonicalValue(std::string(kProgramRunnerLivenessPolicyRevision))},
-      }));
-  RequireExactObjectSize(response, 24U, "Program Runner heartbeat ack");
-  const auto local_age = RequiredNonnegativeUnsigned(
-      RequiredMember(response, "local_heartbeat_age_ns"),
-      "Program Runner local heartbeat age");
+      }),
+      end, "heartbeat");
+  RequireExactObjectSize(response, 9U, "Program Runner heartbeat ack");
   const auto receiver_status_sequence =
       RequiredUnsigned(RequiredMember(response, "receiver_status_sequence"),
                        "Program Runner receiver status sequence");
@@ -1122,35 +1290,8 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
   Require(RequiredString(response, "api_version") ==
                   kProgramRunnerLivenessApiVersion &&
               RequiredString(response, "schema_version") ==
-                  "manyforge.program_runner_liveness_status.v1" &&
+                  "manyforge.program_runner_liveness_status.v2" &&
               RequiredString(response, "kind") == "heartbeat_ack" &&
-              RequiredString(response, "cell_id") ==
-                  required_set.cell_id.value() &&
-              RequiredString(response, "active_bundle_id") ==
-                  required_set.active_bundle_id.value() &&
-              RequiredString(response, "required_runtime_set_digest") ==
-                  required_set.required_runtime_set_digest.value() &&
-              RequiredString(response, "receiver_runtime_unit_id") ==
-                  receiver.runtime_unit_id.value() &&
-              RequiredString(response, "receiver_runtime_epoch") ==
-                  receiver.runtime_epoch.value() &&
-              RequiredString(response, "manager_runtime_epoch") ==
-                  required_set.manager_runtime_epoch.value() &&
-              RequiredString(response, "manager_runtime_unit_id") ==
-                  required_set.manager_runtime_unit_id.value() &&
-              RequiredString(response, "manager_owner_epoch") ==
-                  required_set.manager_owner_epoch.value() &&
-              RequiredString(response, "runtime_policy_id") ==
-                  kProgramRunnerLivenessPolicyId &&
-              RequiredString(response, "runtime_policy_revision") ==
-                  kProgramRunnerLivenessPolicyRevision &&
-              RequiredString(response, "local_safe_state_contract_id") ==
-                  kProgramRunnerLocalSafeStateContractId &&
-              RequiredString(response, "local_safe_state_contract_revision") ==
-                  kProgramRunnerLocalSafeStateContractRevision &&
-              RequiredUnsigned(
-                  RequiredMember(response, "last_accepted_heartbeat_sequence"),
-                  "Program Runner heartbeat sequence") == sequence &&
               (!fault_reference.has_value() ||
                (fault_reference->starts_with("sha256:") &&
                 fault_reference->size() == 71U)),
@@ -1158,26 +1299,23 @@ ProgramRunnerLivenessRenewal RenewProgramRunnerLiveness(
   const auto parsed_state = detail::DecodeProgramRunnerManagerState(state);
   core::ManagerLivenessObservationDTO observation{
       {required_set.cell_id, receiver.runtime_unit_id, receiver.runtime_epoch,
-       required_set.manager_runtime_unit_id, required_set.manager_runtime_epoch,
-       required_set.manager_owner_epoch,
+       required_set.manager_runtime_unit_id,
        core::RuntimePolicyId(std::string(kProgramRunnerLivenessPolicyId)),
        core::RuntimePolicyRevision(
            std::string(kProgramRunnerLivenessPolicyRevision)),
-       sequence, receiver_status_sequence, static_cast<std::int64_t>(local_age),
+       sequence, receiver_status_sequence,
        parsed_state, fenced,
        fault_reference.has_value() ? std::optional<core::ContentDigest>(
                                          core::ContentDigest(*fault_reference))
                                    : std::nullopt},
       required_set.active_bundle_id,
-      required_set.required_runtime_set_digest,
-      core::ContentDigest(RequiredString(response, "receiver_status_digest"))};
+      required_set.required_runtime_set_digest};
   Require(core::ValidateManagerLivenessObservation(observation).ok(),
           "Program Runner liveness observation is malformed");
   const auto cycle = RequiredProgramCycleStatus(
       RequiredMember(response, "program_cycle_status"));
-  detail::CheckProgramRunnerPublicationHealth(
-      RequiredMember(response, "publisher_fault"), cycle,
-      receiver.runtime_epoch, fenced, fault_reference);
+  detail::CheckProgramRunnerHealth(RequiredMember(response, "runner_fault"),
+                                  cycle, fenced);
   Require(current || (!reconciliation_digest.has_value() &&
                       state == "unreconciled" && fenced),
           "Program Runner liveness acknowledgement is not exact");
@@ -1214,7 +1352,7 @@ core::CellAdmissionClaimDTO
 RequiredParentAuthoringClaim(const CanonicalValue &value) {
   RequireExactObjectSize(value, 4U, "parent authoring claim");
   const auto &intent_value = RequiredMember(value, "intent");
-  RequireExactObjectSize(intent_value, 10U, "parent authoring claim intent");
+  RequireExactObjectSize(intent_value, 8U, "parent authoring claim intent");
   Require(RequiredString(intent_value, "claim_kind") == "authoring_mutation" &&
               RequiredString(intent_value, "owner_role") == "authoring_owner",
           "parent claim is not an authoring-owner mutation claim");
@@ -1233,17 +1371,10 @@ RequiredParentAuthoringClaim(const CanonicalValue &value) {
   Require(resources != nullptr && resources->empty() &&
               configurations != nullptr && configurations->empty(),
           "parent authoring claim must have the cell-global empty scope");
-  const auto request_payload_digest =
-      RequiredString(intent_value, "request_payload_digest");
-  Require(core::IsExactLowercaseSha256Digest(request_payload_digest),
-          "parent authoring claim payload digest is invalid");
-  // Decode in the original order before constructing the nested claim, so
-  // malformed later fields unwind only independent owning locals.
-  auto owner =
-      core::RequestOwnerEpoch(RequiredString(intent_value, "owner_epoch"));
-  auto transaction = RequiredString(intent_value, "owner_transaction_id");
-  auto request = core::RequestId(RequiredString(intent_value, "request_id"));
-  auto payload_digest = core::ContentDigest(request_payload_digest);
+  // An authoring claim carries no owner transaction number.
+  Require(RequiredMember(intent_value, "owner_transaction_id").is_null(),
+          "parent authoring claim carries an owner transaction id");
+  const auto request = RequiredRequestKey(intent_value, "request_key");
   const auto expected_generation = core::AdmissionGeneration(RequiredUnsigned(
       RequiredMember(intent_value, "expected_admission_generation"),
       "parent expected_admission_generation"));
@@ -1258,11 +1389,9 @@ RequiredParentAuthoringClaim(const CanonicalValue &value) {
   core::CellAdmissionClaimDTO claim{
       {
           core::CellAdmissionClaimKindDTO::kAuthoringMutation,
-          core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
-          std::move(owner),
-          std::move(transaction),
-          std::move(request),
-          std::move(payload_digest),
+          core::ApplicationRole::kAuthoringOwner,
+          std::nullopt,
+          request,
           expected_generation,
           {},
           std::nullopt,
@@ -1382,36 +1511,6 @@ RequiredPoseObserverBindings(const CanonicalValue &value) {
   return result;
 }
 
-component_manager::ManagerComponentProcessStopRequestDTO
-RequiredComponentProcessStop(const CanonicalValue &value) {
-  RequireExactObjectSize(value, 10U, "component process Stop request");
-  const auto &context = RequiredMember(value, "request_context");
-  const auto *correlation = context.find_object_member("correlation_id");
-  RequireExactObjectSize(context, correlation ? 4U : 3U, "component Stop request context");
-  core::PublicRequestContextDTO request_context{
-      core::RequestId(RequiredString(context, "request_id")),
-      core::RequestOwnerEpoch(RequiredString(context, "request_owner_epoch")),
-      RequiredString(context, "source_label"), std::nullopt};
-  if (correlation) request_context.correlation_id = RequiredString(context, "correlation_id");
-  const auto pid = RequiredUnsigned(RequiredMember(value, "leader_pid"), "leader PID");
-  Require(pid <= static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max()),
-          "component Stop leader PID exceeds int32");
-  component_manager::ManagerComponentProcessStopRequestDTO result{
-      std::move(request_context), RequiredProjectionRevision(RequiredMember(value, "predecessor_projection_revision")),
-      core::ActiveBundlePublicationGeneration(RequiredUnsigned(
-          RequiredMember(value, "expected_predecessor_publication_generation"), "predecessor publication generation")),
-      core::ContentDigest(RequiredString(value, "expected_predecessor_public_pointer_digest")),
-      core::RuntimeUnitId(RequiredString(value, "runtime_unit_id")),
-      core::RuntimeEpoch(RequiredString(value, "runtime_epoch")),
-      core::RuntimeEpoch(RequiredString(value, "manager_runtime_epoch")),
-      core::ControllableComponentId(RequiredString(value, "controllable_component_id")),
-      RequiredString(value, "launch_identity",
-                     core::kMaximumCellAdmissionPrivateBinaryBytes),
-      static_cast<std::int32_t>(pid)};
-  Require(result.valid(), "component process Stop request is invalid");
-  return result;
-}
-
 ManagerCommand DecodeCommand(const std::string_view bytes) {
   Require(!bytes.empty() && bytes.size() <= kMaximumCommandBytes,
           "command packet is empty or exceeds its byte bound");
@@ -1428,24 +1527,8 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
   Require(RequiredString(root, "api_version") == kManagerCommandApiVersion,
           "command api_version is unsupported");
   const auto command = RequiredString(root, "command");
-  if (command == "component_process_stop_offer") {
-    RequireExactObjectSize(root, 3U, "component process Stop offer command");
-    ManagerCommand result{.kind = CommandKind::kComponentProcessStopOffer};
-    result.process_stop_offer_component = core::ControllableComponentId(
-        RequiredString(root, "controllable_component_id"));
-    Require(result.process_stop_offer_component->value().size() <= core::kMaxLifecycleIdentityBytes,
-            "component Stop offer identity is too long");
-    return result;
-  }
-  if (command == "stop_component_process" || command == "component_process_stop_result") {
-    RequireExactObjectSize(root, 3U, "component process Stop command");
-    ManagerCommand result{.kind = command == "stop_component_process"
-        ? CommandKind::kStopComponentProcess : CommandKind::kComponentProcessStopResult};
-    result.component_process_stop = RequiredComponentProcessStop(RequiredMember(root, "request"));
-    return result;
-  }
   if (command == "deployment_candidate_preview") {
-    RequireExactObjectSize(root, 10U, "deployment candidate preview command");
+    RequireExactObjectSize(root, 9U, "deployment candidate preview command");
     const auto deployment_revision =
         RequiredString(root, "deployment_revision");
     Require(core::IsExactLowercaseSha256Digest(deployment_revision),
@@ -1454,7 +1537,6 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     RequireExactObjectSize(expected, 2U, "candidate preview expected_current");
     ManagerCommand result{
         .kind = CommandKind::kDeploymentCandidatePreview,
-        .request_owner_epoch = RequiredString(root, "request_owner_epoch"),
         .deployment_artifact_id = core::DeploymentArtifactId(
             RequiredString(root, "deployment_artifact_id")),
         .deployment_revision = core::DeploymentRevision(deployment_revision),
@@ -1480,49 +1562,21 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
             "candidate preview prepared activation identity is invalid");
     return result;
   }
-  if (command == "reconcile") {
-    RequireExactObjectSize(root, 2U, "reconcile command");
-    return {CommandKind::kReconcile,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt};
-  }
   if (command == "shutdown_runtime") {
     RequireExactObjectSize(root, 2U, "shutdown command");
-    return {CommandKind::kShutdownRuntime,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt,
-            std::nullopt};
+    return ManagerCommand{.kind = CommandKind::kShutdownRuntime};
   }
   if (command == "scene_commit" || command == "scene_transaction_status") {
     RequireExactObjectSize(root, 3U, "scene commit command");
     auto transaction = scene::DecodeCanonicalSceneTransactionRequest(
         content_identity::canonical_json(RequiredMember(root, "transaction")));
-    return {
-        command == "scene_commit" ? CommandKind::kSceneCommit
-                                  : CommandKind::kSceneTransactionStatus,
-        transaction.request_context.request_id.value(),
-        transaction.request_context.request_owner_epoch.value(),
-        transaction.request_context.source_label,
-        transaction.request_context.correlation_id,
-        std::move(transaction),
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-        std::nullopt,
-    };
+    ManagerCommand result{
+        .kind = command == "scene_commit" ? CommandKind::kSceneCommit
+                                          : CommandKind::kSceneTransactionStatus,
+        .request_key = transaction.request_context.request_key,
+        .source_label = transaction.request_context.source_label};
+    result.scene_transaction = std::move(transaction);
+    return result;
   }
   if (command == "scene_owner_read") {
     RequireExactObjectSize(root, 2U, "scene owner read command");
@@ -1614,22 +1668,16 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
                                     : for_new ? CommandKind::kApplyReleaseForNew
                                               : CommandKind::kApplyAcknowledge};
       if (!for_new) {
-        result.apply_id = core::ApplyId(RequiredString(root, "apply_id"));
+        result.apply_id =
+            core::ApplyId(RequiredUnsigned(RequiredMember(root, "apply_id"), "apply_id"));
         result.apply_generation = core::ApplyGeneration(RequiredUnsigned(
             RequiredMember(root, "apply_generation"), "apply_generation"));
       }
       if (acknowledging) {
-        const auto &context = RequiredMember(root, "request_context");
-        const auto *correlation = context.find_object_member("correlation_id");
-        const auto *epoch = context.find_object_member("request_owner_epoch");
-        RequireExactObjectSize(context, 2U + (correlation ? 1U : 0U) + (epoch ? 1U : 0U),
-                               "Apply acknowledgement request context");
-        result.request_id = RequiredString(context, "request_id");
-        result.source_label = RequiredString(context, "source_label");
-        // Accepted for the standard wire context. Only ID/source are retained
-        // as audit labels; neither optional member grants authority here.
-        if (epoch) result.request_owner_epoch = RequiredString(context, "request_owner_epoch");
-        if (correlation) result.correlation_id = RequiredString(context, "correlation_id");
+        auto context = RequiredRequestContext(RequiredMember(root, "request_context"),
+                                              "Apply acknowledgement request context");
+        result.request_key = context.request_key;
+        result.source_label = std::move(context.source_label);
       }
       return result;
     } catch (const std::exception &error) {
@@ -1643,11 +1691,9 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     }
   }
   Require(command == "apply", "command kind is unsupported");
-  RequireExactObjectSize(root, 15U, "Apply command");
-  const auto request_id = RequiredString(root, "request_id");
-  const auto request_owner_epoch = RequiredString(root, "request_owner_epoch");
-  const auto source_label = RequiredString(root, "source_label");
-  const auto correlation_id = OptionalString(root, "correlation_id");
+  RequireExactObjectSize(root, 13U, "Apply command");
+  const auto request_key = RequiredRequestKey(root, "request_key");
+  auto source_label = RequiredString(root, "source_label");
   const auto deployment_artifact_id =
       RequiredString(root, "deployment_artifact_id");
   const auto deployment_revision = RequiredString(root, "deployment_revision");
@@ -1663,10 +1709,9 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
           "Apply busy disposition must be reject_if_affected_busy");
   const auto &admission_context = RequiredMember(root, "admission_context");
   const auto admission_kind = RequiredString(admission_context, "kind");
-  ManagerCommand result{
-      CommandKind::kApply, request_id,   request_owner_epoch, source_label,
-      correlation_id,      std::nullopt, std::nullopt,        std::nullopt,
-      std::nullopt,        std::nullopt};
+  ManagerCommand result{.kind = CommandKind::kApply,
+                        .request_key = request_key,
+                        .source_label = std::move(source_label)};
   result.deployment_artifact_id =
       core::DeploymentArtifactId(deployment_artifact_id);
   result.deployment_revision = core::DeploymentRevision(deployment_revision);
@@ -1847,10 +1892,8 @@ SceneRuntimeIdentityResponseValue(const SceneRuntimeIdentity &identity) {
 
 CanonicalValue
 SceneRuntimeOwnerReadResponse(const std::string_view cell_id,
-                              const std::string_view owner_epoch,
                               const SceneRuntimeStateSnapshot &snapshot) {
-  Require(!cell_id.empty() && !owner_epoch.empty() &&
-              snapshot.runtime_identity.has_value(),
+  Require(!cell_id.empty() && snapshot.runtime_identity.has_value(),
           "scene-runtime owner read is internally incomplete");
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
@@ -1863,7 +1906,6 @@ SceneRuntimeOwnerReadResponse(const std::string_view cell_id,
       {"ok", CanonicalValue(true)},
       {"runtime_identity",
        SceneRuntimeIdentityResponseValue(*snapshot.runtime_identity)},
-      {"scene_runtime_owner_epoch", CanonicalValue(std::string(owner_epoch))},
   });
 }
 
@@ -1956,8 +1998,8 @@ CanonicalValue SceneRuntimeObserveResponse(
            ? ProjectionRevision(*application.projection_revision)
            : CanonicalValue(nullptr)},
       {"scene_request_id",
-       application.scene_request_id.has_value()
-           ? CanonicalValue(application.scene_request_id->value())
+       application.scene_request_key.has_value()
+           ? RequestKeyValue(*application.scene_request_key)
            : CanonicalValue(nullptr)},
       {"scene_runtime_source_generation",
        Unsigned(scene_runtime_source_generation,
@@ -2034,10 +2076,9 @@ CanonicalValue CanonicalCodecValue(const std::string_view bytes,
 }
 
 CanonicalValue
-SceneOwnerReadResponse(const core::RequestOwnerEpoch &request_owner_epoch,
-                       const core::ProjectionRevisionDTO &projection_revision,
+SceneOwnerReadResponse(const core::ProjectionRevisionDTO &projection_revision,
                        const core::LogicalSceneSnapshotDTO &snapshot) {
-  Require(!request_owner_epoch.empty() && projection_revision.valid() &&
+  Require(projection_revision.valid() &&
               snapshot.locally_valid() &&
               snapshot.revision == projection_revision.scene_revision,
           "logical-scene owner read is internally inconsistent");
@@ -2049,22 +2090,6 @@ SceneOwnerReadResponse(const core::RequestOwnerEpoch &request_owner_epoch,
                            "logical-scene snapshot")},
       {"ok", CanonicalValue(true)},
       {"projection_revision", ProjectionRevision(projection_revision)},
-      {"request_owner_epoch", CanonicalValue(request_owner_epoch.value())},
-  });
-}
-
-CanonicalValue ErrorValue(const core::ErrorDTO &error) {
-  Require(!error.code.empty() && !error.message.empty(),
-          "scene response error is incomplete");
-  CanonicalValue::Object details;
-  details.reserve(error.details.size());
-  for (const auto &[key, value] : error.details) {
-    details.emplace_back(key, CanonicalValue(value));
-  }
-  return CanonicalValue(CanonicalValue::Object{
-      {"code", CanonicalValue(error.code)},
-      {"details", CanonicalValue(std::move(details))},
-      {"message", CanonicalValue(error.message)},
   });
 }
 
@@ -2120,11 +2145,10 @@ CanonicalValue SceneCandidatePreviewResponse(
 CanonicalValue SceneCommitResponse(const ManagerCommand &command,
                                    const core::SceneCommitResultDTO &result) {
   Require(command.scene_transaction.has_value() &&
-              command.request_id.has_value() &&
-              command.request_owner_epoch.has_value(),
+              command.request_key.has_value(),
           "decoded scene command lacks request identity");
   Require(result.presence_valid() &&
-              result.request_id.value() == *command.request_id,
+              result.request_key == *command.request_key,
           "scene owner returned an invalid or mismatched result");
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
@@ -2140,8 +2164,7 @@ CanonicalValue SceneCommitResponse(const ManagerCommand &command,
        CanonicalValue(std::string(core::to_string(result.projection_status)))},
       {"replay_status",
        CanonicalValue(std::string(core::to_string(result.replay_status)))},
-      {"request_id", CanonicalValue(*command.request_id)},
-      {"request_owner_epoch", CanonicalValue(*command.request_owner_epoch)},
+      {"request_key", RequestKeyValue(*command.request_key)},
       {"transaction_sequence",
        result.transaction_sequence.has_value()
            ? Unsigned(*result.transaction_sequence, "transaction sequence")
@@ -2208,16 +2231,14 @@ CanonicalValue CaughtErrorResponse(const std::exception &error,
 CanonicalValue ApplyDetailedErrorResponse(
     const ManagerCommand &command, const core::ErrorDTO &error,
     const std::string_view producer = kManagerProducer) {
-  Require(command.request_id.has_value() &&
-              command.request_owner_epoch.has_value(),
+  Require(command.request_key.has_value(),
           "decoded Apply command lacks request identity");
   return CanonicalValue(CanonicalValue::Object{
       {"api_version",
        CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
       {"error", ResponseErrorValue(error, producer)},
       {"ok", CanonicalValue(false)},
-      {"request_id", CanonicalValue(*command.request_id)},
-      {"request_owner_epoch", CanonicalValue(*command.request_owner_epoch)},
+      {"request_key", RequestKeyValue(*command.request_key)},
   });
 }
 
@@ -2423,8 +2444,7 @@ DeploymentCandidatePreviewResponse(const DeploymentCandidateReceipt &receipt,
 CanonicalValue
 ApplyResponse(const ManagerCommand &command,
               const component_manager::ManagerNamedApplyResult &result) {
-  Require(command.request_id.has_value() &&
-              command.request_owner_epoch.has_value(),
+  Require(command.request_key.has_value(),
           "decoded Apply command lacks request identity");
   const auto succeeded =
       result.state ==
@@ -2438,7 +2458,7 @@ ApplyResponse(const ManagerCommand &command,
        CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
       {"apply_generation",
        Unsigned(result.apply_generation.value(), "Apply generation")},
-      {"apply_id", CanonicalValue(result.apply_id.value())},
+      {"apply_id", Unsigned(result.apply_id.value(), "Apply number")},
       {"candidate_projection_revision",
        succeeded
            ? ProjectionRevision(
@@ -2449,8 +2469,7 @@ ApplyResponse(const ManagerCommand &command,
       {"replay_status",
        CanonicalValue(result.request_replayed ? "replayed_exact"
                                               : "accepted_new")},
-      {"request_id", CanonicalValue(*command.request_id)},
-      {"request_owner_epoch", CanonicalValue(*command.request_owner_epoch)},
+      {"request_key", RequestKeyValue(*command.request_key)},
       {"state",
        CanonicalValue(result.state ==
                               component_manager::ManagerNamedApplyResultState::
@@ -2535,7 +2554,7 @@ CanonicalValue ApplyStatusResponse(
        CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
       {"apply_generation",
        Unsigned(intent.apply_generation.value(), "Apply generation")},
-      {"apply_id", CanonicalValue(intent.apply_id.value())},
+      {"apply_id", Unsigned(intent.apply_id.value(), "Apply number")},
       {"candidate_projection_revision",
        succeeded ? ProjectionRevision(*terminal->candidate_projection_revision)
                  : CanonicalValue(nullptr)},
@@ -2555,60 +2574,12 @@ CanonicalValue ApplyStatusResponse(
       {"scene_initialization",
        CanonicalValue(std::string(
            component_manager::ToString(intent.scene_initialization)))},
-      {"request_id", CanonicalValue(intent.request_context.request_id.value())},
-      {"request_owner_epoch",
-       CanonicalValue(intent.request_context.request_owner_epoch.value())},
+      {"request_key", RequestKeyValue(intent.request_context.request_key)},
       {"state", CanonicalValue(terminal == nullptr
                                    ? std::string("pending")
                                    : std::string(component_manager::ToString(
                                          terminal->state)))},
   });
-}
-
-CanonicalValue ComponentProcessStopResultResponse(
-    const component_manager::ManagerComponentProcessStopResultDTO &result) {
-  Require(result.valid(), "component process Stop result is invalid");
-  const auto &request = result.request;
-  CanonicalValue::Object context{
-      {"request_id", CanonicalValue(request.request_context.request_id.value())},
-      {"request_owner_epoch", CanonicalValue(request.request_context.request_owner_epoch.value())},
-      {"source_label", CanonicalValue(request.request_context.source_label)}};
-  if (request.request_context.correlation_id)
-    context.emplace_back("correlation_id", CanonicalValue(*request.request_context.correlation_id));
-  CanonicalValue request_value(CanonicalValue::Object{
-      {"request_context", CanonicalValue(std::move(context))},
-      {"predecessor_projection_revision", ProjectionRevision(request.predecessor_projection_revision)},
-      {"expected_predecessor_publication_generation", Unsigned(request.expected_predecessor_publication_generation.value(), "publication generation")},
-      {"expected_predecessor_public_pointer_digest", CanonicalValue(request.expected_predecessor_public_pointer_digest.value())},
-      {"runtime_unit_id", CanonicalValue(request.runtime_unit_id.value())},
-      {"runtime_epoch", CanonicalValue(request.runtime_epoch.value())},
-      {"manager_runtime_epoch", CanonicalValue(request.manager_runtime_epoch.value())},
-      {"controllable_component_id", CanonicalValue(request.controllable_component_id.value())},
-      {"launch_identity", CanonicalValue(request.launch_identity)},
-      {"leader_pid", CanonicalValue(static_cast<double>(request.leader_pid))}});
-  const auto state = [&] {
-    switch (result.state) {
-      case core::ControllerLaunchCleanupState::kNotRequested: return "not_requested";
-      case core::ControllerLaunchCleanupState::kPending: return "pending";
-      case core::ControllerLaunchCleanupState::kUnknown: return "unknown";
-      case core::ControllerLaunchCleanupState::kDrained: return "drained";
-    }
-    Fail("component process Stop result state is invalid");
-  }();
-  auto receipt = CanonicalValue(nullptr);
-  if (result.receipt) receipt = CanonicalValue(CanonicalValue::Object{
-      {"leader_pid", CanonicalValue(static_cast<double>(result.receipt->leader_pid))},
-      {"controllable_component_id", CanonicalValue(result.receipt->controllable_component_id)},
-      {"launch_identity", CanonicalValue(result.receipt->launch_identity)},
-      {"observed_utc", CanonicalValue(result.receipt->observed_utc)}});
-  return CanonicalValue(CanonicalValue::Object{
-      {"api_version", CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
-      {"ok", CanonicalValue(true)},
-      {"error", CanonicalValue(nullptr)},
-      {"result", CanonicalValue(CanonicalValue::Object{
-          {"request", std::move(request_value)}, {"state", CanonicalValue(state)},
-          {"receipt", std::move(receipt)},
-          {"error", result.error ? ErrorValue(*result.error) : CanonicalValue(nullptr)}})}});
 }
 
 CanonicalValue
@@ -2635,13 +2606,34 @@ SuccessResponse(const std::string_view operation,
   });
 }
 
+/// Waits on the command lane for `events` on a command client (OD-298 (a)):
+/// true when they are ready; false when the client closed or failed the
+/// connection, or the application is stopping (the execution host adapter's
+/// abandon signal, written by the stop signal and the stop sequence). No
+/// time limit: a slow client holds only the command lane, never the main
+/// thread. Readiness is checked first, so a reply the client waits for is
+/// still sent during the stop.
+bool WaitForCommandClient(const int client, const short events) {
+  const int stop_fd = g_abandon_signal_fd.load(std::memory_order_acquire);
+  std::array<pollfd, 2U> descriptors{
+      {{client, events, 0}, {stop_fd, POLLIN, 0}}};
+  const nfds_t count = stop_fd >= 0 ? 2U : 1U;
+  for (;;) {
+    descriptors[0].revents = 0;
+    descriptors[1].revents = 0;
+    if (::poll(descriptors.data(), count, -1) < 0) {
+      if (errno == EINTR) continue;
+      return false;
+    }
+    if ((descriptors[0].revents & events) != 0) return true;
+    if ((descriptors[0].revents & (POLLHUP | POLLERR | POLLNVAL)) != 0)
+      return false;
+    if (count == 2U && (descriptors[1].revents & POLLIN) != 0) return false;
+  }
+}
+
 std::optional<std::string> ReceiveCommand(const int client) {
-  pollfd descriptor{client, POLLIN, 0};
-  int ready = -1;
-  do {
-    ready = ::poll(&descriptor, 1, kClientReadTimeoutMilliseconds);
-  } while (ready < 0 && errno == EINTR);
-  if (ready <= 0 || (descriptor.revents & POLLIN) == 0) {
+  if (!WaitForCommandClient(client, POLLIN)) {
     return std::nullopt;
   }
   std::array<char, kMaximumCommandBytes + 1U> bytes{};
@@ -2668,12 +2660,7 @@ void TrySendResponse(const int client,
           "manager_command_response_oversized",
           "Manager response exceeds the bounded private transport"));
     }
-    pollfd descriptor{client, POLLOUT, 0};
-    int ready = -1;
-    do {
-      ready = ::poll(&descriptor, 1, kClientReadTimeoutMilliseconds);
-    } while (ready < 0 && errno == EINTR);
-    if (ready <= 0 || (descriptor.revents & POLLOUT) == 0) {
+    if (!WaitForCommandClient(client, POLLOUT)) {
       return;
     }
     ssize_t count = -1;
@@ -2883,41 +2870,6 @@ public:
     return product_artifacts_.back().second;
   }
 
-  [[nodiscard]] std::optional<deployment::VerifiedRetainedRuntimeUnitProduct>
-  runtime_unit_product(const deployment::RetainedBundle &bundle,
-                       const core::RuntimeUnitId &runtime_unit_id) const {
-    {
-      std::lock_guard lock(mutex_);
-      const auto cached =
-          std::find_if(runtime_products_.begin(), runtime_products_.end(),
-                       [&](const auto &product) {
-                         return product.retained_bundle_id() ==
-                                    bundle.retained_bundle_id() &&
-                                product.runtime_unit_id() == runtime_unit_id;
-                       });
-      if (cached != runtime_products_.end()) {
-        return *cached;
-      }
-    }
-    auto verified =
-        deployment::verify_runtime_unit_product(bundle, runtime_unit_id, *this);
-    if (!verified.has_value()) {
-      return std::nullopt;
-    }
-    std::lock_guard lock(mutex_);
-    const auto cached = std::find_if(
-        runtime_products_.begin(), runtime_products_.end(),
-        [&](const auto &product) {
-          return product.retained_bundle_id() == bundle.retained_bundle_id() &&
-                 product.runtime_unit_id() == runtime_unit_id;
-        });
-    if (cached != runtime_products_.end()) {
-      return *cached;
-    }
-    runtime_products_.push_back(std::move(*verified));
-    return runtime_products_.back();
-  }
-
   // Fixed pose of an attachment carrier frame in a source-local link of the
   // carrier's model instance, plus the carrier's source link name. Only
   // successful resolutions are cached.
@@ -3029,8 +2981,6 @@ private:
   mutable std::vector<std::pair<deployment::RetainedProductArtifactQuery,
                                 deployment::VerifiedRetainedProductArtifact>>
       product_artifacts_;
-  mutable std::vector<deployment::VerifiedRetainedRuntimeUnitProduct>
-      runtime_products_;
   mutable std::map<std::tuple<std::string, std::string, std::string,
                               std::string, std::string>,
                    SceneRuntimeReferenceLinkResolution>
@@ -3059,7 +3009,8 @@ class DaemonPlannedMaintenanceGate final
 public:
   using StateReader =
       std::function<component_manager::ManagementIdleState()>;
-  using AdmissionCloser = std::function<bool()>;
+  using AdmissionCloser =
+      std::function<component_manager::AdmissionCloseState(bool)>;
 
   DaemonPlannedMaintenanceGate(StateReader state_reader,
                                AdmissionCloser admission_closer)
@@ -3071,8 +3022,9 @@ public:
     return state_reader_();
   }
 
-  [[nodiscard]] bool CloseAdmissionAndProveClosed() override {
-    return admission_closer_();
+  [[nodiscard]] component_manager::AdmissionCloseState
+  CloseAdmissionAndProveClosed(const bool continue_posted) override {
+    return admission_closer_(continue_posted);
   }
 
 private:
@@ -3083,7 +3035,6 @@ private:
 // Only the daemon's named coordinator owns this adapter. Its entries
 // are called inside the original captured named operation; a replacement
 // coordinator has no such capture and can only read retained Scene evidence.
-// The actual remote port supplies checked owner readback, never HeldStatusView.
 class OriginalManagerSceneMaintenanceAdapter final
     : public core::IManagerSceneProjectionMaintenancePort {
 public:
@@ -3114,28 +3065,6 @@ public:
       const core::ProjectionMaintenanceInitializationQueryDTO &query) const override {
     return owner_.ReadMaintenanceInitialization(query);
   }
-  std::vector<core::ProjectionHealthDTO> StageOriginalManagerProductAdoption(
-      const core::QualifiedSceneProductAdoptionRequestDTO &request,
-      const core::ApplyFenceAcquireAttemptQueryDTO &attempt_query) override {
-    return owner_.StageOriginalManagerProductAdoption(request, original_parent_fence_, attempt_query);
-  }
-  std::vector<core::ProjectionHealthDTO> ReadOriginalManagerProductAdoptionProjectionHealth(
-      const core::QualifiedSceneProductAdoptionRequestDTO &request,
-      const core::ApplyFenceAcquireAttemptQueryDTO &attempt_query) override {
-    return owner_.ReadOriginalManagerProductAdoptionProjectionHealth(request, original_parent_fence_, attempt_query);
-  }
-  core::ProjectionMaintenanceInitializationStatusDTO
-  BeginOriginalManagerProductAdoption(
-      const core::QualifiedSceneProductAdoptionRequestDTO &request) override {
-    return owner_.BeginOriginalManagerProductAdoption(request, original_parent_fence_);
-  }
-  core::ProjectionMaintenanceInitializationStatusDTO
-  CompleteOriginalManagerProductAdoption(
-      const core::QualifiedSceneProductAdoptionRequestDTO &request,
-      const core::ActiveBundlePublicationReceiptDTO &publication) override {
-    return owner_.CompleteOriginalManagerProductAdoption(
-        request, publication, original_parent_fence_);
-  }
   std::vector<core::ProjectionHealthDTO> StageOriginalManagerConfigurationAdoption(
       const core::QualifiedSceneConfigurationAdoptionRequestDTO &request,
       const core::ApplyFenceAcquireAttemptQueryDTO &attempt) override {
@@ -3154,6 +3083,11 @@ public:
       const core::QualifiedSceneConfigurationAdoptionRequestDTO &request,
       const core::ActiveBundlePublicationReceiptDTO &publication) override {
     return owner_.CompleteOriginalManagerConfigurationAdoption(request, publication, original_parent_fence_);
+  }
+  void EndOriginalManagerConfigurationAdoption(
+      const core::ApplyId &apply_id, const core::ApplyGeneration apply_generation,
+      const std::optional<core::ActiveBundlePublicationReceiptDTO> &publication) override {
+    owner_.EndOriginalManagerConfigurationAdoption(apply_id, apply_generation, publication);
   }
   core::ProjectionAggregateHealthDTO ActiveProjectionHealth() const override {
     return owner_.ActiveProjectionHealth();
@@ -3175,6 +3109,8 @@ public:
                             deployment::runtime_contract_declaration_registry()
                                 .package_manifest_set()),
         daemon_lock_(config_.manager_run_root),
+        application_start_id_(MintApplicationStartId()),
+        application_start_text_(ApplicationStartText(application_start_id_)),
         admission_(deployment::FilesystemCanonicalEmptyRetainedBundleSource(
                        package_generation_.descriptor_bound_root(),
                        config_.canonical_empty_admission_filename)
@@ -3185,25 +3121,35 @@ public:
                 ? std::nullopt
                 : std::optional(config_.activation_root)),
         execution_host_adapter_(
-            InstalledTargetRoot(), package_generation_.descriptor_bound_root(),
-            config_.manager_state_root, config_.manager_run_root,
+            application_start_id_, InstalledTargetRoot(), package_generation_.descriptor_bound_root(),
+            config_.manager_run_root,
             config_.execution_state_root, config_.execution_run_root,
             verified_package_, verified_package_, "linux",
             std::vector<std::string>{
                 std::string(
                     deployment::ros2_control_execution_runtime_contract::
                         kLaunchEnvironmentContract)},
-            config_.logical_scene_database, config_.program_cycle_journal,
             config_.activation_root, config_.scene_asset_root,
-            site_settings_document_),
-        stores_(config_.manager_state_root, admission_),
+            site_settings_document_,
+            // The Manager's current publication head, read by fence requests
+            // after construction.
+            [this] {
+              const auto &store = stores_.active_bundle_publication_store();
+              auto head = store.ReadActiveBundlePublication(
+                  store.VerifyIntegrity().current_generation);
+              if (!head.ok())
+                throw core::TypedError(head.error(), "component_manager");
+              return std::move(head.value());
+            }),
+        stores_(config_.manager_state_root, admission_, &record_writer_),
         scene_owner_(config_.logical_scene_database, admission_,
                      stores_.active_bundle_publication_store(),
                      verified_package_, execution_host_adapter_,
-                     execution_host_adapter_),
+                     execution_host_adapter_, &record_writer_),
         original_manager_scene_maintenance_(scene_owner_, execution_host_adapter_),
         scene_runtime_pose_projector_(
             scene_owner_, admission_.cell_id(),
+            [this] { return MintRequestKey(); },
             [this](const core::RetainedBundleId &retained_bundle_id,
                    const core::ComponentSceneFrameRefDTO &carrier,
                    const std::string &reference_link) {
@@ -3220,37 +3166,31 @@ public:
         plan_source_(stores_.active_bundle_publication_store(),
                      stores_.apply_journal(),
                      BuildBootstrapRuntimePlan(admission_, verified_package_)),
-        reference_runtime_adapter_(
-            config_.execution_state_root, config_.execution_run_root,
-            verified_package_, verified_package_, "linux", "posix.1-2017"),
-        runtime_adapter_router_(
-            {{std::string(
-                  component_manager::kRetainedPosixProcessAdapterContractId),
-              &reference_runtime_adapter_, &reference_runtime_adapter_},
-             {std::string(deployment::execution_runtime_contract::
-                              kProcessAdapterContractId),
-              &execution_host_adapter_, &execution_host_adapter_}}),
         active_runtime_(
-            plan_source_, runtime_adapter_router_, runtime_adapter_router_,
+            plan_source_, execution_host_adapter_, execution_host_adapter_,
             [this] { return ElapsedNs(); },
             [this] { RequireCurrentPackageGeneration(); }),
         planned_maintenance_gate_(
             [this] { return ReadPlannedMaintenanceState(); },
-            [this] { return ClosePlannedMaintenanceAdmission(); }),
+            [this](const bool continue_posted) {
+              return ClosePlannedMaintenanceAdmission(continue_posted);
+            }),
         planned_maintenance_(plan_source_, planned_maintenance_gate_),
-        manager_runtime_epoch_(RandomToken("manager-runtime-")),
         named_apply_(
             stores_.apply_journal(), plan_source_, verified_package_,
             verified_package_, stores_.active_bundle_publication_store(),
             original_manager_scene_maintenance_, &scene_owner_, execution_host_adapter_,
             execution_host_adapter_, execution_host_adapter_,
-            runtime_adapter_router_, runtime_adapter_router_,
-            planned_maintenance_,
-            manager_runtime_epoch_, "linux",
+            execution_host_adapter_, execution_host_adapter_,
+            planned_maintenance_, "linux",
             {std::string(deployment::ros2_control_execution_runtime_contract::
                              kLaunchEnvironmentContract)},
             [this] { return ElapsedNs(); },
-            [] { return core::ApplyId(RandomToken("apply-")); },
+            // The Manager's Apply number, from 1 per start (contract 1.16.1).
+            [this] {
+              return core::ApplyId(
+                  next_apply_number_.fetch_add(1U, std::memory_order_relaxed) + 1U);
+            },
             [this](const auto &activation, const auto &bundle) {
               return verified_package_.initial_scene(activation, bundle);
             },
@@ -3264,91 +3204,354 @@ public:
             site_facts_),
         scene_runtime_owner_([] { return HostMonotonicNs(); },
                              [] { return RandomToken("scene-init-"); }),
-        manager_channel_(config_.projection_root,
-                         std::string(kManagerSourceFileName)),
-        scene_channel_(config_.projection_root,
-                       std::string(kLogicalSceneSourceFileName)),
-        scene_runtime_channel_(config_.projection_root,
-                               std::string(kSceneRuntimeSourceFileName)),
-        viewer_pose_sessions_channel_(config_.projection_root,
-                                      "viewer-pose-sessions.json"),
-        manager_owner_epoch_(RandomToken("manager-")),
-        scene_runtime_owner_epoch_(RandomToken("scene-runtime-")),
-        manager_owner_id_("component-manager." + admission_.cell_id().value()),
-        scene_owner_id_("logical-scene." + admission_.cell_id().value()),
-        scene_runtime_owner_id_("scene-runtime." +
-                                admission_.cell_id().value()) {
-    RequireCurrentPackageGeneration();
-    EnsureBootstrap();
-    RequireCurrentPackageGeneration();
-    // Preserve native-named per-unit launch, inventory, epochs, liveness, Stop and fencing plumbing.
-    // Native children are directly owned by this Manager process and therefore
-    // never survive its restart. Recreate the runtime selected by the durable
-    // public pointer before the progression lane resumes an incomplete Apply.
-    // Constructor/bootstrap work never advances that Apply: the command socket
-    // must be available while its exact durable status is observed. This is the
-    // only non-Apply caller permitted to start a managed runtime unit.
-    static_cast<void>(InitializeRuntimeAndPublish());
+        status_board_(status_signal_),
+        status_stream_(status_board_, application_start_text_),
+        application_processes_(
+            ParseApplicationProcessList(ReadStartupDocument(
+                config_.application_processes_path, "application processes")),
+            application_start_id_) {
+    // The constructor posts store records (bootstrap); a failure drains them
+    // before the stores close, as the destructor does.
+    // OD-187 (1): a second stop request during the stop sequence also ends
+    // the execution host the adapter is waiting on.
+    execution_host_adapter_.SetShutdownForce(&StopForceRequested);
+    g_abandon_signal_fd.store(execution_host_adapter_.AbandonSignalFd(),
+                              std::memory_order_release);
+    // A stop signal that came before the fd was published.
+    if (g_stop_requested != 0) execution_host_adapter_.AbandonExchanges();
+    try {
+      // Checked as soon as the stores and the Scene owner it reads are open,
+      // before any process is started (OD-242).
+      RefuseAPreviousRun();
+      // S3: the Manager is the one supervisor of the application. Its listed
+      // processes start now, from the main thread, with `A`, in list order
+      // and with no readiness wait (build spec 3.3; contract 1.1).
+      application_processes_.StartImmediate();
+      RequireCurrentPackageGeneration();
+      EnsureBootstrap();
+      RequireCurrentPackageGeneration();
+      // Every application start begins with an empty cell (B1, OD-122 (8)):
+      // the stores are fresh, so the current plan is the canonical-empty
+      // bootstrap. This launches its execution host, once, on the main
+      // thread, which lives as long as the Manager (build spec 3.2, 3.4).
+      // Nothing from a previous run is recreated or resumed.
+      static_cast<void>(LaunchEmptyRuntimeAndPublish());
+    } catch (...) {
+      g_abandon_signal_fd.store(-1, std::memory_order_release);
+      DrainAndCloseStores();
+      throw;
+    }
   }
 
+  /// Runs after Run has returned or thrown: every lane is joined, so nothing
+  /// posts any more.
+  ~ManagerDaemon() {
+    g_abandon_signal_fd.store(-1, std::memory_order_release);
+    DrainAndCloseStores();
+  }
+
+  /// OD-298 (a): the main thread only ticks and supervises. It keeps the
+  /// status tick, the signals, the outstanding-exchange information and the
+  /// supervision of the application's processes, and runs the stop
+  /// sequence. Commands and the periodic reconcile run on the command lane,
+  /// in today's order. The main thread waits for its next tick, a stop
+  /// request (the abandon signal the stop signal writes) or a hand-over from
+  /// the command lane; it never waits on the execution host, the Program
+  /// Runner or a client.
   int Run() {
     CommandSocket command_socket(config_.manager_run_root);
-    StartNativeManagerLivenessLane();
-    StartApplyProgressLane();
+    // OD-216: the status stream's own socket and accepting thread. Declared
+    // after the socket: on return the thread stops (ending every
+    // subscription) before the socket closes.
+    CommandSocket status_socket(config_.manager_run_root,
+                                kManagerStatusSocketFileName);
+    const std::jthread status_acceptor(
+        [this, socket = status_socket.get()](const std::stop_token stop) {
+          status_stream_.Run(socket, stop);
+        });
+    main_wake_fd_ = FileDescriptor(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK));
+    if (!main_wake_fd_) FailErrno("create the Manager main-thread wake");
+    const int stop_fd = execution_host_adapter_.AbandonSignalFd();
+    auto next_status_tick = std::chrono::steady_clock::now();
+    try {
+      StartNativeManagerLivenessLane();
+      StartApplyProgressLane();
+      StartCommandLane(command_socket);
+      while (g_stop_requested == 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= next_status_tick) {
+          status_board_.AdvanceTick();
+          PublishOutstandingExchanges();
+          status_board_.NotifyIfChanged();
+          if (SuperviseApplication()) {
+            EndApplication();
+            return kApplicationComponentExitStatus;
+          }
+          next_status_tick = now + kStatusTickPeriod;
+        }
+        {
+          std::lock_guard lock(command_lane_mutex_);
+          if (command_lane_failure_.has_value())
+            Fail("Manager command lane failed: " + *command_lane_failure_);
+          if (shutdown_client_.has_value()) {
+            // shutdown_runtime (the first stop request): the stop sequence
+            // runs here; its client is answered once it ended.
+            break;
+          }
+        }
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                next_status_tick - std::chrono::steady_clock::now());
+        std::array<pollfd, 2U> descriptors{
+            {{main_wake_fd_.get(), POLLIN, 0}, {stop_fd, POLLIN, 0}}};
+        const int ready = ::poll(
+            descriptors.data(), descriptors.size(),
+            static_cast<int>(std::max<std::int64_t>(1, remaining.count())));
+        if (ready < 0 && errno != EINTR) FailErrno("wait on the Manager main thread");
+        if (ready > 0 && (descriptors[0].revents & POLLIN) != 0) {
+          std::uint64_t count = 0U;
+          [[maybe_unused]] const auto io_result = ::read(main_wake_fd_.get(), &count, sizeof(count));
+        }
+      }
+    } catch (...) {
+      EndApplication();
+      throw;
+    }
+    // SIGTERM or SIGINT, or shutdown_runtime: the orderly stop (build spec
+    // 3.3 item 5).
+    EndApplication();
+    std::optional<FileDescriptor> shutdown_client;
+    {
+      std::lock_guard lock(command_lane_mutex_);
+      shutdown_client = std::move(shutdown_client_);
+      shutdown_client_.reset();
+    }
+    if (shutdown_client.has_value())
+      TrySendResponse(shutdown_client->get(),
+                      SuccessResponse("shutdown_runtime", std::nullopt,
+                                      std::nullopt, std::nullopt));
+    return StoppedExitStatus();
+  }
+
+  /// The command lane (OD-298 (a)): today's main-loop body without the tick.
+  /// One command at a time, accepted from the command socket, and the
+  /// periodic reconcile when it is due, in the same order as before. Its
+  /// waits: the next command or the reconcile period (a period, not a limit),
+  /// a client's request or its reply room (ended by the client closing or
+  /// the application stop, never by a limit), and the host or Runner waits
+  /// inside a command (reply, peer gone or application stop). It ends on the
+  /// application stop (the adapter's abandon signal) or after handing a
+  /// shutdown_runtime request to the main thread. A failure of the socket is
+  /// handed to the main thread, which ends the application.
+  void StartCommandLane(const CommandSocket &socket) {
+    Require(!command_lane_.joinable(), "Manager command lane is already running");
+    command_lane_ = std::thread([this, &socket] { RunCommandLane(socket); });
+  }
+
+  void StopCommandLane() noexcept {
+    // The abandon signal is written: the lane's waits end and it returns.
+    if (command_lane_.joinable()) command_lane_.join();
+  }
+
+  void RunCommandLane(const CommandSocket &socket) noexcept {
+    const int stop_fd = execution_host_adapter_.AbandonSignalFd();
     auto next_reconciliation =
         std::chrono::steady_clock::now() + config_.reconciliation_period;
     try {
-      while (g_stop_requested == 0) {
+      for (;;) {
         const auto now = std::chrono::steady_clock::now();
         if (now >= next_reconciliation) {
           TryPeriodicReconcile();
           next_reconciliation =
               std::chrono::steady_clock::now() + config_.reconciliation_period;
-          continue;
         }
         const auto remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(
-                next_reconciliation - now);
-        pollfd descriptor{command_socket.get(), POLLIN, 0};
-        int ready = -1;
-        do {
-          ready = ::poll(
-              &descriptor, 1,
-              static_cast<int>(std::max<std::int64_t>(1, remaining.count())));
-        } while (ready < 0 && errno == EINTR && g_stop_requested == 0);
-        if (g_stop_requested != 0) {
-          break;
-        }
+                next_reconciliation - std::chrono::steady_clock::now());
+        std::array<pollfd, 2U> descriptors{
+            {{socket.get(), POLLIN, 0}, {stop_fd, POLLIN, 0}}};
+        const int ready = ::poll(
+            descriptors.data(), descriptors.size(),
+            static_cast<int>(std::max<std::int64_t>(1, remaining.count())));
         if (ready < 0) {
+          if (errno == EINTR) continue;
           FailErrno("poll Manager command socket");
         }
-        if (ready == 0) {
-          TryPeriodicReconcile();
-          next_reconciliation =
-              std::chrono::steady_clock::now() + config_.reconciliation_period;
-          continue;
-        }
-        if ((descriptor.revents & POLLIN) != 0 &&
-            HandleOneClient(command_socket)) {
-          StopApplyProgressLane();
-          StopNativeManagerLivenessLane();
-          return 0;
-        }
-        if ((descriptor.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+        if ((descriptors[1].revents & POLLIN) != 0) return;  // Stopping.
+        if (ready == 0) continue;  // The reconcile is due.
+        if ((descriptors[0].revents & POLLIN) != 0 && HandleOneClient(socket))
+          return;  // shutdown_runtime went to the main thread.
+        if ((descriptors[0].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
           Fail("Manager command socket became unavailable");
+      }
+    } catch (const std::exception &error) {
+      HandOverCommandLaneFailure(error.what());
+    } catch (...) {
+      HandOverCommandLaneFailure("unknown error");
+    }
+  }
+
+  void WakeMainThread() noexcept {
+    const std::uint64_t one = 1U;
+    [[maybe_unused]] const auto io_result = ::write(main_wake_fd_.get(), &one, sizeof(one));
+  }
+
+  void HandOverCommandLaneFailure(const char *what) noexcept {
+    try {
+      std::lock_guard lock(command_lane_mutex_);
+      command_lane_failure_ = what;
+    } catch (...) {
+      // Allocation only; the main thread then ends on the next stop request.
+    }
+    WakeMainThread();
+  }
+
+  /// shutdown_runtime: the request is the first stop request; the main
+  /// thread runs the stop sequence and answers the client (OD-298 (a)).
+  void HandOverShutdown(FileDescriptor client) noexcept {
+    g_stop_started_by_command.store(true, std::memory_order_relaxed);
+    {
+      std::lock_guard lock(command_lane_mutex_);
+      shutdown_client_ = std::move(client);
+    }
+    WakeMainThread();
+  }
+
+  /// Any application process exit ends the application (OD-122 (1)). Runs
+  /// on the main thread's observation tick; `waitpid(WNOHANG)`, atomic
+  /// reads and the adapter's non-blocking reply reads under its leaf locks;
+  /// no wait. Also starts the `after_baseline` entries
+  /// once the first converged baseline is published (build spec 4.7 a).
+  /// Returns true when the application must end.
+  [[nodiscard]] bool SuperviseApplication() {
+    if (const auto exit = execution_host_adapter_.HostExit()) {
+      std::cerr << "execution_host exited with "
+                << (exit->signaled ? "signal " : "status ") << exit->value
+                << '\n';
+      return true;
+    }
+    if (const auto exit = application_processes_.PollExit()) {
+      std::cerr << core::ApplicationRoleText(exit->role) << " exited with "
+                << (exit->signaled ? "signal " : "status ") << exit->value
+                << '\n';
+      return true;
+    }
+    LogExecutionHostLateReply();
+    if (!application_processes_.after_baseline_started()) {
+      bool converged = false;
+      {
+        std::lock_guard source_lock(manager_source_mutex_);
+        converged = last_runtime_.has_value() &&
+                    last_runtime_->state ==
+                        component_manager::ManagerActiveRuntimeConvergenceState::
+                            kConverged;
+      }
+      if (converged) {
+        try {
+          application_processes_.StartAfterBaseline();
+        } catch (const std::exception &error) {
+          std::cerr << "application process launch failed: " << error.what()
+                    << '\n';
+          return true;
         }
       }
-    } catch (...) {
-      StopApplyProgressLane();
-      StopNativeManagerLivenessLane();
-      throw;
     }
+    return false;
+  }
+
+  /// The one stop sequence: first the planned Halt, so the arm is at
+  /// rest before any process ends (OD-121 (7), (19)); then the listed
+  /// processes in reverse order, then the execution host's shutdown, then the
+  /// Manager's lanes (build spec 3.3 item 5; contract 1.1). Used for
+  /// shutdown_runtime, a stop signal and a component exit alike.
+  /// No step has a time limit (OD-187 (1)): each waits for its completion or
+  /// its own detector, and logs where it waits. A second stop request forces
+  /// the remaining steps: the processes still running are killed; the
+  /// Manager's own lanes and records still finish. A step that did not
+  /// complete makes the stop incomplete (OD-187 (2)).
+  void EndApplication() noexcept {
+    g_stop_sequence_running.store(true, std::memory_order_release);
+    // OD-270: first end every host exchange without a time limit (projection
+    // preparation, process inspection, rebuild), so the Apply lane returns
+    // and the host's stop below is not held behind it.
+    execution_host_adapter_.AbandonExchanges();
+    // OD-298 (a): the same signal ends the command lane's waits; it takes no
+    // command during the stop.
+    StopCommandLane();
+    // With no execution host there is nothing to halt: an unreachable Stop
+    // control is then not an incomplete Halt.
+    if (!RequestPlannedStopAndWait() && execution_host_adapter_.HasHostChild())
+      stop_incomplete_ = true;
+    if (application_processes_.StopAll([this] {
+          if (!StopForceRequested()) return false;
+          LogStopForced("application_processes");
+          return true;
+        }))
+      stop_incomplete_ = true;
+    try {
+      static_cast<void>(active_runtime_.Shutdown());
+    } catch (const std::exception &error) {
+      stop_incomplete_ = true;
+      std::cerr << "execution host shutdown failed: " << error.what() << '\n';
+    } catch (...) {
+      stop_incomplete_ = true;
+      std::cerr << "execution host shutdown failed\n";
+    }
+    // The adapter's stop records the kill of the host (a second stop
+    // request); the Manager prints its lines here.
+    if (const auto killed = execution_host_adapter_.HostForceKilledPid()) {
+      LogStopForced("execution_host");
+      std::cerr << "{\"code\":\"application_process_killed\",\"role\":"
+                   "\"execution_host\",\"pid\":"
+                << *killed << "}\n";
+      stop_incomplete_ = true;
+    }
+    if (const auto exit = execution_host_adapter_.HostExit();
+        exit.has_value() && (exit->signaled || exit->value != 0))
+      stop_incomplete_ = true;
     StopApplyProgressLane();
     StopNativeManagerLivenessLane();
-    return 0;
+  }
+
+  /// The Manager's status after an orderly stop: 0 when every step
+  /// completed, otherwise kApplicationStopIncompleteExitStatus (OD-187 (2)).
+  [[nodiscard]] int StoppedExitStatus() const noexcept {
+    return stop_incomplete_ ? kApplicationStopIncompleteExitStatus : 0;
+  }
+
+  /// One typed line naming the step at which the second stop request forced
+  /// the stop; printed once, on the main thread, with no lock held.
+  void LogStopForced(const std::string_view step) noexcept {
+    if (stop_forced_logged_) return;
+    stop_forced_logged_ = true;
+    std::cerr << "{\"code\":\"application_stop_forced\",\"step\":\"" << step
+              << "\"}\n";
   }
 
 private:
+  /// The one shutdown point of the stores: write every queued record, then
+  /// close the scene store, the Apply journal, the publication store and the
+  /// bootstrap journal. Called only once nothing posts any more. The drain has
+  /// no time limit (OD-187 (1)): it ends when the queue is written; a second
+  /// stop request does not cut it. A close failure is ignored, as the
+  /// stores' destructors ignore it.
+  void DrainAndCloseStores() noexcept {
+    std::cerr << "application stop: waiting at manager_records: the queued "
+                 "store records to be written\n";
+    record_writer_.DrainAndStop();
+    std::cerr << "application stop: manager_records written\n";
+    const auto close_store = [](auto &store) noexcept {
+      try {
+        store.Close();
+      } catch (...) {
+      }
+    };
+    close_store(scene_owner_);
+    close_store(stores_.apply_journal());
+    close_store(stores_.active_bundle_publication_store());
+    close_store(stores_.bootstrap_journal());
+  }
+
   struct PublicationGenerations final {
     std::uint64_t manager;
     std::uint64_t scene;
@@ -3363,7 +3566,58 @@ private:
 
   struct SuccessfulManagerRenewal final {
     NativeManagerLivenessSnapshot snapshot;
-    std::uint64_t started_at_ns;
+  };
+
+  /// A Runner-lane step that failed (OD-295 (3)(a)); the host-liveness lane
+  /// contains it.
+  struct RunnerLivenessFailure final {
+    std::string_view predicate;
+    std::string_view scope;
+    std::string runtime_unit;
+    std::string cause;
+    // A Program Runner fault: its typed error and the cycle it reported.
+    std::optional<core::ErrorDTO> fault;
+    std::optional<core::ProgramCycleStatusDTO> fault_cycle;
+    // A non-standard exception.
+    bool unknown{};
+  };
+
+  /// One Runner-lane attempt, handed to the host-liveness lane through a
+  /// latest-value slot. It carries the snapshot it was made for, so both
+  /// lanes use the same required set.
+  struct RunnerLivenessAttempt final {
+    std::optional<NativeManagerLivenessSnapshot> snapshot;
+    bool forced_closed{};
+    std::uint64_t readiness_barrier{};
+    bool allow_native{};
+    // The last Apply renewal request posted before this attempt started.
+    std::uint64_t renewal_request{};
+    bool ordinary_heartbeat{};
+    // The Runner answered the probe.
+    bool runner_probed{};
+    std::optional<core::ProgramCycleStatusDTO> cycle_status;
+    // Set when the Runner was renewed.
+    std::optional<core::ManagerLivenessRequiredSetDTO> required_set;
+    std::vector<core::RequiredManagerLivenessReceiverDTO> native_receivers;
+    std::uint64_t heartbeat_sequence{};
+    std::optional<core::ManagerLivenessObservationDTO> runner_observation;
+    std::optional<RunnerLivenessFailure> failure;
+    // The lane's stop ended a Runner exchange (OD-296 (a)).
+    bool stopped{};
+  };
+
+  /// The reconciliation the host-liveness lane delivered to every native
+  /// receiver of one required set; the Runner lane hands the same digest to
+  /// an unreconciled Program Runner.
+  struct ReconciledRequiredSet final {
+    core::ContentDigest required_runtime_set_digest;
+    core::ContentDigest reconciliation_evidence_digest;
+  };
+
+  /// What one host-liveness attempt achieved.
+  struct HostLivenessOutcome final {
+    // The whole renewal, readiness included, succeeded.
+    bool renewed{};
   };
 
   struct PoseObserverSession final {
@@ -3429,15 +3683,10 @@ private:
                                    "candidate/runtime capabilities");
       }
     }
-    config.projection_root = ExistingPrivateDirectory(
-        std::move(config.projection_root), "projection root");
     config.logical_scene_database =
         DatabasePath(std::move(config.logical_scene_database));
-    config.program_cycle_journal = ProspectiveDatabasePath(
-        std::move(config.program_cycle_journal), "Program-cycle journal");
-    const std::array<const std::filesystem::path *, 3U> durable_paths{
-        &config.logical_scene_database, &config.program_cycle_journal,
-        &config.projection_root};
+    const std::array<const std::filesystem::path *, 1U> durable_paths{
+        &config.logical_scene_database};
     const std::array<const std::filesystem::path *, 2U> run_roots{
         &config.manager_run_root, &config.execution_run_root};
     for (const auto *durable_path : durable_paths) {
@@ -3487,15 +3736,26 @@ private:
     return now;
   }
 
-  void EnsureBootstrap() {
-    const auto journal = stores_.bootstrap_journal().ReadSnapshot();
-    const auto access = scene_owner_.ReadAccessStatus();
-    if (access.active_projection.has_value()) {
-      Require(journal.phase == component_manager::ManagerBootstrapJournalPhase::
-                                   kAcceptedTargetPersisted,
-              "active scene exists without durable bootstrap acceptance");
+  // A Manager state that already holds a scene or an Apply belongs to a
+  // previous run: every start begins from an empty current/ directory
+  // (OD-122 (2), (8)), so it is refused with a typed start-up error, never
+  // recovered.
+  void RefuseAPreviousRun() {
+    if (!scene_owner_.ReadAccessStatus().active_projection.has_value() &&
+        stores_.apply_journal().ReadStatusInventory().empty()) {
       return;
     }
+    throw ManagerPreviousRunError(core::ErrorDTO{
+        "manager_run_folder_holds_previous_run",
+        "The Manager was started on a run folder that already holds a run. "
+        "Every application start begins from an empty run folder. Start "
+        "ManyForge with its launcher, which prepares one.",
+        {{"retryable", "false"}}});
+  }
+
+  // Bootstraps the canonical-empty cell into the fresh stores
+  // (RefuseAPreviousRun has checked that they hold no previous run).
+  void EnsureBootstrap() {
     component_manager::CanonicalEmptyBootstrapCoordinator bootstrap(
         stores_, scene_owner_);
     static_cast<void>(bootstrap.BeginOrRecover(admission_));
@@ -3562,8 +3822,8 @@ private:
         *active_publication.request.expected_previous_publication_generation};
   }
   /// Observation-only convergence and publication. Used by periodic runtime
-  /// observation and the public `reconcile` command. The independent liveness
-  /// lane consumes the resulting snapshot; it does not call this method. A
+  /// observation. The liveness lanes
+  /// consume the resulting snapshot; they do not call this method. A
   /// missing required Manager-managed unit is reported as non-converged fault
   /// evidence that closes readiness; this surface never starts or replaces a
   /// process.
@@ -3580,11 +3840,10 @@ private:
     return PublishActiveRuntime(std::move(runtime));
   }
 
-  /// Effect-permitted convergence and publication. Restricted to bootstrap and
-  /// to an admitted maintenance operation that already holds the exact
-  /// operation admission; it may start absent Manager-managed units in
-  /// dependency order.
-  PublicationGenerations InitializeRuntimeAndPublish() {
+  /// The one effect-permitted convergence: at Manager start, it launches the
+  /// empty cell's execution host and publishes. Nothing else starts a
+  /// managed runtime unit (Q1, OD-122 (1)).
+  PublicationGenerations LaunchEmptyRuntimeAndPublish() {
     RequireCurrentPackageGeneration();
     return PublishActiveRuntime(active_runtime_.Initialize());
   }
@@ -3594,9 +3853,8 @@ private:
       const std::string_view fallback_code) {
     const auto cause = ManagerCauseOf(error, fallback_code);
     try {
-      const auto accepted = stores_.apply_journal().ReadRequest(
-          core::RequestOwnerEpoch(*command.request_owner_epoch),
-          core::RequestId(*command.request_id));
+      const auto accepted =
+          stores_.apply_journal().ReadRequest(*command.request_key);
       if (!accepted.has_value()) {
         return WithReferenceDiagnostics(
             ApplyKnownNoEffectDetailedErrorResponse(command, cause.error,
@@ -3644,111 +3902,6 @@ private:
                                 observation.eligible))
       pose_provider_origins_.insert_or_assign(observation.key,
                                               *object.provider_evidence);
-  }
-
-  core::Result<CanonicalValue> ReadComponentProcessStopOffer(
-      const core::ControllableComponentId &component) {
-    using Offer = core::Result<CanonicalValue>;
-    const auto unavailable = [](const std::string &message) {
-      return Offer::Err({"component_process_stop_offer_unknown", message, {}});
-    };
-    const auto active = plan_source_.ReadCurrentPlan();
-    std::optional<component_manager::ManagerActiveRuntimeConvergenceResult> runtime;
-    {
-      std::lock_guard source_lock(manager_source_mutex_);
-      runtime = last_runtime_;
-    }
-    if (!runtime || runtime->plan.active_publication != active.active_publication)
-      return unavailable("the actual current runtime observation is unavailable");
-    const auto bundle = verified_package_.get_verified(active.active_publication.request.candidate_retained_bundle_id);
-    if (!bundle) return unavailable("the actual current publication has no verified host membership");
-    CanonicalValue::Array inventories;
-    std::size_t count = 0U;
-    for (const auto &unit : bundle->value().cell_graph.runtime_units) {
-      if (unit.runtime_profile_id.value() != deployment::ros2_control_execution_runtime_contract::kRuntimeProfileId)
-        continue;
-      const auto *host = runtime->observations.observation(unit.runtime_unit_id.value());
-      if (!host || host->process_presence() != component_manager::ProcessPresenceState::kPresent || host->runtime_epoch().empty())
-        return unavailable("the actual component host occurrence is unavailable; a new epoch is not absence");
-      const auto &publication = active.active_publication;
-      const component_manager::ManagerComponentProcessInventoryRequestDTO request{
-          publication.request.candidate_projection_revision, publication.publication_generation,
-          publication.durable_public_pointer_content_digest, unit.runtime_unit_id,
-          core::RuntimeEpoch(host->runtime_epoch()), manager_runtime_epoch_};
-      const auto observed = execution_host_adapter_.InspectInstalledComponentProcesses(request);
-      if (!observed.ok()) return Offer::Err(observed.error());
-      if (!observed.value().valid() || observed.value().request != request)
-        return unavailable("the installed process inventory has a foreign original scope");
-      if (observed.value().error) return Offer::Err(*observed.value().error);
-      CanonicalValue::Array rows;
-      for (const auto &row : observed.value().process_occurrences) {
-        if (row.controllable_component_id != component) continue;
-        if (++count > component_manager::kMaximumComponentProcessInventoryEntries)
-          return unavailable("the complete addressed process union exceeds its existing bound");
-        if (row.process_owner_kind == component_manager::ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal) {
-          const auto verified = component_manager::ValidateManagerPneumaticNoneProcessOwner(
-              *bundle, site_facts_, request, row);
-          if (!verified.ok()) return Offer::Err(verified.error());
-          const auto& proof = *row.pneumatic_none_owner;
-          // This is an installed logical owner, not a launch or a drain receipt.
-          // Preserve the exact physical row shape below for every physical row.
-          rows.emplace_back(CanonicalValue::Object{
-              {"controllable_component_id", CanonicalValue(row.controllable_component_id.value())},
-              {"process_owner_kind", CanonicalValue("pneumatic_none_local")},
-              {"pneumatic_none_owner", CanonicalValue(CanonicalValue::Object{
-                  {"command_target_id", CanonicalValue(proof.command_target_id.value())},
-                  {"control_binding_id", CanonicalValue(proof.control_binding_id.value())},
-                  {"control_binding_revision", CanonicalValue(proof.control_binding_revision.value())}})},
-              {"installed_runtime_identity", CanonicalValue(row.installed_runtime_identity->value())},
-              {"process_presence", CanonicalValue("absent")}});
-          continue;
-        }
-        const auto state = [&] {
-          switch (row.cleanup_state) {
-            case core::ControllerLaunchCleanupState::kNotRequested: return "not_requested";
-            case core::ControllerLaunchCleanupState::kPending: return "pending";
-            case core::ControllerLaunchCleanupState::kUnknown: return "unknown";
-            case core::ControllerLaunchCleanupState::kDrained: return "drained";
-          }
-          Fail("installed process cleanup state is invalid");
-        }();
-        auto receipt = CanonicalValue(nullptr);
-        if (row.receipt) receipt = CanonicalValue(CanonicalValue::Object{
-            {"leader_pid", CanonicalValue(static_cast<double>(row.receipt->leader_pid))},
-            {"controllable_component_id", CanonicalValue(row.receipt->controllable_component_id)},
-            {"launch_identity", CanonicalValue(row.receipt->launch_identity)},
-            {"observed_utc", CanonicalValue(row.receipt->observed_utc)}});
-        rows.emplace_back(CanonicalValue::Object{
-            {"controllable_component_id", CanonicalValue(row.controllable_component_id.value())},
-            {"launch_identity", CanonicalValue(row.launch_identity)},
-            {"leader_pid", CanonicalValue(static_cast<double>(row.leader_pid))},
-            {"process_presence", CanonicalValue(std::string(component_manager::ToString(row.process_presence)))},
-            {"cleanup_state", CanonicalValue(state)}, {"receipt", std::move(receipt)},
-            {"installed_runtime_identity", row.installed_runtime_identity ? CanonicalValue(row.installed_runtime_identity->value()) : CanonicalValue(nullptr)}});
-      }
-      inventories.emplace_back(CanonicalValue::Object{
-          {"request", CanonicalValue(CanonicalValue::Object{
-              {"predecessor_projection_revision", ProjectionRevision(request.predecessor_projection_revision)},
-              {"expected_predecessor_publication_generation", Unsigned(request.expected_predecessor_publication_generation.value(), "publication generation")},
-              {"expected_predecessor_public_pointer_digest", CanonicalValue(request.expected_predecessor_public_pointer_digest.value())},
-              {"runtime_unit_id", CanonicalValue(request.runtime_unit_id.value())},
-              {"runtime_epoch", CanonicalValue(request.runtime_epoch.value())},
-              {"manager_runtime_epoch", CanonicalValue(request.manager_runtime_epoch.value())}})},
-          {"process_occurrences", CanonicalValue(std::move(rows))}, {"error", CanonicalValue(nullptr)}});
-      {
-        std::lock_guard source_lock(manager_source_mutex_);
-        const auto *current = last_runtime_ ? last_runtime_->observations.observation(unit.runtime_unit_id.value()) : nullptr;
-        if (!last_runtime_ || last_runtime_->plan.active_publication != active.active_publication ||
-            !current || current->process_presence() != component_manager::ProcessPresenceState::kPresent ||
-            current->runtime_epoch() != host->runtime_epoch())
-          return unavailable("the actual host scope changed during its passive process read");
-      }
-    }
-    if (plan_source_.ReadCurrentPlan().active_publication != active.active_publication)
-      return unavailable("the predecessor publication changed during its passive process read");
-    return Offer::Ok(CanonicalValue(CanonicalValue::Object{
-        {"controllable_component_id", CanonicalValue(component.value())},
-        {"process_inventories", CanonicalValue(std::move(inventories))}}));
   }
 
   PublicationGenerations PublishActiveRuntime(
@@ -3849,13 +4002,12 @@ private:
         }
       }
     }
-    const auto manager = [&] {
-      // One lock spans the journal read, the build and the write, so every
-      // Manager source value pairs one active publication with the Apply
-      // history read after it, and values are written in journal order.
+    const auto manager_generation = [&] {
+      // One lock spans the journal read, the build and the board swap, so
+      // every Manager source value pairs one active publication with the
+      // Apply history read after it, and values are stored in journal order.
       std::lock_guard source_lock(manager_source_mutex_);
-      return manager_channel_.Publish(
-          "component_manager", manager_owner_id_, manager_owner_epoch_,
+      return PublishManagerSectionLocked(
           observed_at,
           BuildManagerSourcePayload(
               *active_bundle, admission_, runtime, stores_.apply_journal(),
@@ -3876,8 +4028,7 @@ private:
             "unsettled Manager effect count exceeds readiness capacity");
     PublishNativeManagerLivenessSnapshot(
         {runtime, active_bundle, static_cast<std::uint32_t>(unsettled)});
-    return {manager.source_generation, scene_generation,
-            scene_runtime_generation};
+    return {manager_generation, scene_generation, scene_runtime_generation};
   }
 
   core::CellAdmissionReadinessSnapshotDTO BuildCellAdmissionReadiness(
@@ -3927,9 +4078,13 @@ private:
       return component_manager::ManagementIdleState::kUnavailable;
     }
     try {
+      // OD-296 (a): no time limit; ends on the reply, the Runner gone or the
+      // application stop (the adapter's abandon signal).
       const auto status = ProbeProgramRunnerLiveness(
                               config_.program_runner_liveness_socket,
-                              admission_.cell_id())
+                              admission_.cell_id(),
+                              {execution_host_adapter_.AbandonSignalFd(),
+                               &runner_exchanges_, nullptr})
                               .program_cycle_status;
       switch (status.state) {
       case core::ProgramCycleStateDTO::kIdleAfterReset:
@@ -3954,8 +4109,39 @@ private:
     return component_manager::ManagementIdleState::kUnavailable;
   }
 
-  [[nodiscard]] bool ClosePlannedMaintenanceAdmission() noexcept {
-    std::lock_guard attempt_lock(manager_liveness_attempt_mutex_);
+  /// Apply lane (planned maintenance). OD-295 (3)(a): the close is posted to
+  /// the host-liveness lane, which owns the readiness it publishes, and its
+  /// result observed as an event: no wait on another lane. The first call
+  /// posts a new close and answers pending; when the host-liveness lane has
+  /// done it, that lane requests the next Apply pass, whose call
+  /// (`continue_posted`) picks up the result. Memory only, under the leaf
+  /// lock.
+  [[nodiscard]] component_manager::AdmissionCloseState
+  ClosePlannedMaintenanceAdmission(const bool continue_posted) noexcept {
+    using component_manager::AdmissionCloseState;
+    if (config_.program_runner_liveness_socket.empty()) {
+      return AdmissionCloseState::kNotClosed;
+    }
+    {
+      std::lock_guard lock(manager_liveness_lane_mutex_);
+      if (manager_liveness_lane_stop_) return AdmissionCloseState::kNotClosed;
+      if (continue_posted && manager_liveness_apply_close_request_ != 0U) {
+        if (manager_liveness_close_completed_ <
+            manager_liveness_apply_close_request_)
+          return AdmissionCloseState::kPending;
+        manager_liveness_apply_close_request_ = 0U;
+        return manager_liveness_close_result_ ? AdmissionCloseState::kClosed
+                                              : AdmissionCloseState::kNotClosed;
+      }
+      manager_liveness_apply_close_request_ =
+          ++manager_liveness_close_requested_;
+    }
+    manager_host_liveness_condition_.notify_one();
+    return AdmissionCloseState::kPending;
+  }
+
+  /// Host-liveness lane: close readiness for planned maintenance.
+  [[nodiscard]] bool CloseReadinessForMaintenance() noexcept {
     if (!last_submitted_readiness_.has_value()) {
       return false;
     }
@@ -3981,17 +4167,16 @@ private:
     ClearCarriedObjectLostOnReset(snapshot);
   }
 
-  void RetainRunnerContactFailure(const std::string_view predicate,
-                                  const std::string_view message) noexcept {
+  void RetainRunnerContactFailure(
+      const std::string_view predicate, const std::string_view message,
+      const std::optional<std::string_view> fault_code = std::nullopt) noexcept {
     try {
       if (program_runner_contact_loss_ || !established_program_cycle_status_)
         return;
       program_runner_contact_loss_ = MakeProgramRunnerContactLoss(
-          established_program_cycle_status_,
-          core::RequestOwnerEpoch(manager_owner_epoch_), manager_runtime_epoch_,
-          predicate, message);
+          established_program_cycle_status_, predicate, message, fault_code);
     } catch (...) {
-      // Failure reporting cannot terminate the existing renewal lane.
+      // Failure reporting cannot terminate the host-liveness lane.
     }
   }
 
@@ -4063,26 +4248,6 @@ private:
     if (config_.program_runner_liveness_socket.empty()) {
       return;
     }
-    // Verify immutable product policy on the publication lane. Even a cached
-    // package lookup shares its lock with cold verification during Apply and
-    // must never run on the heartbeat lane.
-    const auto &retained_policy = deployment::
-        execution_runtime_contract::manager_liveness_policy();
-    for (const auto &row : snapshot.runtime.plan.runtime_units) {
-      if (row.process_adapter_contract_id !=
-          deployment::execution_runtime_contract::
-              kProcessAdapterContractId)
-        continue;
-      const auto product = verified_package_.runtime_unit_product(
-          *snapshot.active_bundle, row.runtime_unit_id);
-      Require(product.has_value() &&
-                  product->retained_bundle_id() ==
-                      snapshot.active_bundle->retained_bundle_id() &&
-                  product->product_identity() == row.product_identity &&
-                  product->manager_liveness_policy().has_value() &&
-                  *product->manager_liveness_policy() == retained_policy,
-              "active execution host has no exact retained liveness policy");
-    }
     bool wake = false;
     {
       std::lock_guard lock(manager_liveness_lane_mutex_);
@@ -4118,37 +4283,181 @@ private:
     manager_liveness_lane_condition_.notify_one();
   }
 
-  /// Renew the independent Program Runner lease and every required native
-  /// receiver, publish their observations to the Kernel and reduce one
-  /// cell-admission readiness snapshot.
-  ///
-  /// Traced path: ProbeProgramRunnerLiveness (read-only socket probe) ->
-  /// required-set construction from the currently observed epochs ->
-  /// RenewProgramRunnerLiveness -> RetainedExecutionHostAdapter
-  /// RenewManagerLivenessBatch -> Kernel liveness publication ->
-  /// BuildCellAdmissionReadiness. This lane performs no process lifecycle call:
-  /// it never reaches the active-runtime coordinator's Observe/Initialize and
-  /// therefore never starts a managed unit.
-  ///
-  /// Detector conclusion: the existing lease/renewal path is the
-  /// required-owner-loss detector. A required owner that is missing, foreign or
-  /// stale makes the observation lane report non-converged evidence and makes
-  /// this renewal throw; every throw path above calls SubmitFailClosedReadiness,
-  /// which publishes `required_component_status_current=false` and
-  /// `deployment_status_current=false` before returning. No interval was found in
-  /// which the Kernel stays open after required-owner evidence has expired, so no
-  /// additional progress lease, watchdog or second Stop owner is added here.
-  bool TryRenewNativeManagerLiveness(
-      const NativeManagerLivenessSnapshot &snapshot, const bool forced_closed,
-      const std::uint64_t readiness_barrier, const bool allow_native) noexcept {
-    const auto started_at = ElapsedNs();
-    bool required_owners_published = false;
+  [[nodiscard]] static bool IsApplyPublication(
+      const NativeManagerLivenessSnapshot &snapshot,
+      const component_manager::ManagerApplyIntentDTO &expected) {
+    const auto &publication = snapshot.runtime.plan.active_publication;
+    return publication.request.transaction_ref ==
+               core::ActiveBundlePublicationTransactionRefDTO{
+                   core::NamedApplyPublicationTransactionDTO{
+                       expected.apply_id, expected.apply_generation}} &&
+           publication.request.candidate_retained_bundle_id ==
+               expected.candidate_retained_bundle_id &&
+           publication.request.candidate_graph_revision ==
+               expected.candidate_graph_revision;
+  }
+
+  /// Runner lane (OD-295 (3)(a)): probe the Program Runner, mint the exact
+  /// required set from the snapshot's observed epochs and renew the Runner.
+  /// An unreconciled Runner is renewed again with the reconciliation the
+  /// host-liveness lane delivered to every native receiver of this same
+  /// required set. No execution host call. Each Runner exchange ends on its
+  /// reply, on the Runner refusing or closing the connection (a lost contact)
+  /// or on this lane's stop (OD-296 (a)); a slow Runner holds only this lane.
+  void RenewProgramRunner(
+      RunnerLivenessAttempt &attempt,
+      const std::optional<ReconciledRequiredSet> &reconciled) noexcept {
+    const auto &snapshot = *attempt.snapshot;
     const auto &runtime = snapshot.runtime;
     const auto &active_bundle = *snapshot.active_bundle;
-    std::optional<core::ProgramCycleStatusDTO> probed_cycle_status;
-    using BatchProgress =
-        component_manager::detail::ManagerLivenessBatchProgress;
-    auto native_batch = BatchProgress::kNotStarted;
+    std::string_view predicate = "program_runner_liveness_probe";
+    std::string_view scope = "cell-role:program_runner";
+    std::string runtime_unit;
+    const auto track = [&](const std::string_view next_predicate,
+                           const std::string_view next_scope,
+                           const std::string_view next_runtime_unit = {}) {
+      predicate = next_predicate;
+      scope = next_scope;
+      runtime_unit = next_runtime_unit;
+    };
+    const auto fail = [&](std::string cause) {
+      attempt.failure = RunnerLivenessFailure{
+          predicate, scope, std::move(runtime_unit), std::move(cause),
+          std::nullopt, std::nullopt, false};
+    };
+    try {
+      const LocalExchangeEnd end{runner_lane_stop_fd_.get(),
+                                 &runner_exchanges_, nullptr};
+      const auto runner = ProbeProgramRunnerLiveness(
+          config_.program_runner_liveness_socket, admission_.cell_id(), end);
+      attempt.runner_probed = true;
+      attempt.cycle_status = runner.program_cycle_status;
+      std::vector<core::RequiredManagerLivenessReceiverDTO> native_receivers;
+      native_receivers.reserve(runtime.plan.runtime_units.size());
+      const auto &retained_policy = deployment::
+          execution_runtime_contract::manager_liveness_policy();
+      for (const auto &row : runtime.plan.runtime_units) {
+        if (row.process_adapter_contract_id !=
+            deployment::execution_runtime_contract::
+                kProcessAdapterContractId) {
+          continue;
+        }
+        track("required_native_receiver_observable", "execution_host_unit",
+              row.runtime_unit_id.value());
+        const auto *observation =
+            runtime.observations.observation(row.runtime_unit_id.value());
+        if (observation == nullptr || observation->runtime_epoch().empty()) {
+          throw std::runtime_error(
+              "required native liveness receiver is not observable");
+        }
+        native_receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
+            row.runtime_unit_id,
+            core::RuntimeEpoch(observation->runtime_epoch()),
+            retained_policy.runtime_policy_id,
+            retained_policy.runtime_policy_revision});
+      }
+      auto receivers = native_receivers;
+      receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
+          runner.runtime_unit_id, runner.runtime_epoch,
+          core::RuntimePolicyId(std::string(kProgramRunnerLivenessPolicyId)),
+          core::RuntimePolicyRevision(
+              std::string(kProgramRunnerLivenessPolicyRevision))});
+      std::sort(receivers.begin(), receivers.end(),
+                [](const auto &left, const auto &right) {
+                  return std::tie(left.runtime_unit_id, left.runtime_epoch,
+                                  left.runtime_policy_id,
+                                  left.runtime_policy_revision) <
+                         std::tie(right.runtime_unit_id, right.runtime_epoch,
+                                  right.runtime_policy_id,
+                                  right.runtime_policy_revision);
+                });
+      track("required_runtime_set_valid", "cell");
+      const auto digest = core::ComputeRequiredRuntimeSetDigest(receivers);
+      core::ManagerLivenessRequiredSetDTO required_set{
+          admission_.cell_id(),
+          active_bundle.retained_bundle_id(),
+          digest,
+          core::RuntimeUnitId(std::string(
+              core::ApplicationRoleText(core::ApplicationRole::kManager))),
+          receivers};
+      if (!core::ValidateManagerLivenessRequiredSet(required_set).ok() ||
+          manager_heartbeat_sequence_ >= core::kMaximumManagerLivenessCounter) {
+        throw std::runtime_error(
+            "Manager cannot mint the exact native liveness required set");
+      }
+      const auto heartbeat_sequence = ++manager_heartbeat_sequence_;
+      // Renew the independent Runner before any native or readiness work.
+      // Apply may deliberately retire a native receiver; that is not
+      // evidence that this Manager process has disappeared.
+      track("program_runner_liveness_renewal", "cell-role:program_runner",
+            runner.runtime_unit_id.value());
+      auto renewal = RenewProgramRunnerLiveness(
+          config_.program_runner_liveness_socket, runner, required_set,
+          heartbeat_sequence, std::nullopt, end);
+      attempt.cycle_status = renewal.program_cycle_status;
+      if (renewal.observation.status.state !=
+              core::ManagerLivenessStateDTO::kCurrent &&
+          reconciled.has_value() &&
+          reconciled->required_runtime_set_digest == digest) {
+        track("program_runner_reconciliation_sequence_available",
+              "cell-role:program_runner", runner.runtime_unit_id.value());
+        Require(manager_heartbeat_sequence_ <
+                    core::kMaximumManagerLivenessCounter,
+                "Manager heartbeat sequence is exhausted");
+        track("program_runner_reconciliation_renewal",
+              "cell-role:program_runner", runner.runtime_unit_id.value());
+        renewal = RenewProgramRunnerLiveness(
+            config_.program_runner_liveness_socket, runner, required_set,
+            ++manager_heartbeat_sequence_,
+            reconciled->reconciliation_evidence_digest, end);
+        attempt.cycle_status = renewal.program_cycle_status;
+      }
+      attempt.required_set = std::move(required_set);
+      attempt.native_receivers = std::move(native_receivers);
+      attempt.heartbeat_sequence = heartbeat_sequence;
+      attempt.runner_observation = std::move(renewal.observation);
+    } catch (const detail::ProgramRunnerFault &error) {
+      fail(error.what());
+      attempt.failure->fault = error.error();
+      attempt.failure->fault_cycle = error.cycle();
+    } catch (const LocalExchangeStopped &) {
+      // The lane is stopping: not a lost contact; nothing is handed over.
+      attempt.stopped = true;
+    } catch (const std::exception &error) {
+      fail(error.what());
+    } catch (...) {
+      fail("unknown exception");
+      attempt.failure->unknown = true;
+    }
+  }
+
+  /// Host-liveness lane (OD-295 (3)(a)): from the latest Runner-lane attempt,
+  /// renew every required native receiver, publish the Runner's observation
+  /// to the Kernel and reduce one cell-admission readiness snapshot.
+  ///
+  /// Traced path: RetainedExecutionHostAdapter RenewManagerLivenessBatch ->
+  /// Kernel liveness publication -> BuildCellAdmissionReadiness. This lane
+  /// performs no process lifecycle call: it never reaches the active-runtime
+  /// coordinator's Observe/Initialize and therefore never starts a managed
+  /// unit. Its host waits end on reply, host exit or application stop
+  /// (OD-290 (a)); meanwhile the Runner lane renews the Runner on.
+  ///
+  /// A required owner that is missing, foreign or stale makes the observation
+  /// lane report non-converged evidence and makes this renewal throw; every
+  /// throw path above calls SubmitFailClosedReadiness, which publishes
+  /// `required_component_status_current=false` and
+  /// `deployment_status_current=false` before returning. Reports never expire:
+  /// a late or missing report closes nothing by itself and stops nothing.
+  /// The Runner observations reach the Kernel in the Runner lane's order, so
+  /// their status sequence stays strictly increasing; readiness is published
+  /// only after the Runner observation was.
+  HostLivenessOutcome
+  RenewNativeManagerLiveness(const RunnerLivenessAttempt &attempt) noexcept {
+    HostLivenessOutcome outcome;
+    const auto &snapshot = *attempt.snapshot;
+    const auto &runtime = snapshot.runtime;
+    const auto &active_bundle = *snapshot.active_bundle;
+    const auto probed_cycle_status = attempt.cycle_status;
     std::string_view failure_predicate = "program_runner_liveness_probe";
     std::string_view failure_scope = "cell-role:program_runner";
     std::array<char, 256U> failure_runtime_unit{};
@@ -4165,7 +4474,7 @@ private:
                     failure_runtime_unit.data());
     };
     const auto warn_failure = [&](const std::string_view cause) noexcept {
-      // Diagnostic identity only, owned by this single renewal lane. Lease
+      // Diagnostic identity only, owned by the host-liveness lane. Lease
       // counters and retry decisions never consult it. Diagnostic allocation
       // or stream failure must not escape into renewal or terminate its lane.
       const std::string_view runtime_unit(failure_runtime_unit.data(),
@@ -4198,100 +4507,62 @@ private:
         }
       }
     };
-    const auto record_attempt_failure = [&] {
-      manager_liveness_retry_gate_.RecordAttemptFailure(
-          native_batch, ElapsedNs(),
-          static_cast<std::uint64_t>(
-              deployment::execution_runtime_contract::
-                  manager_liveness_policy()
-                      .expiry_timeout_ns));
+    const auto snapshot_replaced = [&] {
+      std::lock_guard lock(manager_liveness_lane_mutex_);
+      return manager_liveness_snapshot_.has_value() &&
+             !SameNativeManagerLivenessIdentity(snapshot,
+                                                *manager_liveness_snapshot_);
     };
+    // Runner contact loss counts only while it lasts (OD-188 P3): a good
+    // probe ends it. The Stop it caused stays until the operator releases
+    // it; that Stop is the Kernel's, not this mark.
+    if (attempt.runner_probed) program_runner_contact_loss_.reset();
+    if (attempt.failure.has_value()) {
+      const auto &failure = *attempt.failure;
+      track_failure(failure.predicate, failure.scope, failure.runtime_unit);
+      if (failure.fault.has_value()) {
+        // A responding Runner is present. Its BB key publisher or its tick
+        // worker has failed; reuse required-owner containment without
+        // manufacturing process death.
+        track_failure("program_runner_fault", "cell-role:program_runner");
+        const auto &cycle = *failure.fault_cycle;
+        if (established_program_cycle_status_ &&
+            cycle.program_run_id ==
+                established_program_cycle_status_->program_run_id &&
+            cycle.cycle_claim_generation ==
+                established_program_cycle_status_->cycle_claim_generation) {
+          RetainRunnerContactFailure(failure_predicate, failure.fault->message,
+                                     failure.fault->code);
+        }
+        SubmitFailClosedReadiness(probed_cycle_status);
+        warn_failure(failure.cause);
+        return outcome;
+      }
+      if (failure_predicate == "program_runner_liveness_probe" ||
+          failure_predicate == "program_runner_liveness_renewal" ||
+          failure_predicate == "program_runner_reconciliation_renewal")
+        RetainRunnerContactFailure(failure_predicate,
+                                   failure.unknown
+                                       ? "Program Runner contact failed"
+                                       : std::string_view(failure.cause));
+      SubmitFailClosedReadiness(probed_cycle_status);
+      if (!snapshot_replaced()) warn_failure(failure.cause);
+      return outcome;
+    }
     try {
-      const auto runner = ProbeProgramRunnerLiveness(
-          config_.program_runner_liveness_socket, admission_.cell_id());
-      probed_cycle_status = runner.program_cycle_status;
-      std::vector<core::RequiredManagerLivenessReceiverDTO> native_receivers;
-      native_receivers.reserve(runtime.plan.runtime_units.size());
+      const auto &required_set = *attempt.required_set;
+      const auto &runner_observation = *attempt.runner_observation;
       const auto &retained_policy = deployment::
           execution_runtime_contract::manager_liveness_policy();
-      for (const auto &row : runtime.plan.runtime_units) {
-        if (row.process_adapter_contract_id !=
-            deployment::execution_runtime_contract::
-                kProcessAdapterContractId) {
-          continue;
-        }
-        track_failure("required_native_receiver_observable",
-                      "execution_host_unit",
-                      row.runtime_unit_id.value());
-        const auto *observation =
-            runtime.observations.observation(row.runtime_unit_id.value());
-        if (observation == nullptr || observation->runtime_epoch().empty()) {
-          throw std::runtime_error(
-              "required native liveness receiver is not observable");
-        }
-        native_receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
-            row.runtime_unit_id,
-            core::RuntimeEpoch(observation->runtime_epoch()),
-            retained_policy.runtime_policy_id,
-            retained_policy.runtime_policy_revision});
-      }
-      auto receivers = native_receivers;
-      receivers.push_back(core::RequiredManagerLivenessReceiverDTO{
-          runner.runtime_unit_id, runner.runtime_epoch,
-          core::RuntimePolicyId(std::string(kProgramRunnerLivenessPolicyId)),
-          core::RuntimePolicyRevision(
-              std::string(kProgramRunnerLivenessPolicyRevision))});
-      std::sort(receivers.begin(), receivers.end(),
-                [](const auto &left, const auto &right) {
-                  return std::tie(left.runtime_unit_id, left.runtime_epoch,
-                                  left.runtime_policy_id,
-                                  left.runtime_policy_revision) <
-                         std::tie(right.runtime_unit_id, right.runtime_epoch,
-                                  right.runtime_policy_id,
-                                  right.runtime_policy_revision);
-                });
-      track_failure("required_runtime_set_valid", "cell");
-      const auto digest = core::ComputeRequiredRuntimeSetDigest(receivers);
-      const core::ManagerLivenessRequiredSetDTO required_set{
-          admission_.cell_id(),
-          active_bundle.retained_bundle_id(),
-          digest,
-          core::RuntimeUnitId("component-manager." +
-                              admission_.cell_id().value()),
-          manager_runtime_epoch_,
-          core::RequestOwnerEpoch(manager_owner_epoch_),
-          receivers};
-      if (!core::ValidateManagerLivenessRequiredSet(required_set).ok() ||
-          manager_heartbeat_sequence_ >= core::kMaximumManagerLivenessCounter) {
-        throw std::runtime_error(
-            "Manager cannot mint the exact native liveness required set");
-      }
-      ++manager_heartbeat_sequence_;
-      // Renew the independent Runner before any native retry/backoff or
-      // readiness work. Apply may deliberately retire a native receiver;
-      // that is not evidence that this Manager process has disappeared.
-      track_failure("program_runner_liveness_renewal", "cell-role:program_runner",
-                    runner.runtime_unit_id.value());
-      auto runner_renewal = RenewProgramRunnerLiveness(
-          config_.program_runner_liveness_socket, runner, required_set,
-          manager_heartbeat_sequence_, std::nullopt);
-      probed_cycle_status = runner_renewal.program_cycle_status;
       track_failure("cell_admission_readiness_reduction", "cell");
-      if (!allow_native ||
-          !manager_liveness_retry_gate_.attempt_allowed(ElapsedNs())) {
+      if (!attempt.allow_native) {
         SubmitFailClosedReadiness(probed_cycle_status);
-        return required_owners_published;
+        return outcome;
       }
-      // A replacement Runner still reports its predecessor's durable cycle
-      // until the reconciliation renewal below succeeds. Keep admission
-      // closed, but do not prevent the renewal that establishes ownership.
-      if (!IsCurrentProgramRunnerOwner(*probed_cycle_status,
-                                       runner.runtime_epoch)) {
-        SubmitFailClosedReadiness(probed_cycle_status);
-      } else {
+      {
         const auto probed_readiness = BuildCellAdmissionReadiness(
             runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
-            forced_closed);
+            attempt.forced_closed);
         if (last_submitted_readiness_.has_value() &&
             *last_submitted_readiness_ != probed_readiness &&
             !IsSameProgramAdmissionProgress(*last_submitted_readiness_,
@@ -4305,9 +4576,7 @@ private:
       const core::ManagerHeartbeatDTO heartbeat{
           required_set.cell_id,
           required_set.manager_runtime_unit_id,
-          required_set.manager_runtime_epoch,
-          required_set.manager_owner_epoch,
-          manager_heartbeat_sequence_,
+          attempt.heartbeat_sequence,
           retained_policy.runtime_policy_id,
           retained_policy.runtime_policy_revision};
       std::optional<core::ManagerLivenessReconciliationAck> reconciliation;
@@ -4317,11 +4586,9 @@ private:
         material.push_back('\0');
         material.append(active_bundle.retained_bundle_id().value());
         material.push_back('\0');
-        material.append(digest.value());
+        material.append(required_set.required_runtime_set_digest.value());
         material.push_back('\0');
-        material.append(manager_runtime_epoch_.value());
-        material.push_back('\0');
-        material.append(manager_owner_epoch_);
+        material.append(application_start_text_);
         for (const auto &observation : runtime.observations.observations()) {
           material.push_back('\0');
           material.append(observation.runtime_unit_id());
@@ -4334,102 +4601,73 @@ private:
         reconciliation = core::ManagerLivenessReconciliationAck{
             required_set.cell_id,
             required_set.manager_runtime_unit_id,
-            required_set.manager_runtime_epoch,
-            required_set.manager_owner_epoch,
             required_set.active_bundle_id,
             required_set.required_runtime_set_digest,
             core::ContentDigest(content_identity::sha256_digest(material))};
       }
       std::vector<component_manager::ManagerLivenessTransportRequestDTO>
           requests;
-      requests.reserve(native_receivers.size());
-      for (const auto &receiver : native_receivers) {
+      requests.reserve(attempt.native_receivers.size());
+      for (const auto &receiver : attempt.native_receivers) {
         requests.push_back(
-            {receiver.runtime_unit_id,
-             runtime.plan.active_publication.publication_generation,
-             runtime.plan.active_publication.request.candidate_graph_revision,
-             runtime.plan.active_publication
-                 .durable_public_pointer_content_digest,
+            {receiver.runtime_unit_id, runtime.plan.active_publication,
              required_set, retained_policy, heartbeat, reconciliation});
       }
-      if (!requests.empty())
-        native_batch = BatchProgress::kInFlight;
       track_failure("native_liveness_batch", "required_native_receiver_batch");
       const auto responses =
           requests.empty()
               ? std::vector<core::ManagerLivenessObservationDTO>{}
               : execution_host_adapter_.RenewManagerLivenessBatch(requests);
-      if (responses.size() != native_receivers.size()) {
+      if (responses.size() != attempt.native_receivers.size()) {
         throw std::runtime_error(
             "native liveness batch returned the wrong receiver count");
       }
-      for (std::size_t index = 0U; index < native_receivers.size(); ++index) {
-        const auto &receiver = native_receivers[index];
+      for (std::size_t index = 0U; index < attempt.native_receivers.size();
+           ++index) {
+        const auto &receiver = attempt.native_receivers[index];
         const auto &response = responses[index];
         track_failure("native_receiver_reconciliation_identity",
                       "execution_host_unit",
                       receiver.runtime_unit_id.value());
-        if (response.active_bundle_id != required_set.active_bundle_id ||
-            response.required_runtime_set_digest != digest ||
-            response.status.receiver_runtime_unit_id !=
-                receiver.runtime_unit_id ||
-            response.status.receiver_runtime_epoch != receiver.runtime_epoch ||
-            response.status.manager_runtime_epoch != manager_runtime_epoch_ ||
-            response.status.manager_owner_epoch !=
-                core::RequestOwnerEpoch(manager_owner_epoch_) ||
-            response.status.runtime_policy_id != receiver.runtime_policy_id ||
-            response.status.runtime_policy_revision !=
-                receiver.runtime_policy_revision ||
-            response.status.last_accepted_heartbeat_sequence !=
-                manager_heartbeat_sequence_ ||
-            (reconciliation.has_value() &&
-             (response.status.state !=
-                  core::ManagerLivenessStateDTO::kCurrent ||
-              response.status.command_fenced))) {
+        if (reconciliation.has_value() &&
+            (response.status.state !=
+                 core::ManagerLivenessStateDTO::kCurrent ||
+             response.status.command_fenced)) {
           throw std::runtime_error(
               "native liveness receiver returned foreign reconciliation "
               "evidence");
         }
       }
-      native_batch = BatchProgress::kValidated;
       track_failure("runtime_reconciliation_converged", "cell");
       if (!reconciliation.has_value()) {
         throw std::runtime_error(
             "Execution readiness requires converged reconciliation");
       }
-      if (runner_renewal.observation.status.state !=
+      if (runner_observation.status.state !=
           core::ManagerLivenessStateDTO::kCurrent) {
-        track_failure("program_runner_reconciliation_sequence_available",
-                      "cell-role:program_runner",
-                      runner.runtime_unit_id.value());
-        Require(manager_heartbeat_sequence_ <
-                    core::kMaximumManagerLivenessCounter,
-                "Manager heartbeat sequence is exhausted");
-        track_failure("program_runner_reconciliation_renewal",
-                      "cell-role:program_runner",
-                      runner.runtime_unit_id.value());
-        runner_renewal = RenewProgramRunnerLiveness(
-            config_.program_runner_liveness_socket, runner, required_set,
-            ++manager_heartbeat_sequence_,
-            reconciliation->reconciliation_evidence_digest);
+        // Every native receiver of this required set is reconciled: the
+        // Runner lane now hands the same reconciliation to the Runner, and
+        // its next attempt is published.
+        {
+          std::lock_guard lock(manager_liveness_lane_mutex_);
+          manager_liveness_reconciled_set_ = ReconciledRequiredSet{
+              required_set.required_runtime_set_digest,
+              reconciliation->reconciliation_evidence_digest};
+          ++manager_liveness_wake_generation_;
+        }
+        manager_liveness_lane_condition_.notify_one();
+        return outcome;
       }
       // The Program Runner owns cycle progression. A Start or terminal event
       // may legitimately occur between the preflight probe and this renewal;
       // require the private receiver's exact process identity and publish the
       // newer owner-issued status instead of treating ordinary progress as a
       // liveness failure.
-      track_failure("program_runner_cycle_owner_current",
-                    "cell-role:program_runner",
-                    runner.runtime_unit_id.value());
-      Require(IsCurrentProgramRunnerOwner(runner_renewal.program_cycle_status,
-                                          runner.runtime_epoch),
-              "Program cycle is not issued by the current Program Runner");
-      probed_cycle_status = runner_renewal.program_cycle_status;
       track_failure("kernel_program_runner_liveness_publication",
                     "cell-role:program_runner",
-                    runner.runtime_unit_id.value());
+                    runner_observation.status.receiver_runtime_unit_id.value());
       const auto published_runner =
-          execution_host_adapter_.Publish(runner_renewal.observation);
+          execution_host_adapter_.Publish(runner_observation);
       if (!published_runner.ok()) {
         throw std::runtime_error(
             "Kernel rejected Program Runner liveness observation: " +
@@ -4438,12 +4676,11 @@ private:
       // The native rows and this actual Runner row now make the exact
       // successor renewal available to the existing Kernel owner guard.
       // Subsequent readiness reduction/publication is not a settlement gate.
-      required_owners_published = true;
-      successful_manager_renewal_ = SuccessfulManagerRenewal{snapshot, started_at};
+      outcome.renewed = true;
       track_failure("cell_admission_readiness_reduction", "cell");
       const auto readiness = BuildCellAdmissionReadiness(
           runtime, *probed_cycle_status, snapshot.unsettled_effect_count,
-          forced_closed);
+          attempt.forced_closed);
       // Renewal and owner identity are now validated. Publish the complete
       // reduction atomically; an artificial close/reopen here would expose a
       // false outage to already-running Program children.
@@ -4452,154 +4689,91 @@ private:
         track_failure("readiness_snapshot_current", "cell");
         {
           std::lock_guard lock(manager_liveness_lane_mutex_);
-          Require(forced_closed || (readiness_barrier ==
-                                        manager_liveness_readiness_barrier_ &&
-                                    !manager_liveness_force_closed_),
+          Require(attempt.forced_closed ||
+                      (attempt.readiness_barrier ==
+                           manager_liveness_readiness_barrier_ &&
+                       !manager_liveness_force_closed_),
                   "Manager liveness snapshot changed during renewal");
         }
         track_failure("kernel_cell_readiness_publication", "cell");
         SubmitCellAdmissionReadiness(readiness);
       }
-      manager_liveness_retry_gate_.RecordSuccess();
       manager_liveness_last_warning_.reset();
-    } catch (const component_manager::ManagerLivenessRuntimeTransition &) {
-      successful_manager_renewal_.reset();
-      // Runtime replacement is already fenced by Apply. No native heartbeat
-      // was sent, so this is ordinary convergence rather than an uncertain
-      // renewal. Keep readiness closed until the next exact snapshot arrives.
-      SubmitFailClosedReadiness(probed_cycle_status);
-      manager_liveness_retry_gate_.RecordSuccess();
     } catch (const component_manager::ManagerLivenessPublicationSuperseded &) {
-      successful_manager_renewal_.reset();
+      outcome.renewed = false;
       SubmitFailClosedReadiness(probed_cycle_status);
       {
         std::lock_guard lock(manager_liveness_lane_mutex_);
         if (!manager_liveness_snapshot_.has_value() ||
             !SameNativeManagerLivenessIdentity(snapshot,
                                                *manager_liveness_snapshot_)) {
-          return required_owners_published;
+          return outcome;
         }
         manager_liveness_superseded_publication_ =
             snapshot.runtime.plan.active_publication;
       }
       // Every native receiver rejected before renewal and the adapter drained
-      // the complete batch.  Preserve fail-closed readiness, but do not spend
-      // the lease-expiry retry budget on this expected publication race.
-      manager_liveness_retry_gate_.RecordSuccess();
-    } catch (const detail::ProgramRunnerPublisherFault &error) {
-      successful_manager_renewal_.reset();
-      // A responding Runner is present. Its independent publisher has failed;
-      // reuse required-owner containment without manufacturing process death.
-      track_failure("program_runner_publication_fault",
-                    "cell-role:program_runner");
-      const auto &cycle = error.cycle();
-      if (established_program_cycle_status_ &&
-          cycle.program_runner_owner_epoch ==
-              established_program_cycle_status_->program_runner_owner_epoch &&
-          cycle.program_run_id ==
-              established_program_cycle_status_->program_run_id &&
-          cycle.cycle_claim_generation ==
-              established_program_cycle_status_->cycle_claim_generation) {
-        RetainRunnerContactFailure(failure_predicate, error.what());
-      }
-      SubmitFailClosedReadiness(probed_cycle_status);
-      record_attempt_failure();
-      warn_failure(error.what());
+      // the complete batch: an expected publication race. Readiness stays
+      // fail-closed until the next exact snapshot.
     } catch (const std::exception &error) {
-      if (failure_predicate == "program_runner_liveness_probe" ||
-          failure_predicate == "program_runner_liveness_renewal" ||
-          failure_predicate == "program_runner_reconciliation_renewal")
-        RetainRunnerContactFailure(failure_predicate, error.what());
+      outcome.renewed = false;
       SubmitFailClosedReadiness(probed_cycle_status);
-      {
-        std::lock_guard lock(manager_liveness_lane_mutex_);
-        if (manager_liveness_snapshot_.has_value() &&
-            !SameNativeManagerLivenessIdentity(snapshot,
-                                               *manager_liveness_snapshot_)) {
-          return required_owners_published;
-        }
-      }
-      record_attempt_failure();
-      warn_failure(error.what());
+      if (!snapshot_replaced()) warn_failure(error.what());
     } catch (...) {
-      if (failure_predicate == "program_runner_liveness_probe" ||
-          failure_predicate == "program_runner_liveness_renewal" ||
-          failure_predicate == "program_runner_reconciliation_renewal")
-        RetainRunnerContactFailure(failure_predicate, "Program Runner contact failed");
+      outcome.renewed = false;
       SubmitFailClosedReadiness(probed_cycle_status);
-      {
-        std::lock_guard lock(manager_liveness_lane_mutex_);
-        if (manager_liveness_snapshot_.has_value() &&
-            !SameNativeManagerLivenessIdentity(snapshot,
-                                               *manager_liveness_snapshot_)) {
-          return required_owners_published;
-        }
-      }
-      record_attempt_failure();
-      warn_failure("unknown exception");
+      if (!snapshot_replaced()) warn_failure("unknown exception");
     }
-    return required_owners_published;
+    return outcome;
   }
 
-  bool SuccessfulRenewalIsCurrent(
+  /// Under manager_liveness_lane_mutex_. The latest host-liveness attempt
+  /// succeeded for this exact snapshot (every failed attempt clears it). The
+  /// final Kernel guard remains the authority for actual health.
+  bool SuccessfulRenewalIsCurrentLocked(
       const NativeManagerLivenessSnapshot &snapshot) const {
-    if (!successful_manager_renewal_ || program_runner_contact_loss_ ||
-        !SameNativeManagerLivenessIdentity(successful_manager_renewal_->snapshot, snapshot))
-      return false;
-    const auto now = ElapsedNs();
-    const auto started = successful_manager_renewal_->started_at_ns;
-    // Conservative reuse of the real lease: every receipt follows attempt
-    // start. The final Kernel guard remains the authority for actual health.
-    return now >= started && now - started < static_cast<std::uint64_t>(
-        deployment::execution_runtime_contract::manager_liveness_policy().expiry_timeout_ns);
+    return successful_manager_renewal_ && !manager_liveness_runner_contact_lost_ &&
+           SameNativeManagerLivenessIdentity(successful_manager_renewal_->snapshot, snapshot);
   }
 
-  bool RenewCurrentNativeManagerLiveness(
-      const component_manager::ManagerApplyIntentDTO *expected = nullptr,
-      const bool reuse_only = false) {
-    std::lock_guard attempt_lock(manager_liveness_attempt_mutex_);
-    const auto [snapshot, superseded, forced_closed, barrier] = [&] {
+  /// Apply lane. True when a renewal of this Apply's snapshot is already
+  /// current. Otherwise, with `renew`, a new attempt is posted to the
+  /// liveness lanes and false returned (OD-295 (3)(a)): no wait on another
+  /// lane. The release then stays a pending settlement; when the attempt that
+  /// answers the request is done, the host-liveness lane requests the
+  /// settlement retry, which picks up its result here.
+  bool ManagerLivenessRenewedFor(
+      const component_manager::ManagerApplyIntentDTO &expected,
+      const bool renew) {
+    {
       std::lock_guard lock(manager_liveness_lane_mutex_);
-      return std::tuple{manager_liveness_snapshot_, manager_liveness_superseded_publication_,
-                        manager_liveness_force_closed_, manager_liveness_readiness_barrier_};
-    }();
-    if (!snapshot) {
-      if (!reuse_only) SubmitFailClosedReadiness();
-      return false;
+      if (manager_liveness_snapshot_) {
+        if (!IsApplyPublication(*manager_liveness_snapshot_, expected))
+          return false;
+        if (SuccessfulRenewalIsCurrentLocked(*manager_liveness_snapshot_))
+          return true;
+      }
+      if (!renew || manager_liveness_lane_stop_) return false;
+      ++manager_liveness_renewal_requested_;
+      ++manager_liveness_wake_generation_;
     }
-    const auto &publication = snapshot->runtime.plan.active_publication;
-    if (expected &&
-        (publication.request.transaction_ref != core::ActiveBundlePublicationTransactionRefDTO{
-             core::NamedApplyPublicationTransactionDTO{expected->apply_id, expected->apply_generation}} ||
-         publication.request.candidate_retained_bundle_id != expected->candidate_retained_bundle_id ||
-         publication.request.candidate_graph_revision != expected->candidate_graph_revision))
-      return false;
-    if (expected && SuccessfulRenewalIsCurrent(*snapshot)) return true;
-    if (reuse_only) return false;
-    if (!manager_liveness_attempted_publication_ ||
-        *manager_liveness_attempted_publication_ != publication) {
-      // The SAME publication-boundary reset covers heartbeat and initial
-      // settlement, before the existing retry gate can skip a native attempt.
-      manager_liveness_retry_gate_.RecordSuccess();
-      manager_liveness_attempted_publication_ = publication;
-    }
-    const bool allow_native = !superseded || publication != *superseded;
-    const bool published = TryRenewNativeManagerLiveness(*snapshot, forced_closed,
-                                                        barrier, allow_native);
-    return published && !program_runner_contact_loss_;
+    manager_liveness_lane_condition_.notify_one();
+    return false;
   }
 
   bool PrepareSuccessfulApplySettlement(
       const component_manager::ManagerApplyIntentDTO &intent,
       const component_manager::ManagerApplySettlementAttempt attempt) {
     if (config_.program_runner_liveness_socket.empty()) return true;
-    if (RenewCurrentNativeManagerLiveness(&intent, true)) return true;
+    if (ManagerLivenessRenewedFor(intent, false)) return true;
     if (attempt == component_manager::ManagerApplySettlementAttempt::kOrdinaryHeartbeat)
       return false;  // No second attempt: use only this ordinary heartbeat.
     try {
-      // I/O stays outside renewal serialization and all host/Core locks.
+      // I/O stays outside the liveness lanes' lock and all host/Core locks.
+      // The renewal is posted; its result settles on the retry the
+      // host-liveness lane requests (OD-295 (3)(a)).
       static_cast<void>(ObserveRuntimeAndPublish());
-      return RenewCurrentNativeManagerLiveness(&intent);
+      return ManagerLivenessRenewedFor(intent, true);
     } catch (const std::exception &error) {
       std::cerr << "Manager Apply successor observation remains pending: " << error.what() << '\n';
     } catch (...) {
@@ -4612,12 +4786,18 @@ private:
     if (config_.program_runner_liveness_socket.empty()) {
       return;
     }
-    Require(!manager_liveness_lane_.joinable(),
+    Require(!manager_liveness_lane_.joinable() &&
+                !manager_host_liveness_lane_.joinable(),
             "Manager liveness renewal lane is already running");
     {
       std::lock_guard lock(manager_liveness_lane_mutex_);
       manager_liveness_lane_stop_ = false;
     }
+    runner_lane_stop_fd_ =
+        FileDescriptor(::eventfd(0U, EFD_CLOEXEC | EFD_NONBLOCK));
+    if (!runner_lane_stop_fd_) FailErrno("create the Runner lane stop signal");
+    manager_host_liveness_lane_ =
+        std::thread([this] { RunHostLivenessLane(); });
     manager_liveness_lane_ =
         std::thread([this] { RunNativeManagerLivenessLane(); });
   }
@@ -4630,10 +4810,18 @@ private:
       std::lock_guard lock(manager_liveness_lane_mutex_);
       manager_liveness_lane_stop_ = true;
     }
+    // Ends a Runner exchange the Runner lane waits on (OD-296 (a)).
+    const std::uint64_t one = 1U;
+    [[maybe_unused]] const auto io_result = ::write(runner_lane_stop_fd_.get(), &one, sizeof(one));
     manager_liveness_lane_condition_.notify_one();
+    manager_host_liveness_condition_.notify_one();
     manager_liveness_lane_.join();
+    manager_host_liveness_lane_.join();
   }
 
+  /// The Runner lane (OD-295 (3)(a)): renews the Program Runner on the
+  /// heartbeat period and on every wake, whatever the execution host does,
+  /// and hands each attempt to the host-liveness lane.
   void RunNativeManagerLivenessLane() noexcept {
     const auto heartbeat_period = std::chrono::nanoseconds(
         deployment::execution_runtime_contract::manager_liveness_policy().heartbeat_period_ns);
@@ -4644,44 +4832,218 @@ private:
       if (ordinary_heartbeat)
         next_heartbeat = std::chrono::steady_clock::now() + heartbeat_period;
       const auto wake_generation = manager_liveness_wake_generation_;
+      RunnerLivenessAttempt attempt;
+      attempt.snapshot = manager_liveness_snapshot_;
+      attempt.forced_closed = manager_liveness_force_closed_;
+      attempt.readiness_barrier = manager_liveness_readiness_barrier_;
+      attempt.allow_native =
+          attempt.snapshot &&
+          (!manager_liveness_superseded_publication_ ||
+           attempt.snapshot->runtime.plan.active_publication !=
+               *manager_liveness_superseded_publication_);
+      attempt.renewal_request = manager_liveness_renewal_requested_;
+      attempt.ordinary_heartbeat = ordinary_heartbeat;
+      const auto reconciled = manager_liveness_reconciled_set_;
       lock.unlock();
-      static_cast<void>(RenewCurrentNativeManagerLiveness());
-      // Only tag the actual pending Apply with this ordinary heartbeat.
-      // The existing progress owner performs release RPCs; this independent
-      // lease lane never waits behind that owner's operation or transport.
-      try {
-        if (ordinary_heartbeat) {
-          if (const auto pending = named_apply_.PendingSettlementForHeartbeat())
-            RequestApplySettlementProgress(*pending);
-        }
-      } catch (const std::exception &error) {
-        std::cerr << "Manager Apply heartbeat settlement stopped fail-closed: "
-                  << error.what() << '\n';
-      } catch (...) {
-        std::cerr << "Manager Apply heartbeat settlement stopped fail-closed after an unknown error\n";
-      }
+      if (attempt.snapshot) RenewProgramRunner(attempt, reconciled);
       lock.lock();
+      if (attempt.stopped) break;
+      // Latest value: an attempt the host-liveness lane has not taken yet is
+      // replaced; its ordinary heartbeat is kept.
+      if (manager_liveness_runner_attempt_ &&
+          manager_liveness_runner_attempt_->ordinary_heartbeat)
+        attempt.ordinary_heartbeat = true;
+      manager_liveness_runner_attempt_ = std::move(attempt);
+      manager_host_liveness_condition_.notify_one();
       const bool woken = manager_liveness_lane_condition_.wait_until(
           lock, next_heartbeat, [&] {
             return manager_liveness_lane_stop_ ||
                    manager_liveness_wake_generation_ != wake_generation;
           });
       // Keep this SAME ordinary deadline through extra publication/control
-      // wakes: they may renew leases, but cannot starve the timed retry.
+      // wakes: they may report early, but cannot starve the timed report.
       ordinary_heartbeat = !woken;
     }
   }
 
+  /// The host-liveness lane (OD-295 (3)(a)): the only lane that publishes
+  /// liveness and readiness to the Kernel. It takes the latest Runner-lane
+  /// attempt and the Apply lane's close requests; no lock is held across
+  /// its host I/O.
+  void RunHostLivenessLane() noexcept {
+    std::unique_lock lock(manager_liveness_lane_mutex_);
+    while (true) {
+      manager_host_liveness_condition_.wait(lock, [&] {
+        return manager_liveness_lane_stop_ ||
+               manager_liveness_runner_attempt_.has_value() ||
+               manager_liveness_close_requested_ !=
+                   manager_liveness_close_completed_;
+      });
+      if (manager_liveness_lane_stop_) break;
+      const auto close_request = manager_liveness_close_requested_;
+      const bool close = close_request != manager_liveness_close_completed_;
+      auto attempt = std::move(manager_liveness_runner_attempt_);
+      manager_liveness_runner_attempt_.reset();
+      lock.unlock();
+      if (close) {
+        const bool closed = CloseReadinessForMaintenance();
+        lock.lock();
+        manager_liveness_close_completed_ = close_request;
+        manager_liveness_close_result_ = closed;
+        lock.unlock();
+        // The Apply lane picks the result up on its next pass (OD-295 (3)(a)).
+        RequestApplyProgress();
+      }
+      if (attempt) {
+        HostLivenessOutcome outcome;
+        if (attempt->snapshot)
+          outcome = RenewNativeManagerLiveness(*attempt);
+        else
+          SubmitFailClosedReadiness();
+        lock.lock();
+        // Without a snapshot the last successful renewal stays as it is.
+        if (outcome.renewed)
+          successful_manager_renewal_ = SuccessfulManagerRenewal{*attempt->snapshot};
+        else if (attempt->snapshot)
+          successful_manager_renewal_.reset();
+        manager_liveness_runner_contact_lost_ =
+            program_runner_contact_loss_.has_value();
+        // This attempt answers an Apply's renewal request (OD-295 (3)(a)).
+        const bool answered_request =
+            attempt->renewal_request != manager_liveness_renewal_completed_;
+        manager_liveness_renewal_completed_ = attempt->renewal_request;
+        lock.unlock();
+        // Only tag the actual pending Apply with an ordinary heartbeat or the
+        // attempt its renewal request asked for. The existing progress owner
+        // performs release RPCs; this lane never waits behind that owner's
+        // operation or transport.
+        try {
+          if (attempt->ordinary_heartbeat || answered_request) {
+            if (const auto pending = named_apply_.PendingSettlementForHeartbeat())
+              RequestApplySettlementProgress(*pending);
+          }
+        } catch (const std::exception &error) {
+          std::cerr << "Manager Apply heartbeat settlement stopped fail-closed: "
+                    << error.what() << '\n';
+        } catch (...) {
+          std::cerr << "Manager Apply heartbeat settlement stopped fail-closed after an unknown error\n";
+        }
+      }
+      lock.lock();
+    }
+  }
+
+  /// Under manager_source_mutex_. Every Manager section value goes through
+  /// here: `payload` is kept as the last base value and published with the
+  /// outstanding exchanges the main thread last read (information only).
+  std::uint64_t PublishManagerSectionLocked(const std::int64_t observed_at,
+                                            CanonicalValue payload) {
+    last_manager_payload_ = std::move(payload);
+    return PublishManagerValueLocked(observed_at);
+  }
+
+  /// Under manager_source_mutex_, with a last base value.
+  std::uint64_t PublishManagerValueLocked(const std::int64_t observed_at) {
+    if (outstanding_exchanges_.empty())
+      return status_board_.Publish(ManagerStatusSection::kManager, observed_at,
+                                   *last_manager_payload_);
+    return status_board_.Publish(ManagerStatusSection::kManager, observed_at,
+                                 WithOutstandingExchangesLocked());
+  }
+
+  /// Under manager_source_mutex_: the last base value with
+  /// `runtime.outstanding_exchanges` when an exchange is outstanding
+  /// (optional field, absent otherwise; OD-295 (1)(a), OD-296 (a),
+  /// OD-298 (a)).
+  [[nodiscard]] CanonicalValue WithOutstandingExchangesLocked() const {
+    auto object = last_manager_payload_->as_object();
+    for (auto &[key, value] : object) {
+      if (key != "runtime" || !value.is_object()) continue;
+      auto runtime = value.as_object();
+      runtime.emplace_back("outstanding_exchanges",
+                           CanonicalValue(outstanding_exchanges_));
+      value = CanonicalValue(std::move(runtime));
+    }
+    return CanonicalValue(std::move(object));
+  }
+
+  /// Main thread, at each status tick: what the Manager waits for now, as
+  /// information only; it never ends, halts or faults anything. An exchange
+  /// with the execution host (the management channel; a command held by the
+  /// host shows here as "waiting for execution host", OD-298 (a)) or with the
+  /// Program Runner (OD-296 (a)) that is still outstanding at the next tick
+  /// is published with its peer, channel, kind and start (`since_ns`, the
+  /// clock of `observed_at_ns`); it goes when its reply is in. The rule is
+  /// the late-reply log's (OD-290 (a)). Republishes the Manager section only
+  /// when the set changes.
+  void PublishOutstandingExchanges() noexcept {
+    try {
+      const auto now_ns = static_cast<std::int64_t>(ElapsedNs());
+      CanonicalValue::Array rows;
+      const auto row = [&](const char *peer, const char *channel,
+                           const std::string &exchange,
+                           const std::int64_t since_ns) {
+        rows.emplace_back(CanonicalValue(CanonicalValue::Object{
+            {"channel", CanonicalValue(channel)},
+            {"exchange", CanonicalValue(exchange)},
+            {"peer", CanonicalValue(peer)},
+            {"since_ns", CanonicalValue(static_cast<double>(since_ns))},
+        }));
+      };
+      // Seen at two ticks in a row: published, with the start it had at the
+      // first one.
+      const auto observe = [](OutstandingSeen &seen, const std::uint64_t episode,
+                              const std::int64_t since_ns) {
+        const bool again = episode != 0U && seen.episode == episode;
+        if (!again) seen = OutstandingSeen{episode, since_ns};
+        return again;
+      };
+      const auto host = execution_host_adapter_.HostReplyOutstanding();
+      if (observe(host_outstanding_seen_, host ? host->episode : 0U,
+                  host ? now_ns - static_cast<std::int64_t>(
+                                      std::chrono::nanoseconds(host->waited)
+                                          .count())
+                       : 0))
+        row("execution_host", "management", host->exchange,
+            host_outstanding_seen_.since_ns);
+      const auto runner = runner_exchanges_.Oldest();
+      if (observe(runner_outstanding_seen_, runner ? runner->episode : 0U,
+                  runner ? now_ns - static_cast<std::int64_t>(
+                                        std::chrono::duration_cast<
+                                            std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now() -
+                                            runner->since)
+                                            .count())
+                         : 0))
+        row("program_runner", "liveness", runner->exchange,
+            runner_outstanding_seen_.since_ns);
+      std::lock_guard source_lock(manager_source_mutex_);
+      if (rows == outstanding_exchanges_) return;
+      outstanding_exchanges_ = std::move(rows);
+      if (last_manager_payload_.has_value())
+        static_cast<void>(PublishManagerValueLocked(now_ns));
+    } catch (const std::exception &error) {
+      std::cerr << "Manager outstanding-exchange publication failed: "
+                << error.what() << '\n';
+    } catch (...) {
+      std::cerr << "Manager outstanding-exchange publication failed\n";
+    }
+  }
+
+  /// Command strand and Apply lane, with no lock held. One numbered read of
+  /// the scene owner; the board keeps the value of the newest read (OD-302),
+  /// so a slower caller's older value is refused and the generation returned
+  /// is that of a value at least as new as this read.
   std::uint64_t PublishLogicalScene(const std::int64_t observed_at) {
-    const auto access = scene_owner_.ReadAccessStatus();
-    const auto snapshot = scene_owner_.ReadActiveSnapshot();
-    Require(snapshot.has_value(),
+    const auto read = scene_owner_.ReadPublication();
+    Require(read.snapshot.has_value(),
             "Manager daemon cannot publish an absent post-bootstrap scene");
-    const auto scene_epoch = scene_owner_.CurrentRequestOwnerEpoch().value();
-    return scene_channel_
-        .Publish("logical_scene", scene_owner_id_, scene_epoch, observed_at,
-                 BuildLogicalSceneSourcePayload(access, snapshot))
-        .source_generation;
+    const auto generation = status_board_.PublishOrdered(
+        ManagerStatusSection::kLogicalScene, read.read_sequence, observed_at,
+        BuildLogicalSceneSourcePayload(read.access, read.snapshot));
+    // Also carries a Manager value stored just before under the source lock.
+    status_board_.NotifyIfChanged();
+    return generation;
   }
 
   void TryPublishLogicalScene() noexcept {
@@ -4712,8 +5074,10 @@ private:
                                              "source_epoch_order")},
         });
       }
-      static_cast<void>(viewer_pose_sessions_channel_.Publish(
-          "scene_runtime", scene_runtime_owner_id_, scene_runtime_owner_epoch_,
+      // Under the source lock: memory only; the caller's next publication
+      // or the status tick wakes the writers.
+      static_cast<void>(status_board_.Publish(
+          ManagerStatusSection::kViewerPoseSessions,
           static_cast<std::int64_t>(ElapsedNs()),
           CanonicalValue(CanonicalValue::Object{
               {"runtime_identity", *identity},
@@ -4728,12 +5092,21 @@ private:
     }
   }
 
+  /// Command strand and Apply lane, with no lock held. Every input of the
+  /// value (the runtime owner's snapshot, the pose replays, the configured
+  /// pose sources) is read in one manager_source_mutex_ hold, which numbers
+  /// the read; the board keeps the value of the newest read (OD-302), so a
+  /// slower caller's older value is refused and the generation returned is
+  /// that of a value at least as new as this read.
   std::uint64_t PublishSceneRuntime(const std::int64_t observed_at) {
-    const auto runtime_snapshot = scene_runtime_owner_.Snapshot();
-    auto payload = BuildSceneRuntimeSourcePayload(
-        admission_.cell_id().value(), runtime_snapshot);
+    CanonicalValue payload;
+    std::uint64_t read_sequence = 0U;
     {
       std::lock_guard lock(manager_source_mutex_);
+      read_sequence = ++scene_runtime_read_sequence_;
+      const auto runtime_snapshot = scene_runtime_owner_.Snapshot();
+      payload = BuildSceneRuntimeSourcePayload(admission_.cell_id().value(),
+                                               runtime_snapshot);
       auto payload_object =
           std::get<CanonicalValue::Object>(payload.storage());
       const auto state = std::find_if(
@@ -4828,10 +5201,11 @@ private:
                                   CanonicalValue(std::move(joint_states)));
       payload = CanonicalValue(std::move(payload_object));
     }
-    return scene_runtime_channel_
-        .Publish("scene_runtime", scene_runtime_owner_id_,
-                 scene_runtime_owner_epoch_, observed_at, std::move(payload))
-        .source_generation;
+    const auto generation = status_board_.PublishOrdered(
+        ManagerStatusSection::kSceneRuntime, read_sequence, observed_at,
+        payload);
+    status_board_.NotifyIfChanged();
+    return generation;
   }
 
   void TryPublishApplyTransition() noexcept {
@@ -4852,8 +5226,7 @@ private:
         // runtime, which holds the new publication.
         if (ManagerRuntimeAccountsForCommittedApplies(*last_runtime_,
                                                       apply_inventory)) {
-          static_cast<void>(manager_channel_.Publish(
-              "component_manager", manager_owner_id_, manager_owner_epoch_,
+          static_cast<void>(PublishManagerSectionLocked(
               observed_at,
               BuildManagerSourcePayload(
                   *last_active_bundle_, admission_, *last_runtime_,
@@ -4923,9 +5296,9 @@ private:
     {
       std::lock_guard lock(apply_progress_lane_mutex_);
       apply_progress_lane_stop_ = false;
-      apply_progress_requested_ = true;
+      // Nothing to resume: the Apply journal is fresh at every start (B1).
+      apply_progress_requested_ = false;
       apply_settlement_retry_requested_.reset();
-      apply_progress_faulted_ = false;
     }
     apply_progress_lane_ = std::thread([this] { RunApplyProgressLane(); });
   }
@@ -4945,7 +5318,7 @@ private:
   void RequestApplyProgress() noexcept {
     {
       std::lock_guard lock(apply_progress_lane_mutex_);
-      if (apply_progress_lane_stop_ || apply_progress_faulted_) {
+      if (apply_progress_lane_stop_) {
         return;
       }
       apply_progress_requested_ = true;
@@ -4957,7 +5330,7 @@ private:
       const core::NamedApplyPublicationTransactionDTO &expected) {
     {
       std::lock_guard lock(apply_progress_lane_mutex_);
-      if (apply_progress_lane_stop_ || apply_progress_faulted_) return;
+      if (apply_progress_lane_stop_) return;
       // One coalesced scheduling reference, never a replacement journal fact.
       apply_settlement_retry_requested_ = expected;
     }
@@ -5004,16 +5377,19 @@ private:
         if (succeeded)
           CollectUnreferencedActivationContent();
       } catch (const std::exception &error) {
-        std::cerr << "Manager daemon Apply progression stopped fail-closed: "
+        // A nonterminal Apply's step failure is already its terminal outcome
+        // (`apply_progression_failed`, in the coordinator) and a release after
+        // a terminal outcome is a pending settlement, so this lane never parks
+        // (OD-188 P1). What still escapes (a journal read or write) is logged;
+        // the periodic tick requests the next pass while an Apply is open.
+        std::cerr << "Manager daemon Apply progression pass failed: "
                   << error.what() << '\n';
         lock.lock();
-        apply_progress_faulted_ = true;
         continue;
       } catch (...) {
-        std::cerr << "Manager daemon Apply progression stopped fail-closed "
-                     "after an unknown failure\n";
+        std::cerr << "Manager daemon Apply progression pass failed with an "
+                     "unknown error\n";
         lock.lock();
-        apply_progress_faulted_ = true;
         continue;
       }
 
@@ -5070,7 +5446,7 @@ private:
           active.program_revision = core::ProgramRevision(revision->as_string());
       }
       const auto collected = deployment::collect_unreferenced_activation_content(
-          config_.activation_root, active);
+          config_.activation_root, active, activation_content_references_);
       // One line per run, also when nothing is removed or a preparation
       // deferred it: its duration is time this lane holds the writer lock.
       std::cerr << "Manager activation content collection: "
@@ -5079,6 +5455,7 @@ private:
                 << " removed=" << collected.removed_entries
                 << " removed_bytes=" << collected.removed_bytes
                 << " read_bytes=" << collected.read_bytes
+                << " reused_documents=" << collected.reused_documents
                 << " elapsed_ms=" << elapsed_ms() << '\n';
     } catch (const std::exception &error) {
       std::cerr << "Manager activation content collection skipped after "
@@ -5087,12 +5464,17 @@ private:
   }
 
   void RequireCurrentPackageGeneration() {
-    package_generation_.RequireCurrent(
-        deployment::runtime_contract_declaration_registry()
-            .package_manifest_set());
+    package_generation_.RequireCurrent();
   }
 
   void PublishPackageRestartRequired() noexcept {
+    StorePackageRestartRequired();
+    status_board_.NotifyIfChanged();
+  }
+
+  /// The Manager value of a required restart, stored under the source lock.
+
+  void StorePackageRestartRequired() noexcept {
     std::lock_guard source_lock(manager_source_mutex_);
     kernel_apply_available_ = false;
     if (!last_runtime_.has_value() || last_active_bundle_ == nullptr) {
@@ -5107,8 +5489,7 @@ private:
         // would be inconsistent. Readers keep the previous value.
         return;
       }
-      static_cast<void>(manager_channel_.Publish(
-          "component_manager", manager_owner_id_, manager_owner_epoch_,
+      static_cast<void>(PublishManagerSectionLocked(
           static_cast<std::int64_t>(ElapsedNs()),
           BuildManagerSourcePayload(
               *last_active_bundle_, admission_, *last_runtime_, stores_.apply_journal(),
@@ -5155,11 +5536,23 @@ private:
                                           selected->deadband_rotation_rad};
   }
 
+  /// A class 1 key of minter 1 (the Manager), sequence from 1 per start
+  /// (contract 1.4). Memory only; no lock.
+  [[nodiscard]] core::RequestKey MintRequestKey() noexcept {
+    return core::RequestKey::Make(
+        core::RequestKeyClass::kInternal, 0U,
+        static_cast<std::uint64_t>(core::RequestKeyMinter::kManager),
+        next_request_key_sequence_.fetch_add(1U, std::memory_order_relaxed) + 1U);
+  }
+
   // Requests the normal operational Stop of the carrier's motion through the
   // Kernel's Stop control socket, as the public Stop route does.
   // It names the holder and every component it is mounted on, from the
   // active bundle's cell graph, so a loss during an arm move stops the arm.
-  // A component with no running motion is a no-effect Stop.
+  // A component with no running motion is a no-effect Stop. No time limit
+  // (OD-306 (a)): the exchange ends on the host's reply, on the host closing
+  // or refusing the connection (`carrier_stop_unavailable`), or on the
+  // application stop (`application_stopping`).
   std::optional<core::ErrorDTO>
   RequestCarrierStop(const SceneRuntimeCarriedObjectLoss &loss) {
     constexpr std::string_view source = "manager.carried_object_lost";
@@ -5182,7 +5575,7 @@ private:
       const auto response = ExchangeLocalPacket(
           config_.execution_run_root / "execution-control.sock",
           CanonicalValue(CanonicalValue::Object{
-              {"api_version", CanonicalValue("manyforge.execution_command.v3")},
+              {"api_version", CanonicalValue("manyforge.execution_command.v4")},
               {"attribution",
                CanonicalValue(CanonicalValue::Object{
                    {"assurance", CanonicalValue("unverified")},
@@ -5196,16 +5589,10 @@ private:
                                   core::kCarriedObjectLostReason))},
                    {"request_context",
                     CanonicalValue(CanonicalValue::Object{
-                        {"correlation_id",
-                         CanonicalValue(
-                             loss.carried_object_attachment_id.value())},
-                        {"request_id", CanonicalValue(loss.request_id)},
-                        // The Manager does not track the Kernel's owner
-                        // epoch: the Kernel records and journals a Stop with
-                        // a foreign epoch under its own current epoch.
-                        {"request_owner_epoch", CanonicalValue(std::string(source))},
+                        {"request_key", RequestKeyValue(MintRequestKey())},
                         {"source_label", CanonicalValue(std::string(source))}})}})}}),
-          "Kernel Stop control", {kMaximumKernelStopResponseBytes, 32U});
+          "Kernel Stop control", {kMaximumKernelStopResponseBytes, 32U},
+          {execution_host_adapter_.AbandonSignalFd()});
       const auto *ok = response.find_object_member("ok");
       if (ok != nullptr && std::get_if<bool>(&ok->storage()) != nullptr &&
           std::get<bool>(ok->storage())) {
@@ -5218,16 +5605,136 @@ private:
           code != nullptr && code->is_string() ? code->as_string()
                                                : "carrier_stop_refused",
           "Kernel refused the carried-object-lost Stop", {}};
+    } catch (const LocalExchangeStopped &error) {
+      return core::ErrorDTO{
+          std::string(component_manager::kApplicationStoppingCode),
+          error.what(), {}};
     } catch (const std::exception &error) {
       return core::ErrorDTO{"carrier_stop_unavailable", error.what(), {}};
     }
+  }
+
+  /// A late execution host reply is information, never a trigger
+  /// (OD-290 (a)): an exchange whose reply is still outstanding at the next
+  /// observation tick gets one typed line, and one more when its reply
+  /// arrives. Nothing is halted and the host unit does not count as faulted;
+  /// new requests to the host meet the outstanding exchange and are answered
+  /// `execution_host_late` at once. Main thread; non-blocking reads under the
+  /// adapter's leaf locks only.
+  void LogExecutionHostLateReply() noexcept {
+    const auto outstanding = execution_host_adapter_.HostReplyOutstanding();
+    if (late_reply_logged_.has_value() &&
+        (!outstanding || outstanding->episode != late_reply_logged_->first)) {
+      std::cerr << "{\"code\":\"execution_host_late_reply_settled\","
+                   "\"exchange\":\""
+                << late_reply_logged_->second << "\"}\n";
+      late_reply_logged_.reset();
+    }
+    if (outstanding && outstanding->episode == late_reply_seen_episode_ &&
+        !late_reply_logged_.has_value()) {
+      std::cerr << "{\"code\":\"execution_host_late_reply\",\"exchange\":\""
+                << outstanding->exchange
+                << "\",\"waited_ms\":" << outstanding->waited.count() << "}\n";
+      try {
+        late_reply_logged_.emplace(outstanding->episode, outstanding->exchange);
+      } catch (...) {
+      }
+    }
+    late_reply_seen_episode_ = outstanding ? outstanding->episode : 0U;
+  }
+
+  /// Planned application stop (OD-121 (7), (19); stop state model S17): one
+  /// Halt on the Kernel's existing Stop control socket (the channel
+  /// RequestCarrierStop uses), then `read_stop` polls until its event is
+  /// complete. No time limit (OD-187 (1), OD-306 (a)): the wait ends when the
+  /// Stop is complete, when the host refuses, cannot be reached or closes the
+  /// connection (the exchange fails), or when a second stop request forces
+  /// the stop. The abandon signal is already written here, so each exchange
+  /// re-checks the forced stop between short poll slices instead. Returns
+  /// true only when the Stop completed.
+  [[nodiscard]] bool RequestPlannedStopAndWait() noexcept {
+    std::cerr << "application stop: waiting at halt: the Stop to complete\n";
+    const auto socket = config_.execution_run_root / "execution-control.sock";
+    const auto attribution = CanonicalValue(CanonicalValue::Object{
+        {"assurance", CanonicalValue("unverified")},
+        {"principal_id", CanonicalValue(nullptr)},
+        {"transport", CanonicalValue("internal")}});
+    const char *outcome = "not_settled";
+    const LocalExchangeEnd forced_end{-1, nullptr, nullptr,
+                                      &StopForceRequested};
+    try {
+      const auto response = ExchangeLocalPacket(
+          socket,
+          CanonicalValue(CanonicalValue::Object{
+              {"api_version", CanonicalValue("manyforge.execution_command.v4")},
+              {"attribution", attribution},
+              {"command", CanonicalValue("halt")},
+              {"request",
+               CanonicalValue(CanonicalValue::Object{
+                   {"request_context",
+                    CanonicalValue(CanonicalValue::Object{
+                        {"request_key", RequestKeyValue(MintRequestKey())},
+                        {"source_label",
+                         CanonicalValue("manager.planned_application_stop")}})}})}}),
+          "Kernel Stop control", {kMaximumKernelStopResponseBytes, 32U},
+          forced_end);
+      const auto *accepted = response.find_object_member("accepted");
+      const auto *event_id =
+          accepted != nullptr ? accepted->find_object_member("event_id") : nullptr;
+      if (event_id == nullptr) {
+        outcome = "refused";
+      }
+      while (event_id != nullptr) {
+        if (StopForceRequested()) {
+          LogStopForced("halt");
+          return false;
+        }
+        const auto read = ExchangeLocalPacket(
+            socket,
+            CanonicalValue(CanonicalValue::Object{
+                {"api_version", CanonicalValue("manyforge.execution_command.v4")},
+                {"attribution", attribution},
+                {"command", CanonicalValue("read_stop")},
+                {"event_id", *event_id}}),
+            "Kernel Stop control", {kMaximumKernelStopResponseBytes, 32U},
+            forced_end);
+        const auto *status = read.find_object_member("stop_status");
+        if (status == nullptr) {
+          // The host answered the read with an error: the Stop's state
+          // cannot be followed.
+          outcome = "refused";
+          break;
+        }
+        const auto *state = status->find_object_member("state");
+        if (state != nullptr && state->is_string() && state->as_string() == "complete") {
+          outcome = nullptr;
+          break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+      }
+    } catch (const LocalExchangeStopped &) {
+      LogStopForced("halt");
+      return false;
+    } catch (const std::exception &) {
+      outcome = "unavailable";
+    }
+    if (outcome != nullptr) {
+      constexpr std::string_view kPlannedStopOverrunCode = "manager_planned_stop_overrun";
+      std::cerr << "{\"code\":\"" << kPlannedStopOverrunCode << "\",\"outcome\":\""
+                << outcome << "\"}\n";
+      return false;
+    }
+    std::cerr << "application stop: halt complete\n";
+    return true;
   }
 
   // Publishes one gripper's `carried_object_lost.<target>` system signal level
   // into the execution host's signal ingress, on the same control socket and
   // envelope as the loss Stop. `loss` (attachment, object,
   // loss event id, stored key) is present iff the level is `true`. The
-  // host records the level even while no composition holds the signal.
+  // host records the level even while no composition holds the signal. No
+  // time limit (OD-306 (a)): ends on the reply, the host closing or refusing
+  // the connection, or the application stop (`application_stopping`).
   std::optional<core::ErrorDTO> PublishCarriedObjectLostLevel(
       const core::ControllableComponentId &component,
       const core::CommandTargetId &target,
@@ -5236,7 +5743,7 @@ private:
       const auto response = ExchangeLocalPacket(
           config_.execution_run_root / "execution-control.sock",
           CanonicalValue(CanonicalValue::Object{
-              {"api_version", CanonicalValue("manyforge.execution_command.v3")},
+              {"api_version", CanonicalValue("manyforge.execution_command.v4")},
               {"attribution",
                CanonicalValue(CanonicalValue::Object{
                    {"assurance", CanonicalValue("unverified")},
@@ -5261,7 +5768,8 @@ private:
                                    ? CanonicalValue(*loss->set_key)
                                    : CanonicalValue(nullptr)}})}}),
           "Kernel carried-object-lost signal",
-          {kMaximumKernelStopResponseBytes, 32U});
+          {kMaximumKernelStopResponseBytes, 32U},
+          {execution_host_adapter_.AbandonSignalFd()});
       const auto *ok = response.find_object_member("ok");
       if (ok == nullptr || !ok->is_bool() || !ok->as_bool()) {
         const auto *error = response.find_object_member("error");
@@ -5283,6 +5791,10 @@ private:
                               "signal level recorded but not yet delivered",
                               {}};
       return std::nullopt;
+    } catch (const LocalExchangeStopped &error) {
+      return core::ErrorDTO{
+          std::string(component_manager::kApplicationStoppingCode),
+          error.what(), {}};
     } catch (const std::exception &error) {
       return core::ErrorDTO{"carried_object_lost_signal_unavailable",
                             error.what(), {}};
@@ -5350,9 +5862,9 @@ private:
           !snapshot.program_cycle_status->accepted_reset)
         return;
       const auto &reset = *snapshot.program_cycle_status->accepted_reset;
-      if (cleared_reset_request_id_ == reset.request_id.value())
+      if (cleared_reset_request_key_ == reset.request_key)
         return;
-      cleared_reset_request_id_ = reset.request_id.value();
+      cleared_reset_request_key_ = reset.request_key;
       const auto bundle = verified_package_.get_verified(
           scene_owner_.CurrentProjectionRevision().retained_bundle_id);
       if (bundle == nullptr)
@@ -5814,7 +6326,7 @@ private:
   bool HandleOneClient(const CommandSocket &socket) {
     sockaddr_un peer_address{};
     socklen_t peer_address_size = sizeof(peer_address);
-    const FileDescriptor client(
+    FileDescriptor client(
         ::accept4(socket.get(), reinterpret_cast<sockaddr *>(&peer_address),
                   &peer_address_size, SOCK_CLOEXEC | SOCK_NONBLOCK));
     if (!client) {
@@ -5854,8 +6366,7 @@ private:
         } catch (const ManagerPackageGenerationRestartRequired &error) {
           PublishPackageRestartRequired();
           if (command.kind == CommandKind::kApply &&
-              command.request_id.has_value() &&
-              command.request_owner_epoch.has_value()) {
+              command.request_key.has_value()) {
             TrySendResponse(client.get(),
                             ApplyDetailedErrorResponse(command, error.error()));
           } else {
@@ -5868,41 +6379,8 @@ private:
         }
       }
       switch (command.kind) {
-      case CommandKind::kComponentProcessStopOffer: {
-        Require(command.process_stop_offer_component.has_value(), "component process Stop offer lacks its addressed component");
-        const auto offered = ReadComponentProcessStopOffer(*command.process_stop_offer_component);
-        if (!offered.ok()) {
-          auto fields = DetailedErrorResponse(offered.error().code, offered.error().message, offered.error().details).as_object();
-          fields.emplace_back("result", CanonicalValue(nullptr));
-          TrySendResponse(client.get(), CanonicalValue(std::move(fields)));
-        } else TrySendResponse(client.get(), CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue(std::string(kManagerCommandResponseApiVersion))}, {"ok", CanonicalValue(true)},
-            {"error", CanonicalValue(nullptr)}, {"result", offered.value()}}));
-        return false;
-      }
-      case CommandKind::kStopComponentProcess:
-      case CommandKind::kComponentProcessStopResult: {
-        Require(command.component_process_stop.has_value(), "component process Stop request is absent");
-        const auto &request = *command.component_process_stop;
-        Require(request.manager_runtime_epoch == manager_runtime_epoch_,
-                "component process Stop names another Manager occurrence");
-        const auto result = command.kind == CommandKind::kStopComponentProcess
-            ? execution_host_adapter_.StopComponentProcess(request)
-            : execution_host_adapter_.ReadComponentProcessStop({request});
-        if (!result.ok()) {
-          auto fields = DetailedErrorResponse(result.error().code,
-              result.error().message, result.error().details).as_object();
-          fields.emplace_back("result", CanonicalValue(nullptr));
-          TrySendResponse(client.get(), CanonicalValue(std::move(fields)));
-        } else {
-          Require(result.value().request == request, "component process Stop returned a foreign request");
-          TrySendResponse(client.get(), ComponentProcessStopResultResponse(result.value()));
-        }
-        return false;
-  }
       case CommandKind::kDeploymentCandidatePreview: {
-        Require(command.request_owner_epoch.has_value() &&
-                    command.deployment_artifact_id.has_value() &&
+        Require(command.deployment_artifact_id.has_value() &&
                     command.deployment_revision.has_value() &&
                     command.candidate_retained_bundle_id.has_value() &&
                     command.candidate_graph_revision.has_value() &&
@@ -5911,13 +6389,6 @@ private:
                     command.expected_current_graph_revision.has_value() &&
                     command.expected_admission_generation.has_value(),
                 "decoded candidate preview lacks its exact selection");
-        if (*command.request_owner_epoch != manager_owner_epoch_) {
-          TrySendResponse(
-              client.get(),
-              ErrorResponse("stale_request_owner_epoch",
-                            "candidate preview targets a stale Manager owner"));
-          return false;
-        }
         try {
           const auto active = plan_source_.ReadCurrentPlan();
           const auto &current_pointer = active.active_publication.request;
@@ -5984,7 +6455,6 @@ private:
               *command.expected_current_retained_bundle_id,
               *command.expected_current_graph_revision,
               *command.expected_admission_generation,
-              manager_owner_epoch_,
               DeploymentApplyImpactDigest(impact),
               RequiredBool(impact, "destructive"),
               core::ContentDigest(""),
@@ -6018,30 +6488,16 @@ private:
                     command.deployment_revision.has_value() &&
                     command.expected_current_retained_bundle_id.has_value() &&
                     command.expected_current_graph_revision.has_value() &&
-                    command.request_id.has_value() &&
-                    command.request_owner_epoch.has_value() &&
+                    command.request_key.has_value() &&
                     command.source_label.has_value() &&
                     command.deployment_candidate_receipt.has_value() &&
                     command.prepared_activation.has_value(),
                 "decoded Apply command lacks its exact selection");
         try {
-          const auto existing = stores_.apply_journal().ReadRequest(
-              core::RequestOwnerEpoch(*command.request_owner_epoch),
-              core::RequestId(*command.request_id));
-          // A Manager epoch is process-local, while an accepted Apply request
-          // and its terminal outcome are durable. Exact replay must reach the
-          // journal before current-epoch admission so Composer can recover an
-          // interrupted Apply/Revert after a Manager restart. Unknown stale
-          // requests remain rejected and cannot create a new effect.
-          if (!existing.has_value() &&
-              *command.request_owner_epoch != manager_owner_epoch_) {
-            TrySendResponse(
-                client.get(),
-                ApplyKnownNoEffectErrorResponse(
-                    command, "stale_request_owner_epoch",
-                    "Apply request targets a stale Manager owner epoch"));
-            return false;
-          }
+          // Exact replay by request key (contract 1.4) reaches the journal
+          // first; the start identity is checked at Headless only (1.6).
+          const auto existing =
+              stores_.apply_journal().ReadRequest(*command.request_key);
           const auto &candidate_receipt =
               *command.deployment_candidate_receipt;
           const auto receipt_admission_generation =
@@ -6050,8 +6506,7 @@ private:
                   : command.parent_authoring_claim->intent
                         .expected_admission_generation;
           if (!existing.has_value() &&
-              (candidate_receipt.manager_owner_epoch != manager_owner_epoch_ ||
-               candidate_receipt.deployment_artifact_id !=
+              (candidate_receipt.deployment_artifact_id !=
                    *command.deployment_artifact_id ||
                candidate_receipt.deployment_revision !=
                    *command.deployment_revision ||
@@ -6171,12 +6626,8 @@ private:
                   : candidate_receipt.candidate_retained_bundle_id;
           const auto result = named_apply_.AcceptOrReplay(
               {
-                  core::PublicRequestContextDTO{
-                      core::RequestId(*command.request_id),
-                      core::RequestOwnerEpoch(*command.request_owner_epoch),
-                      *command.source_label,
-                      command.correlation_id,
-                  },
+                  core::PublicRequestContextDTO{*command.request_key,
+                                                *command.source_label},
                   *command.deployment_artifact_id,
                   *command.deployment_revision,
                   *command.expected_current_retained_bundle_id,
@@ -6219,10 +6670,10 @@ private:
       }
       case CommandKind::kApplyReleaseForNew: {
         // New: release whatever failed Apply still holds the cell.
-        Require(command.request_id.has_value() && command.source_label.has_value(),
+        Require(command.request_key.has_value() && command.source_label.has_value(),
                 "decoded Apply release for New lacks its request context");
         const auto released = named_apply_.ReleaseFailedApplyForNew(
-            core::RequestId(*command.request_id), *command.source_label);
+            *command.request_key, *command.source_label);
         TrySendResponse(client.get(), CanonicalValue(CanonicalValue::Object{
             {"api_version", CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
             {"error", CanonicalValue(nullptr)},
@@ -6231,7 +6682,7 @@ private:
                              ? CanonicalValue(CanonicalValue::Object{
                                    {"apply_generation", Unsigned(released->apply_generation.value(),
                                                                  "Apply generation")},
-                                   {"apply_id", CanonicalValue(released->apply_id.value())},
+                                   {"apply_id", Unsigned(released->apply_id.value(), "Apply number")},
                                })
                              : CanonicalValue(nullptr)},
         }));
@@ -6263,11 +6714,11 @@ private:
           return false;
         }
         if (command.kind == CommandKind::kApplyAcknowledge) {
-          Require(command.request_id.has_value() && command.source_label.has_value(),
+          Require(command.request_key.has_value() && command.source_label.has_value(),
                   "decoded Apply acknowledgement lacks its request context");
           named_apply_.AcknowledgeFailedApply(*command.apply_id,
                                               *command.apply_generation,
-                                              core::RequestId(*command.request_id),
+                                              *command.request_key,
                                               *command.source_label);
         }
         TrySendResponse(client.get(), ApplyStatusResponse(
@@ -6312,13 +6763,11 @@ private:
       }
       case CommandKind::kSceneOwnerRead: {
         const auto projection = scene_owner_.CurrentProjectionRevision();
-        const auto owner_epoch = scene_owner_.CurrentRequestOwnerEpoch();
         const auto snapshot = scene_owner_.LogicalSnapshot();
         Require(snapshot != nullptr &&
                     snapshot->revision == projection.scene_revision,
                 "logical-scene read crossed a projection revision");
-        TrySendResponse(client.get(), SceneOwnerReadResponse(
-                                          owner_epoch, projection, *snapshot));
+        TrySendResponse(client.get(), SceneOwnerReadResponse(projection, *snapshot));
         return false;
       }
       case CommandKind::kSceneCandidatePreview: {
@@ -6378,8 +6827,7 @@ private:
         }
         TrySendResponse(client.get(),
                         SceneRuntimeOwnerReadResponse(
-                            admission_.cell_id().value(),
-                            scene_runtime_owner_epoch_, snapshot));
+                            admission_.cell_id().value(), snapshot));
         return false;
       }
       case CommandKind::kSceneRuntimeObserverOpen: {
@@ -6472,6 +6920,7 @@ private:
                                 command.pose_observer_bindings});
         TryPublishViewerPoseSessionsLocked();
         source_lock.unlock();
+        status_board_.NotifyIfChanged();
         TrySendResponse(client.get(),
                         SceneRuntimeObserverOpenResponse(
                             admission_.cell_id().value(),
@@ -6712,29 +7161,11 @@ private:
                 *command.expected_scene_runtime_identity, result.value()));
         return false;
       }
-      case CommandKind::kReconcile: {
-        const auto generations = [this] {
-          try {
-            // The public reconcile command is a status refresh, not an
-            // authorized maintenance operation, so it stays observation only:
-            // a missing managed unit is reported, never restarted.
-            return ObserveRuntimeAndPublish();
-          } catch (...) {
-            TrySubmitFailClosedReadiness();
-            throw;
-          }
-        }();
-        TrySendResponse(client.get(),
-                        SuccessResponse("reconcile", generations.manager,
-                                        generations.scene,
-                                        generations.scene_runtime));
-        return false;
-      }
       case CommandKind::kShutdownRuntime:
-        static_cast<void>(active_runtime_.Shutdown());
-        TrySendResponse(client.get(),
-                        SuccessResponse("shutdown_runtime", std::nullopt,
-                                        std::nullopt, std::nullopt));
+        // The request is the first stop request; a later signal forces. The
+        // stop sequence runs on the main thread, which answers the client
+        // once it ended (OD-298 (a)).
+        HandOverShutdown(std::move(client));
         return true;
       }
     } catch (const ManagerPackageGenerationRestartRequired &error) {
@@ -6762,16 +7193,23 @@ private:
   std::chrono::steady_clock::time_point started_at_;
   ManagerPackageGeneration package_generation_;
   DaemonLock daemon_lock_;
+  // Minted once at Manager start, which is application start (OD-122 (1)).
+  core::ApplicationStartId application_start_id_;
+  std::string application_start_text_;
+  // Counters minted per start (contracts 1.4, 1.16.1); memory only, no lock.
+  std::atomic<std::uint64_t> next_apply_number_{0U};
+  std::atomic<std::uint64_t> next_request_key_sequence_{0U};
   deployment::CanonicalEmptyRetainedBundleAdmission admission_;
   ManagerVerifiedPackageView verified_package_;
   component_manager::RetainedExecutionHostUnitAdapter execution_host_adapter_;
+  // The one writer of the Manager's store files; declared before the stores,
+  // which register their connections with it.
+  manyforge::persistence::SqliteRecordWriter record_writer_;
   component_manager::ExternallyProvisionedManagerStores stores_;
   manyforge::scene::LogicalSceneOwner scene_owner_;
   OriginalManagerSceneMaintenanceAdapter original_manager_scene_maintenance_;
   SceneRuntimePoseProjector scene_runtime_pose_projector_;
   component_manager::DurableManagerActiveRuntimePlanSource plan_source_;
-  component_manager::RetainedPosixRuntimeUnitAdapter reference_runtime_adapter_;
-  component_manager::RuntimeUnitAdapterRouter runtime_adapter_router_;
   component_manager::ManagerActiveRuntimeCoordinator active_runtime_;
   DaemonPlannedMaintenanceGate planned_maintenance_gate_;
   component_manager::ManagerPlannedMaintenanceCoordinator
@@ -6784,8 +7222,11 @@ private:
   std::optional<std::string> scene_admission_last_warning_;
   std::optional<component_manager::ManagerActiveRuntimeConvergenceResult>
       last_runtime_;
+  // The last Manager section value as built (without the outstanding
+  // exchanges), and the outstanding exchanges the main thread last read.
+  std::optional<CanonicalValue> last_manager_payload_;
+  CanonicalValue::Array outstanding_exchanges_;
   std::shared_ptr<const deployment::RetainedBundle> last_active_bundle_;
-  core::RuntimeEpoch manager_runtime_epoch_;
   component_manager::ManagerNamedApplyCoordinator named_apply_;
   // Guarded by manager_source_mutex_. The active bundle's pose-source rows
   // and the provider origins of their configured bindings, updated after
@@ -6793,55 +7234,106 @@ private:
   std::vector<ConfiguredPoseSource> configured_pose_sources_;
   std::map<PoseObservationKey, core::SceneObjectProviderEvidenceDTO>
       pose_provider_origins_;
+  // Guarded by manager_source_mutex_: numbers each scene_runtime read, the
+  // section's order key on the status board (OD-302).
+  std::uint64_t scene_runtime_read_sequence_{};
   SceneRuntimeStateOwner scene_runtime_owner_;
-  AtomicSourceSnapshotChannel manager_channel_;
-  AtomicSourceSnapshotChannel scene_channel_;
-  AtomicSourceSnapshotChannel scene_runtime_channel_;
-  AtomicSourceSnapshotChannel viewer_pose_sessions_channel_;
-  std::string manager_owner_epoch_;
-  std::string scene_runtime_owner_epoch_;
-  std::string manager_owner_id_;
-  std::string scene_owner_id_;
-  std::string scene_runtime_owner_id_;
-  // All heartbeat sequence/retry/readiness fields are serialized by this
-  // same attempt mutex. Never take it while holding lane_mutex_.
-  std::mutex manager_liveness_attempt_mutex_;
-  std::optional<SuccessfulManagerRenewal> successful_manager_renewal_;
+  // OD-216: the four status sections in memory, served on the status
+  // stream's own socket and threads; no file is written.
+  core::ExecutionEventChangeSignal status_signal_;
+  ManagerStatusBoard status_board_;
+  ManagerStatusStream status_stream_;
+  // OD-295 (3)(a): two liveness lanes. The Runner lane renews the Program
+  // Runner; the host-liveness lane renews the native receivers and is the
+  // only one to publish liveness and readiness to the Kernel. They meet only
+  // in the fields below, under manager_liveness_lane_mutex_: a leaf lock,
+  // held for memory-only work and never across I/O or another lock.
   std::mutex manager_liveness_lane_mutex_;
+  // Wakes the Runner lane.
   std::condition_variable manager_liveness_lane_condition_;
+  // Wakes the host-liveness lane.
+  std::condition_variable manager_host_liveness_condition_;
   std::optional<NativeManagerLivenessSnapshot> manager_liveness_snapshot_;
   std::uint64_t manager_liveness_readiness_barrier_{};
   std::uint64_t manager_liveness_wake_generation_{};
   bool manager_liveness_force_closed_{true};
   bool manager_liveness_lane_stop_{};
-  std::thread manager_liveness_lane_;
-  std::uint64_t manager_heartbeat_sequence_{};
-  component_manager::detail::ManagerLivenessRetryGate
-      manager_liveness_retry_gate_;
-  // Log-only, accessed under manager_liveness_attempt_mutex_.
-  std::optional<std::string> manager_liveness_last_warning_;
-  std::optional<core::ActiveBundlePublicationReceiptDTO>
-      manager_liveness_attempted_publication_;
   std::optional<core::ActiveBundlePublicationReceiptDTO>
       manager_liveness_superseded_publication_;
+  // Runner lane -> host-liveness lane: the latest attempt not yet taken.
+  std::optional<RunnerLivenessAttempt> manager_liveness_runner_attempt_;
+  // Host-liveness lane -> Runner lane.
+  std::optional<ReconciledRequiredSet> manager_liveness_reconciled_set_;
+  // Apply-lane requests and the host-liveness lane's results, observed by
+  // the Apply lane as events (OD-295 (3)(a)).
+  std::uint64_t manager_liveness_renewal_requested_{};
+  std::uint64_t manager_liveness_renewal_completed_{};
+  std::uint64_t manager_liveness_close_requested_{};
+  std::uint64_t manager_liveness_close_completed_{};
+  bool manager_liveness_close_result_{};
+  // The close the Apply lane posted and has not picked up yet; 0 = none.
+  std::uint64_t manager_liveness_apply_close_request_{};
+  std::optional<SuccessfulManagerRenewal> successful_manager_renewal_;
+  bool manager_liveness_runner_contact_lost_{};
+  std::thread manager_liveness_lane_;
+  std::thread manager_host_liveness_lane_;
+  // Runner lane only.
+  std::uint64_t manager_heartbeat_sequence_{};
+  // Readable once the Runner lane stops: ends its Runner exchange (OD-296 (a)).
+  FileDescriptor runner_lane_stop_fd_;
+  // The Program Runner exchanges outstanding now; information only (OD-296).
+  mutable ProgramRunnerExchangeBoard runner_exchanges_;
+  // Host-liveness lane only, from here to program_runner_contact_loss_.
+  // Log-only.
+  std::optional<std::string> manager_liveness_last_warning_;
   std::optional<core::CellAdmissionReadinessSnapshotDTO>
       last_submitted_readiness_;
-  // Alarm evidence only, serialized with the existing renewal attempt. It does not
-  // alter readiness selection, retry budgets, lease expiry or containment.
+  // Alarm evidence only. It does not alter readiness selection.
   std::optional<core::ProgramCycleStatusDTO> established_program_cycle_status_;
   /// The accepted Reset whose carried-object-lost signals were cleared.
-  std::string cleared_reset_request_id_;
+  std::optional<core::RequestKey> cleared_reset_request_key_;
   std::optional<core::ProgramRunnerContactLossDTO> program_runner_contact_loss_;
   std::mutex apply_progress_lane_mutex_;
   std::condition_variable apply_progress_lane_condition_;
   bool apply_progress_lane_stop_{};
   bool apply_progress_requested_{};
   std::optional<core::NamedApplyPublicationTransactionDTO> apply_settlement_retry_requested_;
-  bool apply_progress_faulted_{};
+  // Apply progression lane only: the references the activation content
+  // collection already read (empty at start, so the first one reads all).
+  deployment::ActivationContentReferences activation_content_references_;
+  // Main thread only: the last late-host episode that got its Stop.
+  // LogExecutionHostLateReply: the outstanding exchange seen at the last
+  // tick, and the one logged (main thread only).
+  std::uint64_t late_reply_seen_episode_{};
+  // PublishOutstandingExchanges (main thread only): the exchange seen at the
+  // last tick per peer and the start published for it.
+  struct OutstandingSeen final {
+    std::uint64_t episode{};
+    std::int64_t since_ns{};
+  };
+  OutstandingSeen host_outstanding_seen_;
+  OutstandingSeen runner_outstanding_seen_;
+  std::optional<std::pair<std::uint64_t, std::string>> late_reply_logged_;
+  // Main thread only (OD-187): a stop step did not complete (a process
+  // killed, the host's exit not clean, the Halt not complete), and whether
+  // the forced step was logged.
+  bool stop_incomplete_{};
+  bool stop_forced_logged_{};
   std::thread apply_progress_lane_;
+  // OD-298 (a): the command lane, and what it hands to the main thread under
+  // command_lane_mutex_ (a leaf lock, memory only). main_wake_fd_ wakes the
+  // main thread for a hand-over.
+  std::thread command_lane_;
+  FileDescriptor main_wake_fd_;
+  std::mutex command_lane_mutex_;
+  std::optional<std::string> command_lane_failure_;
+  std::optional<FileDescriptor> shutdown_client_;
   std::map<std::string, PoseObserverSession> pose_observer_sessions_;
   std::vector<DeploymentCandidateReceipt> deployment_candidate_receipts_;
   std::map<PoseObservationKey, PoseObservationReplay> pose_observation_replays_;
+  // Declared last, so it is destroyed first: its children stop before the
+  // execution host (build spec 3.3 item 5).
+  ApplicationProcessSupervisor application_processes_;
 };
 
 std::uint64_t ParsePeriod(const std::string_view value) {
@@ -6868,12 +7360,11 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
   bool execution_state = false;
   bool execution_run = false;
   bool scene = false;
-  bool program_cycle = false;
-  bool projection = false;
   bool program_runner_liveness = false;
   bool period = false;
   bool scene_asset = false;
   bool site_settings = false;
+  bool processes = false;
   for (int index = 1; index < argc; index += 2) {
     Require(index + 1 < argc, "every option requires one value");
     const std::string_view option(argv[index]);
@@ -6902,12 +7393,6 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
     } else if (option == "--logical-scene-database" && !scene) {
       config.logical_scene_database = value;
       scene = true;
-    } else if (option == "--program-cycle-journal" && !program_cycle) {
-      config.program_cycle_journal = value;
-      program_cycle = true;
-    } else if (option == "--projection-root" && !projection) {
-      config.projection_root = value;
-      projection = true;
     } else if (option == "--program-runner-liveness-socket" &&
                !program_runner_liveness) {
       config.program_runner_liveness_socket = value;
@@ -6919,6 +7404,9 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
       Require(!value.empty(), "--site-settings requires one explicit path");
       config.site_settings_path = value;
       site_settings = true;
+    } else if (option == "--application-processes" && !processes) {
+      config.application_processes_path = value;
+      processes = true;
     } else if (option == "--reconciliation-period-ms" && !period) {
       config.reconciliation_period =
           std::chrono::milliseconds(ParsePeriod(value));
@@ -6929,11 +7417,10 @@ DaemonConfig ParseArguments(const int argc, char **argv) {
   }
   Require(
       install && manager && manager_run && execution_state && execution_run &&
-          scene && program_cycle && projection,
+          scene && processes,
       "--install-root, --manager-state-root, --manager-run-root, "
       "--execution-state-root, --execution-run-root, "
-      "--logical-scene-database, --program-cycle-journal, "
-      "and --projection-root are required");
+      "--logical-scene-database and --application-processes are required");
   return config;
 }
 
@@ -6983,6 +7470,10 @@ int main(int argc, char **argv) {
         manyforge::headless::ParseArguments(argc, argv));
     return daemon.Run();
   } catch (const manyforge::component_manager::ManagerStateMarkerError &error) {
+    std::cerr << manyforge::headless::EncodeManagerStartupError(error.error())
+              << '\n';
+    return 70;
+  } catch (const manyforge::headless::ManagerPreviousRunError &error) {
     std::cerr << manyforge::headless::EncodeManagerStartupError(error.error())
               << '\n';
     return 70;

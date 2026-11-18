@@ -26,7 +26,7 @@ const digest = (character: string) => `sha256:${character.repeat(64)}`;
 
 function appliedProgram(): AppliedProgramSelection {
   return {
-    schemaVersion: 'manyforge.applied_program_selection.v4',
+    schemaVersion: 'manyforge.applied_program_selection.v5',
     scenarioId: 'two-robots',
     sourceDocumentDigest: digest('a'),
     projectPath: '/projects/two-robots.scenario',
@@ -38,7 +38,6 @@ function appliedProgram(): AppliedProgramSelection {
     nodeEnvironmentDigest: digest('f'),
     recordDigest: digest('1'),
     sourceOwnerId: 'applied-owner',
-    sourceOwnerEpoch: 'applied-owner.epoch.1',
     sourceGeneration: 1,
     assistantProjection: null,
     programFrameFacts: {
@@ -47,9 +46,8 @@ function appliedProgram(): AppliedProgramSelection {
       components: [], frames: [],
     },
     ownerIdentities: [{
-      ownerRole: 'headless_projection',
-      ownerId: 'applied-owner',
-      ownerEpoch: 'applied-owner.epoch.1',
+      role: 'headless_projection',
+      applicationStartId: '3f9a00000000002a',
     }],
     program: {
       api_version: 'manyforge.program.v3',
@@ -208,7 +206,7 @@ describe('hardware-acting node rule', () => {
       const id = entry.split('\n', 1)[0].trim();
       const owner = /^ {4}owner_api: (\S+)$/m.exec(entry)?.[1];
       const kernelControl = new Set([
-        'kernel.stop', 'kernel.full_stop', 'kernel.reset']);
+        'kernel.stop', 'kernel.cell_stop', 'kernel.reset']);
       if ((/^ {4}effectful: true$/m.test(entry)
           && (owner === 'kernel.operation' || owner === 'kernel.command_target'))
           || (owner !== undefined && kernelControl.has(owner))) derived.add(id);
@@ -217,7 +215,7 @@ describe('hardware-acting node rule', () => {
     expect(derived.has('gripper.check_status')).toBe(false);
     expect(derived.has('motion.set_tcp')).toBe(true);
     expect(derived.has('kernel.reset_operation')).toBe(true);
-    expect(derived.has('kernel.full_stop')).toBe(true);
+    expect(derived.has('kernel.cell_stop')).toBe(true);
   });
 
   it('counts gripper and I/O commands and Kernel controls, not reads or waits', () => {

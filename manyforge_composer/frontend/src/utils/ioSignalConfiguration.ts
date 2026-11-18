@@ -42,6 +42,8 @@ export const IO_DRIVER_FRESHNESS_NOTE =
   'Freshness depends on the driver reporting read errors.';
 
 export const IO_DEFAULT_INGRESS_DEPTH = 64;
+/** The largest ingress depth Apply accepts (io_signal_catalog.cpp). */
+export const IO_MAXIMUM_INGRESS_DEPTH = 1024;
 export const IO_MAXIMUM_ROWS = 4096;
 const MAXIMUM_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 const PORTABLE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -448,8 +450,8 @@ export function validateIoSignalInput(draft: IoSignalInputDraft, index = 0): str
   const identity = identityProblem(draft, label);
   if (identity !== null) return identity;
   const depth = integerText(draft.ingressDepth);
-  if (depth === null || depth < 1) {
-    return `${label}: ingress depth must be a whole number of samples from 1 to ${Number.MAX_SAFE_INTEGER}.`;
+  if (depth === null || depth < 1 || depth > IO_MAXIMUM_INGRESS_DEPTH) {
+    return `${label}: ingress depth must be a whole number of samples from 1 to ${IO_MAXIMUM_INGRESS_DEPTH}.`;
   }
   if (draft.profile === 'mock') {
     if (!draft.echoEnabled) return null;

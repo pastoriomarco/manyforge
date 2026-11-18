@@ -56,7 +56,7 @@ def _configured_owner_id() -> str:
     return value
 
 
-def _fresh_scene_cell(state: "ComposerState") -> tuple[str, str, int]:
+def _fresh_scene_cell(state: "ComposerState") -> tuple[str, int]:
     client = getattr(state, "headless_client", None)
     if client is None or not callable(getattr(client, "scene", None)):
         raise RuntimeError("pointcloud_scene_owner_unavailable")
@@ -74,13 +74,11 @@ def _fresh_scene_cell(state: "ComposerState") -> tuple[str, str, int]:
     payload = section.get("payload") if type(section) is dict else None
     snapshot = payload.get("snapshot") if type(payload) is dict else None
     if (
-        projection.get("schema_version") != "manyforge.scene_projection.v1"
+        projection.get("schema_version") != "manyforge.scene_projection.v2"
         or type(section) is not dict
         or section.get("available") is not True
         or section.get("freshness") != "fresh"
         or section.get("known_gaps") != []
-        or type(section.get("source_owner_epoch")) is not str
-        or not section["source_owner_epoch"]
         or type(section.get("source_generation")) is not int
         or isinstance(section.get("source_generation"), bool)
         or section["source_generation"] < 0
@@ -93,7 +91,6 @@ def _fresh_scene_cell(state: "ComposerState") -> tuple[str, str, int]:
         raise RuntimeError("pointcloud_scene_owner_stale")
     return (
         snapshot["cell_id"],
-        section["source_owner_epoch"],
         section["source_generation"],
     )
 
@@ -108,7 +105,6 @@ class PointCloudObservationService:
         self._client_count = 0
         self._demand_revision = 0
         self._accepted: _AcceptedSourceFrame | None = None
-        self._scene_owner_epoch: str | None = None
         self._scene_generation: int | None = None
         self._received_total = 0
         self._published_total = 0
@@ -185,7 +181,7 @@ class PointCloudObservationService:
                 self._rejected_total += 1
             return "source_owner_mismatch", observation
         try:
-            cell_id, scene_epoch, scene_generation = _fresh_scene_cell(state)
+            cell_id, scene_generation = _fresh_scene_cell(state)
         except RuntimeError:
             with self._lock:
                 self._rejected_total += 1
@@ -196,7 +192,6 @@ class PointCloudObservationService:
             return "cell_identity_mismatch", observation
         digest = hashlib.sha256(packet).hexdigest()
         with self._lock:
-            self._scene_owner_epoch = scene_epoch
             self._scene_generation = scene_generation
             if self._client_count == 0:
                 self._suppressed_total += 1
@@ -231,7 +226,6 @@ class PointCloudObservationService:
                 "source_owner_epoch": None if accepted is None else accepted.owner_epoch,
                 "stream_generation": None if accepted is None else accepted.stream_generation,
                 "sequence": None if accepted is None else accepted.sequence,
-                "scene_owner_epoch": self._scene_owner_epoch,
                 "scene_generation": self._scene_generation,
                 "received_total": self._received_total,
                 "published_total": self._published_total,

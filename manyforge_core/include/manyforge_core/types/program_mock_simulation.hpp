@@ -26,11 +26,9 @@ struct ProgramMockSimulationSignalDTO final {
 };
 /// Current captured Run attribution, shared by the Run-wide clock receipt.
 struct ProgramRunMockSimulationScopeDTO final {
-  RequestOwnerEpoch request_owner_epoch;
   ProgramBindingId program_binding_id;
-  RequestOwnerEpoch program_runner_owner_epoch;
   CellAdmissionClaimGeneration claim_generation;
-  ProgramRunId program_run_id;
+  ProgramRunNumber program_run_id;
   friend bool operator==(const ProgramRunMockSimulationScopeDTO&,
                          const ProgramRunMockSimulationScopeDTO&) = default;
 };
@@ -46,11 +44,9 @@ struct ProgramRunMockSimulationPauseRequestDTO final {
                          const ProgramRunMockSimulationPauseRequestDTO&) = default;
 };
 struct ProgramNodeMockSimulationScopeDTO final {
-  RequestOwnerEpoch request_owner_epoch;
   ProgramBindingId program_binding_id;
-  RequestOwnerEpoch program_runner_owner_epoch;
   CellAdmissionClaimGeneration claim_generation;
-  ProgramRunId program_run_id;
+  ProgramRunNumber program_run_id;
   ProgramNodeExecutionScopeDTO node;
   /// Positive full-width uint64 decimal text on the private wire. Ordering
   /// and idempotency only; current captured Run/claim supplies authority.

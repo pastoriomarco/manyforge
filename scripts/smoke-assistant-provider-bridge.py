@@ -215,7 +215,7 @@ def preflight(
         "/api/assistant/modes",
         timeout_s=timeout_s,
     )
-    if mode_index.get("schema_version") != "manyforge.assistant_mode_index.v2":
+    if mode_index.get("schema_version") != "manyforge.assistant_mode_index.v3":
         raise SmokeFailure("Composer returned an unsupported assistant mode index")
     assistant_component_id = mode_index.get("assistant_component_id")
     if type(assistant_component_id) is not str or not assistant_component_id:
@@ -238,7 +238,7 @@ def preflight(
         f"/api/assistant/modes/{ASSISTANT_MODE}",
         timeout_s=timeout_s,
     )
-    if mode.get("schema_version") != "manyforge.assistant_mode_projection.v2":
+    if mode.get("schema_version") != "manyforge.assistant_mode_projection.v3":
         raise SmokeFailure("Composer returned an unsupported assistant mode projection")
     endpoint = mode.get("model_endpoint")
     if type(endpoint) is not dict:

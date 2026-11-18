@@ -35,7 +35,7 @@ export function parseSnapshotObserverRequest(value: unknown): SnapshotRequestVie
     throw new Error('snapshot request type is invalid');
   }
   const frame = objectAt(record.requiredFrame, 'snapshot required frame');
-  if (JSON.stringify(Object.keys(frame).sort()) !== JSON.stringify(['generation', 'ownerEpoch'])) {
+  if (JSON.stringify(Object.keys(frame).sort()) !== JSON.stringify(['applicationStartId', 'generation'])) {
     throw new Error('snapshot required frame fields are invalid');
   }
   if (
@@ -45,7 +45,7 @@ export function parseSnapshotObserverRequest(value: unknown): SnapshotRequestVie
     || typeof record.height !== 'number'
     || (record.mime !== 'image/png' && record.mime !== 'image/jpeg')
     || typeof record.timeoutMs !== 'number'
-    || typeof frame.ownerEpoch !== 'string'
+    || typeof frame.applicationStartId !== 'string'
     || typeof frame.generation !== 'number'
   ) {
     throw new Error('snapshot request value types are invalid');
@@ -57,7 +57,7 @@ export function parseSnapshotObserverRequest(value: unknown): SnapshotRequestVie
     mime: record.mime,
     timeoutMs: record.timeoutMs,
     requiredFrame: {
-      ownerEpoch: frame.ownerEpoch,
+      applicationStartId: frame.applicationStartId,
       generation: frame.generation,
     },
   };
@@ -71,9 +71,7 @@ export function parseSnapshotObserverRequest(value: unknown): SnapshotRequestVie
     || !Number.isSafeInteger(request.timeoutMs)
     || request.timeoutMs < 1
     || request.timeoutMs > 2_000
-    || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(
-      request.requiredFrame.ownerEpoch,
-    )
+    || !/^[0-9a-f]{16}$/.test(request.requiredFrame.applicationStartId)
     || !Number.isSafeInteger(request.requiredFrame.generation)
     || request.requiredFrame.generation < 0
   ) {
@@ -156,7 +154,7 @@ export async function uploadSnapshotObserverResult(
       result.size < 1
       || result.size > MAXIMUM_SNAPSHOT_BYTES
       || (result.type !== 'image/png' && result.type !== 'image/jpeg')
-      || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/.test(observedFrame.ownerEpoch)
+      || !/^[0-9a-f]{16}$/.test(observedFrame.applicationStartId)
       || !Number.isSafeInteger(observedFrame.generation)
       || observedFrame.generation < 0
     ) {
@@ -171,7 +169,7 @@ export async function uploadSnapshotObserverResult(
       method: 'POST',
       headers: result === null || observedFrame === null ? undefined : {
         'Content-Type': result.type,
-        'X-ManyForge-Viewer-Owner-Epoch': observedFrame.ownerEpoch,
+        'X-ManyForge-Viewer-Application-Start-Id': observedFrame.applicationStartId,
         'X-ManyForge-Viewer-Generation': String(observedFrame.generation),
       },
       body: result ?? new Blob(),

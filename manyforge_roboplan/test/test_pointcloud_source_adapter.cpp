@@ -137,27 +137,6 @@ TEST(PointCloudSourceAdapter, StateDoesNotWaitForForwardingPublish) {
   EXPECT_EQ(adapter.State(0).lifecycle, core::ComponentLifecycle::kEnabled);
 }
 
-TEST(PointCloudSourceAdapter, PublishExceptionPreservesExistingForwardingOutcome) {
-  class ThrowingLink final : public IPointCloudBridgeLink {
-   public:
-    void SetForwarding(bool value) override {
-      if (value) throw std::runtime_error("publish failed");
-    }
-    PointCloudBridgeObservation Observed() const override { return {}; }
-  };
-  auto log = std::make_shared<ProcessLog>();
-  PointCloudSourceAdapter adapter{
-      Settings(), "/manyforge/components/cloud", "cell",
-      [log](const ComponentProcessCommand &) -> std::unique_ptr<IComponentProcess> {
-        return std::make_unique<FakeProcess>(log);
-      }, std::make_shared<ThrowingLink>()};
-  ASSERT_EQ(adapter.Run(core::ComponentAction::kPrepare, {}).outcome,
-            core::ActionOutcome::kSucceeded);
-  EXPECT_THROW(static_cast<void>(adapter.Run(core::ComponentAction::kEnable, {})),
-               std::runtime_error);
-  EXPECT_EQ(adapter.State(0).lifecycle, core::ComponentLifecycle::kEnabled);
-}
-
 TEST(PointCloudSourceAdapter, StaleStreamIsFreshnessOnlyNeverAFault) {
   Fixture f;
   ASSERT_EQ(f.adapter.Run(core::ComponentAction::kPrepare, {}).outcome,

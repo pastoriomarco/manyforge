@@ -11,6 +11,7 @@ import type {
   ManagerApplyResponse,
   ManagerApplyStatus,
   ManagerDeploymentCandidatePreviewResponse,
+  ManagerOutstandingExchange,
   ManagerDeploymentImpact,
   ManagerDeploymentImpactComponent,
   ManagerDeploymentRecordDiff,
@@ -23,6 +24,7 @@ import type {
   ManagerStatusProjection,
 } from '../../types/api';
 import type { JsonObject } from './shared';
+import { isApplicationStartId, isRequestKey, type ApplicationStartId } from '../applicationIdentity';
 import {
   allowedKeysAt,
   booleanAt,
@@ -44,6 +46,16 @@ import {
   stringArrayAt,
   stringAt,
 } from './shared';
+
+/** The application-start id `A`: 16 lowercase hex characters, not all zeros. */
+export function applicationStartIdAt(value: unknown, path: string): ApplicationStartId {
+  return isApplicationStartId(value) ? value : fail(path, 'an application-start id (16 lowercase hex)');
+}
+
+/** A request key: exactly 32 lowercase hex characters. */
+export function requestKeyAt(value: unknown, path: string): string {
+  return isRequestKey(value) ? value : fail(path, 'a request key (32 lowercase hex)');
+}
 
 export function parseRuntimeAvailability(value: unknown, path: string) {
   const record = objectAt(value, path);
@@ -67,11 +79,9 @@ function parseManagerSourceMetadata(
       'freshness',
       'known_gaps',
       'projection_generation',
-      'projection_owner_epoch',
       'receiver_age_ns',
       'source_content_digest',
       'source_generation',
-      'source_owner_epoch',
       'source_owner_id',
     ],
     path,
@@ -80,10 +90,6 @@ function parseManagerSourceMetadata(
     projectionGeneration: integerAt(
       record.projection_generation,
       path + '.projection_generation',
-    ),
-    projectionOwnerEpoch: stringAt(
-      record.projection_owner_epoch,
-      path + '.projection_owner_epoch',
     ),
     available: booleanAt(record.available, path + '.available'),
     freshness: sourceFreshnessAt(record.freshness, path + '.freshness'),
@@ -95,10 +101,6 @@ function parseManagerSourceMetadata(
     sourceGeneration: nullableNumberAt(
       record.source_generation,
       path + '.source_generation',
-    ),
-    sourceOwnerEpoch: nullableStringAt(
-      record.source_owner_epoch,
-      path + '.source_owner_epoch',
     ),
     sourceOwnerId: nullableStringAt(
       record.source_owner_id,
@@ -224,9 +226,12 @@ function parseManagerApplyRecord(
     ],
     path,
   );
-  // Status publishes the durable preparation receipt, even though this view
-  // only projects Apply progress. Validate it through the shared v3 contract.
-  parsePreparedActivationInput(record.prepared_activation, path + '.prepared_activation');
+  // Only the record of the Apply that installed the active configuration
+  // carries its preparation receipt; every other record carries null (OD-281).
+  // This view only projects Apply progress; validate a present receipt.
+  if (record.prepared_activation !== null) {
+    parsePreparedActivationInput(record.prepared_activation, path + '.prepared_activation');
+  }
   const phase = stringAt(record.phase, path + '.phase');
   if (!MANAGER_APPLY_PHASES.has(phase as ManagerApplyPhase)) {
     return fail(path + '.phase', 'a supported Manager Apply phase');
@@ -264,7 +269,7 @@ function parseManagerApplyRecord(
   const request = objectAt(record.request, path + '.request');
   exactKeysAt(
     request,
-    ['correlation_id', 'request_id', 'request_owner_epoch', 'source_label'],
+    ['request_key', 'source_label'],
     path + '.request',
   );
   const terminalState = nullableStringAt(
@@ -292,7 +297,7 @@ function parseManagerApplyRecord(
       record.apply_generation,
       path + '.apply_generation',
     ),
-    applyId: stringAt(record.apply_id, path + '.apply_id'),
+    applyId: positiveIntegerAt(record.apply_id, path + '.apply_id'),
     sceneInitialization: parseSceneInitialization(record.scene_initialization, path + '.scene_initialization'),
     candidateGraphRevision: stringAt(
       record.candidate_graph_revision,
@@ -328,19 +333,43 @@ function parseManagerApplyRecord(
     intentDigest: stringAt(record.intent_digest, path + '.intent_digest'),
     phase: phase as ManagerApplyPhase,
     request: {
-      correlationId: nullableStringAt(
-        request.correlation_id,
-        path + '.request.correlation_id',
-      ),
-      requestId: stringAt(request.request_id, path + '.request.request_id'),
-      requestOwnerEpoch: stringAt(
-        request.request_owner_epoch,
-        path + '.request.request_owner_epoch',
-      ),
+      requestKey: requestKeyAt(request.request_key, path + '.request.request_key'),
       sourceLabel: stringAt(request.source_label, path + '.request.source_label'),
     },
     terminalState: terminalState as ManagerApplyRecord['terminalState'],
   };
+}
+
+function parseManagerOutstandingExchange(
+  value: unknown,
+  path: string,
+): ManagerOutstandingExchange {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['channel', 'exchange', 'peer', 'since_ns'], path);
+  const peer = nonEmptyStringAt(record.peer, path + '.peer');
+  if (peer !== 'execution_host' && peer !== 'program_runner') {
+    return fail(path + '.peer', 'execution_host or program_runner');
+  }
+  return {
+    peer,
+    channel: nonEmptyStringAt(record.channel, path + '.channel'),
+    exchange: nonEmptyStringAt(record.exchange, path + '.exchange'),
+    sinceNs: integerAt(record.since_ns, path + '.since_ns'),
+  };
+}
+
+/**
+ * The live Manager section's outstanding exchanges (OD-295, OD-298):
+ * information only; empty when nothing is outstanding or no payload is held.
+ */
+export function managerSectionOutstandingExchanges(
+  payload: Record<string, unknown> | null,
+): ManagerOutstandingExchange[] {
+  const runtime = payload === null ? undefined : objectAt(payload.runtime, 'manager.runtime');
+  if (runtime?.outstanding_exchanges === undefined) return [];
+  return boundedArrayAt(runtime.outstanding_exchanges, 'manager.runtime.outstanding_exchanges', 8)
+    .map((item, index) => parseManagerOutstandingExchange(
+      item, 'manager.runtime.outstanding_exchanges[' + index + ']'));
 }
 
 function parseManagerRuntimeProjection(
@@ -348,8 +377,19 @@ function parseManagerRuntimeProjection(
   path: string,
 ): ManagerRuntimeProjection {
   const record = objectAt(value, path);
-  exactKeysAt(record, ['converged', 'desired_units', 'observed_units'], path);
+  allowedKeysAt(
+    record,
+    ['converged', 'desired_units', 'observed_units'],
+    ['outstanding_exchanges'],
+    path,
+  );
+  const outstanding = record.outstanding_exchanges === undefined
+    ? undefined
+    : boundedArrayAt(record.outstanding_exchanges, path + '.outstanding_exchanges', 8)
+      .map((item, index) => parseManagerOutstandingExchange(
+        item, path + '.outstanding_exchanges[' + index + ']'));
   return {
+    ...(outstanding === undefined ? {} : { outstandingExchanges: outstanding }),
     converged: booleanAt(record.converged, path + '.converged'),
     desiredUnits: boundedArrayAt(
       record.desired_units,
@@ -373,10 +413,10 @@ export function parseManagerStatusProjection(
     record.schema_version,
     'managerStatus.schema_version',
   );
-  if (schemaVersion !== 'manyforge.manager_status_projection.v1') {
+  if (schemaVersion !== 'manyforge.manager_status_projection.v2') {
     return fail(
       'managerStatus.schema_version',
-      'manyforge.manager_status_projection.v1',
+      'manyforge.manager_status_projection.v2',
     );
   }
   const status = objectAt(record.status, 'managerStatus.status');
@@ -389,10 +429,10 @@ export function parseManagerStatusProjection(
     status.api_version,
     'managerStatus.status.api_version',
   );
-  if (apiVersion !== 'manyforge.manager_source.v1') {
+  if (apiVersion !== 'manyforge.manager_source.v2') {
     return fail(
       'managerStatus.status.api_version',
-      'manyforge.manager_source.v1',
+      'manyforge.manager_source.v2',
     );
   }
   return {
@@ -435,10 +475,10 @@ export function parseManagerGraphProjection(
     record.schema_version,
     'managerGraph.schema_version',
   );
-  if (schemaVersion !== 'manyforge.manager_graph_projection.v1') {
+  if (schemaVersion !== 'manyforge.manager_graph_projection.v2') {
     return fail(
       'managerGraph.schema_version',
-      'manyforge.manager_graph_projection.v1',
+      'manyforge.manager_graph_projection.v2',
     );
   }
   return {
@@ -466,10 +506,10 @@ export function parseManagerDiffProjection(
     record.schema_version,
     'managerDiff.schema_version',
   );
-  if (schemaVersion !== 'manyforge.manager_diff_projection.v1') {
+  if (schemaVersion !== 'manyforge.manager_diff_projection.v2') {
     return fail(
       'managerDiff.schema_version',
-      'manyforge.manager_diff_projection.v1',
+      'manyforge.manager_diff_projection.v2',
     );
   }
   return {
@@ -505,10 +545,10 @@ export function parseManagerDeploymentCandidatePreviewResponse(
     record.api_version,
     'managerDeploymentCandidatePreview.api_version',
   );
-  if (apiVersion !== 'manyforge.manager_command_response.v2') {
+  if (apiVersion !== 'manyforge.manager_command_response.v3') {
     return fail(
       'managerDeploymentCandidatePreview.api_version',
-      'manyforge.manager_command_response.v2',
+      'manyforge.manager_command_response.v3',
     );
   }
   const receipt = objectAt(
@@ -526,7 +566,6 @@ export function parseManagerDeploymentCandidatePreviewResponse(
       'destructive_impact',
       'expected_current',
       'impact_digest',
-      'manager_owner_epoch',
       'prepared_activation_id',
       'receipt_digest',
       'schema_version',
@@ -537,10 +576,10 @@ export function parseManagerDeploymentCandidatePreviewResponse(
     receipt.schema_version,
     'managerDeploymentCandidatePreview.candidate_receipt.schema_version',
   );
-  if (schemaVersion !== 'manyforge.manager_deployment_candidate_receipt.v2') {
+  if (schemaVersion !== 'manyforge.manager_deployment_candidate_receipt.v3') {
     return fail(
       'managerDeploymentCandidatePreview.candidate_receipt.schema_version',
-      'manyforge.manager_deployment_candidate_receipt.v2',
+      'manyforge.manager_deployment_candidate_receipt.v3',
     );
   }
   const expected = objectAt(
@@ -598,7 +637,6 @@ export function parseManagerDeploymentCandidatePreviewResponse(
         retained_bundle_id: stringAt(expected.retained_bundle_id, 'candidateReceipt.expected_current.retained_bundle_id'),
       },
       expected_admission_generation: positiveIntegerAt(receipt.expected_admission_generation, 'candidateReceipt.expected_admission_generation'),
-      manager_owner_epoch: stringAt(receipt.manager_owner_epoch, 'candidateReceipt.manager_owner_epoch'),
       impact_digest: digestAt(receipt.impact_digest, 'candidateReceipt.impact_digest'),
       destructive_impact: booleanAt(receipt.destructive_impact, 'candidateReceipt.destructive_impact'),
       receipt_digest: digestAt(receipt.receipt_digest, 'candidateReceipt.receipt_digest'),
@@ -795,17 +833,16 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
       'error',
       'ok',
       'replay_status',
-      'request_id',
-      'request_owner_epoch',
+      'request_key',
       'state',
     ],
     'managerApply',
   );
   const apiVersion = stringAt(record.api_version, 'managerApply.api_version');
-  if (apiVersion !== 'manyforge.manager_command_response.v2') {
+  if (apiVersion !== 'manyforge.manager_command_response.v3') {
     return fail(
       'managerApply.api_version',
-      'manyforge.manager_command_response.v2',
+      'manyforge.manager_command_response.v3',
     );
   }
   const ok = booleanAt(record.ok, 'managerApply.ok');
@@ -832,26 +869,10 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
       'pending, succeeded, failed, or unknown_effect',
     );
   }
-  const applyId = stringAt(record.apply_id, 'managerApply.apply_id');
-  if (applyId.length === 0) {
-    return fail('managerApply.apply_id', 'a non-empty Apply identity');
-  }
-  const requestId = stringAt(record.request_id, 'managerApply.request_id');
-  if (requestId.length === 0) {
-    return fail('managerApply.request_id', 'a non-empty request identity');
-  }
-  const requestOwnerEpoch = stringAt(
-    record.request_owner_epoch,
-    'managerApply.request_owner_epoch',
-  );
-  if (requestOwnerEpoch.length === 0) {
-    return fail(
-      'managerApply.request_owner_epoch',
-      'a non-empty request-owner epoch',
-    );
-  }
+  const applyId = positiveIntegerAt(record.apply_id, 'managerApply.apply_id');
+  const requestKey = requestKeyAt(record.request_key, 'managerApply.request_key');
   const base = {
-    apiVersion: 'manyforge.manager_command_response.v2' as const,
+    apiVersion: 'manyforge.manager_command_response.v3' as const,
     applyGeneration: positiveIntegerAt(
       record.apply_generation,
       'managerApply.apply_generation',
@@ -860,8 +881,7 @@ export function parseManagerApplyResponse(value: unknown): ManagerApplyResponse 
     error: null,
     ok: true as const,
     replayStatus: replayStatus as ManagerApplyReplayStatus,
-    requestId,
-    requestOwnerEpoch,
+    requestKey,
   };
   if (state !== 'succeeded') {
     if (record.candidate_projection_revision !== null) {
@@ -934,18 +954,18 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
   exactKeysAt(record, [
     'api_version', 'apply_generation', 'apply_id',
     'candidate_projection_revision', 'error', 'failure', 'last_progress',
-    'ok', 'phase', 'prepared_activation', 'request_id',
-    'request_owner_epoch', 'state', 'scene_initialization',
+    'ok', 'phase', 'prepared_activation', 'request_key',
+    'state', 'scene_initialization',
     'failure_acknowledgement',
   ], 'managerApplyStatus');
   const apiVersion = stringAt(
     record.api_version,
     'managerApplyStatus.api_version',
   );
-  if (apiVersion !== 'manyforge.manager_command_response.v2') {
+  if (apiVersion !== 'manyforge.manager_command_response.v3') {
     return fail(
       'managerApplyStatus.api_version',
-      'manyforge.manager_command_response.v2',
+      'manyforge.manager_command_response.v3',
     );
   }
   if (!booleanAt(record.ok, 'managerApplyStatus.ok')) {
@@ -1129,7 +1149,7 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
       record.apply_generation,
       'managerApplyStatus.apply_generation',
     ),
-    applyId: stringAt(record.apply_id, 'managerApplyStatus.apply_id'),
+    applyId: positiveIntegerAt(record.apply_id, 'managerApplyStatus.apply_id'),
     sceneInitialization: parseSceneInitialization(record.scene_initialization, 'managerApplyStatus.scene_initialization'),
     candidateProjectionRevision: candidate,
     error: null,
@@ -1167,11 +1187,7 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
         'managerApplyStatus.prepared_activation.prepared_activation_id',
       ),
     },
-    requestId: stringAt(record.request_id, 'managerApplyStatus.request_id'),
-    requestOwnerEpoch: stringAt(
-      record.request_owner_epoch,
-      'managerApplyStatus.request_owner_epoch',
-    ),
+    requestKey: requestKeyAt(record.request_key, 'managerApplyStatus.request_key'),
     state: state as ManagerApplyStatus['state'],
     failureAcknowledgement: failureAcknowledgement as ManagerApplyStatus['failureAcknowledgement'],
   };

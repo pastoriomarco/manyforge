@@ -18,8 +18,7 @@ manyforge::roboplan_backend::ComponentAdapters make_assistant_adapter(
       context.node, context.ros_namespace, context.clock, context.ros_entity_owner);
   return {std::make_shared<AssistantComponentAdapter>(
               assistant_settings(context.lane_row), context.ros_namespace,
-              context.start_process, link, context.clock,
-              context.lifecycle_command_timeout),
+              context.start_process, link, context.clock),
           {},
           std::nullopt,
           std::nullopt,

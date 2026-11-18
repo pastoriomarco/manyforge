@@ -60,7 +60,6 @@ enum class KernelEventType {
   kMotionTripCompleted,
   kMotionExecutionOutcomeRecorded,
   // Recovery authority evidence.
-  kStopCertificatePublished,
   kRecoveryAssessmentChanged,
   kRecoveryActionAccepted,
   kRecoveryActionRejected,
@@ -69,6 +68,12 @@ enum class KernelEventType {
   // attempts/queries/unavailable gaps without creating a new runtime fault.
   kRuntimeCollisionCoverage,
   kContactPolicyViolation,
+  // The outcome of a committed motion send, reported only to an addressed
+  // Stop whose fence found that send still in flight: `details["dispatched"]`
+  // is "true" once the session is marked dispatched; otherwise "false", with
+  // `participant_fact` the participant's recorded fact (cancelled before
+  // dispatch when that Stop came first).
+  kParticipantDispatchOutcome,
 };
 
 /// Kernel event structure

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <iostream>
 #include <cstdint>
@@ -177,7 +178,10 @@ CanonicalValue EventIdentityValue(const std::string &component,
   });
 }
 
-std::optional<std::string>
+// A model attempt's identity names its application start too: run numbers
+// and node-attempt counters restart in every start, the historian outlives
+// starts.
+std::optional<CanonicalValue>
 DedicatedEventIdentity(const std::string &component,
                        const std::string &event_type,
                        const CanonicalValue &payload) {
@@ -187,18 +191,19 @@ DedicatedEventIdentity(const std::string &component,
   }
   Require(payload.is_object(), "historian_event_invalid",
           "Program model-attempt event payload must be an object");
-  for (const auto &[name, value] : payload.as_object()) {
-    if (name != "model_attempt_id") {
-      continue;
-    }
-    const auto *identity = std::get_if<std::string>(&value.storage());
-    Require(identity != nullptr, "historian_event_invalid",
-            "Program model-attempt event identity must be text");
-    ValidateText(*identity, "model_attempt_id", kMaximumIdentityBytes);
-    return *identity;
-  }
-  HistorianFail("historian_event_invalid",
-                "Program model-attempt event identity is absent");
+  const auto member = [&](const char *name) {
+    const auto *value = payload.find_object_member(name);
+    const auto *text =
+        value == nullptr ? nullptr : std::get_if<std::string>(&value->storage());
+    Require(text != nullptr, "historian_event_invalid",
+            std::string("Program model-attempt event identity lacks ") + name);
+    ValidateText(*text, name, kMaximumIdentityBytes);
+    return CanonicalValue(*text);
+  };
+  return CanonicalValue(CanonicalValue::Object{
+      {"application_start_id", member("application_start_id")},
+      {"model_attempt_id", member("model_attempt_id")},
+  });
 }
 
 void Advance(std::uint64_t &value) noexcept {
@@ -275,9 +280,19 @@ SummaryIdentities SummaryIdentityValues(const CanonicalValue &payload) {
       for (const auto &[name, child] : current.as_object()) {
         auto *target = name == "program_run_id" ? &run : name == "operation_id" ? &operation :
             name == "condition_id" || name == "operator_alarm_condition_id" ? &condition : nullptr;
-        if (target != nullptr) {
+        if (target != nullptr && target->size() < 2) {
+          // Run and operation numbers are integers (contract 1.5); the
+          // summary names them by their decimal text.
           const auto *text = std::get_if<std::string>(&child.storage());
-          if (text != nullptr && !text->empty() && target->size() < 2) target->insert(*text);
+          const auto *number = std::get_if<double>(&child.storage());
+          if (text != nullptr && !text->empty()) {
+            target->insert(*text);
+          } else if (number != nullptr && name != "condition_id" &&
+                     name != "operator_alarm_condition_id" && *number >= 1.0 &&
+                     *number <= 9007199254740991.0 &&
+                     std::trunc(*number) == *number) {
+            target->insert(std::to_string(static_cast<std::uint64_t>(*number)));
+          }
         }
         // Blackboard/override values are user data, never producer attribution.
         // Match the versioned diagnostic's correlation-index contract.
@@ -348,11 +363,14 @@ std::string OperationFailureHistoryMessage(const CanonicalValue &state) {
     const auto *scope = participant.find_object_member("execution_scope");
     if (scope != nullptr) {
       const auto *node = StringMember(*scope, "node_instance_id");
-      const auto *attempt = StringMember(*scope, "node_attempt_id");
+      const auto *attempt_member = scope->find_object_member("node_attempt_id");
+      const auto *attempt = attempt_member == nullptr
+                                ? nullptr
+                                : std::get_if<double>(&attempt_member->storage());
       if (node != nullptr && attempt != nullptr) {
         result += "[" + Utf8Prefix(*node, kMaximumSummaryTextCodePoints) +
-                  " / " + Utf8Prefix(*attempt, kMaximumSummaryTextCodePoints) +
-                  "] ";
+                  " / " +
+                  std::to_string(static_cast<std::uint64_t>(*attempt)) + "] ";
       }
     }
     result += Utf8Prefix(*code, kMaximumSummaryTextCodePoints) + ": " +
@@ -391,9 +409,7 @@ HistorianEvent MakeHistorianEvent(std::string component, std::string event_type,
       session_report ? CanonicalValue(CanonicalValue::Object{
                            {"session_id", *session_id},
                        }) : dedicated_identity.has_value()
-          ? CanonicalValue(CanonicalValue::Object{
-                {"model_attempt_id", CanonicalValue(*dedicated_identity)},
-            })
+          ? *dedicated_identity
           : EventIdentityValue(component, event_type, severity, occurred_at_ns,
                                occurred_at_wall, payload);
   const auto digest = content_identity::framed_sha256(
@@ -422,14 +438,8 @@ HistorianEvent
 MakeAlarmLifecycleHistorianEvent(const AlarmLifecycleFact &fact) {
   auto payload = AlarmLifecycleFactValue(fact).as_object();
   payload.emplace_back("clock_owner",
-                       CanonicalValue("headless:" + fact.owner_epoch));
-  const bool runtime_fault_raised =
-      fact.event_type == "alarm_raised" &&
-      (fact.definition_id == "manyforge.runtime.program_runner_loss" ||
-       fact.definition_id == "manyforge.runtime.operation_journal_write_fault" ||
-       fact.definition_id == "manyforge.runtime.kernel_internal_fault");
-  return MakeHistorianEvent("manyforge.alarm", fact.event_type,
-                            runtime_fault_raised ? "ERROR" : "INFO",
+                       CanonicalValue("headless:" + fact.application_start_id));
+  return MakeHistorianEvent("manyforge.alarm", fact.event_type, "INFO",
                             fact.occurred_at_ns, fact.occurred_at_wall,
                             CanonicalValue(std::move(payload)));
 }
@@ -472,6 +482,7 @@ CanonicalValue HistorianPageValue(const HistorianPage &page) {
   events.reserve(page.events.size());
   for (const auto &stored : page.events) {
     events.emplace_back(CanonicalValue(CanonicalValue::Object{
+        {"application_start_id", CanonicalValue(stored.application_start_id)},
         {"event", HistorianEventValue(stored.event)},
         {"sequence", Number(stored.sequence, "sequence")},
     }));
@@ -518,6 +529,7 @@ CanonicalValue HistorianSummaryPageValue(const HistorianPage &page) {
   for (const auto &stored : page.events) {
     ValidateEvent(stored.event);
     events.emplace_back(CanonicalValue(CanonicalValue::Object{
+        {"application_start_id", CanonicalValue(stored.application_start_id)},
         {"event", HistorianSummaryEventValue(stored.event, stored.occurred_at_utc_ns,
                                              stored.clock_owner, stored.wall_clock_regressed)},
         {"sequence", Number(stored.sequence, "sequence")},
@@ -542,7 +554,7 @@ CanonicalValue HistorianSummaryEnvelopeValue(CanonicalValue::Array events,
 std::string HistorianConditionSeverity(const HistorianEvent &event) {
   const auto *schema = StringMember(event.payload, "schema_version");
   const auto *original = StringMember(event.payload, "original_severity");
-  if (schema != nullptr && *schema == "manyforge.client_incident_event.v1" && original != nullptr &&
+  if (schema != nullptr && *schema == "manyforge.client_incident_event.v2" && original != nullptr &&
       (*original == "WARN" || *original == "ERROR" || *original == "CRITICAL")) return *original;
   return event.severity;
 }
@@ -607,7 +619,7 @@ CanonicalValue HistorianDetailValue(const HistorianStoredEvent &stored) {
                                 ? nullptr
                                 : std::get_if<std::string>(&schema->storage());
   const bool operation = schema_text != nullptr &&
-                         *schema_text == "manyforge.operation_history_event.v1";
+                         *schema_text == "manyforge.operation_history_event.v2";
   const auto condition_severity = HistorianConditionSeverity(event);
   const bool incident = event.component == "manyforge.alarm" ||
                         condition_severity == "WARN" || condition_severity == "ERROR" ||
@@ -616,9 +628,8 @@ CanonicalValue HistorianDetailValue(const HistorianStoredEvent &stored) {
   CanonicalValue::Object execution;
   if (operation) {
     for (const auto name :
-         {"effect_pending", "native_sequence", "native_sequence_gap",
-          "operation_id", "operation_revision", "payload_digest", "record_kind",
-          "request_id", "source_owner_epoch", "journal_payload"}) {
+         {"native_sequence", "operation_id", "operation_revision", "payload_digest", "record_kind",
+          "request_key", "application_start_id", "journal_payload"}) {
       if (const auto *value = event.payload.find_object_member(name);
           value != nullptr) {
         execution.emplace_back(name, *value);
@@ -710,7 +721,6 @@ CanonicalValue AsyncHistorianHealthValue(const AsyncHistorianHealth &health) {
               "queue_capacity")},
       {"queue_depth",
        Number(static_cast<std::uint64_t>(health.queue_depth), "queue_depth")},
-      {"recovery_ready", CanonicalValue(health.recovery_ready)},
       {"schema_version", CanonicalValue(health.schema_version)},
       {"write_in_flight", CanonicalValue(health.write_in_flight)},
   });
@@ -805,8 +815,9 @@ bool AsyncEventHistorian::TryEnqueue(HistorianEvent event) {
   }
   if (queue_.size() >= queue_capacity_) {
     Advance(overflow_count_);
-    MarkFailureLocked("historian_queue_overflow",
-                      "bounded historian delivery queue is full");
+    queue_full_ = true;
+    MarkLossLocked("historian_queue_overflow",
+                   "bounded historian delivery queue is full");
     return false;
   }
   queued_ids_.insert(event.event_id);
@@ -819,9 +830,8 @@ bool AsyncEventHistorian::TryEnqueue(HistorianEvent event) {
 AsyncHistorianHealth AsyncEventHistorian::Health() const {
   std::lock_guard lock(mutex_);
   return {
-      "manyforge.async_historian_health.v1",
-      !failure_active_,
-      failure_active_ && recovery_write_observed_ && health_generation_ < kMaximumSafeInteger,
+      "manyforge.async_historian_health.v2",
+      !loss_active_,
       accepting_,
       health_generation_,
       error_code_,
@@ -837,10 +847,16 @@ AsyncHistorianHealth AsyncEventHistorian::Health() const {
   };
 }
 
+AsyncHistorianDiskSignals AsyncEventHistorian::DiskSignals() const {
+  std::lock_guard lock(mutex_);
+  return {queue_full_,
+          loss_active_ && error_code_ == "historian_storage_full"};
+}
+
 void AsyncEventHistorian::ReportDeliveryFailure(std::string code, std::string message) {
   std::lock_guard lock(mutex_);
   Advance(delivery_failure_count_);
-  MarkFailureLocked(std::move(code), std::move(message));
+  MarkLossLocked(std::move(code), std::move(message));
 }
 
 bool AsyncEventHistorian::WaitUntilIdle(
@@ -850,45 +866,6 @@ bool AsyncEventHistorian::WaitUntilIdle(
   std::unique_lock lock(mutex_);
   return idle_condition_.wait_for(
       lock, timeout, [this]() { return queue_.empty() && !write_in_flight_; });
-}
-
-bool AsyncEventHistorian::ReconcileHealth(
-    const std::uint64_t expected_generation) {
-  ValidateSafeInteger(expected_generation, "expected_generation");
-  std::lock_guard lock(mutex_);
-  Require(expected_generation == health_generation_,
-          "historian_health_generation_stale",
-          "historian health changed before reconciliation");
-  if (!failure_active_) {
-    // An already healthy generation has no state change or new audit fact.
-    return false;
-  }
-  if (!recovery_write_observed_) {
-    return false;
-  }
-  if (!AdvanceHealthGenerationLocked()) {
-    return false;
-  }
-  failure_active_ = false;
-  recovery_write_observed_ = false;
-  error_code_.reset();
-  error_message_.reset();
-  return true;
-}
-
-bool AsyncEventHistorian::AdvanceHealthGenerationLocked() {
-  if (health_generation_ < kMaximumSafeInteger) {
-    ++health_generation_;
-    return true;
-  }
-  // Diagnostic counters may saturate; a causal generation must never be
-  // reused to authorize a later repair. Only a new owner incarnation can
-  // replace this exhausted namespace.
-  failure_active_ = true;
-  recovery_write_observed_ = false;
-  error_code_ = "historian_health_generation_exhausted";
-  error_message_ = "historian health identity exhausted; owner replacement required";
-  return false;
 }
 
 void AsyncEventHistorian::Shutdown() {
@@ -906,16 +883,17 @@ void AsyncEventHistorian::Shutdown() {
   }
 }
 
-void AsyncEventHistorian::MarkFailureLocked(std::string code,
-                                            std::string message) {
-  const bool changed =
-      !failure_active_ || error_code_ != code || error_message_ != message;
-  failure_active_ = true;
-  recovery_write_observed_ = false;
-  error_code_ = std::move(code);
-  error_message_ = std::move(message);
-  if (changed) {
-    static_cast<void>(AdvanceHealthGenerationLocked());
+void AsyncEventHistorian::MarkLossLocked(std::string code,
+                                         std::string message) {
+  if (!loss_active_) {
+    loss_active_ = true;
+    unlogged_loss_ = "code=" + code + " detail=" + message;
+    condition_.notify_one();
+  }
+  if (error_code_ != code || error_message_ != message) {
+    error_code_ = std::move(code);
+    error_message_ = std::move(message);
+    Advance(health_generation_);
   }
 }
 
@@ -923,8 +901,19 @@ void AsyncEventHistorian::Run() {
   LowerWriterThreadPriority();
   std::unique_lock lock(mutex_);
   while (true) {
-    condition_.wait(lock,
-                    [this]() { return stop_requested_ || !queue_.empty(); });
+    condition_.wait(lock, [this]() {
+      return stop_requested_ || unlogged_loss_.has_value() || !queue_.empty();
+    });
+    if (unlogged_loss_.has_value()) {
+      // One line per loss episode, written outside the lock.
+      const auto line = std::move(*unlogged_loss_);
+      unlogged_loss_.reset();
+      lock.unlock();
+      std::cerr << "historian records dropped; History has gaps until it writes again: "
+                << line << '\n';
+      lock.lock();
+      continue;
+    }
     if (queue_.empty()) {
       if (stop_requested_) {
         break;
@@ -948,46 +937,64 @@ void AsyncEventHistorian::Run() {
     lock.unlock();
 
     IEventHistoryStore::AppendBatchResult result;
+    // A thrown failure is a failure of the whole write: nothing committed.
+    bool write_failed = false;
     try {
       store_->ObserveDeliveryLoss(delivery_loss);
       result = store_->AppendBatch(batch);
       // Without a failure a store may commit a leading part of the batch
       // (its transaction bound); the rest waits for the next commit.
-      if (result.statuses.size() > batch.size() ||
+      if (result.statuses.size() + (result.failure ? 1U : 0U) > batch.size() ||
           (!result.failure && result.statuses.empty())) {
         throw EventHistorianError("historian_store_failure",
                                   "historian store reported an inconsistent batch result");
       }
     } catch (...) {
       result = {{}, std::current_exception()};
+      write_failed = true;
     }
 
     lock.lock();
     write_in_flight_ = false;
-    for (std::size_t index = 0; index < result.statuses.size(); ++index) {
+    // A record whose write failed is dropped and counted, never retried: the
+    // one failing record when it failed alone, the whole batch when the write
+    // failed. The writer then continues with the next records.
+    const auto written = result.statuses.size();
+    const std::size_t dropped =
+        !result.failure ? 0U : (write_failed ? batch.size() : 1U);
+    for (std::size_t index = 0; index < written + dropped; ++index) {
       if (!queue_.empty() && queue_.front().event_id == batch[index].event_id) {
         queued_ids_.erase(queue_.front().event_id);
         queue_.pop_front();
       }
-      if (result.statuses[index] == IEventHistoryStore::AppendStatus::kStored) {
+      if (index >= written) {
+        Advance(delivery_failure_count_);
+      } else if (result.statuses[index] == IEventHistoryStore::AppendStatus::kStored) {
         Advance(delivered_count_);
       } else {
         Advance(duplicate_count_);
       }
     }
-    if (!result.statuses.empty() && failure_active_) {
-      recovery_write_observed_ = true;
-    }
+    // OD-215: "queue full" ends once the queue is empty, whether or not the
+    // batch was written (a store failing for another reason cannot hold the
+    // disk check's stop).
+    if (queue_.empty()) queue_full_ = false;
     if (!result.failure) {
       if (queue_.empty()) {
+        // Written empty again: the loss episode, if any, ends here.
+        if (loss_active_) {
+          loss_active_ = false;
+          error_code_.reset();
+          error_message_.reset();
+          Advance(health_generation_);
+        }
         idle_condition_.notify_all();
       }
       continue;
     }
 
     auto [error_code, error_message] = StoreFailure(result.failure);
-    Advance(delivery_failure_count_);
-    MarkFailureLocked(std::move(error_code), std::move(error_message));
+    MarkLossLocked(std::move(error_code), std::move(error_message));
     idle_condition_.notify_all();
     if (stop_requested_) {
       queue_.clear();

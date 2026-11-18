@@ -17,6 +17,7 @@
 #include <future>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -33,15 +34,10 @@
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
+#include <manyforge_persistence/sqlite_record_writer.hpp>
 #include "lite6_controllable_retention_fixture.hpp"
-#include "runtime_only_retention_fixture.hpp"
 
 namespace manyforge::component_manager {
-
-// Defined by the journal implementation; deliberately omitted from the public API.
-core::Result<PersistedManagerApplyStatus> ReadManagerApplyStatusReadOnlyForTesting(
-    const std::filesystem::path &, const core::CellId &,
-    const core::NamedApplyPublicationTransactionDTO &, std::uint64_t *);
 
 namespace {
 
@@ -70,8 +66,7 @@ using core::ProjectionHealthState;
 using core::ProjectionExecutionHostBindingDTO;
 using core::ProjectionRevisionDTO;
 using core::PublicRequestContextDTO;
-using core::RequestId;
-using core::RequestOwnerEpoch;
+using core::RequestKey;
 using core::ResourceId;
 using core::RetainedBundleId;
 using core::RuntimeEpoch;
@@ -122,19 +117,23 @@ constexpr std::string_view kSceneIdOne =
 constexpr std::string_view kSceneIdTwo =
     "sha256:cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
 
-ManagerApplyIntentDTO Intent(std::string apply_id = "apply-1",
+// A distinct Manager-minted request key per test request number.
+RequestKey Key(const std::uint64_t sequence) {
+  return RequestKey::Make(
+      core::RequestKeyClass::kInternal, 0U,
+      static_cast<std::uint64_t>(core::RequestKeyMinter::kManager), sequence);
+}
+
+ManagerApplyIntentDTO Intent(const std::uint64_t apply_id = 1U,
                              const std::uint64_t generation = 1U,
-                             std::string request_id = "request-1",
-                             std::string owner_epoch = "owner-epoch-1",
+                             const std::uint64_t request = 1U,
                              std::string candidate = "candidate-bundle-1") {
   return {
       PublicRequestContextDTO{
-          RequestId(std::move(request_id)),
-          RequestOwnerEpoch(std::move(owner_epoch)),
+          Key(request),
           "component-manager-test",
-          std::optional<std::string>("correlation-1"),
       },
-      ApplyId(std::move(apply_id)),
+      ApplyId(apply_id),
       ApplyGeneration(generation),
       CellId("cell-1"),
       ProjectionRevisionDTO{
@@ -168,11 +167,12 @@ ManagerApplyIntentDTO ParentClaimIntent() {
   intent.parent_authoring_claim = core::CellAdmissionClaimDTO{
       {
           core::CellAdmissionClaimKindDTO::kAuthoringMutation,
-          core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
-          RequestOwnerEpoch("composer-owner-1"),
-          "composer-transaction-1",
-          RequestId("composer-request-1"),
-          ContentDigest(std::string(kDigestTwo)),
+          core::ApplicationRole::kAuthoringOwner,
+          std::nullopt,
+          RequestKey::Make(
+              core::RequestKeyClass::kInternal, 0U,
+              static_cast<std::uint64_t>(core::RequestKeyMinter::kComposer),
+              1U),
           core::AdmissionGeneration(7U),
           {},
           std::nullopt,
@@ -188,7 +188,7 @@ ManagerApplyIntentDTO ParentClaimIntent() {
 ApplyConfigurationFenceIntentDTO FenceIntent() {
   return {
       Intent().request_context,
-      core::ApplyFenceOwnerDTO{ApplyId("apply-1"), ApplyGeneration(1U)},
+      core::ApplyFenceOwnerDTO{ApplyId(1U), ApplyGeneration(1U)},
       ConfigurationFenceScopeDTO{
           {ControllableComponentId("robot-1")},
           {{ControlDomainId("arm"), ControlDomainRevision("domain-r1"),
@@ -359,7 +359,7 @@ ManagerApplyRuntimeConvergenceIntentDTO
 RuntimeIntent(const ContentDigest &acceptance_digest,
               const bool empty = false) {
   return {
-      ApplyId("apply-1"),
+      ApplyId(1U),
       ApplyGeneration(1U),
       RetainedBundleId("candidate-bundle-1"),
       GraphRevision("candidate-graph"),
@@ -399,7 +399,7 @@ RuntimeStagedReady(const ContentDigest &convergence_digest,
     });
   }
   return {
-      ApplyId("apply-1"),
+      ApplyId(1U),
       ApplyGeneration(1U),
       generation,
       convergence_digest,
@@ -427,7 +427,7 @@ PrivateMaterialization() {
   const auto candidate = CandidateProjection();
   return {
       candidate.scene_revision.content_hash,
-      ApplyId("apply-1"),
+      ApplyId(1U),
       ApplyGeneration(1U),
       candidate,
       ContentDigest(std::string(kDigestTwo)),
@@ -472,11 +472,10 @@ FenceReleaseIntent(const SelectedBundleTransitionRecords &records,
       core::ExecutionHostEpochDTO{
           RuntimeUnitId("kernel-runtime"),
           RuntimeEpoch("kernel-epoch-1"),
-          RequestOwnerEpoch("kernel-owner-epoch-1"),
           ContentDigest(std::string(kDigestTwo)),
           ActiveBundlePublicationGeneration(4U),
       },
-      core::ApplyFenceOwnerDTO{ApplyId("apply-1"), ApplyGeneration(1U)},
+      core::ApplyFenceOwnerDTO{ApplyId(1U), ApplyGeneration(1U)},
       acceptance.accepted_fence.configuration_fence_id,
       acceptance.accepted_fence.configuration_fence_generation,
       acceptance.accepted_fence.captured_scope,
@@ -497,8 +496,7 @@ FenceReleaseIntent(const SelectedBundleTransitionRecords &records,
   return {
       records.publication.publication_receipt_digest,
       acceptance.acceptance_digest,
-      core::ConfigurationFenceReleaseDTO{std::move(evidence),
-                                         RuntimeEpoch("manager-epoch-1")},
+      core::ConfigurationFenceReleaseDTO{std::move(evidence)},
   };
 }
 
@@ -543,7 +541,7 @@ ApplyCompletionRecords
 EnsureApplyCompletion(SqliteManagerApplyJournal &journal,
                       const SelectedBundleTransitionRecords &records) {
   const auto acceptance =
-      journal.ReadFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U));
+      journal.ReadFenceAcceptance(ApplyId(1U), ApplyGeneration(1U));
   if (!acceptance.has_value()) {
     throw std::runtime_error("test fixture lacks fence acceptance");
   }
@@ -565,7 +563,7 @@ AcceptedApplyRecords EnsureAcceptedApply(SqliteManagerApplyJournal &journal) {
   const auto intent = journal.EnsureIntent(Intent()).record;
   const auto attempt = EnsureAttempt(journal, intent.intent_digest).record;
   const auto acceptance = journal.EnsureFenceAcceptance(
-      ApplyId("apply-1"), ApplyGeneration(1U), attempt.fence_attempt_digest,
+      ApplyId(1U), ApplyGeneration(1U), attempt.fence_attempt_digest,
       AcceptedFence());
   return {intent, acceptance.record};
 }
@@ -656,6 +654,135 @@ void ExpectNoSqliteSidecars(const std::filesystem::path &path) {
   EXPECT_FALSE(std::filesystem::exists(path.string() + "-journal"));
 }
 
+// The first column of the first row of `sql`, read from the file with a
+// plain connection; -1 when there is no row.
+std::int64_t QueryInteger(const std::filesystem::path &path,
+                          const std::string &sql) {
+  sqlite3 *database = nullptr;
+  if (sqlite3_open_v2(path.string().c_str(), &database, SQLITE_OPEN_READWRITE,
+                      nullptr) != SQLITE_OK) {
+    sqlite3_close(database);
+    throw std::runtime_error("cannot open test database");
+  }
+  sqlite3_stmt *statement = nullptr;
+  std::int64_t result = -1;
+  if (sqlite3_prepare_v2(database, sql.c_str(), -1, &statement, nullptr) ==
+          SQLITE_OK &&
+      sqlite3_step(statement) == SQLITE_ROW) {
+    result = sqlite3_column_int64(statement, 0);
+  }
+  sqlite3_finalize(statement);
+  sqlite3_close(database);
+  return result;
+}
+
+// A record writer whose thread is held inside a first record until released,
+// so the journal's records queue behind it and nothing reaches the file.
+class GatedWriter final {
+public:
+  explicit GatedWriter(const persistence::SqliteRecordWriterLimits limits =
+                           persistence::kSqliteRecordWriterDefaultLimits)
+      : writer_(limits) {
+    auto entered = entered_.get_future();
+    if (sqlite3_open_v2(":memory:", &gate_,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE |
+                            SQLITE_OPEN_FULLMUTEX,
+                        nullptr) != SQLITE_OK ||
+        sqlite3_create_function(gate_, "gate", 0, SQLITE_UTF8, this, &Wait,
+                                nullptr, nullptr) != SQLITE_OK) {
+      throw std::runtime_error("cannot open the writer gate");
+    }
+    persistence::SqliteRecord record;
+    record.Statement("SELECT gate()");
+    static_cast<void>(writer_.Post(writer_.RegisterConnection(gate_, "gate", "SELECT 1"),
+                                   std::move(record)));
+    entered.wait();
+  }
+
+  ~GatedWriter() {
+    ReleaseAndDrain();
+    sqlite3_close(gate_);
+  }
+
+  GatedWriter(const GatedWriter &) = delete;
+  GatedWriter &operator=(const GatedWriter &) = delete;
+
+  [[nodiscard]] persistence::SqliteRecordWriter &writer() { return writer_; }
+
+  void ReleaseAndDrain() {
+    if (!released_) {
+      released_ = true;
+      release_.set_value();
+    }
+    writer_.DrainAndStop();
+  }
+
+private:
+  static void Wait(sqlite3_context *context, int, sqlite3_value **) {
+    auto *self = static_cast<GatedWriter *>(sqlite3_user_data(context));
+    self->entered_.set_value();
+    self->release_future_.wait();
+    sqlite3_result_null(context);
+  }
+
+  persistence::SqliteRecordWriter writer_;
+  sqlite3 *gate_{};
+  std::promise<void> entered_;
+  std::promise<void> release_;
+  std::shared_future<void> release_future_{release_.get_future().share()};
+  bool released_{};
+};
+
+// Declared after the journal: releases and drains the writer before the
+// journal closes the connection the writer still holds.
+struct DrainFirst final {
+  GatedWriter &gated;
+  ~DrainFirst() { gated.ReleaseAndDrain(); }
+};
+
+// Connections opened while a test captures them, to read the journal
+// connection's own settings.
+std::mutex captured_mutex;
+std::filesystem::path capture_target;
+std::vector<sqlite3 *> captured_connections;
+
+int CaptureConnection(sqlite3 *database, char **,
+                      const sqlite3_api_routines *) {
+  const char *filename = sqlite3_db_filename(database, "main");
+  std::lock_guard lock(captured_mutex);
+  std::error_code error;
+  if (filename != nullptr && *filename != '\0' &&
+      sqlite3_db_readonly(database, "main") == 0 &&
+      (capture_target.string() == filename ||
+       std::filesystem::equivalent(capture_target, filename, error))) {
+    captured_connections.push_back(database);
+  }
+  return SQLITE_OK;
+}
+
+// A complete manager_apply_intents row the journal does not hold.
+std::string ForeignIntentRowSql(const std::uint64_t apply_id) {
+  return "INSERT INTO manager_apply_intents ("
+         "apply_id,apply_generation,request_key,"
+         "source_label,predecessor_retained_bundle_id,"
+         "predecessor_graph_revision,predecessor_scene_id,"
+         "predecessor_scene_revision_id,predecessor_scene_content_hash,"
+         "candidate_retained_bundle_id,candidate_graph_revision,"
+         "captured_input_digest,deployment_artifact_id,deployment_revision,"
+         "program_binding_id,prepared_activation_id,"
+         "prepared_activation_receipt_json,"
+         "expected_admission_generation,parent_authoring_claim,scene_"
+         "initialization,intent_digest,accepted_sequence"
+         ") VALUES (" +
+         std::to_string(apply_id) + ",1,X'" + core::RequestKeyText(Key(99U)) +
+         "','foreign','predecessor-bundle','predecessor-graph','" +
+         std::string(kSceneIdOne) + "',7,'" + std::string(kDigestOne) +
+         "','candidate-bundle','candidate-graph','" + std::string(kDigestOne) +
+         "','deployment-artifact-1','" + std::string(kDigestOne) + "','" +
+         std::string(kDigestTwo) + "','" + std::string(kDigestThree) +
+         "','{}',7,NULL,'preserve','" + std::string(kDigestOne) + "',999);";
+}
+
 TEST(ManagerApplyJournalIntegrity,
      RejectsSchemaEmptyDatabaseWithForeignSqliteIdentity) {
   TemporaryDirectory directory;
@@ -690,49 +817,6 @@ TEST(ManagerApplyJournalIntegrity,
                ManagerApplyJournalConflictError);
   EXPECT_EQ(ReadFileBytes(cell_path), cell_before);
   ExpectNoSqliteSidecars(cell_path);
-}
-
-TEST(ManagerApplyJournalReadOnly,
-     NeverCreatesAndPreservesExactRecordDatabaseAndWal) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "read-only.sqlite3";
-  const auto intent = Intent();
-  const core::NamedApplyPublicationTransactionDTO apply{
-      intent.apply_id, intent.apply_generation};
-  EXPECT_FALSE(
-      ReadManagerApplyStatusReadOnly(path, intent.cell_id, apply).ok());
-  EXPECT_FALSE(std::filesystem::exists(path));
-  ExpectNoSqliteSidecars(path);
-  SqliteManagerApplyJournal owner(path, intent.cell_id);
-  const auto accepted = owner.EnsureIntent(intent);
-  const auto wal = std::filesystem::path(path.string() + "-wal");
-  ASSERT_TRUE(std::filesystem::exists(wal));
-  const auto database_before = ReadFileBytes(path);
-  const auto wal_before = ReadFileBytes(wal);
-  const auto actual =
-      ReadManagerApplyStatusReadOnly(path, intent.cell_id, apply);
-  ASSERT_TRUE(actual.ok()) << actual.error().message;
-  EXPECT_EQ(actual.value().intent, accepted.record);
-  EXPECT_FALSE(
-      ReadManagerApplyStatusReadOnly(path, CellId("another-cell"), apply).ok());
-  EXPECT_FALSE(ReadManagerApplyStatusReadOnly(
-                   path, intent.cell_id, {apply.apply_id, ApplyGeneration(2U)})
-                   .ok());
-  EXPECT_EQ(ReadFileBytes(path), database_before);
-  EXPECT_EQ(ReadFileBytes(wal), wal_before);
-  ExecSql(
-      path,
-      "DROP TRIGGER manager_apply_intents_no_update;"
-      "UPDATE manager_apply_intents SET source_label='tampered';"
-      "CREATE TRIGGER manager_apply_intents_no_update BEFORE UPDATE ON "
-      "manager_apply_intents "
-      "BEGIN SELECT RAISE(ABORT, 'manager_apply_intents is immutable'); END;");
-  const auto corrupt_database = ReadFileBytes(path);
-  const auto corrupt_wal = ReadFileBytes(wal);
-  EXPECT_FALSE(
-      ReadManagerApplyStatusReadOnly(path, intent.cell_id, apply).ok());
-  EXPECT_EQ(ReadFileBytes(path), corrupt_database);
-  EXPECT_EQ(ReadFileBytes(wal), corrupt_wal);
 }
 
 TEST(ManagerApplyJournalIntegrity, RejectsPreUa4JournalVersion) {
@@ -813,16 +897,10 @@ TEST(ManagerApplyIntent, ValidityRejectsMissingRequiredIdentity) {
   auto intent = Intent();
   EXPECT_TRUE(intent.valid());
 
-  intent.request_context.request_id = RequestId("");
-  EXPECT_FALSE(intent.valid());
-  intent = Intent();
-  intent.request_context.request_owner_epoch = RequestOwnerEpoch("");
+  intent.apply_id = ApplyId(0U);
   EXPECT_FALSE(intent.valid());
   intent = Intent();
   intent.request_context.source_label.clear();
-  EXPECT_FALSE(intent.valid());
-  intent = Intent();
-  intent.request_context.correlation_id = "";
   EXPECT_FALSE(intent.valid());
   intent = Intent();
   intent.apply_generation = ApplyGeneration(0U);
@@ -864,11 +942,11 @@ TEST(ManagerApplyJournal,
 
   // An unknown durable identity is not an operation.
   EXPECT_FALSE(
-      journal.ReadStatus(ApplyId("apply-unknown"), ApplyGeneration(1U))
+      journal.ReadStatus(ApplyId(404U), ApplyGeneration(1U))
           .has_value());
 
   const auto accepted =
-      journal.ReadStatus(ApplyId("apply-1"), ApplyGeneration(1U));
+      journal.ReadStatus(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(accepted.has_value());
   EXPECT_EQ(accepted->intent.intent_digest, intent.intent_digest);
   EXPECT_FALSE(accepted->terminal_outcome.has_value());
@@ -882,7 +960,7 @@ TEST(ManagerApplyJournal,
   const auto scope =
       journal.EnsureAffectedScope(intent.intent_digest, AffectedScope()).record;
   const auto fenced =
-      journal.ReadStatus(ApplyId("apply-1"), ApplyGeneration(1U));
+      journal.ReadStatus(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(fenced.has_value());
   const auto fenced_progress = DeriveManagerApplyProgress(*fenced);
   EXPECT_EQ(fenced_progress.phase, ManagerApplyPhase::kFenceAcquired);
@@ -914,7 +992,7 @@ TEST(ManagerApplyTerminalOutcome, RequiresExactlyOneCompleteDisposition) {
   EXPECT_TRUE(failure.valid());
 
   const ManagerApplyTerminalOutcomeDTO full_success{
-      ApplyId("apply-1"),
+      ApplyId(1U),
       ApplyGeneration(1U),
       projection,
       ContentDigest(std::string(kDigestTwo)),
@@ -947,7 +1025,7 @@ TEST(ManagerApplyTerminalOutcome, RequiresExactlyOneCompleteDisposition) {
   EXPECT_FALSE(partial.valid());
 
   const ManagerApplyTerminalOutcomeDTO failed{
-      ApplyId("apply-1"),
+      ApplyId(1U),
       ApplyGeneration(1U),
       std::nullopt,
       std::nullopt,
@@ -1034,7 +1112,7 @@ TEST(ManagerApplyJournal, RetainsTheTypedCauseOfATerminalFailure) {
     // The phase code names the failed Apply step; the cause keeps the Kernel's
     // own code, details (separator bytes included) and producer.
     const ManagerApplyTerminalOutcomeDTO outcome{
-        ApplyId("apply-1"),
+        ApplyId(1U),
         ApplyGeneration(1U),
         std::nullopt,
         std::nullopt,
@@ -1062,7 +1140,7 @@ TEST(ManagerApplyJournal, RetainsTheTypedCauseOfATerminalFailure) {
   }
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
   const auto stored =
-      reopened.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U));
+      reopened.ReadTerminalOutcome(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(stored.has_value() && expected.has_value());
   EXPECT_EQ(stored->terminal_outcome, *expected);
   EXPECT_EQ(stored->terminal_outcome.failure->cause_code, "stale_generation");
@@ -1136,7 +1214,7 @@ TEST(ManagerApplyJournal, RetainsOneImmutableTerminalFailurePerOperation) {
       ManagerApplyEffectBoundary::kUnknown,
   };
   const auto retained = journal.EnsureTerminalOutcome({
-      ApplyId("apply-1"),
+      ApplyId(1U),
       ApplyGeneration(1U),
       std::nullopt,
       std::nullopt,
@@ -1149,7 +1227,7 @@ TEST(ManagerApplyJournal, RetainsOneImmutableTerminalFailurePerOperation) {
 
   // Exact replay is a read of the same immutable terminal outcome.
   const auto replay = journal.EnsureTerminalOutcome({
-      ApplyId("apply-1"),
+      ApplyId(1U),
       ApplyGeneration(1U),
       std::nullopt,
       std::nullopt,
@@ -1166,7 +1244,7 @@ TEST(ManagerApplyJournal, RetainsOneImmutableTerminalFailurePerOperation) {
   auto conflicting = failure;
   conflicting.failure_message = "another failure";
   EXPECT_THROW(journal.EnsureTerminalOutcome({
-                   ApplyId("apply-1"),
+                   ApplyId(1U),
                    ApplyGeneration(1U),
                    std::nullopt,
                    std::nullopt,
@@ -1178,7 +1256,7 @@ TEST(ManagerApplyJournal, RetainsOneImmutableTerminalFailurePerOperation) {
                ManagerApplyJournalConflictError);
 
   const auto status =
-      journal.ReadStatus(ApplyId("apply-1"), ApplyGeneration(1U));
+      journal.ReadStatus(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(status.has_value());
   ASSERT_TRUE(status->terminal_outcome.has_value());
   const auto &terminal = status->terminal_outcome->terminal_outcome;
@@ -1200,221 +1278,13 @@ TEST(ManagerApplyJournal, RetainsOneImmutableTerminalFailurePerOperation) {
 
   // The retained first failure survives a Manager restart exactly.
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
-  const auto stored = reopened.ReadTerminalOutcome(ApplyId("apply-1"),
+  const auto stored = reopened.ReadTerminalOutcome(ApplyId(1U),
                                                    ApplyGeneration(1U));
   ASSERT_TRUE(stored.has_value());
   EXPECT_EQ(stored->terminal_outcome, retained.record.terminal_outcome);
   EXPECT_EQ(stored->terminal_outcome_digest,
             retained.record.terminal_outcome_digest);
   EXPECT_EQ(reopened.VerifyIntegrity().terminal_outcome_count, 1);
-}
-
-// A direct Manager claim settles only after a known refusal at the
-// accepted phase; any later or uncertain failure keeps it held until the
-// cold-restart recovery.
-TEST(ManagerApplyJournal, SettlesADirectClaimOnlyForAKnownAcceptedPhaseRefusal) {
-  const auto settlement = [](const ManagerApplyPhase phase,
-                             const ManagerApplyEffectDisposition disposition,
-                             const bool record_terminal) {
-    TemporaryDirectory directory;
-    const auto path = directory.path() / "settlement.sqlite3";
-    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-    const auto intent = journal.EnsureIntent(Intent()).record;
-    ContentDigest evidence{std::string(kDigestOne)};
-    if (record_terminal) {
-      evidence = journal
-                     .EnsureTerminalOutcome({
-                         ApplyId("apply-1"),
-                         ApplyGeneration(1U),
-                         std::nullopt,
-                         std::nullopt,
-                         std::nullopt,
-                         std::nullopt,
-                         disposition == ManagerApplyEffectDisposition::kKnown
-                             ? ManagerApplyTerminalOutcomeState::kFailed
-                             : ManagerApplyTerminalOutcomeState::kUnknownEffect,
-                         ManagerApplyFailureEvidenceDTO{
-                             intent.intent_digest, phase, "refused",
-                             "refused by the test", disposition,
-                             "typed_cause_code",
-                             {},
-                             "component_manager",
-                             ManagerApplyEffectBoundary::kUnknown},
-                     })
-                     .record.terminal_outcome_digest;
-    }
-    const core::CellAdmissionClaimDTO claim{
-        {
-            core::CellAdmissionClaimKindDTO::kManagerApply,
-            core::CellAdmissionOwnerRoleDTO::kManager,
-            intent.intent.request_context.request_owner_epoch,
-            intent.intent.apply_id.value(),
-            intent.intent.request_context.request_id,
-            intent.intent_digest,
-            *intent.intent.expected_admission_generation,
-            {},
-            std::nullopt,
-            std::nullopt,
-        },
-        core::CellAdmissionClaimGeneration(3U),
-        *intent.intent.expected_admission_generation,
-        42,
-    };
-    const core::CellAdmissionClaimReleaseDTO release{
-        claim.intent.owner_role,
-        claim.intent.owner_epoch,
-        claim.intent.owner_transaction_id,
-        claim.intent.request_id,
-        claim.intent.request_payload_digest,
-        claim.acquired_admission_generation,
-        claim.claim_generation,
-        {core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
-         evidence},
-    };
-    return ValidateManagerApplyCellAdmissionSettlementReadOnly(
-               path, CellId("cell-1"), claim, release)
-        .ok();
-  };
-
-  EXPECT_TRUE(settlement(ManagerApplyPhase::kAccepted,
-                         ManagerApplyEffectDisposition::kKnown, true));
-  EXPECT_FALSE(settlement(ManagerApplyPhase::kFenceAcquired,
-                          ManagerApplyEffectDisposition::kKnown, true));
-  EXPECT_FALSE(settlement(ManagerApplyPhase::kFenceAccepted,
-                          ManagerApplyEffectDisposition::kKnown, true));
-  EXPECT_FALSE(settlement(ManagerApplyPhase::kAccepted,
-                          ManagerApplyEffectDisposition::kUnknown, true));
-  EXPECT_FALSE(settlement(ManagerApplyPhase::kAccepted,
-                          ManagerApplyEffectDisposition::kKnown, false));
-}
-
-// Exact terminal proof is passive; a LIVE holder is never inferred dead.
-TEST(ManagerApplyJournal,
-     ConfigurationSuccessorRequiresExactTerminalOldClaims) {
-  for (const auto disposition : {ManagerApplyEffectDisposition::kKnown,
-                                 ManagerApplyEffectDisposition::kUnknown}) {
-    TemporaryDirectory directory;
-    const auto path = directory.path() / "successor-proof.sqlite3";
-    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-    const auto intent = journal.EnsureIntent(Intent()).record;
-    const core::CellAdmissionClaimDTO claim{
-        {core::CellAdmissionClaimKindDTO::kManagerApply,
-         core::CellAdmissionOwnerRoleDTO::kManager,
-         intent.intent.request_context.request_owner_epoch,
-         intent.intent.apply_id.value(),
-         intent.intent.request_context.request_id,
-         intent.intent_digest,
-         *intent.intent.expected_admission_generation,
-         {},
-         std::nullopt,
-         std::nullopt,
-         std::nullopt},
-        core::CellAdmissionClaimGeneration(3U),
-        *intent.intent.expected_admission_generation,
-        42};
-    const std::array claims{claim};
-    EXPECT_FALSE(ValidateTerminalManagerApplyClaimsReadOnly(
-                     path, CellId("cell-1"), claims)
-                     .ok());
-    const auto terminal =
-        journal
-            .EnsureTerminalOutcome(
-                {ApplyId("apply-1"), ApplyGeneration(1U), std::nullopt,
-                 std::nullopt, std::nullopt, std::nullopt,
-                 disposition == ManagerApplyEffectDisposition::kKnown
-                     ? ManagerApplyTerminalOutcomeState::kFailed
-                     : ManagerApplyTerminalOutcomeState::kUnknownEffect,
-                 ManagerApplyFailureEvidenceDTO{
-                     intent.intent_digest, ManagerApplyPhase::kAccepted,
-                     "refused", "test refusal", disposition,
-                     "typed_cause_code",
-                     {},
-                     "component_manager",
-                     ManagerApplyEffectBoundary::kUnknown}})
-            .record;
-    EXPECT_TRUE(ValidateTerminalManagerApplyClaimsReadOnly(
-                    path, CellId("cell-1"), claims)
-                    .ok());
-    auto foreign = claim;
-    foreign.intent.request_payload_digest =
-        ContentDigest(std::string(kDigestTwo));
-    EXPECT_FALSE(ValidateTerminalManagerApplyClaimsReadOnly(
-                     path, CellId("cell-1"), std::array{foreign})
-                     .ok());
-    EXPECT_FALSE(ValidateTerminalManagerApplyClaimsReadOnly(
-                     path, CellId("cell-other"), claims)
-                     .ok());
-    EXPECT_FALSE(ValidateTerminalManagerApplyClaimsReadOnly(
-                     path, CellId("cell-1"), std::array{claim, claim})
-                     .ok());
-    EXPECT_EQ(
-        journal.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U)),
-        terminal);
-    EXPECT_EQ(journal.VerifyIntegrity().terminal_outcome_count, 1);
-  }
-}
-
-TEST(ManagerApplyJournal,
-     ConfigurationSuccessorRequiresExactFreshSucceededChain) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "fresh-success-proof.sqlite3";
-  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-  const auto transition = EnsureSelectedBundleTransition(journal);
-  const auto status =
-      journal.ReadStatus(ApplyId("apply-1"), ApplyGeneration(1U));
-  ASSERT_TRUE(status.has_value());
-  const auto &intent = status->intent;
-  const core::CellAdmissionClaimDTO claim{
-      {core::CellAdmissionClaimKindDTO::kManagerApply,
-       core::CellAdmissionOwnerRoleDTO::kManager,
-       intent.intent.request_context.request_owner_epoch,
-       intent.intent.apply_id.value(),
-       intent.intent.request_context.request_id,
-       intent.intent_digest,
-       *intent.intent.expected_admission_generation,
-       {},
-       std::nullopt,
-       std::nullopt,
-       std::nullopt},
-      core::CellAdmissionClaimGeneration(3U),
-      *intent.intent.expected_admission_generation,
-      42};
-  core::CellAdmissionClaimReleaseDTO release{
-      claim.intent.owner_role,
-      claim.intent.owner_epoch,
-      claim.intent.owner_transaction_id,
-      claim.intent.request_id,
-      claim.intent.request_payload_digest,
-      claim.acquired_admission_generation,
-      claim.claim_generation,
-      {core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
-       ContentDigest(std::string(kDigestOne))}};
-  EXPECT_FALSE(ValidateFreshManagerApplySuccessReadOnly(path, CellId("cell-1"),
-                                                        claim, release)
-                   .ok());
-  const auto completed = EnsureApplyCompletion(journal, transition);
-  release.settlement.evidence_digest =
-      completed.terminal.terminal_outcome_digest;
-  EXPECT_TRUE(ValidateFreshManagerApplySuccessReadOnly(path, CellId("cell-1"),
-                                                       claim, release)
-                  .ok());
-  EXPECT_FALSE(ValidateTerminalManagerApplyClaimsReadOnly(
-                   path, CellId("cell-1"), std::array{claim})
-                   .ok());
-  auto foreign = release;
-  foreign.settlement.evidence_digest = ContentDigest(std::string(kDigestTwo));
-  EXPECT_FALSE(ValidateFreshManagerApplySuccessReadOnly(path, CellId("cell-1"),
-                                                        claim, foreign)
-                   .ok());
-  foreign = release;
-  foreign.claim_generation = core::CellAdmissionClaimGeneration(4U);
-  EXPECT_FALSE(ValidateFreshManagerApplySuccessReadOnly(path, CellId("cell-1"),
-                                                        claim, foreign)
-                   .ok());
-  EXPECT_EQ(
-      journal.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U)),
-      completed.terminal);
-  EXPECT_EQ(journal.VerifyIntegrity().terminal_outcome_count, 1);
 }
 
 TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
@@ -1425,7 +1295,7 @@ TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
 
   // An unknown operation is not a durable identity.
   EXPECT_THROW(journal.EnsureTerminalOutcome({
-                   ApplyId("apply-unknown"),
+                   ApplyId(404U),
                    ApplyGeneration(1U),
                    std::nullopt,
                    std::nullopt,
@@ -1448,7 +1318,7 @@ TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
 
   // A failure must name the exact accepted intent of the same generation.
   EXPECT_THROW(journal.EnsureTerminalOutcome({
-                   ApplyId("apply-1"),
+                   ApplyId(1U),
                    ApplyGeneration(1U),
                    std::nullopt,
                    std::nullopt,
@@ -1471,7 +1341,7 @@ TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
 
   // A mismatched state/disposition pair is rejected before any write.
   EXPECT_THROW(journal.EnsureTerminalOutcome({
-                   ApplyId("apply-1"),
+                   ApplyId(1U),
                    ApplyGeneration(1U),
                    std::nullopt,
                    std::nullopt,
@@ -1494,7 +1364,7 @@ TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
 
   // Empty and oversized retained failure text is rejected before any write.
   EXPECT_THROW(journal.EnsureTerminalOutcome({
-                   ApplyId("apply-1"),
+                   ApplyId(1U),
                    ApplyGeneration(1U),
                    std::nullopt,
                    std::nullopt,
@@ -1515,7 +1385,7 @@ TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
                }),
                std::invalid_argument);
   EXPECT_THROW(journal.EnsureTerminalOutcome({
-                   ApplyId("apply-1"),
+                   ApplyId(1U),
                    ApplyGeneration(1U),
                    std::nullopt,
                    std::nullopt,
@@ -1537,7 +1407,7 @@ TEST(ManagerApplyJournal, RejectsATerminalFailureThatIsNotBoundToItsIntent) {
                std::invalid_argument);
 
   // None of the refusals left a terminal record behind.
-  EXPECT_FALSE(journal.ReadTerminalOutcome(ApplyId("apply-1"),
+  EXPECT_FALSE(journal.ReadTerminalOutcome(ApplyId(1U),
                                            ApplyGeneration(1U))
                    .has_value());
 }
@@ -1548,16 +1418,6 @@ TEST(ManagerApplyJournalValues,
   using Setter =
       std::function<void(ManagerApplyIntentDTO &, const std::string &)>;
   const std::vector<std::pair<std::string, Setter>> identities{
-      {"request_id",
-       [](auto &value, const auto &text) {
-         value.request_context.request_id = RequestId(text);
-       }},
-      {"request_owner_epoch",
-       [](auto &value, const auto &text) {
-         value.request_context.request_owner_epoch = RequestOwnerEpoch(text);
-       }},
-      {"apply_id",
-       [](auto &value, const auto &text) { value.apply_id = ApplyId(text); }},
       {"predecessor_bundle",
        [](auto &value, const auto &text) {
          value.expected_active_projection_revision.retained_bundle_id =
@@ -1656,10 +1516,6 @@ TEST(ManagerApplyJournalValues,
             [](auto &value, const auto &text) {
               value.request_context.source_label = text;
             }},
-           {"correlation_id", kMaximumManagerApplyCorrelationIdBytes,
-            [](auto &value, const auto &text) {
-              value.request_context.correlation_id = text;
-            }},
        }) {
     SCOPED_TRACE(label);
     auto exact = Intent();
@@ -1683,6 +1539,19 @@ TEST(ManagerApplyJournalValues,
           directory.path() / (label + "-control.sqlite3"), CellId("cell-1"));
       EXPECT_THROW(journal.EnsureIntent(control), std::invalid_argument);
     }
+  }
+
+  // The Apply number is a positive safe integer.
+  {
+    SqliteManagerApplyJournal journal(
+        directory.path() / "apply-number-exact.sqlite3", CellId("cell-1"));
+    EXPECT_TRUE(journal.EnsureIntent(Intent(9007199254740991ULL)).inserted);
+  }
+  {
+    SqliteManagerApplyJournal journal(
+        directory.path() / "apply-number-excessive.sqlite3", CellId("cell-1"));
+    EXPECT_THROW(journal.EnsureIntent(Intent(9007199254740992ULL)),
+                 std::invalid_argument);
   }
 
   auto excessive_generation = Intent();
@@ -1754,21 +1623,11 @@ TEST(ManagerApplyJournalIntegrity,
     mutate(value);
     variants.push_back(std::move(value));
   };
-  add([](auto &value) {
-    value.request_context.request_id = RequestId("request-2");
-  });
-  add([](auto &value) {
-    value.request_context.request_owner_epoch =
-        RequestOwnerEpoch("owner-epoch-2");
-  });
+  add([](auto &value) { value.request_context.request_key = Key(2U); });
   add([](auto &value) {
     value.request_context.source_label = "another-source";
   });
-  add([](auto &value) { value.request_context.correlation_id.reset(); });
-  add([](auto &value) {
-    value.request_context.correlation_id = "correlation-2";
-  });
-  add([](auto &value) { value.apply_id = ApplyId("apply-2"); });
+  add([](auto &value) { value.apply_id = ApplyId(2U); });
   add([](auto &value) { value.apply_generation = ApplyGeneration(2U); });
   add([](auto &value) { value.cell_id = CellId("cell-2"); });
   add([](auto &value) {
@@ -1829,9 +1688,7 @@ TEST(ManagerApplyJournalIntegrity,
         intent.cell_id);
     if (intent.apply_generation.value() == 2U) {
       EXPECT_TRUE(journal
-                      .EnsureIntent(Intent(intent.apply_id.value(), 1U,
-                                           "generation-predecessor-request",
-                                           "generation-predecessor-owner"))
+                      .EnsureIntent(Intent(intent.apply_id.value(), 1U, 99U))
                       .inserted);
     }
     const auto result = journal.EnsureIntent(intent);
@@ -1858,7 +1715,7 @@ TEST(ManagerApplyJournal,
                  ManagerApplyJournalConflictError);
   }
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
-  const auto read = reopened.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U));
+  const auto read = reopened.ReadIntent(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(read.has_value());
   EXPECT_FALSE(read->intent.prepared_activation.program_binding_id.has_value());
   EXPECT_EQ(read->intent, intent);
@@ -1880,20 +1737,19 @@ TEST(ManagerApplyJournal, PersistsExactIntentAndReplaysAcrossRestart) {
     const auto replay = journal.EnsureIntent(intent);
     EXPECT_FALSE(replay.inserted);
     EXPECT_EQ(replay.record, inserted.record);
-    ASSERT_TRUE(journal.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U))
+    ASSERT_TRUE(journal.ReadIntent(ApplyId(1U), ApplyGeneration(1U))
                     .has_value());
     EXPECT_EQ(journal
-                  .ReadRequest(RequestOwnerEpoch("owner-epoch-1"),
-                               RequestId("request-1"))
+                  .ReadRequest(Key(1U))
                   ->intent,
               intent);
-    EXPECT_EQ(journal.ReadApplyGenerationHighWater(ApplyId("apply-1")),
+    EXPECT_EQ(journal.ReadApplyGenerationHighWater(ApplyId(1U)),
               ApplyGeneration(1U));
   }
 
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
   const auto record =
-      reopened.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U));
+      reopened.ReadIntent(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(record.has_value());
   EXPECT_EQ(record->intent, intent);
   EXPECT_EQ(record->intent_digest, digest);
@@ -1917,101 +1773,10 @@ TEST(ManagerApplyJournal, PersistsExactParentAuthoringClaimAcrossRestart) {
 
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
   const auto record =
-      reopened.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U));
+      reopened.ReadIntent(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(record.has_value());
   EXPECT_EQ(record->intent, intent);
   EXPECT_EQ(reopened.VerifyIntegrity().apply_intent_count, 1);
-}
-
-TEST(ManagerApplyJournal,
-     AuthoringOwnerRotationSettlesOnlyClaimsWithoutPendingManagerEffects) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "authoring-owner-rotation.sqlite3";
-  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-  const auto claim = *ParentClaimIntent().parent_authoring_claim;
-  const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> current{
-      {core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
-       RequestOwnerEpoch("composer-owner-1")}};
-  const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> successor{
-      {core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
-       RequestOwnerEpoch("composer-owner-2")}};
-  const auto evidence =
-      core::CellAdmissionOwnerEpochReconciliationEvidenceDigest(
-          core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
-          RequestOwnerEpoch("composer-owner-2"));
-  ASSERT_TRUE(evidence.ok());
-  const core::CellAdmissionReconcileDTO reconcile{
-      RequestOwnerEpoch("kernel-owner-1"), {claim}, successor,
-      evidence.value()};
-
-  const auto local = ValidateManagerAuthoringOwnerReconciliationReadOnly(
-      path, CellId("cell-1"), {claim}, current, reconcile);
-  ASSERT_TRUE(local.ok());
-  ASSERT_EQ(local.value().settlements.size(), 1U);
-  EXPECT_EQ(local.value().settlements[0].predecessor_claim, claim);
-  EXPECT_EQ(local.value().settlements[0].successor_owner_epoch,
-            RequestOwnerEpoch("composer-owner-2"));
-
-  static_cast<void>(journal.EnsureIntent(ParentClaimIntent()));
-  const auto pending = ValidateManagerAuthoringOwnerReconciliationReadOnly(
-      path, CellId("cell-1"), {claim}, current, reconcile);
-  EXPECT_FALSE(pending.ok());
-
-  const auto durable_intent =
-      journal.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U));
-  ASSERT_TRUE(durable_intent.has_value());
-  static_cast<void>(journal.EnsureTerminalOutcome({
-      ApplyId("apply-1"),
-      ApplyGeneration(1U),
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      ManagerApplyTerminalOutcomeState::kFailed,
-      ManagerApplyFailureEvidenceDTO{
-          durable_intent->intent_digest,
-          ManagerApplyPhase::kAccepted,
-          "maintenance_preflight_refused",
-          "maintenance was refused before any runtime effect",
-          ManagerApplyEffectDisposition::kKnown,
-          "typed_cause_code",
-          {},
-          "component_manager",
-          ManagerApplyEffectBoundary::kUnknown},
-  }));
-  const auto refused_before_effect =
-      ValidateManagerAuthoringOwnerReconciliationReadOnly(
-          path, CellId("cell-1"), {claim}, current, reconcile);
-  EXPECT_TRUE(refused_before_effect.ok());
-
-  const auto destructive_path =
-      directory.path() / "authoring-owner-destructive-failure.sqlite3";
-  SqliteManagerApplyJournal destructive(destructive_path, CellId("cell-1"));
-  const auto destructive_intent =
-      destructive.EnsureIntent(ParentClaimIntent()).record;
-  static_cast<void>(destructive.EnsureTerminalOutcome({
-      ApplyId("apply-1"),
-      ApplyGeneration(1U),
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      ManagerApplyTerminalOutcomeState::kFailed,
-      ManagerApplyFailureEvidenceDTO{
-          destructive_intent.intent_digest,
-          ManagerApplyPhase::kRuntimeConverged,
-          "runtime_initialization_failed",
-          "replacement initialization failed after teardown",
-          ManagerApplyEffectDisposition::kKnown,
-          "typed_cause_code",
-          {},
-          "component_manager",
-          ManagerApplyEffectBoundary::kUnknown},
-  }));
-  const auto destructive_failure =
-      ValidateManagerAuthoringOwnerReconciliationReadOnly(
-          destructive_path, CellId("cell-1"), {claim}, current, reconcile);
-  EXPECT_FALSE(destructive_failure.ok());
 }
 
 TEST(ManagerApplyJournal,
@@ -2041,67 +1806,6 @@ TEST(ManagerApplyJournal,
   EXPECT_FALSE(records[0].terminal_outcome.has_value());
 }
 
-TEST(ManagerApplyJournal,
-     ReadsAreReverifiedOnlyAfterAnOwnOrForeignCommit) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "apply.sqlite3";
-  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-  const auto intent = journal.EnsureIntent(Intent()).record;
-  const auto first = journal.ReadStatusInventory();
-  ASSERT_EQ(first.size(), 1U);
-  const auto verified = journal.record_verification_count();
-
-  // Unchanged database: the verified inventory is reused, not re-verified.
-  for (int read = 0; read < 2; ++read) {
-    const auto reused = journal.ReadStatusInventory();
-    ASSERT_EQ(reused.size(), 1U);
-    EXPECT_EQ(reused[0].intent, intent);
-    EXPECT_FALSE(reused[0].affected_scope.has_value());
-  }
-  EXPECT_EQ(journal.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U)),
-            intent);
-  EXPECT_FALSE(
-      journal.ReadAffectedScope(ApplyId("apply-1"), ApplyGeneration(1U))
-          .has_value());
-  EXPECT_EQ(journal.record_verification_count(), verified);
-
-  // An own write is visible and re-verified on the very next read.
-  const auto scope =
-      journal.EnsureAffectedScope(intent.intent_digest, AffectedScope()).record;
-  const auto with_scope = journal.ReadStatusInventory();
-  EXPECT_GT(journal.record_verification_count(), verified);
-  ASSERT_EQ(with_scope.size(), 1U);
-  ASSERT_TRUE(with_scope[0].affected_scope.has_value());
-  EXPECT_EQ(with_scope[0].affected_scope->affected_scope_digest,
-            scope.affected_scope_digest);
-
-  // A foreign commit that corrupts a verified record is detected on the very
-  // next read, and no stale verified inventory survives the failure.
-  const auto rewrite_source = [&](const std::string &source) {
-    ExecSql(
-        path,
-        "DROP TRIGGER manager_apply_intents_no_update;"
-        "UPDATE manager_apply_intents SET source_label='" +
-            source +
-            "';"
-            "CREATE TRIGGER manager_apply_intents_no_update "
-            "BEFORE UPDATE ON manager_apply_intents BEGIN "
-            "SELECT RAISE(ABORT, 'manager_apply_intents is immutable'); END;");
-  };
-  rewrite_source("tampered-source");
-  EXPECT_THROW(static_cast<void>(journal.ReadStatusInventory()),
-               ManagerApplyJournalIntegrityError);
-  EXPECT_THROW(static_cast<void>(journal.ReadStatusInventory()),
-               ManagerApplyJournalIntegrityError);
-  rewrite_source(Intent().request_context.source_label);
-  const auto restored = journal.ReadStatusInventory();
-  ASSERT_EQ(restored.size(), 1U);
-  EXPECT_EQ(restored[0].intent, intent);
-  ASSERT_TRUE(restored[0].affected_scope.has_value());
-  EXPECT_EQ(restored[0].affected_scope->affected_scope_digest,
-            scope.affected_scope_digest);
-}
-
 TEST(ManagerApplyJournal, CommittedChildWriteSurvivesProcessExit) {
   TemporaryDirectory directory;
   const auto path = directory.path() / "apply.sqlite3";
@@ -2112,6 +1816,8 @@ TEST(ManagerApplyJournal, CommittedChildWriteSurvivesProcessExit) {
     try {
       SqliteManagerApplyJournal journal(path, CellId("cell-1"));
       static_cast<void>(journal.EnsureIntent(Intent()));
+      // Records are written afterwards; Close drains them to the file.
+      journal.Close();
       _exit(0);
     } catch (...) {
       _exit(71);
@@ -2124,7 +1830,7 @@ TEST(ManagerApplyJournal, CommittedChildWriteSurvivesProcessExit) {
 
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
   const auto durable =
-      reopened.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U));
+      reopened.ReadIntent(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(durable.has_value());
   EXPECT_EQ(durable->intent, Intent());
 }
@@ -2145,8 +1851,8 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
     const std::string sql =
         "BEGIN IMMEDIATE;"
         "INSERT INTO manager_apply_intents ("
-        "apply_id,apply_generation,request_id,request_owner_epoch,"
-        "source_label,correlation_id,predecessor_retained_bundle_id,"
+        "apply_id,apply_generation,request_key,"
+        "source_label,predecessor_retained_bundle_id,"
         "predecessor_graph_revision,predecessor_scene_id,"
         "predecessor_scene_revision_id,predecessor_scene_content_hash,"
         "candidate_retained_bundle_id,candidate_graph_revision,"
@@ -2156,8 +1862,10 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         "expected_admission_generation,parent_authoring_claim,scene_"
         "initialization,intent_digest,accepted_sequence"
         ") VALUES ("
-        "'apply-uncommitted',1,'request-uncommitted','owner-epoch-1',"
-        "'child',NULL,'predecessor-bundle','predecessor-graph','" +
+        "99,1,X'" +
+        core::RequestKeyText(Key(99U)) +
+        "',"
+        "'child','predecessor-bundle','predecessor-graph','" +
         std::string(kSceneIdOne) +
         "',"
         "7,'" +
@@ -2189,7 +1897,7 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
 
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
   EXPECT_FALSE(
-      reopened.ReadIntent(ApplyId("apply-uncommitted"), ApplyGeneration(1U))
+      reopened.ReadIntent(ApplyId(99U), ApplyGeneration(1U))
           .has_value());
   EXPECT_EQ(reopened.VerifyIntegrity().apply_intent_count, 0);
 }
@@ -2200,22 +1908,20 @@ TEST(ManagerApplyJournal, RequiresContiguousGenerationPerApplyIdentity) {
                                     CellId("cell-1"));
 
   EXPECT_THROW(
-      journal.EnsureIntent(Intent("apply-1", 2U, "request-2", "owner-epoch-1")),
+      journal.EnsureIntent(Intent(1U, 2U, 2U)),
       ManagerApplyJournalConflictError);
   EXPECT_TRUE(journal.EnsureIntent(Intent()).inserted);
   EXPECT_TRUE(journal
-                  .EnsureIntent(Intent("apply-1", 2U, "request-2",
-                                       "owner-epoch-1", "candidate-bundle-2"))
+                  .EnsureIntent(Intent(1U, 2U, 2U, "candidate-bundle-2"))
                   .inserted);
-  EXPECT_EQ(journal.ReadApplyGenerationHighWater(ApplyId("apply-1")),
+  EXPECT_EQ(journal.ReadApplyGenerationHighWater(ApplyId(1U)),
             ApplyGeneration(2U));
   EXPECT_THROW(
-      journal.EnsureIntent(Intent("apply-1", 4U, "request-4", "owner-epoch-1")),
+      journal.EnsureIntent(Intent(1U, 4U, 4U)),
       ManagerApplyJournalConflictError);
 
   EXPECT_TRUE(journal
-                  .EnsureIntent(Intent("apply-2", 1U, "request-3",
-                                       "owner-epoch-1", "candidate-bundle-3"))
+                  .EnsureIntent(Intent(2U, 1U, 3U, "candidate-bundle-3"))
                   .inserted);
   const auto report = journal.VerifyIntegrity();
   EXPECT_EQ(report.apply_intent_count, 3);
@@ -2229,17 +1935,10 @@ TEST(ManagerApplyJournal, PublicRequestIdentityCannotNameAnotherIntent) {
   EXPECT_TRUE(journal.EnsureIntent(Intent()).inserted);
 
   EXPECT_THROW(
-      journal.EnsureIntent(Intent("apply-2", 1U, "request-1", "owner-epoch-1",
-                                  "candidate-bundle-2")),
+      journal.EnsureIntent(Intent(2U, 1U, 1U, "candidate-bundle-2")),
       ManagerApplyJournalConflictError);
   EXPECT_FALSE(
-      journal.ReadIntent(ApplyId("apply-2"), ApplyGeneration(1U)).has_value());
-
-  // The same request ID in a new request-owner epoch is a new identity.
-  EXPECT_TRUE(journal
-                  .EnsureIntent(Intent("apply-2", 1U, "request-1",
-                                       "owner-epoch-2", "candidate-bundle-2"))
-                  .inserted);
+      journal.ReadIntent(ApplyId(2U), ApplyGeneration(1U)).has_value());
 }
 
 TEST(ManagerApplyJournal, ApplyIdentityCannotAcquireConflictingPayload) {
@@ -2277,8 +1976,8 @@ TEST(ManagerApplyJournal, RejectsForeignCellAndMalformedPersistedValues) {
 TEST(ManagerApplyJournal, ExactConcurrentDuplicateHasOneDurableEffect) {
   TemporaryDirectory directory;
   const auto path = directory.path() / "apply.sqlite3";
+  // One owner per file; its two callers race on the same journal.
   SqliteManagerApplyJournal first(path, CellId("cell-1"));
-  SqliteManagerApplyJournal second(path, CellId("cell-1"));
   const auto intent = Intent();
   std::barrier start(2);
   auto write = [&](SqliteManagerApplyJournal &journal) {
@@ -2286,7 +1985,7 @@ TEST(ManagerApplyJournal, ExactConcurrentDuplicateHasOneDurableEffect) {
     return journal.EnsureIntent(intent);
   };
   auto first_result = std::async(std::launch::async, write, std::ref(first));
-  auto second_result = std::async(std::launch::async, write, std::ref(second));
+  auto second_result = std::async(std::launch::async, write, std::ref(first));
   const auto one = first_result.get();
   const auto two = second_result.get();
   EXPECT_NE(one.inserted, two.inserted);
@@ -2335,8 +2034,9 @@ TEST(ManagerApplyJournal, ConcurrentFirstOpenConvergesOneExactSchema) {
 TEST(ManagerApplyJournal, ConcurrentConflictsDoNotCreateMixedIntent) {
   TemporaryDirectory directory;
   const auto path = directory.path() / "apply.sqlite3";
+  // One owner per file; its two callers race on the same journal.
   SqliteManagerApplyJournal first(path, CellId("cell-1"));
-  SqliteManagerApplyJournal second(path, CellId("cell-1"));
+  auto &second = first;
   auto one = Intent();
   auto two = Intent();
   two.candidate_retained_bundle_id = RetainedBundleId("candidate-bundle-2");
@@ -2359,7 +2059,7 @@ TEST(ManagerApplyJournal, ConcurrentConflictsDoNotCreateMixedIntent) {
   const auto stored_two = second_result.get();
   EXPECT_NE(stored_one.has_value(), stored_two.has_value());
   const auto durable =
-      first.ReadIntent(ApplyId("apply-1"), ApplyGeneration(1U));
+      first.ReadIntent(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(durable.has_value());
   EXPECT_TRUE(durable->intent == one || durable->intent == two);
   EXPECT_EQ(first.VerifyIntegrity().apply_intent_count, 1);
@@ -2403,12 +2103,11 @@ TEST(ManagerApplyJournalIntegrity, DetectsRawGenerationDeletionOnReopen) {
     SqliteManagerApplyJournal journal(path, CellId("cell-1"));
     EXPECT_TRUE(journal.EnsureIntent(Intent()).inserted);
     EXPECT_TRUE(journal
-                    .EnsureIntent(Intent("apply-1", 2U, "request-2",
-                                         "owner-epoch-1", "candidate-bundle-2"))
+                    .EnsureIntent(Intent(1U, 2U, 2U, "candidate-bundle-2"))
                     .inserted);
   }
   ExecSql(path, "DELETE FROM manager_apply_intents "
-                "WHERE apply_id='apply-1' AND apply_generation=1;");
+                "WHERE apply_id=1 AND apply_generation=1;");
   EXPECT_THROW(SqliteManagerApplyJournal(path, CellId("cell-1")),
                ManagerApplyJournalIntegrityError);
 }
@@ -2451,10 +2150,9 @@ TEST(ManagerApplyJournal, IntentInventoryIsExhaustionBounded) {
                                     CellId("cell-1"));
   std::optional<PersistedManagerApplyIntent> first_record;
   for (std::size_t index = 0U; index < kMaximumManagerApplyIntents; ++index) {
-    const auto suffix = std::to_string(index);
-    const auto result =
-        journal.EnsureIntent(Intent("apply-" + suffix, 1U, "request-" + suffix,
-                                    "owner-epoch-1", "candidate-" + suffix));
+    const auto number = static_cast<std::uint64_t>(index) + 1U;
+    const auto result = journal.EnsureIntent(
+        Intent(number, 1U, number, "candidate-" + std::to_string(index)));
     EXPECT_TRUE(result.inserted);
     if (index == 0U) {
       first_record = result.record;
@@ -2463,12 +2161,12 @@ TEST(ManagerApplyJournal, IntentInventoryIsExhaustionBounded) {
   EXPECT_EQ(journal.VerifyIntegrity().apply_intent_count,
             static_cast<std::int64_t>(kMaximumManagerApplyIntents));
   EXPECT_THROW(
-      journal.EnsureIntent(Intent("apply-overflow", 1U, "request-overflow",
-                                  "owner-epoch-1", "candidate-overflow")),
+      journal.EnsureIntent(Intent(kMaximumManagerApplyIntents + 1U, 1U,
+                                  kMaximumManagerApplyIntents + 1U,
+                                  "candidate-overflow")),
       ManagerApplyJournalLimitError);
   ASSERT_TRUE(first_record.has_value());
-  const auto replay = journal.EnsureIntent(
-      Intent("apply-0", 1U, "request-0", "owner-epoch-1", "candidate-0"));
+  const auto replay = journal.EnsureIntent(Intent(1U, 1U, 1U, "candidate-0"));
   EXPECT_FALSE(replay.inserted);
   EXPECT_EQ(replay.record, *first_record);
   EXPECT_EQ(journal.VerifyIntegrity().apply_intent_count,
@@ -2478,12 +2176,12 @@ TEST(ManagerApplyJournal, IntentInventoryIsExhaustionBounded) {
 // One complete successful Apply whose fence and publication identities are
 // unique to `index`. Returns its fence-release request for reuse.
 core::ConfigurationFenceReleaseDTO EnsureSucceededApply(SqliteManagerApplyJournal &journal,
-                                                  const std::string &apply_id,
+                                                  const std::uint64_t apply_id,
                                                   const std::size_t index) {
   const ApplyId id(apply_id);
   const ApplyGeneration generation(1U);
   const auto intent =
-      journal.EnsureIntent(Intent(apply_id, 1U, "request-" + apply_id)).record;
+      journal.EnsureIntent(Intent(apply_id, 1U, apply_id)).record;
   auto fence_intent = FenceIntent();
   fence_intent.owner_request_context = intent.intent.request_context;
   fence_intent.owner_transaction = {id, generation};
@@ -2527,9 +2225,9 @@ core::ConfigurationFenceReleaseDTO EnsureSucceededApply(SqliteManagerApplyJourna
 
 // A failure proven before effect at acceptance: no claim or fence remains.
 void EnsureRefusedApply(SqliteManagerApplyJournal &journal,
-                        const std::string &apply_id) {
+                        const std::uint64_t apply_id) {
   const auto intent =
-      journal.EnsureIntent(Intent(apply_id, 1U, "request-" + apply_id)).record;
+      journal.EnsureIntent(Intent(apply_id, 1U, apply_id)).record;
   static_cast<void>(journal.EnsureTerminalOutcome({
       ApplyId(apply_id), ApplyGeneration(1U), std::nullopt, std::nullopt,
       std::nullopt, std::nullopt, ManagerApplyTerminalOutcomeState::kFailed,
@@ -2545,10 +2243,13 @@ TEST(ManagerApplyJournal, FullInventoryEvictsOnlyAppliesNoOwnerStillNeeds) {
   TemporaryDirectory directory;
   SqliteManagerApplyJournal journal(directory.path() / "apply.sqlite3",
                                     CellId("cell-1"));
+  // Apply numbers: 1 is held, 2 is in flight, 100 + index is apply-index.
+  const auto number = [](const std::size_t index) {
+    return static_cast<std::uint64_t>(100U + index);
+  };
   // An unknown-effect failure that still holds its accepted fence.
-  const ApplyId held("held-0");
-  const auto held_intent =
-      journal.EnsureIntent(Intent("held-0", 1U, "request-held-0")).record;
+  const ApplyId held(1U);
+  const auto held_intent = journal.EnsureIntent(Intent(1U, 1U, 1U)).record;
   auto held_fence = FenceIntent();
   held_fence.owner_request_context = held_intent.intent.request_context;
   held_fence.owner_transaction = {held, ApplyGeneration(1U)};
@@ -2576,7 +2277,7 @@ TEST(ManagerApplyJournal, FullInventoryEvictsOnlyAppliesNoOwnerStillNeeds) {
   std::optional<core::ConfigurationFenceReleaseDTO> donor_release;
   std::size_t successes = 0U;
   for (std::size_t index = 0U; index < 320U; ++index) {
-    const auto apply_id = "apply-" + std::to_string(index);
+    const auto apply_id = number(index);
     if (index % 10U == 0U)
       donor_release = EnsureSucceededApply(journal, apply_id, ++successes);
     else
@@ -2594,19 +2295,18 @@ TEST(ManagerApplyJournal, FullInventoryEvictsOnlyAppliesNoOwnerStillNeeds) {
   }
   EXPECT_EQ(journal.VerifyIntegrity().apply_intent_count,
             static_cast<std::int64_t>(kMaximumManagerApplyIntents));
-  EXPECT_FALSE(journal.ReadStatus(ApplyId("apply-0"), ApplyGeneration(1U)));
+  EXPECT_FALSE(journal.ReadStatus(ApplyId(number(0U)), ApplyGeneration(1U)));
   // The newest success (apply-310) is retained although older than the rest.
-  EXPECT_TRUE(journal.ReadStatus(ApplyId("apply-310"), ApplyGeneration(1U)));
+  EXPECT_TRUE(journal.ReadStatus(ApplyId(number(310U)), ApplyGeneration(1U)));
 
   // An in-flight Apply is never evicted.
-  static_cast<void>(
-      journal.EnsureIntent(Intent("in-flight", 1U, "request-in-flight")));
+  static_cast<void>(journal.EnsureIntent(Intent(2U, 1U, 2U)));
   for (std::size_t index = 320U; index < 600U; ++index) {
-    EnsureRefusedApply(journal, "apply-" + std::to_string(index));
-    ASSERT_TRUE(journal.ReadStatus(ApplyId("in-flight"), ApplyGeneration(1U)));
+    EnsureRefusedApply(journal, number(index));
+    ASSERT_TRUE(journal.ReadStatus(ApplyId(2U), ApplyGeneration(1U)));
     ASSERT_TRUE(journal.ReadStatus(held, ApplyGeneration(1U)));
   }
-  EXPECT_TRUE(journal.ReadStatus(ApplyId("apply-310"), ApplyGeneration(1U)));
+  EXPECT_TRUE(journal.ReadStatus(ApplyId(number(310U)), ApplyGeneration(1U)));
 
   // Once its fence and claim are released the held Apply is the oldest
   // evictable one.
@@ -2624,8 +2324,8 @@ TEST(ManagerApplyJournal, FullInventoryEvictsOnlyAppliesNoOwnerStillNeeds) {
   evidence.active_projection_revision.scene_revision.scene_id =
       predecessor.scene_revision.scene_id;
   journal.BeginFailedApplyRelease(held, ApplyGeneration(1U),
-                                  RequestId("acknowledge-held"), "test", release);
-  EnsureRefusedApply(journal, "apply-600");
+                                  Key(9001U), "test", release);
+  EnsureRefusedApply(journal, number(600U));
   EXPECT_TRUE(journal.ReadStatus(held, ApplyGeneration(1U)));
   journal.CompleteFailedApplyRelease(
       held, ApplyGeneration(1U),
@@ -2633,15 +2333,226 @@ TEST(ManagerApplyJournal, FullInventoryEvictsOnlyAppliesNoOwnerStillNeeds) {
           release, release.reconciliation_evidence.execution_host_epoch,
           987654321LL, core::RequestReplayStatusDTO::kAcceptedNew,
           ContentDigest(std::string(kDigestTwo))});
-  EnsureRefusedApply(journal, "apply-601");
+  EnsureRefusedApply(journal, number(601U));
   EXPECT_TRUE(journal.ReadStatus(held, ApplyGeneration(1U)));
   journal.CompleteFailedApplyAcknowledgement(held, ApplyGeneration(1U));
-  EnsureRefusedApply(journal, "apply-602");
+  EnsureRefusedApply(journal, number(602U));
   EXPECT_FALSE(journal.ReadStatus(held, ApplyGeneration(1U)));
-  EXPECT_FALSE(journal.ReadRequest(RequestOwnerEpoch("owner-epoch-1"),
-                                   RequestId("request-held-0")));
+  EXPECT_FALSE(journal.ReadRequest(Key(1U)));
   EXPECT_EQ(journal.VerifyIntegrity().apply_intent_count,
             static_cast<std::int64_t>(kMaximumManagerApplyIntents));
+}
+
+// The file bytes the held records may take on the default 4096-byte pages.
+std::uint64_t FileByteBudget() {
+  return static_cast<std::uint64_t>(
+      kMaximumManagerApplyJournalDatabasePageImageBytes -
+      kManagerApplyJournalReservedFileBytes);
+}
+
+// An intent with the largest prepared receipt.
+ManagerApplyIntentDTO LargeIntent(const std::uint64_t apply_id) {
+  auto intent = Intent(apply_id, 1U, apply_id);
+  intent.prepared_activation.canonical_receipt_json =
+      std::string(kMaximumManagerApplyPreparedReceiptBytes, 'r');
+  return intent;
+}
+
+// The largest fence scope, written as the Apply's affected scope and attempt.
+void EnsureLargeAttempt(SqliteManagerApplyJournal &journal,
+                        const PersistedManagerApplyIntent &intent) {
+  auto fence_intent = MaximumFenceIntent();
+  fence_intent.owner_request_context = intent.intent.request_context;
+  fence_intent.owner_transaction = {intent.intent.apply_id, ApplyGeneration(1U)};
+  static_cast<void>(EnsureAttempt(journal, intent.intent_digest, fence_intent));
+}
+
+// A failure known at acceptance that accepted no fence: deletable once a
+// later Apply exists.
+void EnsureKnownFailure(SqliteManagerApplyJournal &journal,
+                        const PersistedManagerApplyIntent &intent) {
+  static_cast<void>(journal.EnsureTerminalOutcome({
+      intent.intent.apply_id, ApplyGeneration(1U), std::nullopt, std::nullopt,
+      std::nullopt, std::nullopt, ManagerApplyTerminalOutcomeState::kFailed,
+      ManagerApplyFailureEvidenceDTO{
+          intent.intent_digest, ManagerApplyPhase::kAccepted,
+          "apply_admission_failed", "Kernel refused admission",
+          ManagerApplyEffectDisposition::kKnown, "admission_refused", {},
+          "component_manager", ManagerApplyEffectBoundary::kBeforeEffect},
+  }));
+}
+
+void EnsureLargeRefusedApply(SqliteManagerApplyJournal &journal,
+                             const std::uint64_t apply_id) {
+  const auto intent = journal.EnsureIntent(LargeIntent(apply_id)).record;
+  EnsureLargeAttempt(journal, intent);
+  EnsureKnownFailure(journal, intent);
+}
+
+TEST(ManagerApplyJournal, FileByteLimitDeletesWhatTheCountRuleWouldDelete) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "file-bytes.sqlite3";
+  // The test posts about one file budget of bytes in two seconds: a queue
+  // that holds all of it, so a slow disk cannot drop records (OD-185 drops
+  // over the bound by design, which is not what this test is about).
+  persistence::SqliteRecordWriter writer({4096U, 1024U * 1024U * 1024U});
+  std::uint64_t file_bytes = 0U;
+  std::uint64_t oldest = 100U;
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"), &writer);
+    // Still needed: an Apply in flight and the newest success.
+    static_cast<void>(journal.EnsureIntent(Intent(1U, 1U, 1U)));
+    static_cast<void>(EnsureSucceededApply(journal, 2U, 1U));
+    for (std::uint64_t apply_id = 100U; apply_id < 400U; ++apply_id) {
+      EnsureLargeRefusedApply(journal, apply_id);
+      ASSERT_LE(journal.record_file_bytes(), FileByteBudget()) << apply_id;
+      while (!journal.ReadStatus(ApplyId(oldest), ApplyGeneration(1U))) {
+        ++oldest;
+      }
+      // The oldest that no owner needs went first, as the count rule takes
+      // them: the rest is the needed two and an unbroken run of the newest.
+      const auto report = journal.VerifyIntegrity();
+      ASSERT_EQ(report.apply_intent_count,
+                static_cast<std::int64_t>(2U + apply_id + 1U - oldest))
+          << apply_id;
+      ASSERT_LT(report.apply_intent_count,
+                static_cast<std::int64_t>(kMaximumManagerApplyIntents));
+      ASSERT_TRUE(journal.ReadStatus(ApplyId(1U), ApplyGeneration(1U)));
+      ASSERT_TRUE(journal.ReadStatus(ApplyId(2U), ApplyGeneration(1U)));
+    }
+    EXPECT_GT(oldest, 100U);
+    EXPECT_FALSE(journal.ReadRequest(Key(100U)));
+    file_bytes = journal.record_file_bytes();
+    writer.DrainAndStop();
+    journal.Close();
+  }
+  // Every record reached the file: it never met its page limit.
+  EXPECT_EQ(writer.records_not_written(), 0U);
+  EXPECT_EQ(writer.records_dropped(), 0U);
+  EXPECT_EQ(QueryInteger(path, "SELECT records_lost FROM apply_journal_metadata"),
+            0);
+  EXPECT_LE(QueryInteger(path, "PRAGMA page_count") * 4096,
+            kMaximumManagerApplyJournalDatabasePageImageBytes);
+  // Reopening rebuilds the same total from the file.
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  EXPECT_EQ(reopened.record_file_bytes(), file_bytes);
+  EXPECT_TRUE(reopened.ReadStatus(ApplyId(oldest), ApplyGeneration(1U)));
+  EXPECT_FALSE(reopened.ReadStatus(ApplyId(oldest - 1U), ApplyGeneration(1U)));
+}
+
+TEST(ManagerApplyJournal, AnApplyGrowingPastTheFileByteLimitDeletesOlderApplies) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "growing.sqlite3",
+                                    CellId("cell-1"));
+  const auto room = [&] { return FileByteBudget() - journal.record_file_bytes(); };
+  // The sizes, measured: a small intent, a large scope and attempt, a large
+  // Apply, and a large intent with its failure.
+  auto before = journal.record_file_bytes();
+  const auto small = journal.EnsureIntent(Intent(1U, 1U, 1U)).record;
+  const auto small_intent = journal.record_file_bytes() - before;
+  EnsureKnownFailure(journal, small);
+  before = journal.record_file_bytes();
+  const auto large = journal.EnsureIntent(LargeIntent(2U)).record;
+  const auto attempt_before = journal.record_file_bytes();
+  EnsureLargeAttempt(journal, large);
+  const auto growth = journal.record_file_bytes() - attempt_before;
+  EnsureKnownFailure(journal, large);
+  const auto large_apply = journal.record_file_bytes() - before;
+  before = journal.record_file_bytes();
+  EnsureKnownFailure(journal, journal.EnsureIntent(LargeIntent(3U)).record);
+  const auto medium_apply = journal.record_file_bytes() - before;
+  constexpr std::uint64_t kMargin = 4096U;
+  ASSERT_GT(growth, medium_apply + 2U * kMargin);
+
+  // Fill until the next small intent fits and its scope and attempt do not.
+  std::uint64_t next = 4U;
+  while (room() >= large_apply + small_intent + growth) {
+    EnsureLargeRefusedApply(journal, next++);
+  }
+  while (room() >= small_intent + growth - kMargin) {
+    EnsureKnownFailure(journal, journal.EnsureIntent(LargeIntent(next++)).record);
+  }
+  const auto retained = journal.VerifyIntegrity().apply_intent_count;
+  ASSERT_LT(retained, static_cast<std::int64_t>(kMaximumManagerApplyIntents) - 1);
+  ASSERT_TRUE(journal.ReadStatus(ApplyId(1U), ApplyGeneration(1U)));
+
+  // The intent fits: nothing is deleted.
+  const auto growing = journal.EnsureIntent(Intent(next, 1U, next)).record;
+  EXPECT_EQ(journal.VerifyIntegrity().apply_intent_count, retained + 1);
+  EXPECT_TRUE(journal.ReadStatus(ApplyId(1U), ApplyGeneration(1U)));
+  // Its child rows do not: the oldest Applies give way, it and the newest
+  // older one stay.
+  EnsureLargeAttempt(journal, growing);
+  EXPECT_LE(journal.record_file_bytes(), FileByteBudget());
+  EXPECT_FALSE(journal.ReadStatus(ApplyId(1U), ApplyGeneration(1U)));
+  EXPECT_LE(journal.VerifyIntegrity().apply_intent_count, retained);
+  const auto status = journal.ReadStatus(ApplyId(next), ApplyGeneration(1U));
+  ASSERT_TRUE(status.has_value());
+  EXPECT_TRUE(status->fence_attempt.has_value());
+  EXPECT_TRUE(journal.ReadStatus(ApplyId(next - 1U), ApplyGeneration(1U)));
+}
+
+TEST(ManagerApplyJournal, FileByteLimitRefusesAnApplyOnlyWhenNoneMayBeDeleted) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "needed.sqlite3",
+                                    CellId("cell-1"));
+  const auto room = [&] { return FileByteBudget() - journal.record_file_bytes(); };
+  // Applies in flight are all still needed.
+  auto before = journal.record_file_bytes();
+  const auto first = journal.EnsureIntent(LargeIntent(1U)).record;
+  const auto large_intent = journal.record_file_bytes() - before;
+  EnsureLargeAttempt(journal, first);
+  const auto in_flight = journal.record_file_bytes() - before;
+  std::uint64_t next = 2U;
+  while (room() >= in_flight) {
+    EnsureLargeAttempt(journal, journal.EnsureIntent(LargeIntent(next++)).record);
+  }
+  while (room() >= large_intent) {
+    static_cast<void>(journal.EnsureIntent(LargeIntent(next++)));
+  }
+  const auto retained = journal.VerifyIntegrity().apply_intent_count;
+  ASSERT_LT(retained, static_cast<std::int64_t>(kMaximumManagerApplyIntents));
+  const auto file_bytes = journal.record_file_bytes();
+
+  // A new Apply is refused as at the count limit; nothing changes.
+  EXPECT_THROW(static_cast<void>(journal.EnsureIntent(LargeIntent(next))),
+               ManagerApplyJournalLimitError);
+  EXPECT_FALSE(journal.ReadRequest(Key(next)));
+  EXPECT_EQ(journal.VerifyIntegrity().apply_intent_count, retained);
+  EXPECT_EQ(journal.record_file_bytes(), file_bytes);
+  for (std::uint64_t apply_id = 1U; apply_id < next; ++apply_id) {
+    ASSERT_TRUE(journal.ReadStatus(ApplyId(apply_id), ApplyGeneration(1U)));
+  }
+
+  // A row of an Apply already accepted is never refused for its bytes.
+  EnsureLargeAttempt(journal, *journal.ReadIntent(ApplyId(next - 1U),
+                                                  ApplyGeneration(1U)));
+  EXPECT_GT(journal.record_file_bytes(), FileByteBudget());
+  EXPECT_TRUE(journal.ReadStatus(ApplyId(next - 1U), ApplyGeneration(1U))
+                  ->fence_attempt.has_value());
+  EXPECT_EQ(journal.VerifyIntegrity().apply_intent_count, retained);
+}
+
+TEST(ManagerApplyJournal, ReopeningRebuildsTheFileBytesOfEveryRecordKind) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "file-bytes-reload.sqlite3";
+  std::uint64_t file_bytes = 0U;
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    EXPECT_EQ(journal.record_file_bytes(), 0U);
+    const auto transition = EnsureSelectedBundleTransition(journal);
+    static_cast<void>(EnsureApplyCompletion(journal, transition));
+    EnsureRefusedApply(journal, 2U);
+    journal.BeginFailedApplyRelease(ApplyId(2U), ApplyGeneration(1U), Key(9001U),
+                                    "operator", std::nullopt, true);
+    journal.CompleteFailedApplyAcknowledgement(ApplyId(2U), ApplyGeneration(1U));
+    EnsureLargeRefusedApply(journal, 3U);
+    file_bytes = journal.record_file_bytes();
+    EXPECT_GT(file_bytes, 0U);
+    journal.Close();
+  }
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  EXPECT_EQ(reopened.record_file_bytes(), file_bytes);
 }
 
 TEST(ManagerApplyFenceJournal,
@@ -2664,14 +2575,14 @@ TEST(ManagerApplyFenceJournal,
     EXPECT_EQ(attempt_replay.record.fence_attempt_digest, attempt_digest);
 
     const auto accepted =
-        journal.EnsureFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U),
+        journal.EnsureFenceAcceptance(ApplyId(1U), ApplyGeneration(1U),
                                       attempt_digest, AcceptedFence());
     EXPECT_TRUE(accepted.inserted);
     EXPECT_TRUE(
         SameAcceptedFence(accepted.record.accepted_fence, AcceptedFence()));
     acceptance_digest = accepted.record.acceptance_digest;
     const auto accepted_replay =
-        journal.EnsureFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U),
+        journal.EnsureFenceAcceptance(ApplyId(1U), ApplyGeneration(1U),
                                       attempt_digest, AcceptedFence());
     EXPECT_FALSE(accepted_replay.inserted);
     EXPECT_EQ(accepted_replay.record.acceptance_digest, acceptance_digest);
@@ -2679,13 +2590,13 @@ TEST(ManagerApplyFenceJournal,
 
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
   const auto attempt =
-      reopened.ReadFenceAttempt(ApplyId("apply-1"), ApplyGeneration(1U));
+      reopened.ReadFenceAttempt(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(attempt.has_value());
   EXPECT_EQ(attempt->intent_digest, intent_digest);
   EXPECT_EQ(attempt->fence_attempt_digest, attempt_digest);
   EXPECT_TRUE(SameFenceIntent(attempt->fence_intent, FenceIntent()));
   const auto accepted =
-      reopened.ReadFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U));
+      reopened.ReadFenceAcceptance(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(accepted.has_value());
   EXPECT_EQ(accepted->fence_attempt_digest, attempt_digest);
   EXPECT_EQ(accepted->acceptance_digest, acceptance_digest);
@@ -2696,170 +2607,28 @@ TEST(ManagerApplyFenceJournal,
   EXPECT_EQ(report.fence_acceptance_count, 1);
 }
 
-TEST(ManagerApplyJournalReadOnly, ProofLookupsDoNotGrowWithUnrelatedHistory) {
-  const auto measure = [](const int unrelated_count) {
-    TemporaryDirectory directory;
-    const auto path = directory.path() / "apply.sqlite3";
-    const auto target = Intent();
-    SqliteManagerApplyJournal journal(path, target.cell_id);
-    const auto accepted = journal.EnsureIntent(target).record;
-    for (int i = 0; i < unrelated_count; ++i) {
-      const auto suffix = std::to_string(i);
-      static_cast<void>(journal.EnsureIntent(
-          Intent("other-" + suffix, 1U, "other-request-" + suffix)));
-    }
-    const core::NamedApplyPublicationTransactionDTO apply{
-        target.apply_id, target.apply_generation};
-    std::uint64_t lookups = 0U;
-    const auto proof = ReadManagerApplyStatusReadOnlyForTesting(
-        path, target.cell_id, apply, &lookups);
-    EXPECT_TRUE(proof.ok());
-    if (proof.ok()) {
-      EXPECT_EQ(proof.value().intent, accepted);
-    }
-    return lookups;
-  };
-  const auto short_history = measure(0);
-  const auto long_history = measure(32);
-  EXPECT_GT(short_history, 0U);
-  EXPECT_EQ(long_history, short_history);
-}
-
-TEST(ManagerApplyJournal, TouchedWriteAndReadDecodeBoundedHistory) {
-  const auto measure = [](const int unrelated_count) {
-    TemporaryDirectory directory;
-    SqliteManagerApplyJournal journal(directory.path() / "apply.sqlite3",
-                                      CellId("cell-1"));
-    const auto intent = journal.EnsureIntent(Intent()).record;
-    for (int i = 0; i < unrelated_count; ++i) {
-      const auto suffix = std::to_string(i);
-      static_cast<void>(journal.EnsureIntent(
-          Intent("other-" + suffix, 1U, "other-request-" + suffix)));
-    }
-    const auto before_write = journal.record_verification_count();
-    const auto scope = journal.EnsureAffectedScope(intent.intent_digest,
-                                                    AffectedScope());
-    EXPECT_TRUE(scope.inserted);
-    const auto after_write = journal.record_verification_count();
-    const auto status = journal.ReadStatus(intent.intent.apply_id,
-                                           intent.intent.apply_generation);
-    EXPECT_TRUE(status.has_value());
-    if (status.has_value()) {
-      EXPECT_TRUE(status->affected_scope.has_value());
-    }
-    const auto after_read = journal.record_verification_count();
-    return std::pair{after_write - before_write, after_read - after_write};
-  };
-  const auto short_history = measure(0);
-  const auto long_history = measure(32);
-  EXPECT_GT(short_history.first, 0U);
-  EXPECT_GT(short_history.second, 0U);
-  EXPECT_EQ(long_history.first, short_history.first);
-  EXPECT_EQ(long_history.second, short_history.second);
-}
-
-TEST(ManagerApplyJournal, TamperedTouchedIntentRefusesScopeAndRollsBack) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "apply.sqlite3";
-  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-  const auto intent = journal.EnsureIntent(Intent()).record;
-  const auto rewrite = [&](const std::string &source) {
-    ExecSql(path,
-            "DROP TRIGGER manager_apply_intents_no_update;"
-            "UPDATE manager_apply_intents SET source_label='" + source +
-                "' WHERE apply_id='apply-1';"
-                "CREATE TRIGGER manager_apply_intents_no_update BEFORE UPDATE ON "
-                "manager_apply_intents BEGIN SELECT RAISE(ABORT, "
-                "'manager_apply_intents is immutable'); END;");
-  };
-  rewrite("tampered-source");
-  EXPECT_THROW(static_cast<void>(journal.EnsureAffectedScope(
-                   intent.intent_digest, AffectedScope())),
-               ManagerApplyJournalIntegrityError);
-  rewrite(Intent().request_context.source_label);
-  EXPECT_EQ(journal.VerifyIntegrity().affected_scope_count, 0U);
-  EXPECT_TRUE(journal.EnsureAffectedScope(intent.intent_digest, AffectedScope())
-                  .inserted);
-}
-
-TEST(ManagerApplyJournal, CorruptPreviousGenerationRefusesChildWrite) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "apply.sqlite3";
-  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-  static_cast<void>(journal.EnsureIntent(Intent()));
-  const auto current = journal.EnsureIntent(
-      Intent("apply-1", 2U, "request-2", "owner-epoch-1",
-             "candidate-bundle-2")).record;
-  auto scope = AffectedScope();
-  scope.apply_generation = ApplyGeneration(2U);
-  const auto rewrite = [&](const std::string &source) {
-    ExecSql(path,
-            "DROP TRIGGER manager_apply_intents_no_update;"
-            "UPDATE manager_apply_intents SET source_label='" + source +
-                "' WHERE apply_id='apply-1' AND apply_generation=1;"
-                "CREATE TRIGGER manager_apply_intents_no_update BEFORE UPDATE ON "
-                "manager_apply_intents BEGIN SELECT RAISE(ABORT, "
-                "'manager_apply_intents is immutable'); END;");
-  };
-  rewrite("tampered-source");
-  // Ordinary reads keep their existing exact-record behavior.
-  EXPECT_EQ(journal.ReadIntent(ApplyId("apply-1"), ApplyGeneration(2U)),
-            current);
-  EXPECT_THROW(static_cast<void>(journal.EnsureAffectedScope(
-                   current.intent_digest, scope)),
-               ManagerApplyJournalIntegrityError);
-  rewrite(Intent().request_context.source_label);
-  EXPECT_EQ(journal.VerifyIntegrity().affected_scope_count, 0U);
-  EXPECT_TRUE(journal.EnsureAffectedScope(current.intent_digest, scope).inserted);
-}
-
-TEST(ManagerApplyJournal, ChildWriteChecksOnlyImmediateApplyPredecessor) {
-  const auto measure = [](const std::uint64_t generations) {
-    TemporaryDirectory directory;
-    SqliteManagerApplyJournal journal(directory.path() / "apply.sqlite3",
-                                      CellId("cell-1"));
-    for (std::uint64_t generation = 1; generation < generations;
-         ++generation) {
-      const auto suffix = std::to_string(generation);
-      static_cast<void>(journal.EnsureIntent(
-          Intent("apply-1", generation, "request-" + suffix)));
-    }
-    const auto suffix = std::to_string(generations);
-    const auto current = journal.EnsureIntent(
-        Intent("apply-1", generations, "request-" + suffix)).record;
-    auto scope = AffectedScope();
-    scope.apply_generation = ApplyGeneration(generations);
-    const auto before = journal.record_verification_count();
-    EXPECT_TRUE(journal.EnsureAffectedScope(current.intent_digest, scope).inserted);
-    return journal.record_verification_count() - before;
-  };
-  const auto short_history = measure(2U);
-  EXPECT_GT(short_history, 0U);
-  EXPECT_EQ(measure(32U), short_history);
-}
-
 TEST(ManagerApplyJournal, UnrelatedCorruptionIsDetectedOnReopen) {
   TemporaryDirectory directory;
   const auto path = directory.path() / "apply.sqlite3";
   const auto target = Intent();
-  const core::NamedApplyPublicationTransactionDTO apply{
-      target.apply_id, target.apply_generation};
   {
     SqliteManagerApplyJournal journal(path, target.cell_id);
     const auto intent = journal.EnsureIntent(target).record;
-    static_cast<void>(journal.EnsureIntent(
-        Intent("other", 1U, "other-request")));
-    ExecSql(path,
-            "DROP TRIGGER manager_apply_intents_no_update;"
-            "UPDATE manager_apply_intents SET source_label='tampered' "
-            "WHERE apply_id='other';"
-            "CREATE TRIGGER manager_apply_intents_no_update BEFORE UPDATE ON "
-            "manager_apply_intents BEGIN SELECT RAISE(ABORT, "
-            "'manager_apply_intents is immutable'); END;");
+    static_cast<void>(journal.EnsureIntent(Intent(2U, 1U, 2U)));
     EXPECT_TRUE(journal.EnsureAffectedScope(intent.intent_digest,
                                             AffectedScope()).inserted);
-    EXPECT_TRUE(ReadManagerApplyStatusReadOnly(path, target.cell_id, apply).ok());
+    EXPECT_TRUE(journal.ReadStatus(target.apply_id, target.apply_generation)
+                    .has_value());
+    // Close drains the writer, so the file holds every record.
+    journal.Close();
   }
+  ExecSql(path,
+          "DROP TRIGGER manager_apply_intents_no_update;"
+          "UPDATE manager_apply_intents SET source_label='tampered' "
+          "WHERE apply_id=2;"
+          "CREATE TRIGGER manager_apply_intents_no_update BEFORE UPDATE ON "
+          "manager_apply_intents BEGIN SELECT RAISE(ABORT, "
+          "'manager_apply_intents is immutable'); END;");
   EXPECT_THROW((SqliteManagerApplyJournal(path, target.cell_id)),
                ManagerApplyJournalIntegrityError);
 }
@@ -2915,7 +2684,7 @@ TEST(ManagerApplyFenceJournal,
   }
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
   const auto read =
-      reopened.ReadAffectedScope(ApplyId("apply-1"), ApplyGeneration(1U));
+      reopened.ReadAffectedScope(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(read.has_value());
   EXPECT_EQ(read->affected_scope, affected_scope);
   EXPECT_EQ(read->affected_scope.component_delta, ReplacingDelta());
@@ -3001,20 +2770,20 @@ TEST(ManagerApplyFenceJournal,
   EXPECT_THROW(EnsureAttempt(journal, intent.intent_digest, differing_attempt),
                ManagerApplyJournalConflictError);
   EXPECT_THROW(journal.EnsureFenceAcceptance(
-                   ApplyId("apply-1"), ApplyGeneration(1U),
+                   ApplyId(1U), ApplyGeneration(1U),
                    ContentDigest(std::string(kDigestTwo)), AcceptedFence()),
                ManagerApplyJournalConflictError);
 
   EXPECT_TRUE(
       journal
-          .EnsureFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U),
+          .EnsureFenceAcceptance(ApplyId(1U), ApplyGeneration(1U),
                                  attempt.fence_attempt_digest, AcceptedFence())
           .inserted);
   auto differing_acceptance = AcceptedFence();
   differing_acceptance.replay_status =
       core::RequestReplayStatusDTO::kReplayedExact;
   EXPECT_THROW(journal.EnsureFenceAcceptance(
-                   ApplyId("apply-1"), ApplyGeneration(1U),
+                   ApplyId(1U), ApplyGeneration(1U),
                    attempt.fence_attempt_digest, differing_acceptance),
                ManagerApplyJournalConflictError);
 }
@@ -3028,18 +2797,18 @@ TEST(ManagerApplyFenceJournal, RejectsAcceptanceWithDifferentCapturedScope) {
   auto accepted = AcceptedFence();
   accepted.captured_scope.resources.push_back(ResourceId("joint-3"));
   EXPECT_THROW(
-      journal.EnsureFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U),
+      journal.EnsureFenceAcceptance(ApplyId(1U), ApplyGeneration(1U),
                                     attempt.fence_attempt_digest, accepted),
       ManagerApplyJournalConflictError);
   EXPECT_FALSE(
-      journal.ReadFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U))
+      journal.ReadFenceAcceptance(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
 
   auto wrong_generation = AcceptedFence();
   wrong_generation.configuration_fence_generation =
       ConfigurationFenceGeneration(6U);
   EXPECT_THROW(journal.EnsureFenceAcceptance(
-                   ApplyId("apply-1"), ApplyGeneration(1U),
+                   ApplyId(1U), ApplyGeneration(1U),
                    attempt.fence_attempt_digest, wrong_generation),
                ManagerApplyJournalConflictError);
 }
@@ -3054,26 +2823,38 @@ TEST(ManagerApplyFenceJournal,
       EnsureAttempt(journal, first_intent.intent_digest).record;
   EXPECT_TRUE(journal
                   .EnsureFenceAcceptance(
-                      ApplyId("apply-1"), ApplyGeneration(1U),
+                      ApplyId(1U), ApplyGeneration(1U),
                       first_attempt.fence_attempt_digest, AcceptedFence())
                   .inserted);
 
   const auto second_input =
-      Intent("apply-2", 1U, "request-2", "owner-epoch-1", "candidate-bundle-2");
+      Intent(2U, 1U, 2U, "candidate-bundle-2");
   const auto second_intent = journal.EnsureIntent(second_input).record;
   auto second_fence_intent = FenceIntent();
   second_fence_intent.owner_request_context = second_input.request_context;
   second_fence_intent.owner_transaction =
-      core::ApplyFenceOwnerDTO{ApplyId("apply-2"), ApplyGeneration(1U)};
+      core::ApplyFenceOwnerDTO{ApplyId(2U), ApplyGeneration(1U)};
   const auto second_attempt =
       EnsureAttempt(journal, second_intent.intent_digest, second_fence_intent)
           .record;
   EXPECT_THROW(journal.EnsureFenceAcceptance(
-                   ApplyId("apply-2"), ApplyGeneration(1U),
+                   ApplyId(2U), ApplyGeneration(1U),
                    second_attempt.fence_attempt_digest, AcceptedFence()),
                ManagerApplyJournalConflictError);
+  // The refusal carries the text SQLite's UNIQUE constraint gave.
+  try {
+    static_cast<void>(journal.EnsureFenceAcceptance(
+        ApplyId(2U), ApplyGeneration(1U), second_attempt.fence_attempt_digest,
+        AcceptedFence()));
+    FAIL() << "a second Apply cannot bind an accepted fence identity";
+  } catch (const ManagerApplyJournalConflictError &error) {
+    EXPECT_EQ(std::string(error.what()),
+              "step SQLite statement: UNIQUE constraint failed: "
+              "manager_apply_fence_acceptances.configuration_fence_id, "
+              "manager_apply_fence_acceptances.configuration_fence_generation");
+  }
   EXPECT_FALSE(
-      journal.ReadFenceAcceptance(ApplyId("apply-2"), ApplyGeneration(1U))
+      journal.ReadFenceAcceptance(ApplyId(2U), ApplyGeneration(1U))
           .has_value());
   EXPECT_EQ(journal.VerifyIntegrity().fence_acceptance_count, 1);
 }
@@ -3128,7 +2909,7 @@ TEST(ManagerApplyFenceJournal,
     expected_acceptance =
         journal
             .EnsureFenceAcceptance(
-                ApplyId("apply-1"), ApplyGeneration(1U),
+                ApplyId(1U), ApplyGeneration(1U),
                 expected_attempt->fence_attempt_digest,
                 ConfigurationFenceAcceptedDTO{
                     ConfigurationFenceId("fence-maximum"),
@@ -3143,11 +2924,11 @@ TEST(ManagerApplyFenceJournal,
 
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
   const auto stored_scope =
-      reopened.ReadAffectedScope(ApplyId("apply-1"), ApplyGeneration(1U));
+      reopened.ReadAffectedScope(ApplyId(1U), ApplyGeneration(1U));
   const auto stored_attempt =
-      reopened.ReadFenceAttempt(ApplyId("apply-1"), ApplyGeneration(1U));
+      reopened.ReadFenceAttempt(ApplyId(1U), ApplyGeneration(1U));
   const auto stored_acceptance =
-      reopened.ReadFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U));
+      reopened.ReadFenceAcceptance(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(stored_scope.has_value());
   ASSERT_TRUE(stored_attempt.has_value());
   ASSERT_TRUE(stored_acceptance.has_value());
@@ -3188,7 +2969,7 @@ TEST(ManagerApplyFenceJournal,
     const auto intent = journal.EnsureIntent(Intent()).record;
     const auto attempt = EnsureAttempt(journal, intent.intent_digest).record;
     static_cast<void>(journal.EnsureFenceAcceptance(
-        ApplyId("apply-1"), ApplyGeneration(1U), attempt.fence_attempt_digest,
+        ApplyId(1U), ApplyGeneration(1U), attempt.fence_attempt_digest,
         AcceptedFence()));
   }
   ExecSql(
@@ -3244,10 +3025,10 @@ TEST(ManagerApplyRuntimeJournal,
   }
 
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
-  EXPECT_EQ(reopened.ReadRuntimeConvergenceIntent(ApplyId("apply-1"),
+  EXPECT_EQ(reopened.ReadRuntimeConvergenceIntent(ApplyId(1U),
                                                   ApplyGeneration(1U)),
             expected_intent);
-  EXPECT_EQ(reopened.ReadLatestRuntimeStagedReady(ApplyId("apply-1"),
+  EXPECT_EQ(reopened.ReadLatestRuntimeStagedReady(ApplyId(1U),
                                                   ApplyGeneration(1U)),
             expected_staged);
   const auto report = reopened.VerifyIntegrity();
@@ -3268,7 +3049,7 @@ TEST(ManagerApplyRuntimeJournal,
 
   const auto attempt = EnsureAttempt(journal, parent.intent_digest).record;
   const auto acceptance = journal.EnsureFenceAcceptance(
-      ApplyId("apply-1"), ApplyGeneration(1U), attempt.fence_attempt_digest,
+      ApplyId(1U), ApplyGeneration(1U), attempt.fence_attempt_digest,
       AcceptedFence());
   const auto runtime_intent = journal.EnsureRuntimeConvergenceIntent(
       parent.intent_digest, RuntimeIntent(acceptance.record.acceptance_digest));
@@ -3298,7 +3079,7 @@ TEST(ManagerApplyRuntimeJournal,
 }
 
 TEST(ManagerApplyRuntimeJournal,
-     EmptyRuntimeSetIsExplicitAndStagedGenerationsAreBounded) {
+     EmptyRuntimeSetIsExplicit) {
   TemporaryDirectory directory;
   SqliteManagerApplyJournal journal(directory.path() / "runtime.sqlite3",
                                     CellId("cell-1"));
@@ -3309,56 +3090,12 @@ TEST(ManagerApplyRuntimeJournal,
   ASSERT_TRUE(
       runtime_intent.record.runtime_convergence_intent.runtime_units.empty());
 
-  for (std::uint64_t generation = 1U;
-       generation <= kMaximumRuntimeStagedReadySetsPerApply; ++generation) {
-    EXPECT_TRUE(journal
-                    .EnsureRuntimeStagedReady(RuntimeStagedReady(
-                        runtime_intent.record.runtime_convergence_intent_digest,
-                        generation, true))
-                    .inserted);
-  }
-  EXPECT_THROW(journal.EnsureRuntimeStagedReady(RuntimeStagedReady(
-                   runtime_intent.record.runtime_convergence_intent_digest,
-                   kMaximumRuntimeStagedReadySetsPerApply + 1U, true)),
-               ManagerApplyJournalConflictError);
-  EXPECT_EQ(journal.VerifyIntegrity().runtime_staged_ready_count,
-            static_cast<std::int64_t>(kMaximumRuntimeStagedReadySetsPerApply));
-}
-
-TEST(ManagerApplyRuntimeJournal, CorruptStagedPredecessorRefusesLaterWrite) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "runtime.sqlite3";
-  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-  const auto accepted = EnsureAcceptedApply(journal);
-  const auto runtime = journal.EnsureRuntimeConvergenceIntent(
-      accepted.intent.intent_digest,
-      RuntimeIntent(accepted.acceptance.acceptance_digest));
-  const auto digest = runtime.record.runtime_convergence_intent_digest;
-  ASSERT_TRUE(journal.EnsureRuntimeStagedReady(RuntimeStagedReady(digest, 1U))
+  EXPECT_TRUE(journal
+                  .EnsureRuntimeStagedReady(RuntimeStagedReady(
+                      runtime_intent.record.runtime_convergence_intent_digest,
+                      1U, true))
                   .inserted);
-  ExecSql(path,
-          "DROP TRIGGER manager_apply_runtime_staged_ready_sets_no_update;"
-          "UPDATE manager_apply_runtime_staged_ready_sets "
-          "SET runtime_evidence_encoding='0;' WHERE staged_ready_generation=1;"
-          "CREATE TRIGGER manager_apply_runtime_staged_ready_sets_no_update "
-          "BEFORE UPDATE ON manager_apply_runtime_staged_ready_sets BEGIN "
-          "SELECT RAISE(ABORT, 'manager_apply_runtime_staged_ready_sets is "
-          "immutable'); END;");
-  EXPECT_THROW(static_cast<void>(journal.EnsureRuntimeStagedReady(
-                   RuntimeStagedReady(digest, 2U))),
-               ManagerApplyJournalIntegrityError);
-  sqlite3 *database = nullptr;
-  ASSERT_EQ(sqlite3_open_v2(path.string().c_str(), &database,
-                            SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
-                            nullptr), SQLITE_OK);
-  sqlite3_stmt *statement = nullptr;
-  ASSERT_EQ(sqlite3_prepare_v2(database,
-      "SELECT COUNT(*) FROM manager_apply_runtime_staged_ready_sets "
-      "WHERE staged_ready_generation=2", -1, &statement, nullptr), SQLITE_OK);
-  ASSERT_EQ(sqlite3_step(statement), SQLITE_ROW);
-  EXPECT_EQ(sqlite3_column_int64(statement, 0), 0);
-  EXPECT_EQ(sqlite3_finalize(statement), SQLITE_OK);
-  EXPECT_EQ(sqlite3_close(database), SQLITE_OK);
+  EXPECT_EQ(journal.VerifyIntegrity().runtime_staged_ready_count, 1);
 }
 
 TEST(ManagerApplyRuntimeJournal,
@@ -3429,11 +3166,11 @@ TEST(ManagerApplySelectedBundleJournal,
 
   ASSERT_TRUE(expected.has_value());
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
-  EXPECT_EQ(reopened.ReadPrivateMaterialization(ApplyId("apply-1"),
+  EXPECT_EQ(reopened.ReadPrivateMaterialization(ApplyId(1U),
                                                 ApplyGeneration(1U)),
             expected->materialization);
   EXPECT_EQ(
-      reopened.ReadPublicationReceipt(ApplyId("apply-1"), ApplyGeneration(1U)),
+      reopened.ReadPublicationReceipt(ApplyId(1U), ApplyGeneration(1U)),
       expected->publication);
 }
 
@@ -3489,7 +3226,7 @@ TEST(ManagerApplyCompletionJournal,
     expected = EnsureApplyCompletion(journal, *transition);
 
     const auto acceptance =
-        journal.ReadFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U));
+        journal.ReadFenceAcceptance(ApplyId(1U), ApplyGeneration(1U));
     ASSERT_TRUE(acceptance.has_value());
     const auto release_intent = journal.EnsureFenceReleaseIntent(
         FenceReleaseIntent(*transition, *acceptance));
@@ -3503,7 +3240,7 @@ TEST(ManagerApplyCompletionJournal,
         TerminalOutcome(*transition, expected->released));
     EXPECT_FALSE(terminal.inserted);
     EXPECT_EQ(terminal.record, expected->terminal);
-    const auto status = journal.ReadStatus(ApplyId("apply-1"),
+    const auto status = journal.ReadStatus(ApplyId(1U),
                                            ApplyGeneration(1U));
     ASSERT_TRUE(status.has_value());
     const auto progress = DeriveManagerApplyProgress(*status);
@@ -3520,49 +3257,13 @@ TEST(ManagerApplyCompletionJournal,
   ASSERT_TRUE(expected.has_value());
   SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
   EXPECT_EQ(
-      reopened.ReadFenceReleaseIntent(ApplyId("apply-1"), ApplyGeneration(1U)),
+      reopened.ReadFenceReleaseIntent(ApplyId(1U), ApplyGeneration(1U)),
       expected->release_intent);
-  EXPECT_EQ(reopened.ReadFenceReleased(ApplyId("apply-1"), ApplyGeneration(1U)),
+  EXPECT_EQ(reopened.ReadFenceReleased(ApplyId(1U), ApplyGeneration(1U)),
             expected->released);
   EXPECT_EQ(
-      reopened.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U)),
+      reopened.ReadTerminalOutcome(ApplyId(1U), ApplyGeneration(1U)),
       expected->terminal);
-}
-
-TEST(ManagerApplyCompletionJournal,
-     DependencyReadsDoNotRetainAbsenceOrCorruptionAcrossCalls) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "read-scope.sqlite3";
-  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-  const auto transition = EnsureSelectedBundleTransition(journal);
-  const auto read = [&] {
-    return journal.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U));
-  };
-  EXPECT_FALSE(read().has_value());
-  const auto completed = EnsureApplyCompletion(journal, transition);
-  EXPECT_EQ(read(), completed.terminal);
-
-  // A separate writer changes a deep predecessor without changing schema
-  // shape. A completed earlier read must not hide it, and an exception must
-  // not leave a stale read context behind after the database is restored.
-  const auto rewrite_source = [&](const std::string &source) {
-    ExecSql(
-        path,
-        "DROP TRIGGER manager_apply_intents_no_update;"
-        "UPDATE manager_apply_intents SET source_label='" +
-            source +
-            "';"
-            "CREATE TRIGGER manager_apply_intents_no_update "
-            "BEFORE UPDATE ON manager_apply_intents BEGIN "
-            "SELECT RAISE(ABORT, 'manager_apply_intents is immutable'); END;");
-  };
-  rewrite_source("tampered-source");
-  EXPECT_THROW(static_cast<void>(read()), ManagerApplyJournalIntegrityError);
-  EXPECT_THROW(static_cast<void>(journal.VerifyIntegrity()),
-               ManagerApplyJournalIntegrityError);
-  rewrite_source(Intent().request_context.source_label);
-  EXPECT_EQ(read(), completed.terminal);
-  EXPECT_EQ(journal.VerifyIntegrity().terminal_outcome_count, 1);
 }
 
 TEST(ManagerApplyCompletionJournal,
@@ -3572,16 +3273,16 @@ TEST(ManagerApplyCompletionJournal,
       directory.path() / "apply-completion-conflict.sqlite3", CellId("cell-1"));
   const auto transition = EnsureSelectedBundleTransition(journal);
   const auto acceptance =
-      journal.ReadFenceAcceptance(ApplyId("apply-1"), ApplyGeneration(1U));
+      journal.ReadFenceAcceptance(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(acceptance.has_value());
   const auto release_intent = journal.EnsureFenceReleaseIntent(
       FenceReleaseIntent(transition, *acceptance));
   EXPECT_FALSE(
-      journal.ReadTerminalOutcome(ApplyId("apply-1"), ApplyGeneration(1U))
+      journal.ReadTerminalOutcome(ApplyId(1U), ApplyGeneration(1U))
           .has_value());
 
   auto impossible_terminal = ManagerApplyTerminalOutcomeDTO{
-      ApplyId("apply-1"),
+      ApplyId(1U),
       ApplyGeneration(1U),
       transition.materialization.private_materialization
           .candidate_projection_revision,
@@ -3595,8 +3296,8 @@ TEST(ManagerApplyCompletionJournal,
                ManagerApplyJournalConflictError);
 
   auto conflicting_intent = FenceReleaseIntent(transition, *acceptance);
-  conflicting_intent.release_request.manager_runtime_epoch =
-      RuntimeEpoch("manager-epoch-2");
+  conflicting_intent.release_request.reconciliation_evidence
+      .operation_resource_generation += 1U;
   EXPECT_THROW(journal.EnsureFenceReleaseIntent(conflicting_intent),
                ManagerApplyJournalConflictError);
 
@@ -3636,97 +3337,284 @@ TEST(ManagerApplyCompletionJournal,
                ManagerApplyJournalIntegrityError);
 }
 
-} // namespace
-TEST(ManagerApplyJournal, ReadOnlyClaimIntentResolvesOrdinaryParent) {
+TEST(ManagerApplyJournalWriter, EveryWriteAnswersWhileTheWriterIsBlocked) {
   TemporaryDirectory directory;
-  const auto path = directory.path() / "ordinary-parent-claim-read.sqlite3";
-  const auto parent = Intent();
-  const auto durable = [&] {
-    SqliteManagerApplyJournal journal(path, parent.cell_id);
-    return journal.EnsureIntent(parent).record;
-  }();
-  const core::CellAdmissionClaimIntentDTO claim{
-      core::CellAdmissionClaimKindDTO::kManagerApply,
-      core::CellAdmissionOwnerRoleDTO::kManager,
-      parent.request_context.request_owner_epoch, parent.apply_id.value(),
-      parent.request_context.request_id, durable.intent_digest,
-      *parent.expected_admission_generation, {}, std::nullopt, std::nullopt};
-  const auto before = ReadFileBytes(path);
-  const auto ordinary = ReadManagerApplyStatusByClaimIntentReadOnly(path, parent.cell_id, claim);
-  ASSERT_TRUE(ordinary.ok()) << ordinary.error().message;
-  EXPECT_EQ(ordinary.value().intent, durable);
-  auto foreign = claim;
-  foreign.request_payload_digest = ContentDigest(std::string(kDigestTwo));
-  EXPECT_FALSE(ReadManagerApplyStatusByClaimIntentReadOnly(path, parent.cell_id, foreign).ok());
-  foreign = claim;
-  foreign.expected_admission_generation = core::AdmissionGeneration(8U);
-  EXPECT_FALSE(ReadManagerApplyStatusByClaimIntentReadOnly(path, parent.cell_id, foreign).ok());
-  foreign = claim;
-  foreign.owner_role = core::CellAdmissionOwnerRoleDTO::kAuthoringOwner;
-  EXPECT_FALSE(ReadManagerApplyStatusByClaimIntentReadOnly(path, parent.cell_id, foreign).ok());
-  EXPECT_FALSE(ReadManagerApplyStatusByClaimIntentReadOnly(path, CellId("foreign-cell"), claim).ok());
-  const auto absent = directory.path() / "absent-claim-parent.sqlite3";
-  const auto missing = ReadManagerApplyStatusByClaimIntentReadOnly(absent, parent.cell_id, claim);
-  ASSERT_FALSE(missing.ok());
-  EXPECT_EQ(missing.error().code, "manager_apply_configuration_read_unavailable");
-  EXPECT_FALSE(std::filesystem::exists(absent));
-  EXPECT_EQ(ReadFileBytes(path), before);
+  const auto path = directory.path() / "blocked-writer.sqlite3";
+  GatedWriter gated;
+  SqliteManagerApplyJournal journal(path, CellId("cell-1"), &gated.writer());
+  const DrainFirst drain_first{gated};
+
+  // A successful Apply, intent to terminal outcome.
+  const auto transition = EnsureSelectedBundleTransition(journal);
+  const auto completion = EnsureApplyCompletion(journal, transition);
+
+  // A failure before effect that holds its accepted fence, then its release.
+  const ApplyId failed(2U);
+  const auto failed_intent = journal.EnsureIntent(Intent(2U, 1U, 2U)).record;
+  auto failed_fence = FenceIntent();
+  failed_fence.owner_request_context = failed_intent.intent.request_context;
+  failed_fence.owner_transaction = {failed, ApplyGeneration(1U)};
+  const auto failed_attempt =
+      EnsureAttempt(journal, failed_intent.intent_digest, failed_fence).record;
+  auto failed_accepted = AcceptedFence();
+  failed_accepted.configuration_fence_id = ConfigurationFenceId("fence-2");
+  const auto failed_acceptance =
+      journal
+          .EnsureFenceAcceptance(failed, ApplyGeneration(1U),
+                                 failed_attempt.fence_attempt_digest,
+                                 failed_accepted)
+          .record;
+  const auto failed_terminal =
+      journal
+          .EnsureTerminalOutcome({
+              failed, ApplyGeneration(1U), std::nullopt, std::nullopt,
+              std::nullopt, std::nullopt,
+              ManagerApplyTerminalOutcomeState::kFailed,
+              ManagerApplyFailureEvidenceDTO{
+                  failed_intent.intent_digest, ManagerApplyPhase::kFenceAccepted,
+                  "runtime_staging_refused", "refused before any effect",
+                  ManagerApplyEffectDisposition::kKnown, "typed_cause_code", {},
+                  "component_manager", ManagerApplyEffectBoundary::kBeforeEffect},
+          })
+          .record;
+  ASSERT_TRUE(FailedApplyAcknowledgementEligible(
+      *journal.ReadStatus(failed, ApplyGeneration(1U))));
+  const auto donor =
+      journal.ReadFenceAcceptance(ApplyId(1U), ApplyGeneration(1U));
+  ASSERT_TRUE(donor.has_value());
+  auto release = FenceReleaseIntent(transition, *donor).release_request;
+  auto &evidence = release.reconciliation_evidence;
+  evidence.owner_transaction = {failed, ApplyGeneration(1U)};
+  evidence.configuration_fence_id =
+      failed_acceptance.accepted_fence.configuration_fence_id;
+  evidence.configuration_fence_generation =
+      failed_acceptance.accepted_fence.configuration_fence_generation;
+  const auto &predecessor =
+      failed_intent.intent.expected_active_projection_revision;
+  evidence.active_projection_revision.retained_bundle_id =
+      predecessor.retained_bundle_id;
+  evidence.active_projection_revision.graph_revision =
+      predecessor.graph_revision;
+  evidence.active_graph_revision = predecessor.graph_revision;
+  evidence.active_projection_revision.scene_revision.scene_id =
+      predecessor.scene_revision.scene_id;
+  journal.BeginFailedApplyRelease(failed, ApplyGeneration(1U), Key(9001U),
+                                  "operator", release);
+  journal.CompleteFailedApplyRelease(
+      failed, ApplyGeneration(1U),
+      core::ConfigurationFenceReleasedDTO{
+          release, release.reconciliation_evidence.execution_host_epoch,
+          987654321LL, core::RequestReplayStatusDTO::kAcceptedNew,
+          ContentDigest(std::string(kDigestTwo))});
+  journal.CompleteFailedApplyAcknowledgement(failed, ApplyGeneration(1U));
+
+  // Every answer comes from memory while nothing has reached the file.
+  EXPECT_EQ(QueryInteger(path, "SELECT COUNT(*) FROM manager_apply_intents"),
+            0);
+  const auto inventory = journal.ReadStatusInventory();
+  ASSERT_EQ(inventory.size(), 2U);
+  EXPECT_EQ(inventory[0].terminal_outcome, completion.terminal);
+  EXPECT_EQ(DeriveManagerApplyProgress(inventory[0]).phase,
+            ManagerApplyPhase::kSettled);
+  EXPECT_EQ(inventory[1].terminal_outcome, failed_terminal);
+  EXPECT_EQ(journal.ReadRequest(Key(2U))->intent, failed_intent.intent);
+  EXPECT_EQ(journal.ReadApplyGenerationHighWater(failed), ApplyGeneration(1U));
+  const auto failed_release =
+      journal.ReadFailedApplyRelease(failed, ApplyGeneration(1U));
+  ASSERT_TRUE(failed_release.has_value());
+  EXPECT_TRUE(failed_release->acknowledged);
+  EXPECT_TRUE(failed_release->request.has_value());
+  EXPECT_TRUE(failed_release->released.has_value());
+  EXPECT_EQ(failed_release->terminal_outcome_digest,
+            failed_terminal.terminal_outcome_digest);
+  EXPECT_EQ(failed_release->fence_acceptance_digest,
+            failed_acceptance.acceptance_digest);
+  EXPECT_EQ(journal.VerifyIntegrity().terminal_outcome_count, 2);
+
+  gated.ReleaseAndDrain();
+  EXPECT_EQ(gated.writer().records_dropped(), 0U);
+  EXPECT_EQ(gated.writer().records_not_written(), 0U);
+  journal.Close();
+  ExpectNoSqliteSidecars(path);
+  EXPECT_EQ(QueryInteger(path, "SELECT COUNT(*) FROM manager_apply_intents"),
+            2);
+  EXPECT_EQ(QueryInteger(path, "SELECT COUNT(*) FROM manager_apply_fence_acceptances"),
+            2);
+  EXPECT_EQ(QueryInteger(path, "SELECT COUNT(*) FROM manager_apply_fence_released_records"),
+            1);
+  EXPECT_EQ(QueryInteger(path, "SELECT COUNT(*) FROM manager_apply_terminal_outcomes"),
+            2);
+  EXPECT_EQ(QueryInteger(path,
+                         "SELECT COUNT(*) FROM manager_apply_failed_release "
+                         "WHERE apply_id=2 AND acknowledged=1 "
+                         "AND released_fence_encoding IS NOT NULL"),
+            1);
+  EXPECT_EQ(QueryInteger(path, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
+            0);
+
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  const auto reloaded =
+      reopened.ReadFailedApplyRelease(failed, ApplyGeneration(1U));
+  ASSERT_TRUE(reloaded.has_value());
+  EXPECT_TRUE(reloaded->acknowledged);
+  EXPECT_EQ(reopened.ReadTerminalOutcome(ApplyId(1U), ApplyGeneration(1U)),
+            completion.terminal);
 }
 
-TEST(ManagerApplyJournal, ReadOnlyConfigurationParentKeepsDirectAndAuthoringGrammars) {
+TEST(ManagerApplyJournalWriter, AFailedFileWriteLeavesTheAnswersUnchanged) {
   TemporaryDirectory directory;
-  for (const bool authoring : {false, true}) {
-    const auto path = directory.path() / (authoring ? "authoring-config.sqlite3" : "direct-config.sqlite3");
-    const auto parent = authoring ? ParentClaimIntent() : Intent();
-    const auto durable = [&] {
-      SqliteManagerApplyJournal journal(path, parent.cell_id);
-      return journal.EnsureIntent(parent).record;
-    }();
-    const auto claim = parent.parent_authoring_claim.value_or(core::CellAdmissionClaimDTO{
-        {core::CellAdmissionClaimKindDTO::kManagerApply, core::CellAdmissionOwnerRoleDTO::kManager,
-         parent.request_context.request_owner_epoch, parent.apply_id.value(), parent.request_context.request_id,
-         durable.intent_digest, core::AdmissionGeneration(7U), {}, std::nullopt, std::nullopt},
-        core::CellAdmissionClaimGeneration(3U), core::AdmissionGeneration(7U), 42});
-    const core::NamedApplyPublicationTransactionDTO apply{parent.apply_id, parent.apply_generation};
-    std::optional<core::CellAdmissionClaimDTO> other_authoring_claim;
-    if (authoring) {
-      auto other = ParentClaimIntent();
-      other.apply_id = ApplyId("apply-2");
-      other.request_context.request_id = RequestId("request-2");
-      other.parent_authoring_claim->intent.owner_transaction_id = "composer-transaction-2";
-      other.parent_authoring_claim->intent.request_id = RequestId("composer-request-2");
-      other.parent_authoring_claim->intent.request_payload_digest = ContentDigest(std::string(kDigestThree));
-      other.parent_authoring_claim->claim_generation = core::CellAdmissionClaimGeneration(4U);
-      SqliteManagerApplyJournal journal(path, parent.cell_id);
-      EXPECT_EQ(journal.EnsureIntent(other).record.intent, other);
-      other_authoring_claim = other.parent_authoring_claim;
-    }
-    const auto before = ReadFileBytes(path);
-    const auto observed = ReadManagerApplyConfigurationStatusReadOnly(path, parent.cell_id, apply, claim);
-    ASSERT_TRUE(observed.ok()) << observed.error().message;
-    EXPECT_EQ(observed.value().intent, durable);
-    auto foreign = claim;
-    if (authoring) foreign.claim_generation = core::CellAdmissionClaimGeneration(4U);
-    else foreign.intent.request_payload_digest = ContentDigest(std::string(kDigestTwo));
-    const auto refused = ReadManagerApplyConfigurationStatusReadOnly(path, parent.cell_id, apply, foreign);
-    ASSERT_FALSE(refused.ok());
-    EXPECT_EQ(refused.error().details.at("integrity_detail"), authoring
-        ? "configuration authoring parent claim mismatch" : "configuration direct parent intent mismatch");
-    const auto missing = ReadManagerApplyConfigurationStatusReadOnly(path, parent.cell_id,
-        {parent.apply_id, ApplyGeneration(2U)}, claim);
-    ASSERT_FALSE(missing.ok());
-    EXPECT_EQ(missing.error().details.at("integrity_detail"), "ordinary configuration parent missing");
-    if (other_authoring_claim) {
-      const auto foreign_apply = ReadManagerApplyConfigurationStatusReadOnly(
-          path, parent.cell_id, apply, *other_authoring_claim);
-      ASSERT_FALSE(foreign_apply.ok());
-      EXPECT_EQ(foreign_apply.error().details.at("integrity_detail"),
-                "configuration authoring parent claim mismatch");
-    }
-    EXPECT_EQ(ReadFileBytes(path), before);
+  const auto path = directory.path() / "failing-writer.sqlite3";
+  persistence::SqliteRecordWriter writer;
+  SqliteManagerApplyJournal journal(path, CellId("cell-1"), &writer);
+  // A row the journal does not hold makes the writer's insert fail.
+  ExecSql(path, ForeignIntentRowSql(1U));
+  const auto inserted = journal.EnsureIntent(Intent());
+  EXPECT_TRUE(inserted.inserted);
+  writer.DrainAndStop();
+  EXPECT_GE(writer.records_not_written(), 1U);
+  EXPECT_EQ(journal.ReadIntent(ApplyId(1U), ApplyGeneration(1U)),
+            inserted.record);
+  EXPECT_EQ(journal.ReadRequest(Key(1U)), inserted.record);
+  EXPECT_FALSE(journal.EnsureIntent(Intent()).inserted);
+  journal.Close();
+  // The writer marked the file: records of this start were not written.
+  EXPECT_EQ(QueryInteger(path, "SELECT records_lost FROM apply_journal_metadata"),
+            1);
+}
+
+TEST(ManagerApplyJournalWriter, ADroppedRecordLeavesTheAnswersUnchanged) {
+  TemporaryDirectory directory;
+  GatedWriter gated(persistence::SqliteRecordWriterLimits{
+      1U, persistence::kSqliteRecordWriterDefaultLimits.maximum_bytes});
+  SqliteManagerApplyJournal journal(directory.path() / "dropping.sqlite3",
+                                    CellId("cell-1"), &gated.writer());
+  const DrainFirst drain_first{gated};
+  const auto intent = journal.EnsureIntent(Intent()).record;
+  const auto scope =
+      journal.EnsureAffectedScope(intent.intent_digest, AffectedScope()).record;
+  EXPECT_GT(gated.writer().records_dropped(), 0U);
+  const auto status = journal.ReadStatus(ApplyId(1U), ApplyGeneration(1U));
+  ASSERT_TRUE(status.has_value());
+  EXPECT_EQ(status->intent, intent);
+  EXPECT_EQ(status->affected_scope, scope);
+  gated.ReleaseAndDrain();
+  journal.Close();
+}
+
+TEST(ManagerApplyJournalWriter, TheJournalConnectionUsesNormalSynchronousMode) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "synchronous.sqlite3";
+  {
+    std::lock_guard lock(captured_mutex);
+    capture_target = path;
+    captured_connections.clear();
   }
+  ASSERT_EQ(sqlite3_auto_extension(
+                reinterpret_cast<void (*)()>(&CaptureConnection)),
+            SQLITE_OK);
+  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+  sqlite3_cancel_auto_extension(
+      reinterpret_cast<void (*)()>(&CaptureConnection));
+  std::vector<sqlite3 *> connections;
+  {
+    std::lock_guard lock(captured_mutex);
+    connections = captured_connections;
+  }
+  ASSERT_EQ(connections.size(), 1U);
+  // The writer is idle: nothing was posted.
+  sqlite3_stmt *statement = nullptr;
+  ASSERT_EQ(sqlite3_prepare_v2(connections.front(), "PRAGMA synchronous", -1,
+                               &statement, nullptr),
+            SQLITE_OK);
+  EXPECT_EQ(sqlite3_step(statement), SQLITE_ROW);
+  EXPECT_EQ(sqlite3_column_int(statement, 0), 1);
+  sqlite3_finalize(statement);
+  journal.Close();
 }
 
+TEST(ManagerApplyJournalWriter, ACleanCloseLeavesEveryRecordInTheFile) {
+  TemporaryDirectory directory;
+  const auto path = directory.path() / "clean-close.sqlite3";
+  std::optional<ManagerApplyJournalIntegrityReport> report;
+  {
+    SqliteManagerApplyJournal journal(path, CellId("cell-1"));
+    const auto transition = EnsureSelectedBundleTransition(journal);
+    static_cast<void>(EnsureApplyCompletion(journal, transition));
+    EnsureRefusedApply(journal, 2U);
+    report = journal.VerifyIntegrity();
+    journal.Close();
+  }
+  ASSERT_TRUE(report.has_value());
+  ExpectNoSqliteSidecars(path);
+  const auto count = [&](const std::string &table) {
+    return QueryInteger(path, "SELECT COUNT(*) FROM " + table);
+  };
+  EXPECT_EQ(count("manager_apply_intents"), report->apply_intent_count);
+  EXPECT_EQ(count("manager_apply_affected_scopes"), report->affected_scope_count);
+  EXPECT_EQ(count("manager_apply_fence_attempts"), report->fence_attempt_count);
+  EXPECT_EQ(count("manager_apply_fence_acceptances"),
+            report->fence_acceptance_count);
+  EXPECT_EQ(count("manager_apply_runtime_convergence_intents"),
+            report->runtime_convergence_intent_count);
+  EXPECT_EQ(count("manager_apply_runtime_staged_ready_sets"),
+            report->runtime_staged_ready_count);
+  EXPECT_EQ(count("manager_apply_private_materializations"),
+            report->private_materialization_count);
+  EXPECT_EQ(count("manager_apply_publication_receipts"),
+            report->publication_receipt_count);
+  EXPECT_EQ(count("manager_apply_fence_release_intents"),
+            report->fence_release_intent_count);
+  EXPECT_EQ(count("manager_apply_fence_released_records"),
+            report->fence_released_count);
+  EXPECT_EQ(count("manager_apply_terminal_outcomes"),
+            report->terminal_outcome_count);
+  EXPECT_EQ(QueryInteger(path, "SELECT accepted_sequence FROM "
+                               "manager_apply_intents WHERE apply_id=2"),
+            2);
+  EXPECT_EQ(QueryInteger(path, "SELECT COUNT(*) FROM pragma_quick_check "
+                               "WHERE quick_check <> 'ok'"),
+            0);
+  EXPECT_EQ(QueryInteger(path, "SELECT COUNT(*) FROM pragma_foreign_key_check"),
+            0);
+
+  // Reopening loads the same records; reads then decode nothing.
+  SqliteManagerApplyJournal reopened(path, CellId("cell-1"));
+  const auto loaded = reopened.VerifyIntegrity();
+  EXPECT_EQ(loaded.apply_intent_count, report->apply_intent_count);
+  EXPECT_EQ(loaded.terminal_outcome_count, report->terminal_outcome_count);
+  EXPECT_EQ(loaded.runtime_staged_ready_count,
+            report->runtime_staged_ready_count);
+  const auto verified = reopened.record_verification_count();
+  EXPECT_GT(verified, 0U);
+  EXPECT_EQ(reopened.ReadStatusInventory().size(), 2U);
+  EXPECT_EQ(reopened.record_verification_count(), verified);
+}
+
+TEST(ManagerApplyJournal, RefusesAnAdmissionGenerationTheFileCannotHold) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "admission.sqlite3",
+                                    CellId("cell-1"));
+  auto intent = Intent();
+  intent.expected_admission_generation =
+      core::AdmissionGeneration(9007199254740992ULL);
+  try {
+    static_cast<void>(journal.EnsureIntent(intent));
+    FAIL() << "the file's CHECK bounds the admission generation";
+  } catch (const ManagerApplyJournalConflictError &error) {
+    EXPECT_EQ(std::string(error.what()),
+              "step SQLite statement: CHECK constraint failed: "
+              "expected_admission_generation IS NULL\n"
+              "            OR (\n"
+              "                expected_admission_generation > 0\n"
+              "                AND expected_admission_generation <= "
+              "9007199254740991\n"
+              "            )");
+  }
+  EXPECT_FALSE(
+      journal.ReadIntent(ApplyId(1U), ApplyGeneration(1U)).has_value());
+}
+
+} // namespace
 TEST(ManagerApplyJournalIntegrity,
      RefusesV20InterruptedIntentWithActionablePreservationMessage) {
   TemporaryDirectory directory;
@@ -3744,7 +3632,7 @@ TEST(ManagerApplyJournalIntegrity,
     const std::string message(error.what());
     EXPECT_NE(message.find(path.string()), std::string::npos);
     EXPECT_NE(message.find("version 20"), std::string::npos);
-    EXPECT_NE(message.find("v22"), std::string::npos);
+    EXPECT_NE(message.find("v24"), std::string::npos);
     EXPECT_NE(message.find("Preserve"), std::string::npos);
     EXPECT_NE(message.find("interrupted"), std::string::npos);
     EXPECT_NE(message.find("reconcile"), std::string::npos);
@@ -3806,11 +3694,11 @@ TEST(ManagerApplyJournal,
   }
   SqliteManagerApplyJournal reopened(database, CellId("cell-1"));
   const auto scope =
-      reopened.ReadAffectedScope(ApplyId("apply-1"), ApplyGeneration(1U));
+      reopened.ReadAffectedScope(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(scope);
   EXPECT_EQ(scope->affected_scope.scope, fence.scope);
   const auto attempt =
-      reopened.ReadFenceAttempt(ApplyId("apply-1"), ApplyGeneration(1U));
+      reopened.ReadFenceAttempt(ApplyId(1U), ApplyGeneration(1U));
   ASSERT_TRUE(attempt);
   EXPECT_EQ(attempt->fence_intent.scope, fence.scope);
   EXPECT_TRUE(

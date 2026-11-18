@@ -10,7 +10,7 @@
 #include <manyforge_core/types/participant_stop_stage.hpp>
 #include <manyforge_core/types/recovery.hpp>
 #include <manyforge_core/types/runtime_scale.hpp>
-#include <manyforge_core/types/stop_certificate.hpp>
+#include <manyforge_core/types/stop_event.hpp>
 #include <optional>
 #include <string>
 
@@ -28,12 +28,13 @@ inline bool is_settled_execution_failure(const ParticipantExecutionFact& fact) {
 
 /// Exact process-local handoff after the addressed owner has proved either
 /// physical containment for one dispatched participant or effect-free
-/// cancellation behind the coordinated dispatch barrier. The aggregate Stop
-/// certificate identity is reserved by the addressed owner; the participant
-/// records only this reference and MUST NOT issue another Stop or certificate.
+/// cancellation behind the coordinated dispatch barrier. `stop_event_id` is
+/// the Stop event that started the participant's current stop attempt
+/// (`ParticipantStopState::started_by`); the participant records only this
+/// identity and MUST NOT issue another Stop.
 struct AddressedParticipantStopSettlementRequestDTO final {
   std::uint64_t execution_id{};
-  StopCertificateRefDTO aggregate_stop_certificate;
+  StopEventId stop_event_id{0U};
   /// Carries the exact addressed operation/participant/goal identity in both
   /// cases. For effect-free cancellation it has kNotDispatched disposition,
   /// successful outcome, no evidence items, and is never retained as a
@@ -46,15 +47,14 @@ struct AddressedParticipantStopSettlementRequestDTO final {
 /// Participant recovery evidence returned synchronously to the addressed
 /// reducer after it recorded the owner's containment. The participant commits
 /// no outcome; the addressed Kernel owns the operation terminal. Repeating the
-/// exact request returns the same evidence; a conflicting Stop identity is
+/// exact request returns the same evidence; a conflicting Stop event id is
 /// rejected without changing the participant.
 struct AddressedParticipantStopSettlementDTO final {
   std::uint64_t execution_id{};
-  StopCertificateRefDTO aggregate_stop_certificate;
-  OperationId operation_id;
+  StopEventId stop_event_id{0U};
+  OperationNumber operation_id;
   OperationParticipantId participant_id;
   ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation;
   KernelRecoveryAssessmentDTO recovery_assessment;
   /// A contained local failure keeps its original cause and cannot acquire
   /// ordinary-Stop retry permission. Absence retains the ordinary Stop path.
@@ -71,6 +71,32 @@ enum class AddressedParticipantStopFenceDisposition : std::uint8_t {
   kDispatchCommitted,
 };
 
+/// Dispatch gates the linearising fence call (1) moved from open to
+/// fenced-before-dispatch. Call (2) completes exactly these. A bit set.
+enum class AddressedParticipantStopFenceGate : std::uint8_t {
+  kNone = 0,
+  /// The active prepared session's (or the gripper session's) gate.
+  kActiveSession = 1U << 0U,
+  /// The pending moving replacement whose source is this execution.
+  kPendingReplacement = 1U << 1U,
+};
+
+/// Result of fence call (1).
+struct AddressedParticipantStopFenceResult final {
+  AddressedParticipantStopFenceDisposition disposition{
+      AddressedParticipantStopFenceDisposition::kUnknown};
+  /// Bit set of `AddressedParticipantStopFenceGate`.
+  std::uint8_t closed_gates{};
+  /// `kDispatchCommitted` while the committed send has not returned: whether
+  /// the goal went out is reported later by the participant
+  /// (`KernelEventType::kParticipantDispatchOutcome`); the Stop's settlement
+  /// waits for that report.
+  bool send_outcome_pending{};
+
+  friend bool operator==(const AddressedParticipantStopFenceResult&,
+                         const AddressedParticipantStopFenceResult&) = default;
+};
+
 /// Subordinate single-participant execution mechanism used by the addressed
 /// Kernel owner. It does not resolve Program roles, select a robot/group, or
 /// reserve resources; those responsibilities remain outside this port.
@@ -78,15 +104,31 @@ class IResolvedParticipantExecutionEngine {
  public:
   virtual ~IResolvedParticipantExecutionEngine() = default;
 
-  /// Close lower-priority participant work as soon as the addressed owner has
-  /// linearized an exact Stop, before it publishes the physical Stop stages.
-  /// This process-local, non-blocking fence does not issue a backend command,
-  /// claim containment, or publish a terminal. The addressed owner remains
-  /// responsible for the physical result and aggregate certificate.
-  virtual AddressedParticipantStopFenceDisposition fence_addressed_participant_stop(
+  /// Fence call (1), the linearising part (stop state model §3.1 E2/E11).
+  /// Called with the addressed owner's state lock held, so it does only:
+  /// store the fence execution id (atomic); copy the active and pending
+  /// session pointers under the engine's session-pointer leaf lock; move the
+  /// dispatch gates from open to fenced-before-dispatch by compare-and-swap.
+  /// A gripper does its session-state compare-and-assign under its session
+  /// lock (its dispatch gate). Nothing else: no other lock, no wake-up, no
+  /// cancellation callback, no process signal, no allocation, no print.
+  /// It never issues a backend command or claims containment.
+  virtual AddressedParticipantStopFenceResult fence_addressed_participant_stop(
       std::uint64_t execution_id) noexcept {
     (void)execution_id;
-    return AddressedParticipantStopFenceDisposition::kUnknown;
+    return {};
+  }
+  /// Fence call (2), after the addressed owner released its locks and before
+  /// it publishes the participant's Stop lane index. Made after every call (1)
+  /// that named an execution, also when no gate closed (`closed_gates` 0):
+  /// it always revokes the lookahead permits, and for the gates call (1)
+  /// closed it does the rest of the fence (session and pending state writes
+  /// under their own locks, the replacement's stop request, planning and
+  /// validation cancels, wake-ups). Never dispatches.
+  virtual void complete_addressed_participant_stop_fence(std::uint64_t execution_id,
+                                                         std::uint8_t closed_gates) noexcept {
+    (void)execution_id;
+    (void)closed_gates;
   }
   /// Record the addressed owner's containment for one exact participant
   /// execution after the owner has already contained its dispatched goal or
@@ -120,7 +162,7 @@ class IResolvedParticipantExecutionEngine {
   virtual Result<ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
       const ResolvedRuntimeScaleCommandDTO& command) = 0;
   virtual Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
-      const OperationId& operation_id, const ControlBindingId& control_binding_id) const = 0;
+      const OperationNumber& operation_id, const ControlBindingId& control_binding_id) const = 0;
   /// OD-72: the operator's speed setting for this participant's binding,
   /// idle or moving: it overwrites the participant's ramp target (latest
   /// `sequence` wins), which a starting motion reads when it registers its
@@ -186,7 +228,7 @@ class IResolvedParticipantExecutionEngine {
   virtual KernelRecoveryActionResultDTO apply_recovery_action(
       const KernelRecoveryActionRequestDTO& request) {
     return KernelRecoveryActionResultDTO{
-        request.request_id, request.action, false, get_recovery_assessment(),
+        request.request_key, request.action, false, get_recovery_assessment(),
         ErrorDTO{"recovery_unavailable",
                  "participant execution engine does not expose recovery",
                  {{"reason", "recovery_port_unavailable"}}}};

@@ -86,8 +86,8 @@ struct ActiveControlConfigurationDTO final {
   TopologyRevision topology_revision;
   RuntimeUnitId source_runtime_unit_id;
   RuntimeEpoch source_runtime_epoch;
-  /// CCLC verifies source-local monotonicity; this value layer does not invent
-  /// a first-sequence convention that the active-configuration spec omits.
+  /// This value layer does not check source-local monotonicity and does not
+  /// invent a first-sequence convention that the active-configuration spec omits.
   std::uint64_t source_sequence{};
   std::vector<KinematicResourceSourceProjectionDTO> kinematic_resource_source_projections;
   ActiveControlConfigurationGeneration active_control_configuration_generation;

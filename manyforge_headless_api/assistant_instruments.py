@@ -29,9 +29,9 @@ from manyforge_behavior.canonical_artifact import canonical_json_bytes, raw_sha2
 from manyforge_behavior.catalog import CatalogEntry, NodeCatalog
 from manyforge_behavior.catalog_schema import CatalogSchema
 
-MODE_PROJECTION_VERSION: Final = "manyforge.assistant_mode_projection.v2"
+MODE_PROJECTION_VERSION: Final = "manyforge.assistant_mode_projection.v3"
 MODE_CATALOG_VERSION: Final = "manyforge.assistant_mode_catalog.v1"
-INDEX_VERSION: Final = "manyforge.assistant_mode_index.v2"
+INDEX_VERSION: Final = "manyforge.assistant_mode_index.v3"
 INSTRUMENTS_VERSION: Final = "manyforge.assistant_instruments.v1"
 _CONTENT_IDENTITY_PREFIX: Final = b"manyforge.content-identity.v1"
 NODE_TOOL_IDS: Final = frozenset(

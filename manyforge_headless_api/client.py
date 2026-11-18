@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
 import hashlib
 import json
 import re
@@ -14,6 +13,8 @@ from urllib.parse import quote, urlsplit, urlunsplit
 import httpx
 from websockets.sync.client import ClientConnection, connect as connect_websocket
 
+from .identity import format_request_key, http_request_key
+from .internal_http import INTERNAL_HTTP_CLIENT_LIMITS
 from .native import (
     MAX_ASSISTANT_MODE_CONTEXT_RESPONSE_BYTES,
     MAX_SOURCE_MODEL_CONTEXT_RESPONSE_BYTES,
@@ -41,8 +42,25 @@ MAX_HTTP_RESPONSE_BYTES = 64 * 1024 * 1024
 _CONDITION_ID_PATTERN = re.compile(r"^condition-[0-9a-f]{24}$")
 _ASSISTANT_MODE_PATTERN = re.compile(r"^[a-z][a-z0-9.-]*$")
 _SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
-_OBSERVATION_CREDIT_SCHEMA = "manyforge.execution_observation_credit.v1"
+_OBSERVATION_CREDIT_SCHEMA = "manyforge.execution_observation_credit.v2"
 _MAXIMUM_OBSERVATION_FRAME_BYTES = 4 * 1024 * 1024
+# Command calls (OD-214): runner commands, stored-value edits, control
+# commands, activation preparation and the Apply's Manager submissions answer
+# at acceptance and are followed through their published status. The
+# Runner's between-nodes Scene latch is answered once Headless's mirror shows
+# what it committed (OD-294), a wait with no time limit. Only the connection
+# is bounded; the wait for the reply is not.
+_COMMAND_PATH = re.compile(
+    r"^/api/(?:"
+    r"program/runs(?:/[1-9][0-9]*/(?:motion-start|resume-motion|resume-halt"
+    r"|reset|blackboard-values|manual-result))?"
+    r"|program/cycle/reset|cycle/recovery-actions"
+    r"|program/persistent-values(?:/reset|/clear)?"
+    r"|control/commands|activation-preparations"
+    r"|manager/apply(?:/release-for-new)?"
+    r"|scene/runtime-latch|scene/transactions"
+    r")$"
+)
 
 
 class HeadlessClientError(RuntimeError):
@@ -63,12 +81,6 @@ class HeadlessClientError(RuntimeError):
         self.response = dict(response) if response is not None else None
         # The owner that produced the refusal, as the headless API reported it.
         self.producer = producer
-
-
-@dataclass(frozen=True, slots=True)
-class CallerIdentity:
-    request_owner_epoch: str
-    source_label: str
 
 
 class HeadlessExecutionObservationStream:
@@ -200,6 +212,7 @@ class HeadlessHttpClient:
         self._client = client or httpx.Client(
             base_url=self._base_url,
             timeout=httpx.Timeout(timeout_seconds),
+            limits=INTERNAL_HTTP_CLIENT_LIMITS,
         )
         self._timeout_seconds = timeout_seconds
 
@@ -290,11 +303,16 @@ class HeadlessHttpClient:
             raise ValueError("per-request HTTP timeout must be positive")
         maximum_response_bytes = self._response_bound(method, path)
         try:
-            timeout_override = (
-                {"timeout": min(float(timeout_seconds), self._timeout_seconds)}
-                if timeout_seconds is not None
-                else {}
-            )
+            if timeout_seconds is not None:
+                timeout_override: dict[str, Any] = {
+                    "timeout": min(float(timeout_seconds), self._timeout_seconds)
+                }
+            elif method.upper() == "POST" and _COMMAND_PATH.match(path):
+                timeout_override = {
+                    "timeout": httpx.Timeout(None, connect=self._timeout_seconds)
+                }
+            else:
+                timeout_override = {}
             with self._client.stream(
                 method,
                 path,
@@ -638,20 +656,6 @@ class HeadlessHttpClient:
             "POST", "/api/program/authoring-transactions/settle", body=body
         )
 
-    def recover_authoring_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request(
-            "POST",
-            "/api/program/authoring-transactions/recovery-receipt",
-            body=body,
-        )
-
-    def reconcile_authoring_owner(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request(
-            "POST",
-            "/api/program/authoring-transactions/reconcile-owner",
-            body=body,
-        )
-
     # Component model v2.
 
     @staticmethod
@@ -773,7 +777,9 @@ class HeadlessHttpClient:
         result = self.request("POST", "/api/program/scene-preparations", body=body)
         if body.get("clear_empty_scene") is True and body.get("expected_applied_record_digest") is None:
             clear = result.get("scene_clear")
-            if (not isinstance(clear, dict) or clear.get("request_id") != body.get("request_id")
+            if (not isinstance(clear, dict)
+                or clear.get("request_key")
+                != format_request_key(http_request_key(body.get("request_key")))
                 or clear.get("state") not in {"succeeded", "partial", "failed", "unknown", "superseded"}):
                 raise HeadlessClientError("program_scene_preparation_invalid",
                                           "headless API returned an invalid Scene clear result", status_code=502)
@@ -816,16 +822,10 @@ class HeadlessHttpClient:
         return self.request("POST", "/api/program/component-frame-lookup", body=body)
 
     @staticmethod
-    def _program_run_path(program_run_id: str) -> str:
-        if (
-            not isinstance(program_run_id, str)
-            or not program_run_id
-            or len(program_run_id.encode("utf-8")) > 256
-            or "/" in program_run_id
-            or ".." in program_run_id
-        ):
+    def _program_run_path(program_run_id: int) -> str:
+        if type(program_run_id) is not int or not 1 <= program_run_id <= 9_007_199_254_740_991:
             raise ValueError("program_run_id is invalid")
-        return f"/api/program/runs/{quote(program_run_id, safe='')}"
+        return f"/api/program/runs/{program_run_id}"
 
     def program_runs(
         self,
@@ -849,23 +849,18 @@ class HeadlessHttpClient:
     def program_run_start(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/program/runs", body=body)
 
-    def program_run(self, program_run_id: str) -> dict[str, Any]:
-        return self.request("GET", self._program_run_path(program_run_id))
-
-    def program_run_stop(
-        self,
-        program_run_id: str,
-        body: Mapping[str, Any],
+    def program_run(
+        self, program_run_id: int, *, application_start_id: str
     ) -> dict[str, Any]:
         return self.request(
-            "POST",
-            f"{self._program_run_path(program_run_id)}/stop",
-            body=body,
+            "GET",
+            self._program_run_path(program_run_id),
+            params=(("application_start_id", application_start_id),),
         )
 
     def program_run_motion_stop(
         self,
-        program_run_id: str,
+        program_run_id: int,
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
         return self.request(
@@ -876,7 +871,7 @@ class HeadlessHttpClient:
 
     def program_run_motion_resume(
         self,
-        program_run_id: str,
+        program_run_id: int,
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
         return self.request(
@@ -887,7 +882,7 @@ class HeadlessHttpClient:
 
     def program_run_motion_start(
         self,
-        program_run_id: str,
+        program_run_id: int,
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
         return self.request(
@@ -896,31 +891,20 @@ class HeadlessHttpClient:
             body=body,
         )
 
-    def program_run_full_stop(
+    def program_run_resume_halt(
         self,
-        program_run_id: str,
+        program_run_id: int,
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
         return self.request(
             "POST",
-            f"{self._program_run_path(program_run_id)}/full-stop",
+            f"{self._program_run_path(program_run_id)}/resume-halt",
             body=body,
         )
 
-    def program_run_resume_full_stop(
+    def program_run_discard_halt(
         self,
-        program_run_id: str,
-        body: Mapping[str, Any],
-    ) -> dict[str, Any]:
-        return self.request(
-            "POST",
-            f"{self._program_run_path(program_run_id)}/resume-full-stop",
-            body=body,
-        )
-
-    def program_run_reset_full_stop(
-        self,
-        program_run_id: str,
+        program_run_id: int,
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
         return self.request(
@@ -929,13 +913,17 @@ class HeadlessHttpClient:
             body=body,
         )
 
-    def program_runtime_controls(self, program_run_id: str) -> dict[str, Any]:
+    def program_runtime_controls(
+        self, program_run_id: int, *, application_start_id: str
+    ) -> dict[str, Any]:
         return self.request(
-            "GET", f"{self._program_run_path(program_run_id)}/runtime-controls"
+            "GET",
+            f"{self._program_run_path(program_run_id)}/runtime-controls",
+            params=(("application_start_id", application_start_id),),
         )
 
     def program_node_correction_preview(
-        self, program_run_id: str, body: Mapping[str, Any]
+        self, program_run_id: int, body: Mapping[str, Any]
     ) -> dict[str, Any]:
         """Effect-free native preview of one held motion node with proposals."""
 
@@ -947,7 +935,7 @@ class HeadlessHttpClient:
 
     def program_runtime_control_action(
         self,
-        program_run_id: str,
+        program_run_id: int,
         suffix: str,
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -1061,22 +1049,36 @@ class HeadlessHttpClient:
         )
 
     def prepare_activation(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Start one activation preparation; answered at acceptance with its
+        row (``manyforge.activation_preparation_reply.v1``)."""
+
         return self.request("POST", "/api/activation-preparations", body=body)
+
+    def prepared_activation(self, captured_input_digest: str) -> dict[str, Any]:
+        """The prepared activation of a preparation that ended ``succeeded``."""
+
+        if not isinstance(captured_input_digest, str) or not _SHA256_PATTERN.fullmatch(
+            captured_input_digest
+        ):
+            raise ValueError("captured_input_digest is invalid")
+        return self.request(
+            "GET", f"/api/activation-preparations/{captured_input_digest}"
+        )
 
     def manager_apply(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/manager/apply", body=body)
 
     def manager_apply_status(
         self,
-        apply_id: str,
+        apply_id: int,
         apply_generation: int,
         *,
+        application_start_id: str,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         if (
-            not isinstance(apply_id, str)
-            or not apply_id
-            or len(apply_id.encode("utf-8")) > 256
+            type(apply_id) is not int
+            or not 1 <= apply_id <= 9_007_199_254_740_991
             or type(apply_generation) is not int
             or not 1 <= apply_generation <= 9_007_199_254_740_991
         ):
@@ -1084,22 +1086,26 @@ class HeadlessHttpClient:
         return self.request(
             "GET",
             "/api/manager/apply/status",
-            params=(("apply_id", apply_id), ("apply_generation", apply_generation)),
+            params=(
+                ("apply_id", apply_id),
+                ("apply_generation", apply_generation),
+                ("application_start_id", application_start_id),
+            ),
             timeout_seconds=timeout_seconds,
         )
 
     def manager_apply_acknowledge(
         self,
-        apply_id: str,
+        apply_id: int,
         apply_generation: int,
         request_context: ManagerApplyAcknowledgementContext | Mapping[str, Any],
         *,
+        application_start_id: str,
         timeout_seconds: float | None = None,
     ) -> dict[str, Any]:
         if (
-            not isinstance(apply_id, str)
-            or not apply_id
-            or len(apply_id.encode("utf-8")) > 256
+            type(apply_id) is not int
+            or not 1 <= apply_id <= 9_007_199_254_740_991
             or type(apply_generation) is not int
             or not 1 <= apply_generation <= 9_007_199_254_740_991
         ):
@@ -1116,7 +1122,10 @@ class HeadlessHttpClient:
                 ("apply_id", apply_id),
                 ("apply_generation", apply_generation),
             ),
-            body={"request_context": context.model_dump(mode="json", exclude_none=True)},
+            body={
+                "application_start_id": application_start_id,
+                "request_context": context.model_dump(mode="json", exclude_none=True),
+            },
             timeout_seconds=timeout_seconds,
         )
 
@@ -1189,19 +1198,43 @@ class HeadlessHttpClient:
         return self.request("POST", "/api/execution/pick-place/plans/place", body=body)
 
     @staticmethod
-    def _operation_path(operation_id: str) -> str:
-        if not operation_id or len(operation_id.encode("utf-8")) > 256:
-            raise ValueError("operation_id must be bounded non-empty text")
-        if "/" in operation_id or ".." in operation_id:
-            raise ValueError("operation_id is invalid for an HTTP path")
+    def _planning_job_path(job_id: str) -> str:
+        if (
+            not isinstance(job_id, str)
+            or not job_id
+            or len(job_id.encode("utf-8")) > 96
+            or "/" in job_id
+        ):
+            raise ValueError("planning job id is invalid")
+        return f"/api/execution/pick-place/plans/{quote(job_id, safe='')}"
+
+    def read_planning_job(self, job_id: str) -> dict[str, Any]:
+        return self.request("GET", self._planning_job_path(job_id))
+
+    def cancel_planning_job(self, job_id: str) -> dict[str, Any]:
+        return self.request("POST", f"{self._planning_job_path(job_id)}/cancel")
+
+    def release_planning_job(self, job_id: str) -> dict[str, Any]:
+        return self.request("POST", f"{self._planning_job_path(job_id)}/release")
+
+    @staticmethod
+    def _operation_path(operation_id: int) -> str:
+        if type(operation_id) is not int or not 1 <= operation_id <= 9_007_199_254_740_991:
+            raise ValueError("operation_id is invalid")
         return f"/api/execution/operations/{operation_id}"
 
-    def operation(self, operation_id: str) -> dict[str, Any]:
-        return self.request("GET", self._operation_path(operation_id))
+    def operation(
+        self, operation_id: int, *, application_start_id: str
+    ) -> dict[str, Any]:
+        return self.request(
+            "GET",
+            self._operation_path(operation_id),
+            params=(("application_start_id", application_start_id),),
+        )
 
     def _operation_control(
         self,
-        operation_id: str,
+        operation_id: int,
         control: str,
         body: Mapping[str, Any],
     ) -> dict[str, Any]:
@@ -1212,12 +1245,12 @@ class HeadlessHttpClient:
         )
 
     def reset_operation(
-        self, operation_id: str, body: Mapping[str, Any]
+        self, operation_id: int, body: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self._operation_control(operation_id, "reset", body)
 
     def acknowledge_completed_operation(
-        self, operation_id: str, body: Mapping[str, Any]
+        self, operation_id: int, body: Mapping[str, Any]
     ) -> dict[str, Any]:
         return self._operation_control(operation_id, "acknowledge-completed", body)
 
@@ -1225,17 +1258,25 @@ class HeadlessHttpClient:
         return self.request("POST", "/api/execution/stops", body=body)
 
     def recognized_malformed_stop(self, path: str) -> dict[str, Any]:
-        if path not in {"/api/execution/stops", "/api/execution/full-stop"}:
+        if path not in {
+            "/api/execution/stops",
+            "/api/execution/stop-all",
+            "/api/execution/halt",
+        }:
             raise ValueError("recognized malformed Stop path is invalid")
         # The Headless adapter is the semantic Stop ingress. Forward one
         # deliberately non-normalizable bounded body through the exact route
-        # so it mints the internal malformed-ingress identity and performs the
-        # conservative Full-Stop promotion; Composer must not invent that
-        # identity or duplicate Kernel admission semantics.
+        # so it mints the internal malformed-ingress identity and the Kernel
+        # widens it from that route (Halt stays Halt, the others Stop all);
+        # Composer must not invent that identity or duplicate Kernel
+        # admission semantics.
         return self.request("POST", path, body={})
 
-    def full_stop(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/execution/full-stop", body=body)
+    def stop_all(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/execution/stop-all", body=body)
+
+    def halt(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/execution/halt", body=body)
 
     def set_runtime_scale_control(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/runtime-scale-control", body=body)
@@ -1275,6 +1316,12 @@ class HeadlessHttpClient:
 
     def commit_scene_transaction(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/scene/transactions", body=body)
+
+    def scene_runtime_owner(self) -> dict[str, Any]:
+        return self.request("GET", "/api/scene/runtime-owner")
+
+    def latch_scene_runtime_between_nodes(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        return self.request("POST", "/api/scene/runtime-latch", body=body)
 
     def scene_transaction_status(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/scene/transactions/status", body=body)
@@ -1354,11 +1401,10 @@ class HeadlessHttpClient:
             "POST", "/api/execution/history/apply-outcomes", body=body
         )
 
-    def reconcile_historian(self, body: Mapping[str, Any]) -> dict[str, Any]:
+    def record_program_reset_outcome(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """One Program Reset terminal into History (OD-305)."""
         return self.request(
-            "POST",
-            "/api/execution/history/reconcile",
-            body=body,
+            "POST", "/api/execution/history/program-reset-outcomes", body=body
         )
 
     def close(self) -> None:

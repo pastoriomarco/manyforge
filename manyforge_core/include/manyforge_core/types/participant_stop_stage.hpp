@@ -16,7 +16,7 @@ namespace manyforge::core {
 class RuntimeParticipantBinding;
 
 inline constexpr std::string_view kResolvedParticipantStopScopePolicyApiVersion =
-    "manyforge.resolved_participant_stop_scope_policy.v1";
+    "manyforge.resolved_participant_stop_scope_policy.v2";
 inline constexpr std::string_view kResolvedParticipantStopScopePolicyIdentityDomain =
     "resolved-participant-stop-scope-policy-digest";
 inline constexpr std::size_t kMaximumStopEvidenceValueBytes = 64U * 1024U;
@@ -50,8 +50,8 @@ enum class StopEvidenceItemStateDTO : std::uint8_t {
 /// Durations are relative to the stage dispatch, so receivers translate them
 /// onto their own monotonic clocks and never see the Kernel's timestamps.
 struct RemainingStopBudgetDTO final {
-  StopId stop_id;
-  StopGeneration stop_generation;
+  /// The Stop event that started this participant's attempt.
+  StopEventId stop_event_id{0U};
   /// Time since the Stop was accepted (deadlines run from the Stop
   /// request).
   std::int64_t elapsed_since_stop_ns{};
@@ -75,13 +75,12 @@ struct RemainingStopBudgetDTO final {
 /// prepared participant Stop plan. The adapter receives no alternative stage,
 /// endpoint, mode, or profile from which it could make a runtime choice.
 struct ResolvedParticipantStopStageDTO final {
-  StopId stop_id;
-  StopGeneration stop_generation;
-  OperationId operation_id;
+  /// The Stop event that started this participant's attempt.
+  StopEventId stop_event_id{0U};
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ControllerGoalId controller_goal_id;
-  ControllerGoalGeneration controller_goal_generation;
   ControllableComponentId controllable_component_id;
   CommandTargetId command_target_id;
   CapabilityId capability_id;

@@ -618,7 +618,6 @@ class ObservationDispatcher:
         self._expired = 0
         self._joins = 0
         self._last_error_code = ""
-        self._manager_owner_epoch: str | None = None
 
     @classmethod
     def for_manager_root(
@@ -712,7 +711,6 @@ class ObservationDispatcher:
                         source_id=self._source_id,
                         source_epoch=self._source_epoch,
                     )
-                    self._manager_owner_epoch = owner.owner_epoch
                 except SceneRuntimeManagerError as exc:
                     with self._condition:
                         self._retries += 1
@@ -746,7 +744,6 @@ class ObservationDispatcher:
                         if self._next_sequence > MAXIMUM_SAFE_INTEGER:
                             self._source_epoch = self._new_source_epoch()
                             self._session = None
-                            self._manager_owner_epoch = None
                             self._next_sequence = 1
                             restart_session = True
                         else:
@@ -768,17 +765,14 @@ class ObservationDispatcher:
                     if (
                         owner.cell_id != self._expected_cell_id
                         or self._session is None
-                        or owner.owner_epoch != self._manager_owner_epoch
                         or owner.runtime_identity != self._session.runtime_identity
                     ):
                         self._session = None
-                        self._manager_owner_epoch = None
                 except SceneRuntimeManagerError as exc:
                     with self._condition:
                         self._retries += 1
                         self._last_error_code = exc.code
                     self._session = None
-                    self._manager_owner_epoch = None
                 continue
             assert pending is not None
             age_ns = max(0, self._clock_ns() - pending.enqueued_at_ns)
@@ -819,11 +813,9 @@ class ObservationDispatcher:
                     self._last_error_code = exc.code
                     if exc.code in _REJOIN_CODES:
                         self._session = None
-                        self._manager_owner_epoch = None
                     elif exc.code == "scene_runtime_observation_request_conflict":
                         self._source_epoch = self._new_source_epoch()
                         self._session = None
-                        self._manager_owner_epoch = None
                         pending.source_sequence = 1
                         self._next_sequence = 1
                 self._emit(

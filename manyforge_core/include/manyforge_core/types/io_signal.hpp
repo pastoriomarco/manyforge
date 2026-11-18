@@ -108,7 +108,6 @@ struct IoSignalDescriptorDTO final {
 
 /// Owner identity and generation come from existing host/activation authority.
 struct IoSignalCatalogDTO final {
-  RequestOwnerEpoch owner_epoch;
   std::uint64_t generation;
   std::vector<IoSignalDescriptorDTO> signals;
   /// Installed capability from sealed authoritative Mock provider profiles.
@@ -223,7 +222,6 @@ struct IoSourceLossDTO final {
 
 /// Host record ordering includes availability changes with no provider sample.
 struct IoSourceCursorDTO final {
-  RequestOwnerEpoch owner_epoch;
   std::uint64_t catalog_generation;
   InterruptSourceId source_id;
   std::uint64_t record_sequence;
@@ -299,8 +297,7 @@ struct IoSignalRecordPageDTO final {
 };
 
 struct IoWatchScopeDTO final {
-  RequestOwnerEpoch program_runner_owner_epoch;
-  ProgramRunId program_run_id;
+  ProgramRunNumber program_run_id;
   ProgramNodeExecutionScopeDTO node;
   friend bool operator==(const IoWatchScopeDTO&, const IoWatchScopeDTO&) = default;
 };
@@ -313,7 +310,6 @@ struct IoLevelWatchRequestDTO final {
 };
 
 struct IoWatchRegistrationDTO final {
-  RequestOwnerEpoch owner_epoch;
   std::uint64_t catalog_generation;
   std::uint64_t registration_id;
   IoWatchScopeDTO scope;

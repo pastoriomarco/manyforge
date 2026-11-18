@@ -10,39 +10,6 @@
 
 namespace manyforge::component_manager {
 
-bool ManagerComponentProcessStopRequestDTO::valid() const noexcept {
-  using namespace manyforge::core;
-  const auto identity = [](const auto &value) {
-    return !value.empty() && value.value().size() <= kMaxLifecycleIdentityBytes;
-  };
-  return identity(request_context.request_id) && identity(request_context.request_owner_epoch) &&
-         !request_context.source_label.empty() &&
-         request_context.source_label.size() <= kMaxLifecycleRequestLabelBytes &&
-         (!request_context.correlation_id ||
-          (!request_context.correlation_id->empty() &&
-           request_context.correlation_id->size() <= kMaxLifecycleRequestLabelBytes)) &&
-         predecessor_projection_revision.valid() &&
-         expected_predecessor_publication_generation.nonzero() &&
-         IsExactLowercaseSha256Digest(expected_predecessor_public_pointer_digest.value()) &&
-         identity(runtime_unit_id) && identity(runtime_epoch) && identity(manager_runtime_epoch) &&
-         identity(controllable_component_id) && !launch_identity.empty() &&
-         launch_identity.size() <= detail::kMaximumSelectedRuntimeCompositionRpcPacketBytes && leader_pid > 0;
-}
-
-bool ManagerComponentProcessStopResultDTO::valid() const noexcept {
-  using namespace manyforge::core;
-  if (!request.valid() ||
-      !(state == ControllerLaunchCleanupState::kNotRequested ||
-        state == ControllerLaunchCleanupState::kPending ||
-        state == ControllerLaunchCleanupState::kUnknown ||
-        state == ControllerLaunchCleanupState::kDrained)) return false;
-  if (state != ControllerLaunchCleanupState::kDrained) return !receipt;
-  return receipt && !error && receipt->leader_pid == request.leader_pid &&
-         receipt->controllable_component_id == request.controllable_component_id.value() &&
-         receipt->launch_identity == request.launch_identity && !receipt->observed_utc.empty() &&
-         receipt->observed_utc.size() <= kMaxLifecycleIdentityBytes;
-}
-
 bool ManagerComponentProcessInventoryRequestDTO::valid() const noexcept {
   using namespace manyforge::core;
   const auto identity = [](const auto &value) {
@@ -52,8 +19,7 @@ bool ManagerComponentProcessInventoryRequestDTO::valid() const noexcept {
          expected_predecessor_publication_generation.nonzero() &&
          IsExactLowercaseSha256Digest(
              expected_predecessor_public_pointer_digest.value()) &&
-         identity(runtime_unit_id) && identity(runtime_epoch) &&
-         identity(manager_runtime_epoch);
+         identity(runtime_unit_id) && identity(runtime_epoch);
 }
 
 bool ManagerPneumaticNoneProcessOwnerDTO::valid() const noexcept {
@@ -144,6 +110,11 @@ bool ManagerComponentProcessInventoryResultDTO::valid() const noexcept {
   return !error || (!error->code.empty() && !error->message.empty());
 }
 
+bool HostApplyProgramSelection::valid() const noexcept {
+  return !program_id.empty() && !program_revision.empty() &&
+         !program_binding_id.empty();
+}
+
 bool HostApplyRequest::valid() const noexcept {
   const auto sorted_unique = [](const auto &values) {
     return std::adjacent_find(values.begin(), values.end(),
@@ -163,18 +134,21 @@ bool HostApplyRequest::valid() const noexcept {
                       [&](const auto &id) {
                         return std::binary_search(components.begin(),
                                                   components.end(), id);
-                      });
+                      }) &&
+         (!program || program->valid());
 }
 
 HostApplyRequest MakeHostApplyRequest(
     const manyforge::core::NamedApplyPublicationTransactionDTO &apply,
     const manyforge::deployment::RetainedBundle &predecessor,
     const manyforge::deployment::RetainedBundle &candidate,
-    const manyforge::deployment::ApplyComponentDeltaDTO &delta) {
+    const manyforge::deployment::ApplyComponentDeltaDTO &delta,
+    std::optional<HostApplyProgramSelection> program) {
   using manyforge::deployment::ApplyComponentDisposition;
   const auto &graph = candidate.value().cell_graph;
   HostApplyRequest request{apply, candidate.retained_bundle_id(),
-                           graph.graph_revision, {}, {}, {}, {}};
+                           graph.graph_revision, {}, {}, {}, {},
+                           std::move(program)};
   for (const auto &component : graph.controllable_components)
     request.components.push_back(component.controllable_component_id);
   for (const auto &change : delta.components) {
@@ -200,7 +174,7 @@ HostApplyRequest MakeHostApplyRequest(
 bool ManagerApplyPrivateMaterializationDTO::valid() const noexcept {
   return manyforge::core::IsExactLowercaseSha256Digest(
              authoritative_scene_snapshot_digest.value()) &&
-         !apply_id.empty() && apply_generation.nonzero() &&
+         apply_id.nonzero() && apply_generation.nonzero() &&
          candidate_projection_revision.valid() &&
          manyforge::core::IsExactLowercaseSha256Digest(
              retained_bundle_canonical_content_digest.value()) &&

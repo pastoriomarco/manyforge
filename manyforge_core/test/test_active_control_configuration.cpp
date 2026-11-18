@@ -10,10 +10,11 @@
 namespace manyforge::core {
 namespace {
 
-static_assert(!std::is_same_v<LifecycleTransactionId, StopCertificateId>);
+static_assert(!std::is_same_v<LifecycleTransactionGeneration, StopEventId>);
 static_assert(!std::is_same_v<ComponentLifecycleGeneration,
                              ActiveControlConfigurationGeneration>);
-static_assert(!std::is_same_v<StopCertificateRevision, StopGeneration>);
+// StopCertificateRevision/StopGeneration assertion removed: both types were deleted
+// with the Stop certificate (stop state model).
 static_assert(std::is_same_v<decltype(ActiveControlConfigurationDTO::control_domain_id),
                              ControlDomainId>);
 static_assert(
@@ -73,14 +74,13 @@ static_assert(std::is_same_v<
   };
 }
 
-TEST(ActiveControlConfigurationContract, StrongLifecycleAndStopCertificateTypesStayDistinct) {
-  const LifecycleTransactionId lifecycle("same");
-  const StopCertificateId certificate("same");
-
-  EXPECT_EQ(lifecycle.value(), certificate.value());
+// The Stop certificate id/revision cases were removed with the certificate
+// (stop state model); the lifecycle and Stop event id types stay distinct.
+TEST(ActiveControlConfigurationContract, StrongLifecycleAndStopEventTypesStayDistinct) {
+  EXPECT_EQ(LifecycleTransactionId("same").value(), "same");
   EXPECT_EQ(LifecycleTransactionGeneration(4U).value(), 4U);
   EXPECT_EQ(ComponentLifecycleGeneration(5U).value(), 5U);
-  EXPECT_EQ(StopCertificateRevision(7U).value(), 7U);
+  EXPECT_EQ(StopEventId(7U).value(), 7U);
 }
 
 TEST(ActiveControlConfigurationContract, AcceptsCanonicalReconciledAndExternalFacts) {

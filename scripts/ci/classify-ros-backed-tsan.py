@@ -10,6 +10,7 @@ from pathlib import Path
 WARNING = re.compile(r"^WARNING: ThreadSanitizer:.*$", re.MULTILINE)
 FATAL = re.compile(r"(?:FATAL: ThreadSanitizer|ThreadSanitizer: CHECK failed)")
 FRAME = re.compile(r"^\s*#\d+\s+(.*)$")
+LOCK_ORDER = re.compile(r"ThreadSanitizer: lock-order-inversion")
 ACCESS = re.compile(
     r"^(?:previous\s+)?(?:atomic\s+)?(?:read|write)\s+(?:of|at)\b", re.I
 )
@@ -103,6 +104,63 @@ def report_is_project(report: str) -> bool:
     return project_stack()
 
 
+# Lock-order inversions: the acquiring frames are pthread and libstdc++ lock
+# wrappers. Skip those wrappers unless they were compiled into an SDK library
+# (then the acquisition is the SDK's); the first other frame decides.
+LOCK_ACQUIRED = re.compile(r"^mutex\s+\S+\s+(?:previously\s+)?acquired\b", re.I)
+LOCK_WRAPPER = re.compile(
+    r"^(?:void\s+)?(?:__gthread_\w+|std::(?:unique_lock|lock_guard|scoped_lock|"
+    r"shared_lock|(?:recursive_|timed_|recursive_timed_|shared_|shared_timed_)?mutex)\b)"
+)
+MODULE = re.compile(r"\(([^()\s]+)\+0x[0-9a-fA-F]+\)")
+PROJECT_MODULE = re.compile(r"^(?:lib)?manyforge|^test_")
+NEUTRAL_MODULE = re.compile(r"^(?:libstdc\+\+|libtsan|libc|libpthread|ld-linux)")
+
+
+def frame_module(frame: str) -> str | None:
+    found = MODULE.search(frame)
+    return found.group(1) if found else None
+
+
+def acquisition_is_project(frames: list[str]) -> bool:
+    for frame in frames:
+        if is_runtime_frame(frame) and not LOCK_WRAPPER.search(frame):
+            continue
+        module = frame_module(frame)
+        if LOCK_WRAPPER.search(frame):
+            if module and not PROJECT_MODULE.search(module) and not NEUTRAL_MODULE.search(module):
+                return False  # A lock wrapper inside an SDK library.
+            continue
+        return is_project_frame(frame) or bool(module and PROJECT_MODULE.search(module))
+    return False
+
+
+def lock_order_is_project(report: str) -> bool:
+    stacks: list[list[str]] = []
+    current: list[str] | None = None
+    for line in report.splitlines():
+        frame = FRAME.match(line)
+        if frame:
+            if current is not None:
+                current.append(frame.group(1))
+            continue
+        stripped = line.strip()
+        if LOCK_ACQUIRED.match(stripped):
+            current = []
+            stacks.append(current)
+        elif stripped:
+            current = None
+    return any(acquisition_is_project(stack) for stack in stacks)
+
+
+def report_fails(report: str) -> bool:
+    # A lock-order inversion fails only when at least one of its mutex
+    # acquisitions is ManyForge's own.
+    if LOCK_ORDER.search(report.splitlines()[0]):
+        return lock_order_is_project(report)
+    return report_is_project(report)
+
+
 def classify(path: Path) -> bool:
     text = path.read_text(encoding="utf-8", errors="replace")
     failed = False
@@ -113,7 +171,7 @@ def classify(path: Path) -> bool:
     for index, match in enumerate(matches):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         report = text[match.start():end]
-        if report_is_project(report):
+        if report_fails(report):
             print(f"::error::ManyForge ThreadSanitizer report {index + 1}: {path}")
             failed = True
         else:

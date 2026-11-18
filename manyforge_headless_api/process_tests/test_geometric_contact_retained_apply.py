@@ -80,10 +80,8 @@ def test_first_geometric_profile_recollects_retained_cell_sources() -> None:
         assert applied["retained_bundle_id"] != before_apply["retained_bundle_id"]
 
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            owner = headless.execution_identity()["identity"]["owner_epoch"]
             request = {
-                "schema_version": "manyforge.target_observation_query.v2",
-                "owner_epoch": owner,
+                "schema_version": "manyforge.target_observation_query.v3",
                 "program_binding_id": applied["program_binding_id"],
                 "kind": "io_signal",
                 "signal": {"component_id": "station_io", "signal_name": "probe_contact"},

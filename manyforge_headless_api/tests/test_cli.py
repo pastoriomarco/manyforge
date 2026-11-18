@@ -88,3 +88,41 @@ def test_an_unknown_action_and_the_old_apply_are_refused() -> None:
         cli.main(["components", "action", "lite6", "home"])
     with pytest.raises(SystemExit):
         cli.main(["apply"])
+
+
+def test_serve_passes_the_disk_floor_and_margin_to_the_config(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OD-215: both launchers pass them; the disk check reads them from the config."""
+    observed: list[Any] = []
+    monkeypatch.setattr(cli, "create_app", lambda config: observed.append(config) or object())
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *_args, **_kwargs: None)
+    args = ["serve", "--cell-id", "cell_a", "--application-start-id", "3f9a0000000000a1",
+            "--disk-free-floor-bytes", "10000000000", "--disk-free-margin-bytes", "1000000000"]
+    for flag in (
+        "install-root", "artifact-root", "node-catalog-path",
+        "node-environment-manifest-path", "alarm-catalog-path", "historian-directory",
+        "manager-run-root", "execution-run-root",
+    ):
+        args += [f"--{flag}", str(tmp_path / flag)]
+    assert cli.main(args) == 0
+    assert observed[0].disk_free_floor_bytes == 10_000_000_000
+    assert observed[0].disk_free_margin_bytes == 1_000_000_000
+
+
+def test_serve_refuses_the_removed_projection_root(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OD-216: the Headless API reads no status files, so the option is gone."""
+    monkeypatch.setattr(cli, "create_app", lambda _config: pytest.fail("must not start"))
+    monkeypatch.setattr(cli.uvicorn, "run", lambda *_args, **_kwargs: None)
+    args = ["serve", "--cell-id", "cell_a", "--application-start-id", "3f9a0000000000a1"]
+    for flag in (
+        "install-root", "artifact-root", "node-catalog-path",
+        "node-environment-manifest-path", "alarm-catalog-path", "historian-directory",
+        "manager-run-root", "execution-run-root",
+    ):
+        args += [f"--{flag}", str(tmp_path / flag)]
+    with pytest.raises(SystemExit) as refused:
+        cli.main([*args, "--projection-root", str(tmp_path / "projection")])
+    assert refused.value.code == 2

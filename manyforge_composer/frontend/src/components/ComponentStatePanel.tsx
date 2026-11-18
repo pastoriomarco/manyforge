@@ -1,6 +1,7 @@
 import { useRef, useState } from 'react';
 
 import { api, apiErrorCode } from '../api/client';
+import type { ApplicationStartId } from '../api/applicationIdentity';
 import { busyLabel, busyReason, type BusyOperation } from '../state/busyOperation';
 import {
   actionBusyLabel,
@@ -85,9 +86,11 @@ function useRequest(states: readonly ComponentState[]) {
  * only an action in progress or this request in flight
  * disables them. A refused request shows under them.
  */
-export function ComponentActions({ state, enabled, states = [], className = 'dactions' }: {
+export function ComponentActions({ state, enabled, states = [], className = 'dactions', applicationStartId = null }: {
   state: ComponentState;
   enabled: boolean;
+  /** The current application start; recover-enable names it (null: unknown). */
+  applicationStartId?: ApplicationStartId | null;
   states?: readonly ComponentState[];
   className?: string;
 }) {
@@ -136,7 +139,9 @@ export function ComponentActions({ state, enabled, states = [], className = 'dac
         returnFocusRef={confirmButton}
         onConfirm={(confirmation) => {
           setRecovering(false);
-          void request.run([id], () => api.components.recoverEnable(id, confirmation), {
+          void request.run([id], () => (applicationStartId === null
+            ? Promise.reject(new Error('Execution owner identity is unavailable.'))
+            : api.components.recoverEnable(id, confirmation, applicationStartId)), {
             command: 'enable', label: 'Recovering and enabling…', name: `Recover and enable ${id}`,
           });
         }}
@@ -186,9 +191,11 @@ export function concernedOwnerFault(state: ComponentState, states: readonly Comp
  * and, as a banner, an owner fault that concerns it. `embedded`: the rows
  * only, for a card that shows the state itself (the machine card's header).
  */
-export function ComponentStatePanel({ state, enabled, states = [], embedded = false }: {
+export function ComponentStatePanel({ state, enabled, states = [], embedded = false, applicationStartId = null }: {
   state: ComponentState;
   enabled: boolean;
+  /** The current application start; recover-enable names it (null: unknown). */
+  applicationStartId?: ApplicationStartId | null;
   states?: readonly ComponentState[];
   embedded?: boolean;
 }) {
@@ -253,7 +260,7 @@ export function ComponentStatePanel({ state, enabled, states = [], embedded = fa
           ))}
         </dl>
       )}
-      <ComponentActions state={state} enabled={enabled} states={states} />
+      <ComponentActions state={state} enabled={enabled} states={states} applicationStartId={applicationStartId} />
     </Root>
   );
 }

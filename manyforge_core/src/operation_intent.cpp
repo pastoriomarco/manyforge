@@ -35,12 +35,13 @@ namespace {
     return value.size() <= kMaxActionSpanFieldBytes;
   };
   if (span.action_span_id.empty() || !bounded(span.action_span_id) ||
-      !bounded(span.program_run_id) || !bounded(span.node_instance_id) ||
+      !bounded(span.node_instance_id) ||
       !bounded(span.node_attempt_id) || !bounded(span.parent_node_attempt_id)) {
     return false;
   }
   if (span.action_source == ActionSource::kProgramNode) {
-    return !span.program_run_id.empty() && !span.node_instance_id.empty() &&
+    return span.program_run_id.has_value() && span.program_run_id->nonzero() &&
+           !span.node_instance_id.empty() &&
            !span.node_attempt_id.empty() && span.action_span_id == span.node_attempt_id;
   }
   return span.node_instance_id.empty() && span.node_attempt_id.empty();
@@ -232,11 +233,10 @@ namespace {
 }  // namespace
 
 Result<void> validate_operation_intent(const OperationIntentDTO& intent) {
-  if (intent.request_context.request_id.empty() ||
-      intent.request_context.request_owner_epoch.empty() ||
-      intent.request_context.source_label.empty() || intent.program_id.empty() ||
+  if (intent.request_context.source_label.empty() || intent.program_id.empty() ||
       intent.program_revision.empty() || intent.program_binding_id.empty() ||
-      intent.program_run_id.empty() || intent.expected_graph_revision.empty() ||
+      (intent.program_run_id && !intent.program_run_id->nonzero()) ||
+      intent.expected_graph_revision.empty() ||
       intent.expected_retained_bundle_id.empty()) {
     return invalid("operation intent has an empty required identity", "operation_identity_empty");
   }
@@ -254,15 +254,12 @@ Result<void> validate_operation_intent(const OperationIntentDTO& intent) {
   }
   if (intent.manual_handover) {
     const auto& context = *intent.manual_handover;
-    if (context.program_runner_owner_epoch.empty() || context.program_run_id.empty() ||
+    if (!context.program_run_id.nonzero() ||
+        context.program_run_id.value() > 9007199254740991ULL ||
         !context.claim_generation.nonzero() ||
         context.claim_generation.value() > 9007199254740991ULL ||
-        context.selection_revision > 9007199254740991ULL ||
-        context.program_runner_owner_epoch.value().size() > 128U ||
-        context.program_run_id.value().size() > 128U ||
-        context.program_runner_owner_epoch.value().find('\0') != std::string::npos ||
-        context.program_run_id.value().find('\0') != std::string::npos ||
-        context.program_run_id == intent.program_run_id || intent.participants.size() != 1U ||
+        context.hold_revision > 9007199254740991ULL ||
+        intent.program_run_id.has_value() || intent.participants.size() != 1U ||
         intent.coordination_policy != OperationCoordinationPolicy::kIndependent ||
         intent.participants.front().execution_scope) {
       return invalid("manual handover context is invalid", "manual_handover_context_invalid");
@@ -292,8 +289,8 @@ Result<void> validate_operation_intent(const OperationIntentDTO& intent) {
                        "operation_execution_scope_invalid");
       }
     }
-    if (participant.action_span.has_value() && !participant.action_span->program_run_id.empty() &&
-        participant.action_span->program_run_id != intent.program_run_id.value()) {
+    if (participant.action_span.has_value() && participant.action_span->program_run_id &&
+        participant.action_span->program_run_id != intent.program_run_id) {
       return invalid("operation action span names a different Program run",
                      "operation_action_span_run_mismatch");
     }

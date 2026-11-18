@@ -16,13 +16,14 @@ namespace manyforge::core {
     std::string_view canonical_bytes);
 
 struct PreparedParticipantStopPlanContextDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ProgramId program_id;
   ProgramRevision program_revision;
   ProgramBindingId program_binding_id;
-  ProgramRunId program_run_id;
+  std::optional<ProgramRunNumber> program_run_id;
+
   std::optional<MotionInterruptStopProfileDTO> participant_stop_profile;
   ParticipantStopProfilePurposeDTO participant_stop_profile_purpose{
       ParticipantStopProfilePurposeDTO::kOrdinary};

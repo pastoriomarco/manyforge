@@ -83,7 +83,7 @@ function render(measuredRobot: MeasuredRobotPresentationReader, enabled = true):
         latestFrameAppliers={new Set()}
         manifest={manifest}
         objects={[]}
-        ownerIdentity={{ ownerEpoch: 'owner-1', generation: 4 }}
+        ownerIdentity={{ applicationStartId: 'owner-1', generation: 4 }}
         onAssetError={() => undefined}
       />,
     );

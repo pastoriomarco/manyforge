@@ -11,6 +11,7 @@
 #include <manyforge_deployment/content_identity.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
 #include <manyforge_deployment/retention_qualified_deployment.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_profile_codec.hpp>
 #include <manyforge_deployment/site_overlay_resolution.hpp>
 #include <optional>
@@ -21,8 +22,8 @@
 #include <utility>
 #include <variant>
 
-#include "reference_runtime_unit_internal.hpp"
 #include "retained_bundle_internal.hpp"
+#include "ros2_control_execution_runtime_unit_internal.hpp"
 
 namespace manyforge::deployment::test {
 
@@ -31,6 +32,8 @@ inline constexpr std::string_view kRuntimeOnlyZeroDigest =
 inline constexpr std::string_view kRuntimeOnlyProfileSchemaRevision =
     "sha256:c254afa8c2bfcc803f12a7af63b1f09a8ee804b1ffa2a65b7361ad9309b87ae7";
 
+/// One-unit package built on the one qualified runtime profile: the
+/// ros2_control execution host with its build-owned empty-host configuration.
 struct RuntimeOnlyRetentionFixture final {
   QualifiedRuntimeProfile runtime_profile;
   RevisionVerifiedDeploymentArtifact deployment;
@@ -39,7 +42,7 @@ struct RuntimeOnlyRetentionFixture final {
 };
 
 [[nodiscard]] inline std::string runtime_only_profile_document() {
-  return detail::reference_runtime_profile_document();
+  return detail::ros2_control_execution_runtime_profile_document();
 }
 
 [[nodiscard]] inline std::string runtime_only_revision_from_document(
@@ -66,8 +69,8 @@ qualify_runtime_only_profile() {
       "sha256/runtime-only-profile");
   return resolve_and_qualify_runtime_profile(
       {
-          core::RuntimeProfileId(
-              std::string(detail::kReferenceRuntimeProfileId)),
+          core::RuntimeProfileId(std::string(
+              ros2_control_execution_runtime_contract::kRuntimeProfileId)),
           core::RuntimeProfileRevision(
               runtime_only_revision_from_document(document)),
           core::SchemaId(std::string(core::kRuntimeProfileApiVersion)),
@@ -81,14 +84,18 @@ qualify_runtime_only_profile() {
 
 [[nodiscard]] inline std::string runtime_only_graph(
     const QualifiedRuntimeProfile& profile,
-    std::string_view runtime_unit_id = detail::kReferenceRuntimeUnitId) {
+    std::string_view runtime_unit_id =
+        ros2_control_execution_runtime_contract::kCellHostRuntimeUnitId) {
   return "{\"runtime_units\":[{\"runtime_unit_id\":\"" +
          std::string(runtime_unit_id) +
          "\",\"runtime_profile_id\":\"" +
          profile.value().runtime_profile_id.value() +
          "\",\"runtime_profile_revision\":\"" +
          profile.value().runtime_profile_revision.value() +
-         "\",\"dependency_runtime_unit_ids\":[],\"configuration\":{}}],"
+         "\",\"dependency_runtime_unit_ids\":[],\"configuration\":" +
+         canonical_json(
+             ros2_control_execution_runtime_contract::empty_host_configuration()) +
+         "}],"
          "\"model_instances\":[],\"controllable_components\":[],"
          "\"control_domains\":[],\"control_bindings\":[],"
          "\"component_attachments\":[]}";

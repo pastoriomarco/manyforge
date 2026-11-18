@@ -75,8 +75,8 @@ image. They are not part of this repository.
 Copyright (c) 2025-2026 Open Planning
 License: MIT
 Source: https://github.com/open-planning/roboplan
-Note: the example robot models in roboplan_example_models (used by the UR5
-example Scenarios) carry their upstream provenance; see that package.
+Note: the example robot models in roboplan_example_models (used by the
+RoboPlan tests) carry their upstream provenance; see that package.
 
 ### ProxSuite 0.8.2
 Copyright (c) 2022-2026, Inria

@@ -103,7 +103,7 @@ function alarmPhase(eventType: string): HistoryAlarmPhase {
   if (eventType === 'operator_alarm_activated') return 'activation';
   if (eventType === 'operator_alarm_returned') return 'return';
   if (eventType === 'operator_alarm_acknowledged'
-    || eventType === 'operator_alarm_bulk_acknowledged') return 'acknowledgement';
+    || eventType === 'operator_alarms_acknowledged') return 'acknowledgement';
   return null;
 }
 
@@ -127,6 +127,7 @@ export function historianEventView(
     alarmPhase: alarmPhase(stored.event.eventType),
     programRunId: stored.event.programRunId,
     operationId: stored.event.operationId,
+    applicationStartId: stored.applicationStartId,
   };
 }
 
@@ -427,7 +428,7 @@ export function HeadlessRuntimeSurfacesView({
         && candidate.recordRevision === view.recordRevision,
     );
     if (snapshot === null || alarm === undefined) return;
-    await acknowledgeExact([alarm], snapshot.alarms.ownerEpoch);
+    await acknowledgeExact([alarm], snapshot.applicationStartId);
   };
 
   const gatingMembers = () => redAcknowledgementMembers(snapshot?.alarms);
@@ -437,7 +438,7 @@ export function HeadlessRuntimeSurfacesView({
       alarmFence: snapshot === null || members.length === 0
         ? null
         : acknowledgementFence(
-            snapshot.alarms.ownerEpoch,
+            snapshot.applicationStartId,
             snapshot.alarms.generation,
             members,
           ),
@@ -452,7 +453,7 @@ export function HeadlessRuntimeSurfacesView({
       snapshot === null
       || !acknowledgementFenceMatches(
         bulkFence.alarmFence,
-        snapshot.alarms.ownerEpoch,
+        snapshot.applicationStartId,
         snapshot.alarms.generation,
         members,
       )
@@ -466,7 +467,7 @@ export function HeadlessRuntimeSurfacesView({
     setBulkBusy(true);
     try {
       if (bulkFence.alarmFence !== null && snapshot !== null) {
-        await acknowledgeExact(members, snapshot.alarms.ownerEpoch);
+        await acknowledgeExact(members, snapshot.applicationStartId);
       }
       setBulkFence(null);
     } finally {
@@ -649,7 +650,8 @@ export function HeadlessRuntimeSurfacesView({
         hasNewer={historyNewerCursors.length > 0}
         events={historyEvents}
         retention={historyRetention}
-        currentProgramRunId={snapshot?.programCycle.programRunId}
+        currentProgramRunId={snapshot?.programCycle.programRunId ?? null}
+        applicationStartId={snapshot?.applicationStartId ?? null}
         eyebrow="Backend history"
         loading={historyLoading}
         error={historyError}

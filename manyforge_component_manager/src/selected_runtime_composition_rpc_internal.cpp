@@ -16,18 +16,18 @@ namespace {
 namespace core = manyforge::core;
 
 // Version 6 carries the host Apply in place of the composition
-// request, its phases and receipts.
+// request, its phases and receipts. Version 7 carries numeric Apply ids
+// in place of the request id, owner epoch and correlation id, has no
+// component process Stop messages, and the host Apply carries its bound
+// Program.
 constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'S',
-                                              'R', 'C', '6', 0};
+                                              'R', 'C', '7', 0};
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
 constexpr std::uint8_t kFailureTag = 4U;
 constexpr std::uint8_t kHostApplyRequestTag = 18U;
 constexpr std::uint8_t kHostApplyResultTag = 19U;
 constexpr std::uint8_t kInstalledInventoryRequestTag = 16U;
 constexpr std::uint8_t kInstalledInventoryResultTag = 17U;
-constexpr std::uint8_t kProcessStopSubmitTag = 13U;
-constexpr std::uint8_t kProcessStopReadTag = 14U;
-constexpr std::uint8_t kProcessStopResultTag = 15U;
 
 constexpr std::uint8_t kPneumaticNoneOwnersTail = 4U;
 constexpr std::string_view kInstalledNoneOwnersMagic = "MFNSRC4-INSTALLED-PNEUMATIC-NONE-V1";
@@ -258,7 +258,7 @@ template <typename Strong>
 }
 
 void WriteHostApplyRequest(Writer &writer, const HostApplyRequest &request) {
-  WriteStrong(writer, request.apply.apply_id);
+  WriteGeneration(writer, request.apply.apply_id);
   WriteGeneration(writer, request.apply.apply_generation);
   WriteStrong(writer, request.candidate_retained_bundle_id);
   WriteStrong(writer, request.candidate_graph_revision);
@@ -266,17 +266,32 @@ void WriteHostApplyRequest(Writer &writer, const HostApplyRequest &request) {
   WriteStrongVector(writer, request.retained_components);
   WriteStrongVector(writer, request.removed_components);
   WriteStrongVector(writer, request.removed_domains);
+  writer.Boolean(request.program.has_value());
+  if (request.program) {
+    WriteStrong(writer, request.program->program_id);
+    WriteStrong(writer, request.program->program_revision);
+    WriteStrong(writer, request.program->program_binding_id);
+  }
 }
 
 [[nodiscard]] HostApplyRequest ReadHostApplyRequest(Reader &reader) {
-  return {{ReadStrong<core::ApplyId>(reader),
-           ReadGeneration<core::ApplyGeneration>(reader)},
-          ReadStrong<core::RetainedBundleId>(reader),
-          ReadStrong<core::GraphRevision>(reader),
-          ReadStrongVector<core::ControllableComponentId>(reader),
-          ReadStrongVector<core::ControllableComponentId>(reader),
-          ReadStrongVector<core::ControllableComponentId>(reader),
-          ReadStrongVector<core::ControlDomainId>(reader)};
+  HostApplyRequest request{{ReadGeneration<core::ApplyId>(reader),
+                            ReadGeneration<core::ApplyGeneration>(reader)},
+                           ReadStrong<core::RetainedBundleId>(reader),
+                           ReadStrong<core::GraphRevision>(reader),
+                           ReadStrongVector<core::ControllableComponentId>(reader),
+                           ReadStrongVector<core::ControllableComponentId>(reader),
+                           ReadStrongVector<core::ControllableComponentId>(reader),
+                           ReadStrongVector<core::ControlDomainId>(reader),
+                           std::nullopt};
+  if (reader.Boolean()) {
+    auto program_id = ReadStrong<core::ProgramId>(reader);
+    auto program_revision = ReadStrong<core::ProgramRevision>(reader);
+    request.program = HostApplyProgramSelection{
+        std::move(program_id), std::move(program_revision),
+        ReadStrong<core::ProgramBindingId>(reader)};
+  }
+  return request;
 }
 
 void WriteInstalledInventoryRequest(
@@ -286,7 +301,6 @@ void WriteInstalledInventoryRequest(
   WriteStrong(writer, request.expected_predecessor_public_pointer_digest);
   WriteStrong(writer, request.runtime_unit_id);
   WriteStrong(writer, request.runtime_epoch);
-  WriteStrong(writer, request.manager_runtime_epoch);
   if (request.include_component_lifecycles) {
     writer.Byte(kInstalledLifecycleRequestTail);
     writer.String(kInstalledLifecycleMagic);
@@ -299,7 +313,6 @@ ReadInstalledInventoryRequest(Reader &reader) {
       ReadGeneration<core::ActiveBundlePublicationGeneration>(reader),
       ReadStrong<core::ContentDigest>(reader),
       ReadStrong<core::RuntimeUnitId>(reader),
-      ReadStrong<core::RuntimeEpoch>(reader),
       ReadStrong<core::RuntimeEpoch>(reader)};
   if (!reader.AtEnd() && reader.Peek() == kInstalledLifecycleRequestTail) {
     static_cast<void>(reader.Byte());
@@ -347,40 +360,6 @@ ManagerComponentProcessOccurrenceDTO ReadInstalledOccurrence(Reader &reader) {
   row.installed_runtime_identity =
       ReadOptionalStrong<core::ContentDigest>(reader);
   return row;
-}
-
-void WriteProcessStopRequest(Writer &writer, const ManagerComponentProcessStopRequestDTO &request) {
-  WriteStrong(writer, request.request_context.request_id);
-  WriteStrong(writer, request.request_context.request_owner_epoch);
-  writer.String(request.request_context.source_label);
-  writer.Boolean(request.request_context.correlation_id.has_value());
-  if (request.request_context.correlation_id) writer.String(*request.request_context.correlation_id);
-  WriteProjectionRevision(writer, request.predecessor_projection_revision);
-  WriteGeneration(writer, request.expected_predecessor_publication_generation);
-  WriteStrong(writer, request.expected_predecessor_public_pointer_digest);
-  WriteStrong(writer, request.runtime_unit_id);
-  WriteStrong(writer, request.runtime_epoch);
-  WriteStrong(writer, request.manager_runtime_epoch);
-  WriteStrong(writer, request.controllable_component_id);
-  writer.String(request.launch_identity);
-  writer.U32(static_cast<std::uint32_t>(request.leader_pid));
-}
-
-ManagerComponentProcessStopRequestDTO ReadProcessStopRequest(Reader &reader) {
-  core::PublicRequestContextDTO context{ReadStrong<core::RequestId>(reader),
-      ReadStrong<core::RequestOwnerEpoch>(reader), reader.String(), std::nullopt};
-  if (reader.Boolean()) context.correlation_id = reader.String();
-  ManagerComponentProcessStopRequestDTO request{std::move(context),
-      ReadProjectionRevision(reader),
-      ReadGeneration<core::ActiveBundlePublicationGeneration>(reader),
-      ReadStrong<core::ContentDigest>(reader), ReadStrong<core::RuntimeUnitId>(reader),
-      ReadStrong<core::RuntimeEpoch>(reader), ReadStrong<core::RuntimeEpoch>(reader),
-      ReadStrong<core::ControllableComponentId>(reader), reader.String(), 0};
-  const auto pid = reader.U32();
-  if (pid > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()))
-    Fail("process Stop PID exceeds signed value domain");
-  request.leader_pid = static_cast<std::int32_t>(pid);
-  return request;
 }
 
 void WritePneumaticNoneOwner(Writer &writer,
@@ -489,21 +468,6 @@ std::string EncodeSelectedRuntimeCompositionRpcRequest(
 }
 
 std::string EncodeSelectedRuntimeCompositionRpcRequest(
-    const ManagerComponentProcessStopRequestDTO &request) {
-  if (!request.valid()) Fail("cannot encode invalid process Stop request");
-  Writer writer(kProcessStopSubmitTag);
-  WriteProcessStopRequest(writer, request);
-  return std::move(writer).Finish();
-}
-std::string EncodeSelectedRuntimeCompositionRpcRequest(
-    const ManagerComponentProcessStopReadRequestDTO &request) {
-  if (!request.valid()) Fail("cannot encode invalid process Stop read");
-  Writer writer(kProcessStopReadTag);
-  WriteProcessStopRequest(writer, request.request);
-  return std::move(writer).Finish();
-}
-
-std::string EncodeSelectedRuntimeCompositionRpcRequest(
     const ManagerComponentProcessInventoryRequestDTO &request) {
   if (!request.valid())
     Fail("cannot encode invalid installed process inventory request");
@@ -521,10 +485,6 @@ DecodeSelectedRuntimeCompositionRpcRequestVariant(
       [&]() -> SelectedRuntimeCompositionRpcRequest {
     if (tag == kInstalledInventoryRequestTag)
       return ReadInstalledInventoryRequest(reader);
-    if (tag == kProcessStopSubmitTag)
-      return ReadProcessStopRequest(reader);
-    if (tag == kProcessStopReadTag)
-      return ManagerComponentProcessStopReadRequestDTO{ReadProcessStopRequest(reader)};
     if (tag == kHostApplyRequestTag)
       return ReadHostApplyRequest(reader);
     Fail("packet is not a request");
@@ -571,22 +531,6 @@ std::string EncodeSelectedRuntimeCompositionRpcResponse(
                           out.Byte(static_cast<std::uint8_t>(row.state));
                         });
           }
-          return std::move(writer).Finish();
-        } else if constexpr (std::is_same_v<
-                                 Value, ManagerComponentProcessStopResultDTO>) {
-          if (!value.valid()) Fail("cannot encode invalid process Stop result");
-          Writer writer(kProcessStopResultTag);
-          WriteProcessStopRequest(writer, value.request);
-          writer.Byte(static_cast<std::uint8_t>(value.state));
-          writer.Boolean(value.receipt.has_value());
-          if (value.receipt) {
-            writer.U32(static_cast<std::uint32_t>(value.receipt->leader_pid));
-            writer.String(value.receipt->controllable_component_id);
-            writer.String(value.receipt->launch_identity);
-            writer.String(value.receipt->observed_utc);
-          }
-          writer.Boolean(value.error.has_value());
-          if (value.error) WriteError(writer, *value.error);
           return std::move(writer).Finish();
         } else {
           Writer writer(kFailureTag);
@@ -635,21 +579,6 @@ DecodeSelectedRuntimeCompositionRpcResponse(const std::string_view bytes) {
     reader.Finish();
     if (!result.valid())
       Fail("decoded installed process inventory is invalid");
-    return result;
-  }
-  if (tag == kProcessStopResultTag) {
-    ManagerComponentProcessStopResultDTO result{ReadProcessStopRequest(reader),
-        static_cast<core::ControllerLaunchCleanupState>(reader.Byte())};
-    if (reader.Boolean()) {
-      const auto pid = reader.U32();
-      if (pid > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
-        Fail("drain receipt PID exceeds signed value domain");
-      result.receipt = core::ControllerLaunchGroupDrainReceipt{
-          static_cast<int>(pid), reader.String(), reader.String(), reader.String()};
-    }
-    if (reader.Boolean()) result.error = ReadError(reader);
-    reader.Finish();
-    if (!result.valid()) Fail("decoded process Stop result is invalid");
     return result;
   }
   if (tag != kHostApplyResultTag) Fail("packet is not a response");

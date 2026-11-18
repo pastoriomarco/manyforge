@@ -50,7 +50,7 @@ class FakeEngine final : public IResolvedParticipantExecutionEngine,
     return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(unsupported());
   }
   Result<ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
-      const OperationId&, const ControlBindingId&) const override {
+      const OperationNumber&, const ControlBindingId&) const override {
     return Result<ResolvedRuntimeScaleStatusDTO>::Err(unsupported());
   }
   GripperCommandResultDTO command_gripper(const GripperCommandRequestDTO&) override { return {}; }
@@ -96,8 +96,7 @@ class FakeEngine final : public IResolvedParticipantExecutionEngine,
     return Result<ResolvedPreparedCapabilityCommandSnapshotDTO>::Err(unsupported());
   }
   Result<GripperCommandResultDTO> DispatchPreparedCapabilityCommand(
-      std::uint64_t, const ContentDigest&, const ControllerGoalId&,
-      ControllerGoalGeneration) override {
+      std::uint64_t, const ContentDigest&, const ControllerGoalId&) override {
     return Result<GripperCommandResultDTO>::Err(unsupported());
   }
   Result<void> CancelPreparedCapabilityCommand(std::uint64_t) override {
@@ -200,12 +199,13 @@ class Receiver final : public IOperationControlEffectCompletionReceiver {
 };
 
 [[nodiscard]] OperationControlEffectRequest request(
-    FakeEngine& engine, const std::string& operation, const std::string& participant,
+    FakeEngine& engine, const std::uint64_t operation, const std::uint32_t participant_ordinal,
     const OperationControlKind control = OperationControlKind::kAcknowledgeCompleted,
     const std::uint64_t subordinate_id = 1U) {
   return OperationControlEffectRequest{&engine,
-                                       OperationId(operation),
-                                       OperationParticipantId(participant),
+                                       OperationNumber(operation),
+                                       OperationParticipantId{OperationNumber(operation),
+                                                              participant_ordinal},
                                        OperationRevision(2U),
                                        control,
                                        subordinate_id,
@@ -235,6 +235,25 @@ class Receiver final : public IOperationControlEffectCompletionReceiver {
   return !executor.has_active_calls();
 }
 
+// The Kernel's sequence: stage before its state lock, commit under it,
+// release after it.
+[[nodiscard]] OperationControlLaneUpdateStatus Reconfigure(
+    BoundedOperationControlExecutor& executor,
+    std::vector<IResolvedParticipantExecutionEngine*> engines) {
+  executor.StageEngines(std::move(engines));
+  const auto status = executor.CommitStagedEngines();
+  executor.ReleaseLaneUpdate();
+  return status;
+}
+
+void CompleteAndRelease(BoundedOperationControlExecutor& executor, Receiver& receiver,
+                        const OperationControlEffectHandle handle) {
+  ASSERT_TRUE(receiver.Wait(executor, handle));
+  ASSERT_EQ(WaitForResult(executor, handle).status, OperationControlEffectTakeStatus::kCompleted);
+  ASSERT_EQ(executor.Release(handle), OperationControlEffectReleaseStatus::kReleased);
+  ASSERT_TRUE(WaitForNoCalls(executor));
+}
+
 TEST(BoundedOperationControlExecutorTest, ConstructionRequiresCanonicalDistinctEngineLanes) {
   Receiver receiver;
   FakeEngine engine;
@@ -251,7 +270,7 @@ TEST(BoundedOperationControlExecutorTest,
   FakeEngine removed;
   FakeEngine added;
   BoundedOperationControlExecutor executor({&retained, &removed}, receiver);
-  const auto first = executor.TryStart(request(retained, "operation.before", "participant.before"));
+  const auto first = executor.TryStart(request(retained, 5U, 1U));
   ASSERT_TRUE(first.handle.has_value());
   ASSERT_TRUE(receiver.Wait(executor, *first.handle));
   ASSERT_EQ(WaitForResult(executor, *first.handle).status,
@@ -261,20 +280,20 @@ TEST(BoundedOperationControlExecutorTest,
   const auto worker_before = retained.effect_thread();
   ASSERT_NE(worker_before, std::thread::id{});
 
-  EXPECT_EQ(executor.ReconfigureEngines({&retained, &added}),
+  EXPECT_EQ(Reconfigure(executor, {&retained, &added}),
             OperationControlLaneUpdateStatus::kApplied);
   EXPECT_TRUE(executor.prequalified_ready());
   EXPECT_EQ(executor.capacity(), 2U);
-  EXPECT_EQ(executor.TryStart(request(removed, "operation.removed", "participant.removed")).status,
+  EXPECT_EQ(executor.TryStart(request(removed, 8U, 1U)).status,
             OperationControlEffectStartStatus::kNotPrequalified);
-  const auto second = executor.TryStart(request(retained, "operation.after", "participant.after"));
+  const auto second = executor.TryStart(request(retained, 4U, 1U));
   ASSERT_TRUE(second.handle.has_value());
   ASSERT_TRUE(receiver.Wait(executor, *second.handle));
   ASSERT_EQ(WaitForResult(executor, *second.handle).status,
             OperationControlEffectTakeStatus::kCompleted);
   EXPECT_EQ(executor.Release(*second.handle), OperationControlEffectReleaseStatus::kReleased);
   EXPECT_EQ(retained.effect_thread(), worker_before);
-  const auto new_effect = executor.TryStart(request(added, "operation.added", "participant.added"));
+  const auto new_effect = executor.TryStart(request(added, 3U, 1U));
   ASSERT_TRUE(new_effect.handle.has_value());
   ASSERT_TRUE(receiver.Wait(executor, *new_effect.handle));
   ASSERT_EQ(WaitForResult(executor, *new_effect.handle).status,
@@ -290,10 +309,10 @@ TEST(BoundedOperationControlExecutorTest, IncrementalUpdateRejectsLiveEffectWith
   FakeEngine replacement;
   retained.BlockEffect();
   BoundedOperationControlExecutor executor({&retained}, receiver);
-  const auto active = executor.TryStart(request(retained, "operation.live", "participant.live"));
+  const auto active = executor.TryStart(request(retained, 6U, 1U));
   ASSERT_TRUE(active.handle.has_value());
   ASSERT_TRUE(retained.WaitForEffect());
-  EXPECT_EQ(executor.ReconfigureEngines({&replacement}), OperationControlLaneUpdateStatus::kBusy);
+  EXPECT_EQ(Reconfigure(executor, {&replacement}), OperationControlLaneUpdateStatus::kBusy);
   EXPECT_EQ(executor.capacity(), 1U);
   retained.ReleaseEffect();
   ASSERT_TRUE(receiver.Wait(executor, *active.handle));
@@ -301,9 +320,89 @@ TEST(BoundedOperationControlExecutorTest, IncrementalUpdateRejectsLiveEffectWith
             OperationControlEffectTakeStatus::kCompleted);
   EXPECT_EQ(executor.Release(*active.handle), OperationControlEffectReleaseStatus::kReleased);
   ASSERT_TRUE(WaitForNoCalls(executor));
-  EXPECT_EQ(executor.ReconfigureEngines({&replacement}),
+  EXPECT_EQ(Reconfigure(executor, {&replacement}),
             OperationControlLaneUpdateStatus::kApplied);
   executor.CloseIngress();
+  EXPECT_TRUE(executor.DrainFor(1s));
+}
+
+TEST(BoundedOperationControlExecutorTest,
+     StagedLaneUpdateLeavesExistingLanesUsableAndJoinsRetiredLaneAfterCommit) {
+  Receiver receiver;
+  FakeEngine retained;
+  FakeEngine removed;
+  FakeEngine added;
+  BoundedOperationControlExecutor executor({&retained, &removed}, receiver);
+
+  // Staging starts the added lane's worker without publishing it and without
+  // holding any lock a control start needs.
+  executor.StageEngines({&retained, &added});
+  EXPECT_EQ(executor.capacity(), 2U);
+  EXPECT_EQ(executor.TryStart(request(added, 1U, 1U)).status,
+            OperationControlEffectStartStatus::kNotPrequalified);
+  const auto during_stage = executor.TryStart(request(retained, 2U, 1U));
+  ASSERT_EQ(during_stage.status, OperationControlEffectStartStatus::kStarted);
+  ASSERT_TRUE(during_stage.handle.has_value());
+  CompleteAndRelease(executor, receiver, *during_stage.handle);
+
+  EXPECT_EQ(executor.CommitStagedEngines(), OperationControlLaneUpdateStatus::kApplied);
+  // Before the retired lane's worker is joined, the committed lanes already
+  // accept work and the retired engine is refused.
+  EXPECT_TRUE(executor.prequalified_ready());
+  EXPECT_EQ(executor.TryStart(request(removed, 3U, 1U)).status,
+            OperationControlEffectStartStatus::kNotPrequalified);
+  const auto new_lane = executor.TryStart(request(added, 4U, 1U));
+  ASSERT_EQ(new_lane.status, OperationControlEffectStartStatus::kStarted);
+  ASSERT_TRUE(new_lane.handle.has_value());
+  CompleteAndRelease(executor, receiver, *new_lane.handle);
+  executor.ReleaseLaneUpdate();
+
+  EXPECT_EQ(executor.capacity(), 2U);
+  const auto after_release = executor.TryStart(request(retained, 5U, 1U));
+  ASSERT_TRUE(after_release.handle.has_value());
+  CompleteAndRelease(executor, receiver, *after_release.handle);
+  executor.CloseIngress();
+  EXPECT_TRUE(executor.DrainFor(1s));
+}
+
+TEST(BoundedOperationControlExecutorTest, RefusedCommitKeepsOldLanesAndReleasesStagedWorkers) {
+  Receiver receiver;
+  FakeEngine retained;
+  FakeEngine added;
+  retained.BlockEffect();
+  BoundedOperationControlExecutor executor({&retained}, receiver);
+  const auto active = executor.TryStart(request(retained, 6U, 1U));
+  ASSERT_TRUE(active.handle.has_value());
+  ASSERT_TRUE(retained.WaitForEffect());
+
+  executor.StageEngines({&retained, &added});
+  EXPECT_EQ(executor.CommitStagedEngines(), OperationControlLaneUpdateStatus::kBusy);
+  executor.ReleaseLaneUpdate();
+  EXPECT_EQ(executor.capacity(), 1U);
+  EXPECT_EQ(executor.TryStart(request(added, 7U, 1U)).status,
+            OperationControlEffectStartStatus::kNotPrequalified);
+
+  retained.ReleaseEffect();
+  CompleteAndRelease(executor, receiver, *active.handle);
+  // Nothing staged: a commit alone is refused without change.
+  EXPECT_EQ(executor.CommitStagedEngines(), OperationControlLaneUpdateStatus::kInvalid);
+  EXPECT_EQ(Reconfigure(executor, {&added, &added}), OperationControlLaneUpdateStatus::kInvalid);
+  EXPECT_EQ(executor.capacity(), 1U);
+  EXPECT_EQ(Reconfigure(executor, {&retained, &added}), OperationControlLaneUpdateStatus::kApplied);
+  EXPECT_EQ(executor.capacity(), 2U);
+  executor.CloseIngress();
+  EXPECT_TRUE(executor.DrainFor(1s));
+}
+
+TEST(BoundedOperationControlExecutorTest, ClosedIngressRefusesStagedUpdate) {
+  Receiver receiver;
+  FakeEngine retained;
+  FakeEngine added;
+  BoundedOperationControlExecutor executor({&retained}, receiver);
+  executor.StageEngines({&retained, &added});
+  executor.CloseIngress();
+  EXPECT_EQ(executor.CommitStagedEngines(), OperationControlLaneUpdateStatus::kClosed);
+  executor.ReleaseLaneUpdate();
   EXPECT_TRUE(executor.DrainFor(1s));
 }
 
@@ -315,12 +414,12 @@ TEST(BoundedOperationControlExecutorTest, BlockedEngineDoesNotStarveDisjointEngi
   BoundedOperationControlExecutor executor({&blocked_engine, &fast_engine}, receiver);
   ASSERT_TRUE(executor.prequalified_ready());
 
-  const auto blocked = executor.TryStart(request(blocked_engine, "operation.a", "participant.a"));
+  const auto blocked = executor.TryStart(request(blocked_engine, 1U, 1U));
   ASSERT_EQ(blocked.status, OperationControlEffectStartStatus::kStarted);
   ASSERT_TRUE(blocked.handle.has_value());
   ASSERT_TRUE(blocked_engine.WaitForEffect());
 
-  const auto fast = executor.TryStart(request(fast_engine, "operation.b", "participant.b"));
+  const auto fast = executor.TryStart(request(fast_engine, 2U, 1U));
   ASSERT_EQ(fast.status, OperationControlEffectStartStatus::kStarted);
   ASSERT_TRUE(fast.handle.has_value());
   ASSERT_TRUE(receiver.Wait(executor, *fast.handle));
@@ -345,10 +444,10 @@ TEST(BoundedOperationControlExecutorTest, OneEngineLaneIsBusyUntilResultIsTakenA
   FakeEngine engine;
   engine.BlockEffect();
   BoundedOperationControlExecutor executor({&engine}, receiver);
-  const auto first = executor.TryStart(request(engine, "operation.a", "participant.a"));
+  const auto first = executor.TryStart(request(engine, 1U, 1U));
   ASSERT_TRUE(first.handle.has_value());
   ASSERT_TRUE(engine.WaitForEffect());
-  EXPECT_EQ(executor.TryStart(request(engine, "operation.b", "participant.b")).status,
+  EXPECT_EQ(executor.TryStart(request(engine, 2U, 1U)).status,
             OperationControlEffectStartStatus::kLaneBusy);
   engine.ReleaseEffect();
   ASSERT_TRUE(receiver.Wait(executor, *first.handle));
@@ -356,7 +455,7 @@ TEST(BoundedOperationControlExecutorTest, OneEngineLaneIsBusyUntilResultIsTakenA
             OperationControlEffectTakeStatus::kCompleted);
   EXPECT_EQ(executor.Release(*first.handle), OperationControlEffectReleaseStatus::kReleased);
 
-  const auto second = executor.TryStart(request(engine, "operation.b", "participant.b",
+  const auto second = executor.TryStart(request(engine, 2U, 1U,
                                                 OperationControlKind::kAcknowledgeCompleted, 77U));
   ASSERT_TRUE(second.handle.has_value());
   EXPECT_EQ(second.handle->slot, first.handle->slot);
@@ -376,14 +475,14 @@ TEST(BoundedOperationControlExecutorTest, ThrowingEffectRetainsExactFailureIdent
   FakeEngine engine;
   engine.ThrowEffect();
   BoundedOperationControlExecutor executor({&engine}, receiver);
-  const auto started = executor.TryStart(request(engine, "operation.throw", "participant.throw"));
+  const auto started = executor.TryStart(request(engine, 1001U, 1U));
   ASSERT_TRUE(started.handle.has_value());
   ASSERT_TRUE(receiver.Wait(executor, *started.handle));
   auto result = WaitForResult(executor, *started.handle);
   ASSERT_EQ(result.status, OperationControlEffectTakeStatus::kInfrastructureFailure);
   ASSERT_TRUE(result.result.has_value());
-  EXPECT_EQ(result.result->operation_id, OperationId("operation.throw"));
-  EXPECT_EQ(result.result->participant_id, OperationParticipantId("participant.throw"));
+  EXPECT_EQ(result.result->operation_id, OperationNumber(1001U));
+  EXPECT_EQ(result.result->participant_id, (OperationParticipantId{OperationNumber(1001U), 1U}));
   EXPECT_FALSE(result.result->accepted);
   ASSERT_TRUE(result.result->error.has_value());
   EXPECT_EQ(result.result->error->details.at("reason"), "operation_control_effect_threw");
@@ -399,7 +498,7 @@ TEST(BoundedOperationControlExecutorTest,
   BoundedOperationControlExecutor executor({&engine}, receiver);
 
   const auto motion = executor.TryStart(
-      request(engine, "operation.motion", "participant.motion", OperationControlKind::kReset, 77U));
+      request(engine, 7U, 1U, OperationControlKind::kReset, 77U));
   ASSERT_TRUE(motion.handle.has_value());
   ASSERT_TRUE(receiver.Wait(executor, *motion.handle));
   const auto motion_result = WaitForResult(executor, *motion.handle);
@@ -411,8 +510,8 @@ TEST(BoundedOperationControlExecutorTest,
 
   const auto command = executor.TryStart(
       OperationControlEffectRequest{&engine,
-                                    OperationId("operation.command"),
-                                    OperationParticipantId("participant.command"),
+                                    OperationNumber(1002U),
+                                    OperationParticipantId{OperationNumber(1002U), 1U},
                                     OperationRevision(4U),
                                     OperationControlKind::kReset,
                                     91U,

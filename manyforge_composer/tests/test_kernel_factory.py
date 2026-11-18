@@ -90,3 +90,57 @@ def test_structural_options_are_not_classified_as_removed_runtime_options() -> N
             "INFO",
         )
     ) is None
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        (),
+        ("--application-start-id",),
+        ("--application-start-id", "0000000000000000"),
+        ("--application-start-id", "3F9A0000000000A1"),
+        ("--application-start-id", "3f9a"),
+        ("--application-start-id", "3f9a0000000000a1ff"),
+    ],
+)
+def test_missing_or_invalid_application_start_id_is_a_usage_error(
+    arguments: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["manyforge_composer", *arguments])
+    monkeypatch.setattr(
+        composer_main,
+        "setup_logging",
+        lambda _level: pytest.fail("a usage error must precede start-up"),
+    )
+
+    with pytest.raises(SystemExit) as exited:
+        composer_main.main()
+
+    assert exited.value.code == 2
+    assert "--application-start-id" in capsys.readouterr().err
+
+
+def test_the_application_start_id_reaches_the_composer_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Started(Exception):
+        pass
+
+    received: dict[str, object] = {}
+
+    def from_paths(**kwargs: object) -> None:
+        received.update(kwargs)
+        raise Started
+
+    monkeypatch.setattr(
+        sys, "argv", ["manyforge_composer", "--application-start-id", "3f9a0000000000a1"]
+    )
+    monkeypatch.setattr(composer_main, "setup_logging", lambda _level: None)
+    monkeypatch.setattr(composer_main.ComposerState, "from_paths", from_paths)
+
+    with pytest.raises(Started):
+        composer_main.main()
+
+    assert received["application_start_id"] == 0x3F9A0000000000A1

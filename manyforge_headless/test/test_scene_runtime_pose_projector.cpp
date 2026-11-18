@@ -101,6 +101,17 @@ Observation(const CanonicalValue &payload = PosePayload()) {
   };
 }
 
+core::RequestKey Key(const std::uint64_t sequence) {
+  return core::RequestKey::Make(
+      core::RequestKeyClass::kInternal, 0U,
+      static_cast<std::uint64_t>(core::RequestKeyMinter::kManager), sequence);
+}
+
+// The Manager's key counter, from 1, as the daemon injects it.
+SceneRuntimeRequestKeyMinter Keys() {
+  return [next = std::uint64_t{0U}]() mutable { return Key(++next); };
+}
+
 class FakeSceneAuthority final : public core::ISceneAuthority {
 public:
   core::SceneCommitResultDTO
@@ -109,7 +120,7 @@ public:
     last_request = request;
     if (failure.has_value()) {
       return {
-          request.request_context.request_id,
+          request.request_context.request_key,
           core::RequestReplayStatusDTO::kAcceptedNew,
           false,
           failure,
@@ -123,7 +134,7 @@ public:
             std::get_if<core::DetachCarriedObjectRequestDTO>(&request.operation)) {
       if (detach_refusals > 0U) {
         --detach_refusals;
-        return {request.request_context.request_id,
+        return {request.request_context.request_key,
                 core::RequestReplayStatusDTO::kAcceptedNew, false,
                 core::ErrorDTO{"scene_object_state_conflict", "refused", {}},
                 std::nullopt, std::nullopt,
@@ -136,7 +147,7 @@ public:
       state.carried_object_attachment_id.reset();
       pose = detach->pose;
       projection = Projection(projection.scene_revision.revision_id + 1U);
-      return {request.request_context.request_id,
+      return {request.request_context.request_key,
               core::RequestReplayStatusDTO::kAcceptedNew, true, std::nullopt,
               static_cast<std::uint64_t>(commit_count), projection,
               core::SceneProjectionCommitStatusDTO::kCommitted,
@@ -148,7 +159,7 @@ public:
     state.provider_evidence = update.provider_evidence;
     projection = Projection(projection.scene_revision.revision_id + 1U);
     return {
-        request.request_context.request_id,
+        request.request_context.request_key,
         core::RequestReplayStatusDTO::kAcceptedNew,
         true,
         std::nullopt,
@@ -157,10 +168,6 @@ public:
         core::SceneProjectionCommitStatusDTO::kCommitted,
         core::SceneUpdateStatusDTO::kGeometryChanged,
     };
-  }
-
-  core::RequestOwnerEpoch CurrentRequestOwnerEpoch() const override {
-    return core::RequestOwnerEpoch(owner_epoch);
   }
 
   core::ProjectionRevisionDTO CurrentProjectionRevision() const override {
@@ -201,7 +208,6 @@ public:
   std::optional<core::SceneTransactionRequestDTO> last_request;
   std::optional<core::Pose3DTO> detached_at;
   std::size_t commit_count{};
-  std::string owner_epoch{"scene-owner.1"};
   std::size_t detach_refusals{};
 };
 
@@ -228,7 +234,7 @@ TEST(SceneRuntimePoseProjector,
      CommitsProviderIdentityEvidenceAndRecognizesReplay) {
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;
-  SceneRuntimePoseProjector projector(scene, cell_id);
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys());
   const std::vector providers{Provider(cell_id)};
   const auto observation = Observation();
 
@@ -244,8 +250,9 @@ TEST(SceneRuntimePoseProjector,
   ASSERT_TRUE(scene.last_request.has_value());
   EXPECT_EQ(scene.last_request->request_context.source_label,
             "scene_runtime_pose_source");
-  EXPECT_EQ(scene.last_request->request_context.correlation_id,
-            scene.last_request->request_context.request_id.value());
+  // A Manager class 1 key from the injected minter (contract 1.4).
+  EXPECT_EQ(scene.last_request->request_context.request_key, Key(1U));
+  EXPECT_EQ(committed.value().scene_request_key, Key(1U));
   const auto &update =
       std::get<core::UpdateObjectPoseRequestDTO>(scene.last_request->operation);
   EXPECT_EQ(update.scene_resource_id.value(), "box");
@@ -278,7 +285,7 @@ TEST(SceneRuntimePoseProjector,
 TEST(SceneRuntimePoseProjector, LongServicePoseEvidenceRemainsIdempotent) {
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;
-  SceneRuntimePoseProjector projector(scene, cell_id);
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys());
   const std::vector providers{Provider(cell_id)};
   constexpr std::int64_t years31 = 31LL * 366 * 86400 * 1000000000;
   auto observation = Observation(PosePayload(0.25, 1.0, years31 - 1));
@@ -302,7 +309,7 @@ TEST(SceneRuntimePoseProjector, SkipsAttachedObjectsWithoutChangingScene) {
   scene.state.attached = true;
   scene.state.carried_object_attachment_id =
       core::CarriedObjectAttachmentId("attachment.1");
-  SceneRuntimePoseProjector projector(scene, cell_id);
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys());
   const std::vector providers{Provider(cell_id)};
 
   const auto result =
@@ -320,7 +327,7 @@ TEST(SceneRuntimePoseProjector, UnchangedSameOriginSampleDoesNotCommit) {
                              "before_planning", "between_nodes"}) {
     const core::CellId cell_id("cell.1");
     FakeSceneAuthority scene;
-    SceneRuntimePoseProjector projector(scene, cell_id);
+    SceneRuntimePoseProjector projector(scene, cell_id, Keys());
     const std::vector providers{Provider(cell_id)};
     const auto apply = [&](const PoseSourceObservation &observation) {
       return projector.Apply(providers, scene.projection.retained_bundle_id,
@@ -355,7 +362,7 @@ TEST(SceneRuntimePoseProjector, ContinuousUpdatesAttachedPoseThroughAuthority) {
     const core::CellId cell_id("cell.1");
     FakeSceneAuthority scene;
     scene.state.attached = true;
-    SceneRuntimePoseProjector projector(scene, cell_id);
+    SceneRuntimePoseProjector projector(scene, cell_id, Keys());
     const std::vector providers{Provider(cell_id)};
     const auto result = projector.Apply(
         providers, scene.projection.retained_bundle_id,
@@ -391,7 +398,7 @@ TEST(SceneRuntimePoseProjector,
      RejectsMissingObjectsMalformedPayloadAndProviderAmbiguity) {
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;
-  SceneRuntimePoseProjector projector(scene, cell_id);
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys());
   const std::vector providers{Provider(cell_id)};
 
   scene.state.exists = false;
@@ -426,7 +433,7 @@ TEST(SceneRuntimePoseProjector,
 TEST(SceneRuntimePoseProjector, FailsClosedOnSceneOwnerRejection) {
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;
-  SceneRuntimePoseProjector projector(scene, cell_id);
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys());
   const std::vector providers{Provider(cell_id)};
   const auto observation = Observation();
   const auto initial =
@@ -468,7 +475,7 @@ TEST(SceneRuntimePoseProjector, PlanningEvidenceRuleIsStatusSensitive) {
 TEST(SceneRuntimePoseProjector, CommitsChangedPoseOrOtherOrigin) {
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;
-  SceneRuntimePoseProjector projector(scene, cell_id);
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys());
   const std::vector providers{Provider(cell_id)};
   ASSERT_TRUE(ApplyTo(projector, scene, providers, Observation()).ok());
 
@@ -596,7 +603,7 @@ TEST(SceneRuntimePoseProjector,
   FakeSceneAuthority scene;
   AttachInSnapshot(scene);
   std::size_t calls = 0U;
-  SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls));
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys(), TcpAboveReference(calls));
   const auto result = projector.Apply(
       std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
       scene.projection.graph_revision, Observation(ReferencedPayload()),
@@ -639,7 +646,7 @@ TEST(SceneRuntimePoseProjector, RelativePolicySelectsExactHolderTarget) {
     FakeSceneAuthority scene;
     AttachInSnapshot(scene);
     std::size_t calls = 0U;
-    SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls));
+    SceneRuntimePoseProjector projector(scene, cell_id, Keys(), TcpAboveReference(calls));
     const auto result = projector.Apply(
         std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
         scene.projection.graph_revision, Observation(payload), std::nullopt,
@@ -673,7 +680,7 @@ TEST(SceneRuntimePoseProjector,
   FakeSceneAuthority scene;
   AttachInSnapshot(scene);
   std::size_t calls = 0U;
-  SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls));
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys(), TcpAboveReference(calls));
   const auto apply = [&](const std::uint64_t sequence) {
     return projector.Apply(
         std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
@@ -722,7 +729,7 @@ TEST(SceneRuntimePoseProjector,
     FakeSceneAuthority scene;
     AttachInSnapshot(scene);
     std::size_t calls = 0U;
-    SceneRuntimePoseProjector projector(scene, cell_id,
+    SceneRuntimePoseProjector projector(scene, cell_id, Keys(),
                                         TcpAboveReference(calls));
     const auto result = projector.Apply(
         std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
@@ -738,7 +745,7 @@ TEST(SceneRuntimePoseProjector,
   FakeSceneAuthority scene;
   AttachInSnapshot(scene);
   SceneRuntimePoseProjector projector(
-      scene, cell_id,
+      scene, cell_id, Keys(),
       [](const core::RetainedBundleId &, const core::ComponentSceneFrameRefDTO &,
          const std::string &) {
         return core::Result<SceneRuntimeReferenceLinkResolution>::Err(core::ErrorDTO{
@@ -758,7 +765,7 @@ TEST(SceneRuntimePoseProjector, RelativePolicyIsUnattachedWorldUpdateWhileDetach
     const core::CellId cell_id("cell.1");
     FakeSceneAuthority scene;
     std::size_t calls = 0U;
-    SceneRuntimePoseProjector projector(scene, cell_id,
+    SceneRuntimePoseProjector projector(scene, cell_id, Keys(),
                                         TcpAboveReference(calls));
     const auto result = projector.Apply(
         std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
@@ -778,7 +785,7 @@ TEST(SceneRuntimePoseProjector, RelativePolicyIsUnattachedWorldUpdateWhileDetach
 TEST(SceneRuntimePoseProjector, ExistingPoliciesRejectReferencedPayloadShapes) {
   const core::CellId cell_id("cell.1");
   FakeSceneAuthority scene;
-  SceneRuntimePoseProjector projector(scene, cell_id);
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys());
   const auto result =
       ApplyTo(projector, scene, {Provider(cell_id)},
               Observation(WithMember(PosePayload(), "reference",
@@ -980,7 +987,7 @@ TEST(SceneRuntimePoseProjector, RelativeGraspLostComparesWithTheFirstMeasuredOff
     AttachInSnapshot(scene, attach_offset, GraspCheck());
     std::size_t calls = 0U;
     StopRecorder stops;
-    SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls),
+    SceneRuntimePoseProjector projector(scene, cell_id, Keys(), TcpAboveReference(calls),
                                         stops.Requester(scene));
     const auto apply = [&](const std::uint64_t sequence, const double x,
                            const double yaw) {
@@ -1021,7 +1028,7 @@ TEST(SceneRuntimePoseProjector, LostSampleReappliedForPlanningRetainsEvidence) {
   AttachInSnapshot(scene, attach_offset, GraspCheck());
   std::size_t calls = 0U;
   StopRecorder stops;
-  SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls),
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys(), TcpAboveReference(calls),
                                       stops.Requester(scene));
   const auto apply = [&](const PoseSourceObservation &observation) {
     return projector.Apply(
@@ -1054,7 +1061,7 @@ TEST(SceneRuntimePoseProjector, FailedDetachKeepsLossBaselineOnReplay) {
   AttachInSnapshot(scene, attach_offset, GraspCheck());
   std::size_t calls = 0U;
   StopRecorder stops;
-  SceneRuntimePoseProjector projector(scene, cell_id, TcpAboveReference(calls),
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys(), TcpAboveReference(calls),
                                       stops.Requester(scene));
   const auto apply = [&](const PoseSourceObservation &observation) {
     return projector.Apply(
@@ -1093,7 +1100,7 @@ TEST(SceneRuntimePoseProjector, ContinuousGraspLostComparesWithTheFirstMeasuredO
   scene.pose = core::Pose3DTO{{0.25, -0.5, 0.75}, {}};
   AttachInSnapshot(scene, {}, GraspCheck());
   StopRecorder stops;
-  SceneRuntimePoseProjector projector(scene, cell_id, {}, stops.Requester(scene));
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys(), {}, stops.Requester(scene));
   const auto apply = [&](const std::uint64_t sequence, const double x) {
     return projector.Apply(
         std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
@@ -1174,7 +1181,7 @@ TEST(SceneRuntimePoseProjector, OnGraspLostFlagsDriveSignalStopDetachAndAlarm) {
     AttachInSnapshot(scene, {}, check);
     StopRecorder stops;
     SignalRecorder signals;
-    SceneRuntimePoseProjector projector(scene, cell_id, {},
+    SceneRuntimePoseProjector projector(scene, cell_id, Keys(), {},
                                         stops.Requester(scene),
                                         signals.Publisher());
     const auto apply = [&](const std::uint64_t sequence, const double x) {
@@ -1241,7 +1248,7 @@ TEST(SceneRuntimePoseProjector, FailedSignalPublicationFailsClosedOncePerLoss) {
       StopRecorder stops;
       std::size_t publications = 0U;
       SceneRuntimePoseProjector projector(
-          scene, cell_id, {}, stops.Requester(scene),
+          scene, cell_id, Keys(), {}, stops.Requester(scene),
           [&](const SceneRuntimeCarriedObjectLoss &) {
             ++publications;
             return std::optional(core::ErrorDTO{code, "refused", {}});
@@ -1288,7 +1295,7 @@ TEST(SceneRuntimePoseProjector, TargetWithoutSignalFollowsItsFlags) {
   AttachInSnapshot(scene, {}, check);
   StopRecorder stops;
   SceneRuntimePoseProjector projector(
-      scene, cell_id, {}, stops.Requester(scene),
+      scene, cell_id, Keys(), {}, stops.Requester(scene),
       [](const SceneRuntimeCarriedObjectLoss &) {
         return std::optional(core::ErrorDTO{"io_signal_unbound", "no signal", {}});
       });
@@ -1320,7 +1327,7 @@ TEST(SceneRuntimePoseProjector, RefusedDetachKeepsTheGraspBaseline) {
   AttachInSnapshot(scene, {}, GraspCheck());
   StopRecorder stops;
   SignalRecorder signals;
-  SceneRuntimePoseProjector projector(scene, cell_id, {}, stops.Requester(scene),
+  SceneRuntimePoseProjector projector(scene, cell_id, Keys(), {}, stops.Requester(scene),
                                       signals.Publisher());
   const auto apply = [&](const std::uint64_t sequence, const double x) {
     return projector.Apply(
@@ -1357,7 +1364,7 @@ TEST(SceneRuntimePoseProjector, GraspLostCheckOnlyForMeasuredOffsetPolicies) {
       FakeSceneAuthority scene;
       AttachInSnapshot(scene, {},
                        checked ? std::optional(GraspCheck()) : std::nullopt);
-      SceneRuntimePoseProjector projector(scene, cell_id);
+      SceneRuntimePoseProjector projector(scene, cell_id, Keys());
       const auto result = projector.Apply(
           std::vector{Provider(cell_id)}, scene.projection.retained_bundle_id,
           scene.projection.graph_revision, Observation(PosePayload(1.8)),
@@ -1395,7 +1402,7 @@ TEST(SceneRuntimePoseProjector, DeadbandTreatsSmallSameOriginChangesAsUnchanged)
   for (const auto &entry : cases) {
     const core::CellId cell_id("cell.1");
     FakeSceneAuthority scene;
-    SceneRuntimePoseProjector projector(scene, cell_id);
+    SceneRuntimePoseProjector projector(scene, cell_id, Keys());
     const std::vector providers{Provider(cell_id)};
     const auto apply = [&](const PoseSourceObservation &observation) {
       return projector.Apply(providers, scene.projection.retained_bundle_id,

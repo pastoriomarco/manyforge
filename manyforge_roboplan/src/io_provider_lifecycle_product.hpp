@@ -170,11 +170,25 @@ public:
   // sim-plc / pose source: the exact supervised process serving this
   // component. Its typed exit fault (absent while it runs or after an ordered
   // stop; the source names the code, e.g. `simulated_plc_exited`) is a driver
-  // fault: prepare/enable/recover are refused and the component is in
-  // `fault_process_exited`. A later Apply installs the restarted process's source,
-  // replacing this one; an empty source removes it.
+  // fault: the component is in `fault_process_exited` and enable is refused.
+  // Prepare and recover start the process again through the restart hook
+  // (below), which installs the restarted process's source; without a hook
+  // they are refused. A later Apply also installs a restarted process's
+  // source, replacing this one; an empty source removes it.
   void SetSupervisedProcessFaultSource(
       std::function<std::optional<core::ErrorDTO>()> source);
+
+  // The host's driver-restart entry for this component's supervised process:
+  // stops it, starts it again on the same command, waits for it as its Apply
+  // does and installs its exit source here, or returns a typed error (the
+  // exit fault then stays). Called without the delivery barrier. With it,
+  // the exit fault offers Recover.
+  using ProcessRestartHook = std::function<core::Result<void>(std::stop_token)>;
+  void SetSupervisedProcessRestart(ProcessRestartHook restart);
+  // After such a restart: the configured transport is ready and, with ROS
+  // inputs, a sender is matched again (IO-1), so Prepare and Recover can run.
+  // Takes the delivery barrier.
+  [[nodiscard]] bool TransportReported() const;
 
   // CP9 model-free stream observers: pose source
   // (`kPoseSourceProviderManifestId`) and AI model

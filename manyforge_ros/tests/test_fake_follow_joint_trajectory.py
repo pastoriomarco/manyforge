@@ -49,7 +49,7 @@ def test_fake_follow_joint_trajectory_accepts_and_completes_goal():
     )
     executor.add_node(server_node)
     executor.add_node(client_node)
-    thread = threading.Thread(target=executor.spin, daemon=True)
+    thread = threading.Thread(target=executor.spin)
     thread.start()
 
     try:
@@ -76,6 +76,7 @@ def test_fake_follow_joint_trajectory_accepts_and_completes_goal():
         fake_server.destroy()
         client.destroy()
         executor.shutdown()
+        thread.join()
         server_node.destroy_node()
         client_node.destroy_node()
         rclpy.shutdown()
@@ -116,7 +117,7 @@ def test_fake_follow_joint_trajectory_can_abort_with_error_feedback():
     )
     executor.add_node(server_node)
     executor.add_node(client_node)
-    thread = threading.Thread(target=executor.spin, daemon=True)
+    thread = threading.Thread(target=executor.spin)
     thread.start()
 
     try:
@@ -154,6 +155,7 @@ def test_fake_follow_joint_trajectory_can_abort_with_error_feedback():
         fake_server.destroy()
         client.destroy()
         executor.shutdown()
+        thread.join()
         server_node.destroy_node()
         client_node.destroy_node()
         rclpy.shutdown()

@@ -151,18 +151,6 @@ core::LogicalSceneSnapshotRoot CanonicalEmptyScene(
               {}}));
 }
 
-ManagerBootstrapIntentDTO DurableIntent(
-    const deployment::CanonicalEmptyRetainedBundleAdmission& admission) {
-  return {
-      BootstrapId("bootstrap-0123456789abcdef0123456789abcdef"),
-      BootstrapGeneration(1U),
-      admission.cell_id(),
-      admission.retained_bundle_id(),
-      admission.graph_revision(),
-      {},
-  };
-}
-
 class InstrumentedSceneOwner final
     : public core::IManagerSceneProjectionBootstrapPort {
  public:
@@ -530,25 +518,6 @@ TEST(
 
 TEST(
     CanonicalEmptyBootstrapCoordinator,
-    ExactAcceptedReplayReturnsTheSameDurableTargetWithoutAnotherBegin) {
-  TemporaryDirectory directory;
-  const auto admission = LoadCanonicalEmptyAdmission();
-  ExternallyProvisionedManagerStores stores(directory.path(), admission);
-  InstrumentedSceneOwner scene_owner(Query(admission));
-  CanonicalEmptyBootstrapCoordinator coordinator(stores, scene_owner);
-  const auto first = coordinator.BeginOrRecover(admission);
-  const auto begin_calls = scene_owner.begin_calls();
-
-  const auto replay = coordinator.BeginOrRecover(admission);
-
-  EXPECT_EQ(replay, first);
-  EXPECT_EQ(scene_owner.begin_calls(), begin_calls);
-  EXPECT_EQ(scene_owner.rebuild_calls(), 0U);
-  EXPECT_EQ(scene_owner.finalize_calls(), 0U);
-}
-
-TEST(
-    CanonicalEmptyBootstrapCoordinator,
     AcceptedResponseLossRecoversOnlyThroughExactStatus) {
   TemporaryDirectory directory;
   const auto admission = LoadCanonicalEmptyAdmission();
@@ -635,25 +604,6 @@ TEST(
 
 TEST(
     CanonicalEmptyBootstrapCoordinator,
-    DurableIntentWithAbsentOwnerReobservesAndBeginsExactReplay) {
-  TemporaryDirectory directory;
-  const auto admission = LoadCanonicalEmptyAdmission();
-  ExternallyProvisionedManagerStores stores(directory.path(), admission);
-  const auto intent = DurableIntent(admission);
-  ASSERT_TRUE(stores.bootstrap_journal().EnsureIntent(intent).inserted);
-  InstrumentedSceneOwner scene_owner(Query(admission));
-  CanonicalEmptyBootstrapCoordinator coordinator(stores, scene_owner);
-
-  const auto result = coordinator.BeginOrRecover(admission);
-
-  EXPECT_EQ(result.accepted_target.bootstrap_id, intent.bootstrap_id);
-  EXPECT_EQ(
-      scene_owner.events(),
-      (std::vector<std::string>{"status", "observe", "begin"}));
-}
-
-TEST(
-    CanonicalEmptyBootstrapCoordinator,
     BeginFailureBeforeEffectKeepsUsefulContextAndLeavesIntentForRetry) {
   TemporaryDirectory directory;
   const auto admission = LoadCanonicalEmptyAdmission();
@@ -718,92 +668,6 @@ TEST(
 
 TEST(
     CanonicalEmptyBootstrapCoordinator,
-    LaterStateBeforeDurableAcceptanceFailsClosed) {
-  TemporaryDirectory directory;
-  const auto admission = LoadCanonicalEmptyAdmission();
-  ExternallyProvisionedManagerStores stores(directory.path(), admission);
-  ASSERT_TRUE(
-      stores.bootstrap_journal()
-          .EnsureIntent(DurableIntent(admission))
-          .inserted);
-  InstrumentedSceneOwner scene_owner(Query(admission));
-  scene_owner.SetState(InstrumentedSceneOwner::State::kRebuilding);
-  CanonicalEmptyBootstrapCoordinator coordinator(stores, scene_owner);
-
-  EXPECT_THROW(
-      static_cast<void>(coordinator.BeginOrRecover(admission)),
-      CanonicalEmptyBootstrapCoordinatorError);
-  EXPECT_EQ(scene_owner.begin_calls(), 0U);
-}
-
-TEST(
-    CanonicalEmptyBootstrapCoordinator,
-    DurableAcceptedTargetAllowsExactLaterNonUncertainStatus) {
-  TemporaryDirectory directory;
-  const auto admission = LoadCanonicalEmptyAdmission();
-  ExternallyProvisionedManagerStores stores(directory.path(), admission);
-  InstrumentedSceneOwner scene_owner(Query(admission));
-  CanonicalEmptyBootstrapCoordinator coordinator(stores, scene_owner);
-  const auto accepted = coordinator.BeginOrRecover(admission);
-  scene_owner.SetState(InstrumentedSceneOwner::State::kRebuilding);
-
-  const auto recovered = coordinator.BeginOrRecover(admission);
-
-  EXPECT_EQ(recovered, accepted);
-  EXPECT_EQ(scene_owner.begin_calls(), 1U);
-}
-
-TEST(
-    CanonicalEmptyBootstrapCoordinator,
-    StoreReopenRecoversExactDurableAcceptanceWithoutAnotherBegin) {
-  TemporaryDirectory directory;
-  const auto admission = LoadCanonicalEmptyAdmission();
-  PersistedManagerBootstrapAcceptedTarget accepted = [&] {
-    ExternallyProvisionedManagerStores stores(directory.path(), admission);
-    InstrumentedSceneOwner scene_owner(Query(admission));
-    CanonicalEmptyBootstrapCoordinator coordinator(stores, scene_owner);
-    return coordinator.BeginOrRecover(admission);
-  }();
-
-  ExternallyProvisionedManagerStores reopened(directory.path(), admission);
-  InstrumentedSceneOwner recovered_owner(Query(admission));
-  recovered_owner.SetState(InstrumentedSceneOwner::State::kAccepted);
-  CanonicalEmptyBootstrapCoordinator recovered(reopened, recovered_owner);
-
-  const auto replay = recovered.BeginOrRecover(admission);
-
-  EXPECT_EQ(replay, accepted);
-  EXPECT_EQ(recovered_owner.begin_calls(), 0U);
-  EXPECT_EQ(recovered_owner.rebuild_calls(), 0U);
-  EXPECT_EQ(recovered_owner.finalize_calls(), 0U);
-}
-
-TEST(
-    CanonicalEmptyBootstrapCoordinator,
-    DurableAcceptedTargetRejectsAbsentMismatchAndUncertainStatus) {
-  const auto exercise = [](
-                            const InstrumentedSceneOwner::State state,
-                            const bool mismatch) {
-    TemporaryDirectory directory;
-    const auto admission = LoadCanonicalEmptyAdmission();
-    ExternallyProvisionedManagerStores stores(directory.path(), admission);
-    InstrumentedSceneOwner scene_owner(Query(admission));
-    CanonicalEmptyBootstrapCoordinator coordinator(stores, scene_owner);
-    static_cast<void>(coordinator.BeginOrRecover(admission));
-    scene_owner.SetState(state);
-    scene_owner.SetStatusIdentityMismatch(mismatch);
-    EXPECT_THROW(
-        static_cast<void>(coordinator.BeginOrRecover(admission)),
-        CanonicalEmptyBootstrapCoordinatorError);
-  };
-
-  exercise(InstrumentedSceneOwner::State::kAbsent, false);
-  exercise(InstrumentedSceneOwner::State::kAccepted, true);
-  exercise(InstrumentedSceneOwner::State::kUncertain, false);
-}
-
-TEST(
-    CanonicalEmptyBootstrapCoordinator,
     NonEmptyPublicationHeadFailsBeforeAnySceneOwnerCall) {
   TemporaryDirectory directory;
   const auto admission = LoadCanonicalEmptyAdmission();
@@ -822,38 +686,6 @@ TEST(
   EXPECT_EQ(
       stores.bootstrap_journal().ReadSnapshot().phase,
       ManagerBootstrapJournalPhase::kEmpty);
-}
-
-TEST(
-    CanonicalEmptyBootstrapCoordinator,
-    ConcurrentEmptyReadersReuseOneDurableWinner) {
-  TemporaryDirectory directory;
-  const auto admission = LoadCanonicalEmptyAdmission();
-  ExternallyProvisionedManagerStores stores(directory.path(), admission);
-  InstrumentedSceneOwner scene_owner(Query(admission));
-  std::barrier initial_observations(2);
-  scene_owner.SetInitialObservationBarrier(&initial_observations);
-  CanonicalEmptyBootstrapCoordinator first(stores, scene_owner);
-  CanonicalEmptyBootstrapCoordinator second(stores, scene_owner);
-
-  auto first_result = std::async(
-      std::launch::async,
-      [&] { return first.BeginOrRecover(admission); });
-  auto second_result = std::async(
-      std::launch::async,
-      [&] { return second.BeginOrRecover(admission); });
-
-  const auto first_value = first_result.get();
-  const auto second_value = second_result.get();
-  EXPECT_EQ(first_value, second_value);
-  const auto snapshot = stores.bootstrap_journal().ReadSnapshot();
-  ASSERT_TRUE(snapshot.intent.has_value());
-  ASSERT_TRUE(snapshot.accepted_target.has_value());
-  EXPECT_EQ(first_value, *snapshot.accepted_target);
-  EXPECT_TRUE(snapshot.intent->intent.execution_host_bindings.empty());
-  EXPECT_EQ(scene_owner.accept_effect_count(), 1U);
-  EXPECT_EQ(scene_owner.rebuild_calls(), 0U);
-  EXPECT_EQ(scene_owner.finalize_calls(), 0U);
 }
 
 }  // namespace

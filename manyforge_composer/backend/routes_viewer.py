@@ -20,7 +20,7 @@ _SEND_TIMEOUT_SECONDS = 0.25
 _MAXIMUM_CREDIT_BYTES = 4_096
 
 
-def _credit_identity(message: str) -> tuple[tuple[str, str, int, int] | None, int]:
+def _credit_identity(message: str) -> tuple[tuple[str, int, int] | None, int]:
     from .execution_observation_stream import OBSERVATION_CREDIT_SCHEMA
 
     if len(message.encode("utf-8")) > _MAXIMUM_CREDIT_BYTES:
@@ -43,10 +43,7 @@ def _credit_identity(message: str) -> tuple[tuple[str, str, int, int] | None, in
         return None, rate
     if (
         not isinstance(cursor, dict)
-        or set(cursor) != {"owner_epoch", "source_epoch", "source_sequence", "delivery_sequence"}
-        or not isinstance(cursor.get("owner_epoch"), str)
-        or not cursor["owner_epoch"]
-        or len(cursor["owner_epoch"].encode("utf-8")) > 2_048
+        or set(cursor) != {"source_epoch", "source_sequence", "delivery_sequence"}
         or not isinstance(cursor.get("source_epoch"), str)
         or not cursor["source_epoch"]
         or len(cursor["source_epoch"].encode("utf-8")) > 2_048
@@ -58,7 +55,6 @@ def _credit_identity(message: str) -> tuple[tuple[str, str, int, int] | None, in
         raise ValueError("execution observation credit cursor is invalid")
     return (
         (
-            cursor["owner_epoch"],
             cursor["source_epoch"],
             cursor["source_sequence"],
             cursor["delivery_sequence"],

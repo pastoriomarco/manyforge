@@ -22,7 +22,7 @@ import {
 } from '../hooks/useHeadlessState';
 import type { HeadlessStateSource } from '../hooks/useHeadlessState';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
-import { browserRequestIdentity } from '../utils/requestIdentity';
+import { newRequestKey } from '../api/applicationIdentity';
 import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
 import { SettingsSubheading } from './SettingsScope';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
@@ -42,6 +42,7 @@ import { CarriedObjectPoseCard } from './CarriedObjectPoseCard';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import { RobotControlPanelView } from './RobotControlPanel';
 import { ToolIoPanel } from './ToolIoPanel';
+import { OverlayPanel } from './OverlayPanel';
 import { useGizmoSettings } from './common/GizmoControls';
 import type { GizmoController } from './common/GizmoControls';
 import type { ViewerInspectorPanel } from './StructuralViewer';
@@ -77,6 +78,7 @@ import {
 } from '../state/runtimeScenePresentation';
 import {
   quaternionFromRpyDegrees,
+  rpyDegreesFromQuaternion,
   robotControlCandidatePresentationAllowed,
   robotControlHasActiveOperation,
   robotControlHasLocalDraft,
@@ -194,6 +196,19 @@ function viewerFrameVisible(
   return viewer?.frame_visibility?.find((row) => (
     row.frame.component_id === componentId && row.frame.frame_id === frameId
   ))?.visible ?? true;
+}
+
+/**
+ * The orientation as roll, pitch and yaw in degrees, the form the operator
+ * edits; a stored quaternion is converted (rounded to 1e-6 deg, no -0).
+ */
+function orientationRpyDegrees(
+  orientation: ProgramSceneResource['pose']['orientation'],
+): [number, number, number] {
+  if ('rpy_deg' in orientation) return orientation.rpy_deg;
+  const [x, y, z, w] = orientation.xyzw;
+  return rpyDegreesFromQuaternion({ x, y, z, w })
+    .map((value) => Number(value.toFixed(6)) + 0) as [number, number, number];
 }
 
 function defaultResource(existingIds: Set<string>): ProgramSceneResource {
@@ -877,6 +892,127 @@ export function CopyObservedToDraftButton({
   );
 }
 
+/** The Program rule for a scene object's name (its `scene_resource_id`). */
+const SCENE_OBJECT_NAME = /^[a-z][a-z0-9_.-]*$/;
+
+function sceneObjectNameError(name: string, usedNames: ReadonlySet<string>): string | null {
+  if (name === '') return 'Enter a name.';
+  if (name.length > 256) return 'A name has at most 256 characters.';
+  if (!SCENE_OBJECT_NAME.test(name)) {
+    return 'Use lowercase letters, digits, "_", "." or "-", starting with a letter.';
+  }
+  if (usedNames.has(name)) return `"${name}" is already the name of another object.`;
+  return null;
+}
+
+/** "Add object": its name and shape (a mesh from the approved files), then one Draft edit. */
+function AddSceneObjectDialog({ open, usedNames, onClose, onAdd }: {
+  open: boolean;
+  usedNames: ReadonlySet<string>;
+  onClose: () => void;
+  onAdd: (resource: ProgramSceneResource) => void;
+}) {
+  const [candidate, setCandidate] = useState<ProgramSceneResource>(() => defaultResource(new Set(usedNames)));
+  useEffect(() => {
+    // A fresh suggestion each time the dialog opens.
+    if (open) setCandidate(defaultResource(new Set(usedNames)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on opening
+  }, [open]);
+  const name = candidate.scene_resource_id.trim();
+  const error = sceneObjectNameError(name, usedNames)
+    ?? programSceneResourceError({ ...candidate, scene_resource_id: name });
+  return (
+    <OverlayPanel
+      open={open}
+      title="Add object"
+      titleId="program-scene-add-object-title"
+      kind="dialog"
+      compact
+      onClose={onClose}
+    >
+      <div className="dialog-copy" data-testid="add-scene-object-dialog">
+        <label>
+          <span>Name</span>
+          <input
+            aria-label="New object name"
+            value={candidate.scene_resource_id}
+            onChange={(event) => setCandidate({ ...candidate, scene_resource_id: event.target.value })}
+          />
+        </label>
+        <SceneShapeFields
+          shape={candidate.shape}
+          disabled={false}
+          onChange={(shape) => setCandidate({ ...candidate, shape })}
+        />
+        <p className="muted">It is placed at the cell origin, 5 cm up; move it in the viewer or in its fields.</p>
+        {error !== null && <p className="inline-message severity-error" role="alert">{error}</p>}
+        <div className="dialog-actions">
+          <button type="button" onClick={onClose}>Cancel</button>
+          <button
+            type="button"
+            className="transport-run"
+            disabled={error !== null}
+            onClick={() => onAdd({ ...candidate, scene_resource_id: name })}
+          >Add</button>
+        </div>
+      </div>
+    </OverlayPanel>
+  );
+}
+
+/** "Rename": the object and every reference to it in the Drafts, as one Draft edit. */
+function RenameSceneObjectDialog({ current, usedNames, onClose, onRename }: {
+  current: string | null;
+  usedNames: ReadonlySet<string>;
+  onClose: () => void;
+  onRename: (name: string) => void;
+}) {
+  const [name, setName] = useState(current ?? '');
+  useEffect(() => {
+    if (current !== null) setName(current);
+  }, [current]);
+  const trimmed = name.trim();
+  const others = useMemo(
+    () => new Set([...usedNames].filter((id) => id !== current)),
+    [current, usedNames],
+  );
+  const error = sceneObjectNameError(trimmed, others);
+  return (
+    <OverlayPanel
+      open={current !== null}
+      title={`Rename ${current ?? ''}`}
+      titleId="program-scene-rename-object-title"
+      kind="dialog"
+      compact
+      onClose={onClose}
+    >
+      <div className="dialog-copy" data-testid="rename-scene-object-dialog">
+        <label>
+          <span>New name</span>
+          <input
+            aria-label="Object new name"
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+          />
+        </label>
+        <p className="muted">
+          Every node, key and pose source that names this object is renamed with it, in one Draft edit.
+        </p>
+        {error !== null && <p className="inline-message severity-error" role="alert">{error}</p>}
+        <div className="dialog-actions">
+          <button type="button" onClick={onClose}>Cancel</button>
+          <button
+            type="button"
+            className="transport-run"
+            disabled={error !== null || trimmed === current}
+            onClick={() => onRename(trimmed)}
+          >Rename</button>
+        </div>
+      </div>
+    </OverlayPanel>
+  );
+}
+
 export function ProgramSceneEditor({
   program,
   draftRevision,
@@ -953,6 +1089,8 @@ export function ProgramSceneEditor({
         === selectedRuntimeAttachment.carried_object_attachment_revision
     ))?.poseMeasurement ?? null;
   const [staged, setStaged] = useState<ProgramSceneResource | null>(selected);
+  const [addOpen, setAddOpen] = useState(false);
+  const [renaming, setRenaming] = useState<string | null>(null);
 
   useEffect(() => {
     setStaged(selected);
@@ -983,24 +1121,10 @@ export function ProgramSceneEditor({
     position[index] = value;
     setStaged({ ...staged, pose: { ...staged.pose, position_m: position } });
   };
-  const setQuaternion = (index: number, value: number) => {
-    if (staged === null || !Number.isFinite(value)) return;
-    const source = 'xyzw' in staged.pose.orientation
-      ? staged.pose.orientation.xyzw
-      : [0, 0, 0, 1] as [number, number, number, number];
-    const xyzw = [...source] as [number, number, number, number];
-    xyzw[index] = value;
-    setStaged({
-      ...staged,
-      pose: { ...staged.pose, orientation: { xyzw } },
-    });
-  };
   const setRpyDegrees = (index: number, value: number) => {
     if (staged === null || !Number.isFinite(value)) return;
-    const source = 'rpy_deg' in staged.pose.orientation
-      ? staged.pose.orientation.rpy_deg
-      : [0, 0, 0] as [number, number, number];
-    const rpy = [...source] as [number, number, number];
+    // Editing writes roll, pitch and yaw; a stored quaternion becomes its RPY.
+    const rpy = [...orientationRpyDegrees(staged.pose.orientation)] as [number, number, number];
     rpy[index] = value;
     setStaged({
       ...staged,
@@ -1015,6 +1139,10 @@ export function ProgramSceneEditor({
     setStaged(empty ? withoutZeroMass(next) : next);
   };
   const massKg = staged?.metadata?.mass_kg;
+  const usedNames = useMemo(
+    () => new Set(resources.map((resource) => resource.scene_resource_id)),
+    [resources],
+  );
   const addResource = (resource: ProgramSceneResource) => {
     onSelectResource(resource.scene_resource_id);
     if (committed !== null && dirty) {
@@ -1073,12 +1201,10 @@ export function ProgramSceneEditor({
           type="button"
           disabled={busy}
           onPointerDown={(event) => event.preventDefault()}
-          onClick={() => addResource(defaultResource(
-            new Set(resources.map((resource) => resource.scene_resource_id)),
-          ))}
-          title={blockedTitle ?? 'Add a new 10 cm box to the Program Draft.'}
+          onClick={() => setAddOpen(true)}
+          title={blockedTitle ?? 'Add an object (box, sphere, cylinder or mesh) to the Program Draft.'}
         >
-          Add box
+          Add object
         </button>
       </header>
       <p>
@@ -1103,7 +1229,38 @@ export function ProgramSceneEditor({
         ))}
       </select>
       </label>
+      <button
+        type="button"
+        disabled={busy || selected === null}
+        title={blockedTitle ?? 'Rename this object and every reference to it.'}
+        onClick={() => setRenaming(selected?.scene_resource_id ?? null)}
+      >Rename</button>
       </section>
+      <AddSceneObjectDialog
+        open={addOpen}
+        usedNames={usedNames}
+        onClose={() => setAddOpen(false)}
+        onAdd={(resource) => {
+          setAddOpen(false);
+          addResource(resource);
+        }}
+      />
+      <RenameSceneObjectDialog
+        current={renaming}
+        usedNames={usedNames}
+        onClose={() => setRenaming(null)}
+        onRename={(name) => {
+          const previous = renaming;
+          setRenaming(null);
+          if (previous === null) return;
+          void mutate('scene_draft_rename_object', {
+            scene_resource_id: previous,
+            new_scene_resource_id: name,
+          }).then((response) => {
+            if (response !== null) onSelectResource(name);
+          });
+        }}
+      />
       {showRuntimeDetachAction && selectedRuntimeAttachment !== null && (
         <CarriedObjectPoseCard
           key={selectedRuntimeAttachment.scene_resource_id}
@@ -1176,25 +1333,6 @@ export function ProgramSceneEditor({
               </label>
             ))}
           </div>
-          {'xyzw' in staged.pose.orientation ? (
-            <div className="scene-pose-grid scene-quaternion-grid dgrid">
-              {(['Qx', 'Qy', 'Qz', 'Qw'] as const).map((axis, index) => (
-                <label key={axis}>
-                  <span>{axis}</span>
-                  <input
-                    type="number"
-                    step={0.001}
-                    value={'xyzw' in staged.pose.orientation
-                      ? staged.pose.orientation.xyzw[index]
-                      : 0}
-                    disabled={busy}
-                    title={blockedTitle}
-                    onChange={(event) => setQuaternion(index, event.currentTarget.valueAsNumber)}
-                  />
-                </label>
-              ))}
-            </div>
-          ) : (
             <div className="scene-pose-grid dgrid">
               {(['Roll', 'Pitch', 'Yaw'] as const).map((axis, index) => (
                 <label key={axis}>
@@ -1202,9 +1340,8 @@ export function ProgramSceneEditor({
                   <input
                     type="number"
                     step={0.1}
-                    value={'rpy_deg' in staged.pose.orientation
-                      ? staged.pose.orientation.rpy_deg[index]
-                      : 0}
+                    aria-label={`Draft ${axis.toLowerCase()} (deg)`}
+                    value={orientationRpyDegrees(staged.pose.orientation)[index]}
                     disabled={busy}
                     title={blockedTitle}
                     onChange={(event) => setRpyDegrees(index, event.currentTarget.valueAsNumber)}
@@ -1212,7 +1349,6 @@ export function ProgramSceneEditor({
                 </label>
               ))}
             </div>
-          )}
           <label>
             <span>Mass (kg)</span>
             <input
@@ -1656,7 +1792,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     sceneResourceId: string,
     pose: LogicalScenePose,
     scale: [number, number, number],
-    expectedDraftIdentity: { ownerEpoch: string; generation: number },
+    expectedDraftIdentity: { draftId: string; generation: number },
   ) => Promise<boolean>;
   onEditSelection: (kind: 'owner_object' | 'program_resource', id: string) => void;
   hiddenSelectionKeys: ReadonlySet<string>;
@@ -1746,19 +1882,21 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     retainedPresentation,
     productIdentity,
   ), [facts, productIdentity, resetPresentationHeld, retainedPresentation]);
+  // The facts come from this admitted snapshot's runtime, so its start
+  // identity is captured with them.
+  const factsApplicationStartId = headlessState.snapshot?.applicationStartId ?? null;
   useLayoutEffect(() => {
     if (!resetPresentationHeld && facts !== null && productIdentity !== null) {
       setRetainedPresentation((current) => (
         current?.productIdentity === productIdentity
+        && current.applicationStartId === factsApplicationStartId
         && current.facts.sourceGeneration === facts.sourceGeneration
-        && current.facts.sourceOwnerEpoch === facts.sourceOwnerEpoch
         && current.facts.runtimeSourceGeneration === facts.runtimeSourceGeneration
-        && current.facts.runtimeSourceOwnerEpoch === facts.runtimeSourceOwnerEpoch
           ? current
-          : { productIdentity, facts }
+          : { productIdentity, applicationStartId: factsApplicationStartId, facts }
       ));
     }
-  }, [facts, productIdentity, resetPresentationHeld]);
+  }, [facts, factsApplicationStartId, productIdentity, resetPresentationHeld]);
   const readyManifest = presentedManifest;
   const objects = presentationFacts?.logicalScene.snapshot?.objects
     ?? EMPTY_LOGICAL_SCENE_OBJECTS;
@@ -1931,10 +2069,10 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           ghost, robotControl.selectedStatus, sourceValue, readyManifest, measured.linkTransforms,
         );
     const capabilityPreview = robotControl.state.preview?.schemaVersion
-      === 'manyforge.direct_control_capability_command_preview.v2'
+      === 'manyforge.direct_control_capability_command_preview.v3'
       ? robotControl.state.preview
       : null;
-    const currentMotionPreview = robotControl.state.preview?.schemaVersion === 'manyforge.direct_control_motion_preview.v4'
+    const currentMotionPreview = robotControl.state.preview?.schemaVersion === 'manyforge.direct_control_motion_preview.v5'
       ? robotControl.state.preview : null;
     const path = robotControl.state.diagnosticPreview ?? currentMotionPreview?.pathPreview;
     const sample = path?.samples[robotControl.state.previewSampleIndex];
@@ -2187,30 +2325,31 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
         }]))
       : {}
   ), [objectsEditable, program?.scene, visibleObjects]);
-  const sceneOwnerEpoch = facts?.sourceOwnerEpoch;
+  // The start of the admitted snapshot the facts and the runtime came from.
+  const snapshotApplicationStartId = headlessState.snapshot?.applicationStartId;
+  const sceneOwnerStartId = facts === null ? undefined : snapshotApplicationStartId;
   const sceneOwnerGeneration = facts?.sourceGeneration;
   const sceneOwnerIdentity = useMemo(() => (
-    sceneOwnerEpoch === undefined || sceneOwnerGeneration === undefined
+    sceneOwnerStartId === undefined || sceneOwnerGeneration === undefined
       ? undefined
       : {
-          ownerEpoch: sceneOwnerEpoch,
+          applicationStartId: sceneOwnerStartId,
           generation: sceneOwnerGeneration,
         }
-  ), [sceneOwnerEpoch, sceneOwnerGeneration]);
+  ), [sceneOwnerStartId, sceneOwnerGeneration]);
   const viewerRuntime = headlessState.snapshot?.runtime;
-  const viewerFrameOwnerEpoch = viewerRuntime?.projectionOwnerEpoch;
   const viewerFrameGeneration = viewerRuntime?.projectionGeneration;
   const viewerFrameIdentity = useMemo(() => (
     viewerRuntime?.complete === true
-      && viewerFrameOwnerEpoch !== undefined
+      && snapshotApplicationStartId !== undefined
       && viewerFrameGeneration !== undefined ? {
-      ownerEpoch: viewerFrameOwnerEpoch,
+      applicationStartId: snapshotApplicationStartId,
       generation: viewerFrameGeneration,
     }
       : undefined
   ), [
     viewerFrameGeneration,
-    viewerFrameOwnerEpoch,
+    snapshotApplicationStartId,
     viewerRuntime?.complete,
   ]);
   const objectAxesVisibleIds = useMemo(() => visibleObjects.flatMap((object) => {
@@ -2342,7 +2481,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       candidateTcpEditable={candidatePoseEditable}
       onEditCandidateTcpPose={finishCandidateDragStable}
       onBeginCandidateTcpDrag={beginCandidateDragStable}
-      candidateContextKey={JSON.stringify([robotControl.selectedStatus?.ownerEpoch,
+      candidateContextKey={JSON.stringify([robotControl.selectedStatus?.applicationStartId,
         robotControl.selectedStatus?.retainedBundleId, robotControl.selectedStatus?.graphRevision,
         robotControl.selectedStatus?.directControl?.programBindingId,
         robotControl.state.mode, robotControl.state.moveToDraft?.source,
@@ -2391,7 +2530,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
       ioControlSurface={(
         <ToolIoPanel
           enabled={runtimeEnabled}
-          ownerEpoch={robotControl.selectedStatus?.ownerEpoch ?? null}
+          applicationStartId={robotControl.selectedStatus?.applicationStartId ?? null}
           retainedBundleId={robotControl.selectedStatus?.retainedBundleId ?? null}
           ioSignalBindings={robotControl.selectedStatus?.ioSignalBindings}
           systemSignals={robotControl.selectedStatus?.systemSignals}
@@ -2628,12 +2767,16 @@ export function SceneAuthoringWorkspace({
     if (facts === null) throw new Error('The current logical Scene owner is unavailable.');
     const expectedProjection = facts.logicalScene.access.active_projection;
     if (expectedProjection === null) throw new Error('The logical Scene has no active projection.');
-    const requestId = browserRequestIdentity('composer-scene-detach');
-    const response = await api.scene.commit(sceneDetachRequest(attachment, facts, requestId));
-    if (!sceneDetachReceiptAccepted(response, requestId, facts.sourceOwnerEpoch, expectedProjection)) {
+    const applicationStartId = headlessState.snapshot?.applicationStartId ?? null;
+    if (applicationStartId === null) throw new Error('Execution owner identity is unavailable.');
+    const requestKey = newRequestKey();
+    const response = await api.scene.commit(
+      sceneDetachRequest(attachment, facts, applicationStartId, requestKey),
+    );
+    if (!sceneDetachReceiptAccepted(response, requestKey, expectedProjection)) {
       throw new Error('The detach receipt does not confirm a successor Scene revision.');
     }
-  }, [detachUnavailableReasonFor, facts]);
+  }, [detachUnavailableReasonFor, facts, headlessState.snapshot]);
   const directControl = robotControl.selectedStatus?.directControl ?? null;
   const controlManifest = manifest.status === 'ready' ? manifest.data : null;
   const observedRobotForControl = useMemo(() => executionRobotPresentation(
@@ -2774,12 +2917,12 @@ export function SceneAuthoringWorkspace({
     sceneResourceId: string,
     pose: LogicalScenePose,
     scale: [number, number, number],
-    expectedDraftIdentity: { ownerEpoch: string; generation: number },
+    expectedDraftIdentity: { draftId: string; generation: number },
   ) => {
     if (
       busyDraft
       || draftId === null
-      || expectedDraftIdentity.ownerEpoch !== draftId
+      || expectedDraftIdentity.draftId !== draftId
       || expectedDraftIdentity.generation !== draftRevision
     ) return false;
     const resource = program?.scene?.find(
@@ -2881,8 +3024,8 @@ export function SceneAuthoringWorkspace({
           <details className="dcard">
             <summary>Owner and runtime source facts</summary>
             <dl>
-              <div><dt>Scene source</dt><dd><code>{facts.sourceOwnerEpoch}</code> / {facts.sourceGeneration}</dd></div>
-              <div><dt>Runtime source</dt><dd><code>{facts.runtimeSourceOwnerEpoch}</code> / {facts.runtimeSourceGeneration}</dd></div>
+              <div><dt>Scene source</dt><dd>{facts.sourceGeneration}</dd></div>
+              <div><dt>Runtime source</dt><dd>{facts.runtimeSourceGeneration}</dd></div>
               <div><dt>Scene revision</dt><dd><code>{facts.logicalScene.snapshot?.revision.revision_id}</code></dd></div>
               <div><dt>Observations</dt><dd>{runtimeStatus.freshGood} fresh / {runtimeStatus.total} total</dd></div>
             </dl>

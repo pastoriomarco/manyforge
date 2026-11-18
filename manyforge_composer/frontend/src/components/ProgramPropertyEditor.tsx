@@ -984,7 +984,8 @@ export function ProgramPropertyEditor({
             node: selected,
             parameterId: parameter.id,
             program,
-            directReferenceChoices,
+            // Unknown until the Draft is validated: the editors then show the value unchecked, not invalid.
+            ...(selectorFacts === null ? {} : { directReferenceChoices }),
             frameScope: {
               program,
               frames: frameFacts.filter((row) => !row.ambiguous && (!frameNeedsTarget || row.moving_targets.some(isMovingTarget))).map((row) => row.reference),

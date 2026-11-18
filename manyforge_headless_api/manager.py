@@ -17,6 +17,7 @@ from .models import (
     ManagerDeploymentCandidatePreviewRequest,
     ProjectionRevisionRequest,
     SceneResourcePoseQuery,
+    SceneRuntimeLatchRequest,
     SceneTransactionRequest,
 )
 from .native import (
@@ -33,8 +34,8 @@ from .private_transport import (
 
 
 MANAGER_SOCKET_FILE = "manager-command.sock"
-MANAGER_COMMAND_VERSION = "manyforge.manager_command.v1"
-MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v2"
+MANAGER_COMMAND_VERSION = "manyforge.manager_command.v2"
+MANAGER_RESPONSE_VERSION = "manyforge.manager_command_response.v3"
 MAX_MANAGER_PACKET_BYTES = 128 * 1024 + 4 * 1024
 MAX_MANAGER_RESPONSE_BYTES = 64 * 1024
 _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
@@ -44,7 +45,6 @@ _SCENE_REPLAY_STATUSES = {
     "request_result_expired",
     "request_id_conflict",
     "request_ledger_full",
-    "stale_request_owner_epoch",
 }
 _SCENE_PROJECTION_STATUSES = {
     "not_attempted",
@@ -58,6 +58,10 @@ _SCENE_UPDATE_STATUSES = {"geometry_changed", "freshness_only", "no_op"}
 class ManagerPort(Protocol):
     def scene_runtime_owner(self) -> dict[str, Any]: ...
 
+    def latch_scene_runtime_between_nodes(
+        self, request: SceneRuntimeLatchRequest
+    ) -> dict[str, Any]: ...
+
     def preview_deployment_candidate(
         self, request: ManagerDeploymentCandidatePreviewRequest
     ) -> dict[str, Any]: ...
@@ -65,12 +69,12 @@ class ManagerPort(Protocol):
     def apply(self, request: ManagerApplyRequest) -> dict[str, Any]: ...
 
     def observe_apply(
-        self, apply_id: str, apply_generation: int
+        self, apply_id: int, apply_generation: int
     ) -> dict[str, Any]: ...
 
     def acknowledge_apply(
         self,
-        apply_id: str,
+        apply_id: int,
         apply_generation: int,
         request_context: ManagerApplyAcknowledgementContext,
     ) -> dict[str, Any]: ...
@@ -192,8 +196,15 @@ class ManagerCommandClient:
                 MANAGER_SOCKET_FILE
             ) as socket_address:
                 with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
+                    # OD-298 (a): only the connection is limited, as for the
+                    # execution host (cell_admission.py). A connected command
+                    # waits for its answer, ended by the reply or by the
+                    # Manager closing the connection (its exit or stop); a
+                    # command held by a slow execution host shows as the
+                    # Manager's outstanding exchange, not as a time-out.
                     client.settimeout(self._timeout_seconds)
                     client.connect(socket_address)
+                    client.settimeout(None)
                     sent = client.send(encoded)
                     if sent != len(encoded):
                         raise HeadlessApiError(
@@ -215,10 +226,17 @@ class ManagerCommandClient:
                 "manager_command_unavailable",
                 f"Manager command transport failed: {exc}",
             ) from exc
-        if flags & socket.MSG_TRUNC or not payload:
+        if not payload:
+            # The Manager closed the connection before answering (it exited
+            # or is stopping); the command's outcome is unknown.
+            raise HeadlessApiError(
+                "manager_command_unavailable",
+                "Manager closed the connection before answering",
+            )
+        if flags & socket.MSG_TRUNC:
             raise HeadlessApiError(
                 "manager_command_response_invalid",
-                "Manager command response is empty or oversized",
+                "Manager command response is oversized",
             )
         try:
             text = payload.decode("utf-8", errors="strict")
@@ -256,12 +274,50 @@ class ManagerCommandClient:
             raise HeadlessApiError("manager_command_response_invalid", "Scene runtime owner refusal is invalid")
         if (response.get("ok") is not True or set(response) != {
                 "api_version", "ok", "cell_id", "initialization_generation",
-                "initialization_state", "runtime_identity", "scene_runtime_owner_epoch"}
+                "initialization_state", "runtime_identity"}
                 or not isinstance(response.get("cell_id"), str)
-                or not isinstance(response.get("scene_runtime_owner_epoch"), str)
-                or not response["scene_runtime_owner_epoch"]
                 or not isinstance(response.get("runtime_identity"), dict)):
             raise HeadlessApiError("manager_command_response_invalid", "Scene runtime owner response is invalid")
+        return response
+
+    def latch_scene_runtime_between_nodes(
+        self, request: SceneRuntimeLatchRequest
+    ) -> dict[str, Any]:
+        """Forward one between-nodes latch; the Runner checks the full answer.
+
+        Only the fields Headless itself reads (the committed count and the
+        projection revision it waits for) are checked here.
+        """
+
+        command: dict[str, Any] = {
+            "api_version": MANAGER_COMMAND_VERSION,
+            "command": "scene_runtime_latch_between_nodes",
+            "expected_runtime_identity": request.expected_runtime_identity.model_dump(),
+        }
+        if request.scene_resource_ids is not None:
+            command["scene_resource_ids"] = list(request.scene_resource_ids)
+        response = self._exchange(command)
+        if response.get("ok") is False:
+            typed = _manager_error(response.get("error"))
+            if typed is not None:
+                raise typed
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "between-nodes latch refusal is invalid",
+            )
+        count = response.get("committed_observation_count")
+        try:
+            ProjectionRevisionRequest.model_validate(response.get("projection_revision"))
+        except ValueError as exc:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "between-nodes latch projection revision is invalid",
+            ) from exc
+        if type(count) is not int or not 0 <= count <= _MAXIMUM_SAFE_INTEGER:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "between-nodes latch committed observation count is invalid",
+            )
         return response
 
     def preview_deployment_candidate(
@@ -280,7 +336,6 @@ class ManagerCommandClient:
                     request.expected_admission_generation
                 ),
                 "expected_current": request.expected_current.model_dump(),
-                "request_owner_epoch": request.request_owner_epoch,
             }
         )
         return response
@@ -292,15 +347,13 @@ class ManagerCommandClient:
                 "command": "apply",
                 "accepted_impact_digest": request.accepted_impact_digest,
                 "candidate_receipt": request.candidate_receipt.model_dump(),
-                "correlation_id": request.correlation_id,
                 "deployment_artifact_id": request.deployment_artifact_id,
                 "deployment_revision": request.deployment_revision,
                 "expected_current": request.expected_current.model_dump(),
                 "reject_if_affected_busy": request.reject_if_affected_busy,
                 "prepared_activation": request.prepared_activation.model_dump(),
                 "scene_initialization": request.scene_initialization,
-                "request_id": request.request_id,
-                "request_owner_epoch": request.request_owner_epoch,
+                "request_key": request.request_key,
                 "source_label": request.source_label,
                 "admission_context": (
                     {
@@ -331,14 +384,14 @@ class ManagerCommandClient:
         self,
         command_name: str,
         label: str,
-        apply_id: str,
+        apply_id: int,
         apply_generation: int,
         request_context: ManagerApplyAcknowledgementContext | None = None,
     ) -> dict[str, Any]:
+        # ``apply_id`` is the Manager's Apply number (contract 1.16.1).
         if (
-            not isinstance(apply_id, str)
-            or not apply_id
-            or len(apply_id.encode("utf-8")) > 256
+            type(apply_id) is not int
+            or not 1 <= apply_id <= _MAXIMUM_SAFE_INTEGER
             or type(apply_generation) is not int
             or not 1 <= apply_generation <= _MAXIMUM_SAFE_INTEGER
         ):
@@ -387,7 +440,7 @@ class ManagerCommandClient:
         return response
 
     def observe_apply(
-        self, apply_id: str, apply_generation: int
+        self, apply_id: int, apply_generation: int
     ) -> dict[str, Any]:
         return self._apply_status_command(
             "apply_status", "Manager Apply status", apply_id, apply_generation
@@ -395,7 +448,7 @@ class ManagerCommandClient:
 
     def acknowledge_apply(
         self,
-        apply_id: str,
+        apply_id: int,
         apply_generation: int,
         request_context: ManagerApplyAcknowledgementContext,
     ) -> dict[str, Any]:
@@ -442,7 +495,7 @@ class ManagerCommandClient:
             and (
                 not isinstance(released, dict)
                 or set(released) != {"apply_id", "apply_generation"}
-                or not isinstance(released["apply_id"], str)
+                or type(released["apply_id"]) is not int
                 or type(released["apply_generation"]) is not int
             )
         ):
@@ -461,8 +514,7 @@ class ManagerCommandClient:
             "ok",
             "projection_status",
             "replay_status",
-            "request_id",
-            "request_owner_epoch",
+            "request_key",
             "transaction_sequence",
             "update_status",
         }

@@ -43,7 +43,7 @@ interface ViewerObservationMetricWindow {
 }
 
 export interface ViewerObservationIdentity {
-  ownerEpoch: string;
+  applicationStartId: string;
   sourceEpoch: string;
   sourceSequence: number;
   receivedAtComposerMonotonicUs: number;

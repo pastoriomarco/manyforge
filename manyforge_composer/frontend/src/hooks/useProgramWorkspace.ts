@@ -14,6 +14,12 @@ import { cellApplyErrorText } from './useDeploymentWorkspace';
 import type { ManagerApplyIdentity } from '../state/managerApply';
 import type { AuthoringCommand } from '../state/busyOperation';
 import {
+  applyRowRefusal, awaitCommandEnd, CommandEndedError, withApplyStep,
+} from '../state/commandRows';
+import { applyResultOfRow } from '../api/parsers/commandRows';
+import { codedErrorText } from '../state/componentPresentation';
+import { useCommandRowWaiter } from './useCommandRowWaiter';
+import {
   programLocalFenceFromAdmission,
   publicationSupersedesProgram,
   programActionUnavailableReason,
@@ -27,6 +33,7 @@ import {
   type ProgramWorkspaceActionName,
 } from '../state/programWorkspace';
 import type {
+  ApplyCommandRow,
   DraftMutationResponse,
   SaveScenarioDocumentInput,
   JsonValue,
@@ -35,20 +42,13 @@ import type {
   ProgramOperatorStopPolicy,
   ProgramTreeNode,
   ProgramWorkspaceResponse,
-  ProgramWorkspaceTransitionResponse,
   ProgramWorkspaceTransitionStatus,
   ScenarioDocumentFenceRequest,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
-import { browserStableIdentity } from './useHeadlessState';
+import { displayApplyId, newRequestKey, type ApplicationStartId } from '../api/applicationIdentity';
 import { programRuntimeWakeKey } from './useProgramRuntime';
-
-function identity(prefix: string): string {
-  const random = globalThis.crypto?.randomUUID?.()
-    ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  return `${prefix}.${random}`;
-}
 
 /** The exact Program Draft content a caller acts on (a confirmed Apply). */
 export interface ExpectedProgramDraft {
@@ -102,7 +102,7 @@ function acceptedApplyIdentity(
   applyId: unknown,
   applyGeneration: unknown,
 ): ManagerApplyIdentity | null {
-  return typeof applyId === 'string' && applyId.length > 0
+  return typeof applyId === 'number' && Number.isSafeInteger(applyId) && applyId > 0
     && typeof applyGeneration === 'number' && Number.isSafeInteger(applyGeneration)
     ? { applyId, applyGeneration }
     : null;
@@ -115,44 +115,37 @@ function workspaceResult(
   return { workspace, message, transitionStatus: null };
 }
 
-export function programWorkspaceTransitionResult(
-  action: 'apply' | 'load' | 'revert',
-  response: ProgramWorkspaceTransitionResponse,
+/**
+ * What a Program Apply or Revert that ended succeeded did: the Manager Apply
+ * its `applying` step started (followed under Activity and by
+ * Reset-and-Apply), or none when Applied already matched.
+ */
+export function programApplyCommandResult(
+  action: 'apply' | 'revert',
+  row: ApplyCommandRow,
+  workspace: ProgramWorkspaceResponse,
+  applicationStartId: ApplicationStartId | null = null,
 ): ProgramWorkspaceRunResult {
-  if (response.status === 'accepted'
-      && (action === 'apply' || action === 'revert')) {
-    const applyId = response.headless?.apply_id;
+  const source = row.stepSource;
+  if (source !== null && source.status === 'manager_apply') {
     return {
-      workspace: response.workspace,
-      message: `${action === 'apply' ? 'Apply' : 'Revert'} accepted (${String(applyId)}); configuration progress is shown under Activity.`,
-      transitionStatus: response.status,
-      acceptedApply: acceptedApplyIdentity(applyId, response.headless?.apply_generation),
+      workspace,
+      message: `${action === 'apply' ? 'Apply' : 'Revert'} accepted (${displayApplyId(applicationStartId, source.applyId)}); configuration progress is shown under Activity.`,
+      transitionStatus: 'accepted',
+      acceptedApply: acceptedApplyIdentity(source.applyId, source.applyGeneration),
     };
   }
-  if (action === 'revert' && response.status === 'reverted') {
-    return {
-      workspace: response.workspace,
-      message: response.headless === null
-        ? 'Saved already matched Applied; Draft now matches Saved. No owner Apply was issued.'
-        : 'Revert completed through authoritative Apply; Draft now matches Saved.',
-      transitionStatus: response.status,
-    };
-  }
-  if (action === 'load' && response.status === 'loaded') {
-    return {
-      workspace: response.workspace,
-      message: 'Scenario configured; activate components separately before execution.',
-      transitionStatus: response.status,
-    };
-  }
-  if (action === 'apply' && response.status === 'applied') {
-    return {
-      workspace: response.workspace,
+  return action === 'revert'
+    ? {
+      workspace,
+      message: 'Saved already matched Applied; Draft now matches Saved. No owner Apply was issued.',
+      transitionStatus: 'reverted',
+    }
+    : {
+      workspace,
       message: 'Apply completed; the owner-issued Applied state was replaced.',
-      transitionStatus: response.status,
+      transitionStatus: 'applied',
     };
-  }
-  throw new Error(`Unexpected ${response.status} status for ${action}.`);
 }
 
 /** The operation each Program workspace action names while it runs. */
@@ -183,6 +176,24 @@ export function useProgramWorkspace(
     INITIAL_PROGRAM_WORKSPACE_STATE,
   );
   const [acceptedApply, setAcceptedApply] = useState<ManagerApplyIdentity | null>(null);
+  const applyRows = useCommandRowWaiter(snapshot?.applyCommands ?? null, snapshot?.applicationStartId ?? null);
+  /**
+   * Program Apply or Revert: answered at acceptance, its outcome is the row's
+   * end (OD-214); the workspace is read once it ended.
+   */
+  const programApplyCommand = useCallback(async (
+    action: 'apply' | 'revert',
+    send: () => Promise<ApplyCommandRow>,
+    applicationStartId: ApplicationStartId,
+  ): Promise<ProgramWorkspaceRunResult> => {
+    const ended = await awaitCommandEnd(await send(), applyRows);
+    // A new application start keeps no row of it: the current state is read.
+    if (ended === null) {
+      return { workspace: await api.programWorkspace.get(), message: null, transitionStatus: null };
+    }
+    if (ended.end?.outcome !== 'succeeded') throw new CommandEndedError(ended);
+    return programApplyCommandResult(action, ended, await api.programWorkspace.get(), applicationStartId);
+  }, [applyRows]);
   const [programDraftInputResetEpoch, setProgramDraftInputResetEpoch] = useState(0);
   const [scenarioDraftInputResetEpoch, setScenarioDraftInputResetEpoch] = useState(0);
   const scenarioOpened = useRef(onScenarioOpened);
@@ -193,10 +204,6 @@ export function useProgramWorkspace(
   const workspaceReadGeneration = useRef<number | null>(null);
   const projectionIdentityRead = useRef<string | null>(null);
   const appliedIdentityRead = useRef<string | null>(null);
-  const requestOwnerEpoch = useRef(browserStableIdentity(
-    'manyforge.composer.request_owner_epoch',
-    'composer-authoring-owner',
-  ));
   // Authoring identity, both Draft projections' fences and the admission gate
   // come from the one shared publication. This hook contributes the
   // Applied/applicability projection it reads from the Program workspace route,
@@ -311,8 +318,12 @@ export function useProgramWorkspace(
       if (action !== 'refresh') finishMutation(null, error);
       // A stale fence is also refused before any effect, but it needs the
       // refresh below, so it is never handled as a plain refusal.
+      // A Program Apply/Revert row that ended refused had no effect: its
+      // reason shows where the HTTP refusal of that check showed.
       const refusal = action === 'refresh' || isStaleWorkspaceError(error)
-        ? null : authoringRefusalMessage(error);
+        ? null : authoringRefusalMessage(error)
+          ?? (error instanceof CommandEndedError && error.row.end?.outcome === 'refused'
+            ? error.message : null);
       if (refusal !== null) {
         if (mounted.current) dispatch({ type: 'request_refused', generation: current, message: refusal });
         onAuthoringRefusal?.(refusal);
@@ -441,6 +452,7 @@ export function useProgramWorkspace(
    * otherwise nothing may be sent (`ProgramDraftChangedError`).
    */
   const admissionGeneration = snapshot?.authoringAdmission.admissionGeneration ?? null;
+  const applicationStartId = snapshot?.applicationStartId ?? null;
   const localFence = useCallback((
     kind: 'edit' | 'document',
     expected?: ExpectedProgramDraft,
@@ -449,16 +461,17 @@ export function useProgramWorkspace(
       (kind === 'edit' ? mutationUnavailableReason : documentUnavailableReason) !== null
       || published === null
       || admissionGeneration === null
+      || applicationStartId === null
     ) return null;
     const mismatch = expected === undefined ? null : programDraftMismatch(published, expected);
     if (mismatch !== null) throw new ProgramDraftChangedError(mismatch);
     return programLocalFenceFromAdmission(
       published,
       admissionGeneration,
-      requestOwnerEpoch.current,
-      identity('composer-authoring'),
+      applicationStartId,
+      newRequestKey(),
     );
-  }, [documentUnavailableReason, mutationUnavailableReason, published, admissionGeneration]);
+  }, [documentUnavailableReason, mutationUnavailableReason, published, admissionGeneration, applicationStartId]);
 
   /**
    * The one Scenario document fence.
@@ -472,12 +485,7 @@ export function useProgramWorkspace(
       || published === null
       || snapshot === null
     ) return null;
-    return scenarioLocalFence(
-      published,
-      snapshot,
-      requestOwnerEpoch.current,
-      identity('composer-document'),
-    );
+    return scenarioLocalFence(published, snapshot, newRequestKey());
   }, [documentUnavailableReason, published, snapshot]);
 
   const mutate = useCallback(async (
@@ -552,7 +560,7 @@ export function useProgramWorkspace(
    * sent.
    */
   const apply = useCallback((
-    options: { correlationId?: string; expectedDraft?: ExpectedProgramDraft } = {},
+    options: { expectedDraft?: ExpectedProgramDraft } = {},
   ): Promise<ProgramWorkspaceRunResult | null> => {
     let requestFence: LocalWorkspaceFenceRequest | null;
     try {
@@ -563,10 +571,10 @@ export function useProgramWorkspace(
     if (!requestFence) return Promise.resolve(null);
     return run(
       'apply',
-      () => api.programWorkspace.apply(requestFence, undefined, options.correlationId)
-        .then((response) => programWorkspaceTransitionResult('apply', response)),
+      () => programApplyCommand('apply', () => api.programWorkspace.apply(requestFence),
+        requestFence.applicationStartId),
     );
-  }, [localFence, run]);
+  }, [localFence, programApplyCommand, run]);
 
   const discard = useCallback(() => {
     const requestFence = localFence('edit');
@@ -584,12 +592,7 @@ export function useProgramWorkspace(
   /** Discard unapplied Draft changes of the whole Scenario (Program and Deployment). */
   const discardScenario = useCallback(() => {
     if (mutationUnavailableReason !== null || published === null || snapshot === null) return;
-    const requestFence = scenarioLocalFence(
-      published,
-      snapshot,
-      requestOwnerEpoch.current,
-      identity('composer-authoring'),
-    );
+    const requestFence = scenarioLocalFence(published, snapshot, newRequestKey());
     void run(
       'discard_scenario',
       () => api.scenarioDocuments.discard(requestFence).then((next) =>
@@ -600,15 +603,27 @@ export function useProgramWorkspace(
     );
   }, [mutationUnavailableReason, published, run, snapshot]);
 
-  const revert = useCallback(() => {
-    const requestFence = localFence('document');
-    if (!requestFence) return;
-    void run(
+  /**
+   * Revert Draft and Applied to Saved, like `apply`: also the step a
+   * Reset-and-Revert chain sends once the run has ended, then with
+   * `expectedDraft` (the Draft the operator confirmed it on).
+   */
+  const revert = useCallback((
+    options: { expectedDraft?: ExpectedProgramDraft } = {},
+  ): Promise<ProgramWorkspaceRunResult | null> => {
+    let requestFence: LocalWorkspaceFenceRequest | null;
+    try {
+      requestFence = localFence('document', options.expectedDraft);
+    } catch (error: unknown) {
+      return Promise.reject(error);
+    }
+    if (!requestFence) return Promise.resolve(null);
+    return run(
       'revert',
-      () => api.programWorkspace.revert(requestFence)
-        .then((response) => programWorkspaceTransitionResult('revert', response)),
+      () => programApplyCommand('revert', () => api.programWorkspace.revert(requestFence),
+        requestFence.applicationStartId),
     );
-  }, [localFence, run]);
+  }, [localFence, programApplyCommand, run]);
 
   const saveScenarioDocument = useCallback((input: SaveScenarioDocumentInput) => {
     void run('save_scenario_document', async () => {
@@ -649,9 +664,9 @@ export function useProgramWorkspace(
   ) => {
     const label = kind === 'new' ? 'New Scenario' : 'Scenario Load';
     return run(`${kind}_scenario_document`, async () => {
-      let result;
+      let accepted;
       try {
-        result = kind === 'new' ? await api.cellApply.newScenario()
+        accepted = kind === 'new' ? await api.cellApply.newScenario()
           : await api.cellApply.load(path as string);
       } catch (error: unknown) {
         // A dropped connection is no refusal: the request may have taken
@@ -661,7 +676,16 @@ export function useProgramWorkspace(
         }
         throw new Error(`${label} refused: ${cellApplyErrorText(error, `${label} failed.`)}`, { cause: error });
       }
-      // The reply states the failure: the outcome is known, not unconfirmed.
+      // Answered at acceptance; the outcome is the row's end (OD-214). A new
+      // application start keeps no row of it: the current state is read.
+      const ended = await awaitCommandEnd(accepted, applyRows);
+      if (ended === null) {
+        return { workspace: await api.programWorkspace.get(), message: null, transitionStatus: null };
+      }
+      const refusal = applyRowRefusal(ended);
+      if (refusal !== null) throw new Error(`${label} refused: ${codedErrorText(refusal)}`);
+      const result = applyResultOfRow(ended);
+      // The row states the failure: the outcome is known, not unconfirmed.
       if (result.outcome === 'failed') throw new KnownOutcomeError(`${label}: ${applyResultText(result)}`);
       scenarioOpened.current?.(kind);
       return {
@@ -671,7 +695,7 @@ export function useProgramWorkspace(
         transitionStatus: 'applied',
       };
     }, onRefusal);
-  }, [run]);
+  }, [applyRows, run]);
   /**
    * `onRefusal` receives the reason when Load is refused before any effect,
    * or (`failed`) when the Load ran and its reply stated a failed outcome.
@@ -713,12 +737,13 @@ export function useProgramWorkspace(
     dispatch({ type: 'clear_feedback' });
   }, []);
 
+  const busyOperation = withApplyStep(authoring.operation, snapshot?.applyCommands);
   return useMemo(() => ({
     state,
     programDraftInputResetEpoch,
     scenarioDraftInputResetEpoch,
     /** The authoring operation in progress (busy label and tooltip), or null. */
-    busyOperation: authoring.operation,
+    busyOperation,
     acceptedApply,
     mutationAvailable,
     mutationUnavailableReason,
@@ -756,7 +781,7 @@ export function useProgramWorkspace(
   }), [
     acceptedApply,
     admissionObserved,
-    authoring.operation,
+    busyOperation,
     apply,
     clearFeedback,
     discard,

@@ -223,7 +223,7 @@ void remove_unreferenced(const std::filesystem::path &root,
 
 ActivationContentCollection collect_unreferenced_activation_content(
     const std::filesystem::path &activation_root,
-    const ActiveActivationContent &active) {
+    const ActiveActivationContent &active, ActivationContentReferences &known) {
   ActivationContentCollection result;
   const Flock writers(activation_root / std::string(kWriterLockFilename),
                       LOCK_EX | LOCK_NB);
@@ -234,6 +234,25 @@ ActivationContentCollection collect_unreferenced_activation_content(
     auto bytes = read_file(path);
     result.read_bytes += bytes.size();
     return bytes;
+  };
+  // A document named by its content digest never changes under that name, so
+  // its tokens are read once and reused while it stays live; what is not live
+  // in this collection is forgotten.
+  auto previous = std::move(known.tokens_by_path);
+  known.tokens_by_path.clear();
+  const auto add_live_tokens = [&](const std::filesystem::path &path,
+                                   Names &tokens) {
+    auto key = path.string();
+    if (auto found = previous.find(key); found != previous.end()) {
+      ++result.reused_documents;
+      tokens.insert(found->second.begin(), found->second.end());
+      known.tokens_by_path.insert(previous.extract(found));
+      return;
+    }
+    const auto own = tokens_of(read_live(path));
+    tokens.insert(own.begin(), own.end());
+    known.tokens_by_path.emplace(
+        std::move(key), std::vector<std::string>(own.begin(), own.end()));
   };
 
   // Roots: the active configuration, the retained prepared activations and
@@ -246,19 +265,16 @@ ActivationContentCollection collect_unreferenced_activation_content(
     add_digest(active.program_revision->value(), roots);
   if (active.program_binding_id)
     add_digest(active.program_binding_id->value(), roots);
-  std::vector<std::filesystem::path> root_documents;
+  Names tokens;
   for (const auto &path :
        list_directory(activation_root / "prepared-activations"))
     if (path.extension() == ".json")
-      root_documents.push_back(path);
+      add_live_tokens(path, tokens);
   for (const auto &path : list_directory(activation_root)) {
     const auto name = path.filename().string();
     if (name.starts_with(kAdmissionPrefix) && name.ends_with(".json"))
-      root_documents.push_back(path);
+      add_tokens(read_live(path), tokens);
   }
-  Names tokens;
-  for (const auto &path : root_documents)
-    add_tokens(read_live(path), tokens);
   roots.insert(tokens.begin(), tokens.end());
 
   // Live bundles, Programs and bindings come from the roots only (a bundle
@@ -267,7 +283,7 @@ ActivationContentCollection collect_unreferenced_activation_content(
   for (const auto *space : {&kBundles, &kPrograms, &kBindings})
     for (const auto &hex : committed_entries(activation_root, *space))
       if (roots.contains(hex))
-        add_tokens(read_live(entry_path(activation_root, *space, hex)), tokens);
+        add_live_tokens(entry_path(activation_root, *space, hex), tokens);
 
   const auto raw = committed_entries(activation_root, kRawArtifacts);
   std::vector<std::pair<std::string, Names>> catalog;
@@ -283,8 +299,7 @@ ActivationContentCollection collect_unreferenced_activation_content(
     for (const auto &hex : raw)
       if (!live_raw.contains(hex) && tokens.contains(hex)) {
         live_raw.insert(hex);
-        add_tokens(read_live(entry_path(activation_root, kRawArtifacts, hex)),
-                   tokens);
+        add_live_tokens(entry_path(activation_root, kRawArtifacts, hex), tokens);
         changed = true;
       }
     for (const auto &[hex, key_tokens] : catalog) {
@@ -296,9 +311,8 @@ ActivationContentCollection collect_unreferenced_activation_content(
         referenced = referenced || tokens.contains(token);
       if (referenced) {
         live_catalog.insert(hex);
-        add_tokens(
-            read_live(entry_path(activation_root, kCatalogArtifacts, hex)),
-            tokens);
+        add_live_tokens(entry_path(activation_root, kCatalogArtifacts, hex),
+                        tokens);
         changed = true;
       }
     }

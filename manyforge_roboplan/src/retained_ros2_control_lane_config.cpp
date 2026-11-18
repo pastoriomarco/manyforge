@@ -207,8 +207,9 @@ make_ros2_control_jtc_config(const std::string &runtime_namespace,
   // motion or a Stop is a fault on this lane. The age is the component's
   // effective `measured_joints` budget (measured_joints_budget_ns).
   participant.stop.controller_state_max_age_ns = controller_state_max_age_ns;
-  // Decided simulation-lane allowance and two actual CM periods;
-  // live lanes still require measurement. ROS timing stays monitor-only.
+  // On scheduled lanes (Mock, Real) the lead from the latest controller sample
+  // to the stamped start; on Isaac still the unscheduled start estimate
+  // (OD-313). ROS timing stays monitor-only.
   participant.stop.replacement_start_allowance_s = 0.020;
   participant.late_cycle_margin_s = 2.0 / rates.controller_update_rate_hz;
   participant.tracking = core::ExecutionTrackingPolicy{
@@ -254,7 +255,7 @@ namespace {
 /// What a stale stream means is the lane's. A simulated robot's
 /// or tool's stream going stale is simulator state (a warning that clears by
 /// itself); on every other lane it faults the component.
-std::pair<core::StreamSeverityDTO, core::StreamRecoveryDTO> retained_component_stream_meaning(
+core::StreamSeverityDTO retained_component_stream_meaning(
     const deployment::ros2_control_execution_runtime_contract::Configuration
         &configuration,
     const core::ControllableComponentId &component) {
@@ -262,8 +263,8 @@ std::pair<core::StreamSeverityDTO, core::StreamRecoveryDTO> retained_component_s
       configuration.controller_profiles.begin(), configuration.controller_profiles.end(),
       [&](const auto &row) { return row.controllable_component_id == component; });
   if (profile != configuration.controller_profiles.end() && profile->lane == "isaac")
-    return {core::StreamSeverityDTO::kWarning, core::StreamRecoveryDTO::kAuto};
-  return {core::StreamSeverityDTO::kFault, core::StreamRecoveryDTO::kAck};
+    return core::StreamSeverityDTO::kWarning;
+  return core::StreamSeverityDTO::kFault;
 }
 
 } // namespace
@@ -276,11 +277,11 @@ RetainedMeasuredJointStateLane retained_measured_joint_state_lane(
   const auto &row = retained_component_stream(
       configuration, component,
       deployment::ros2_control_execution_runtime_contract::kMeasuredJointsStreamId);
-  const auto [severity, recovery] = retained_component_stream_meaning(configuration, component);
+  const auto severity = retained_component_stream_meaning(configuration, component);
   return RetainedMeasuredJointStateLane{
       std::move(absolute_topic), row.budget_ns,
       core::StateAuthorityId(std::string(kMeasuredJointStateAuthorityId)),
-      std::string(kMeasuredJointStateProfileId), severity, recovery, std::nullopt};
+      std::string(kMeasuredJointStateProfileId), severity, std::nullopt};
 }
 
 core::Duration retained_ros2_control_motion_state_budget_ns(
@@ -486,8 +487,7 @@ void configure_retained_gripper_output_mode(
         deployment::ros2_control_execution_runtime_contract::kGripperFeedbackStreamId);
     config.gripper->state_freshness_timeout_s =
         static_cast<double>(feedback.budget_ns) / 1e9;
-    std::tie(config.gripper->feedback_stream_severity,
-             config.gripper->feedback_stream_recovery) =
+    config.gripper->feedback_stream_severity =
         retained_component_stream_meaning(configuration,
                                           binding.value().controllable_component_id);
   }
@@ -605,7 +605,7 @@ make_retained_mock_ros2_control_backend_config(
       row.runtime_scale_supported.value());
   config.arm.measured_joint_state_lane = std::move(measured_lane);
   config.arm.mock_reset_position = artifacts.mock_reset_position;
-  // Only the generated Mock controllers enable stock JTC scheduled replacement.
+  // Stock JTC scheduled replacement (Mock and Real; Isaac not yet, OD-313).
   config.arm.adapter.lane_facts.supports_scheduled_replacement = true;
   config.arm.adapter.lane_facts.experiment = experimental_replacement_flags();
   constexpr auto kAllowance = "MANYFORGE_EXPERIMENTAL_REPLACEMENT_START_ALLOWANCE_MS";
@@ -638,6 +638,13 @@ make_retained_mock_ros2_control_backend_config(
         compiled_joints[index], found->second);
   }
   return config;
+}
+
+core::Duration retained_lane_hard_stop_completion_timeout_ns(const ModelLaneRow &row) {
+  constexpr std::string_view key = "hard_stop_completion_timeout_s";
+  if (!row.adapter_keys.contains(key)) return 0;
+  // The same conversion as `participant.stop.hard_stop_completion_timeout_ns`.
+  return static_cast<core::Duration>(row_number(row, key) * 1e9);
 }
 
 RealLaneRowGates real_lane_row_gates(const ModelLaneRow &row) {
@@ -700,6 +707,10 @@ make_retained_real_ros2_control_backend_config(
           motion_binding.value().controllable_component_id, stream_overrides),
       row.runtime_scale_supported.value());
   config.participant.stop.trip_authority = core::StateAuthorityClass::kMeasured;
+  // Controller-stamped replacement, as on Mock (OD-313): a Stop's or
+  // take-over's replacement starts at a header stamp on the controller's own
+  // tick grid, so its time 0 is exactly where the original's cursor will be.
+  config.arm.adapter.lane_facts.supports_scheduled_replacement = true;
   // The component's Deployment setting: the soft Stop lead-in starts at the
   // controller's command position (absent or `commanded`) or at the measured
   // position (`measured`).

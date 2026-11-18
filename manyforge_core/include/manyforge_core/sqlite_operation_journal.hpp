@@ -8,21 +8,39 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <manyforge_core/types/application_identity.hpp>
 #include <string_view>
 #include <vector>
 
 namespace manyforge::core {
 
-/// v20: operation intents use direct component references; older journals are
-/// refused, never converted.
+/// v23: `journal_metadata.records_lost` (0 or 1) is 1 once a record of this
+/// start was not written (dropped by the full queue, a failed write, or a
+/// reused Stop ring slot); no cell-admission or claim generation columns.
+/// v22: no `operation_participants`, `operation_resources` or
+/// `operation_error_details` tables (the operation state is in the anchored
+/// record's payload); the Stop event index is not unique. No cell-admission
+/// claim tables: a claim is two `journal_records` rows without operation,
+/// `cell_claim_acquired` and `cell_claim_released`, keyed by the payload's
+/// `claim_generation`. No unique request-key index.
+/// v21 (bulk change 1, one bump): the application-start identity `A` once in
+/// the metadata (no owner_epochs table, no owner_epoch columns), 16-byte
+/// request keys, integer operation numbers, participant ordinals, no
+/// operation disposition, no effect_pending, no request tombstones, no
+/// takeover or reconcile records. Stops (stop state model): one
+/// `stop_event_accepted` and one `stop_event_completed` row per Stop event
+/// (payload `manyforge.stop_event.v1`, keyed by `stop_event_id`), no
+/// `stop_projections` table and no Stop recovery projection; the rows of
+/// finished events are compacted to the newest 64. Operation snapshots name
+/// their Stop by `stop_event_id`. Older journals are refused, never converted.
+/// v20: operation intents use direct component references.
 /// v19: the motion takeover decision carries its planning cap.
 /// v18: lean Stop record without fault latch or surveillance. `stop_projections`
 /// is an index of journal_records sequences; each Stop payload is stored once,
-/// in journal_records. Earlier journals are refused
-/// (operation_journal_version_unsupported), not converted.
+/// in journal_records.
 inline constexpr std::string_view kOperationJournalSchemaId =
-    "manyforge.internal.execution.operation-journal.o1.5.v20";
-inline constexpr std::int64_t kOperationJournalSchemaVersion = 20;
+    "manyforge.internal.execution.operation-journal.o1.5.v23";
+inline constexpr std::int64_t kOperationJournalSchemaVersion = 23;
 inline constexpr std::int64_t kOperationJournalSqliteApplicationId = 0x4D46454A;
 inline constexpr std::string_view kOperationJournalFilename = "operation-journal.sqlite3";
 inline constexpr std::size_t kMaximumOperationJournalHistory = 4096U;
@@ -33,20 +51,17 @@ inline constexpr std::size_t kMaximumOperationJournalEventPage = 32U;
 /// acquire a deployment-codec dependency.
 struct OperationJournalEventDTO final {
   std::uint64_t sequence;
-  RequestOwnerEpoch owner_epoch;
   std::string record_kind;
-  std::optional<RequestId> request_id;
-  std::optional<OperationId> operation_id;
+  std::optional<RequestKey> request_key;
+  std::optional<OperationNumber> operation_id;
   std::optional<OperationRevision> operation_revision;
   std::int64_t occurred_at_ns;
   std::string occurred_at_wall;
-  bool effect_pending;
   std::string payload_json;
   std::string payload_digest;
 };
 
 struct OperationJournalEventPageDTO final {
-  RequestOwnerEpoch owner_epoch;
   std::vector<OperationJournalEventDTO> events;
   std::uint64_t next_after_sequence;
   bool has_more;
@@ -57,90 +72,34 @@ struct OperationJournalEventPageDTO final {
 /// algorithm consumers do not acquire a SQLite dependency.
 class SqliteOperationJournal final : public IOperationJournal {
  public:
+  /// `wall_time_text` (tests) gives a row's wall time from the action's
+  /// steady-clock time; by default it is derived from the system clock.
+  /// `critical_section_observer` (tests) is called inside an event read's
+  /// snapshot, once its first row has been read. It runs under the reader
+  /// lock and must not call back into this journal on its own thread.
   SqliteOperationJournal(std::filesystem::path database_path, CellId cell_id,
                          std::size_t history_capacity = kMaximumOperationJournalHistory,
-                         std::function<std::string()> wall_time_text = {},
+                         std::function<std::string(std::int64_t)> wall_time_text = {},
                          std::function<void(std::string_view)> critical_section_observer = {});
   ~SqliteOperationJournal() override;
 
   SqliteOperationJournal(const SqliteOperationJournal&) = delete;
   SqliteOperationJournal& operator=(const SqliteOperationJournal&) = delete;
 
-  [[nodiscard]] Result<OperationJournalRecoveryDTO> BeginOwnerEpoch(
-      const RequestOwnerEpoch& owner_epoch, std::int64_t started_at_ns,
-      std::size_t request_capacity, const std::vector<ResourceId>& resource_inventory) override;
+  [[nodiscard]] Result<void> BeginStart(ApplicationStartId application_start_id,
+                                        std::int64_t started_at_ns,
+                                        std::size_t request_capacity) override;
 
-  [[nodiscard]] Result<std::uint64_t> RecordOperationAccepted(
-      const RequestOwnerEpoch& owner_epoch, const OperationIntentDTO& intent,
-      const OperationAcceptedDTO& accepted, const OperationStateDTO& state,
-      std::span<const OperationId> protected_operation_ids = {}) override;
-
-  [[nodiscard]] Result<std::uint64_t> RecordControlAccepted(
-      const RequestOwnerEpoch& owner_epoch, const OperationControlRequestDTO& request,
-      const OperationControlAcceptedDTO& accepted, const OperationStateDTO& state) override;
-
-  [[nodiscard]] EmergencyStopAcceptanceProjectionResultDTO RecordStopAccepted(
-      const RequestOwnerEpoch& owner_epoch, const EmergencyStopAcceptanceRecordDTO& acceptance,
-      const EmergencyStopProjectedIntentDTO& intent, const StopAcceptedDTO& accepted,
-      const EmergencyStopAffectedStateSnapshotDTO& affected_state) noexcept override;
-
-  [[nodiscard]] StopForensicProjectionResultDTO RecordStopTerminal(
-      const RequestOwnerEpoch& owner_epoch, const StopStatusDTO& stop_status,
-      const StopCertificateDTO& certificate) noexcept override;
-
-  [[nodiscard]] Result<std::uint64_t> CloseOwnerEpoch(const RequestOwnerEpoch& owner_epoch,
-                                                      std::int64_t closed_at_ns) override;
-
-  [[nodiscard]] Result<std::uint64_t> RecordRuntimeScaleAccepted(
-      const RequestOwnerEpoch& owner_epoch, const RuntimeScaleRequestDTO& request,
-      const RuntimeScaleAcceptedDTO& accepted, const OperationStateDTO& state,
-      const RuntimeScaleStatusDTO& scale_status) override;
-
-  [[nodiscard]] Result<std::uint64_t> RecordOperationState(
-      const RequestOwnerEpoch& owner_epoch, const OperationStateDTO& state,
-      const RuntimeScaleStatusDTO* scale_status, const char* transition_reason,
-      std::span<const PreparedMotionDiagnosticsDTO> prepared_motion_diagnostics = {}) override;
-
-  [[nodiscard]] Result<std::uint64_t> RecordCellAdmissionClaimAcquired(
-      const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& claim) override;
-  [[nodiscard]] Result<CellAdmissionClaimDTO> RecordConfigurationApplyClaimAcquired(
-      const RequestOwnerEpoch& kernel_owner_epoch, const CellAdmissionClaimDTO& fresh_claim,
-      const CellAdmissionCurrentOwnerEpochDTO& verified_manager,
-      const std::vector<CellAdmissionClaimDTO>& expected_held_claims,
-      const std::vector<CellAdmissionCurrentOwnerEpochDTO>& expected_current_owners) override;
-  [[nodiscard]] Result<AdmissionGeneration> RecordTerminalApplyClaimsReleasedBySuccess(
-      const RequestOwnerEpoch& kernel_owner_epoch, const CellAdmissionClaimDTO& fresh_claim,
-      const CellAdmissionClaimReleaseDTO& fresh_success_release,
-      const std::vector<CellAdmissionClaimDTO>& expected_held_claims,
-      const std::vector<CellAdmissionCurrentOwnerEpochDTO>& expected_current_owners,
-      AdmissionGeneration expected_admission_generation) override;
-  [[nodiscard]] Result<std::uint64_t> RecordCellAdmissionClaimReleased(
-      const RequestOwnerEpoch& owner_epoch, const CellAdmissionClaimDTO& claim,
-      const CellAdmissionClaimReleaseDTO& release,
-      AdmissionGeneration resulting_generation) override;
-  [[nodiscard]] Result<std::uint64_t> RecordCellAdmissionClaimsReconciled(
-      const RequestOwnerEpoch& owner_epoch, const CellAdmissionReconcileDTO& reconcile,
-      const CellAdmissionReconcileValidationDTO& validation,
-      AdmissionGeneration resulting_generation) override;
-  [[nodiscard]] Result<std::uint64_t> RecordCellAdmissionGenerationAdvanced(
-      const RequestOwnerEpoch& owner_epoch, AdmissionGeneration prior_generation,
-      AdmissionGeneration resulting_generation) override;
-  [[nodiscard]] Result<std::uint64_t> RecordInterruptRuleStateChanged(
-      const IoRuleStateChangeDTO& change) override;
-  [[nodiscard]] Result<std::uint64_t> RecordActiveTcpChanged(
-      const RequestOwnerEpoch& owner_epoch, const ActiveTcpChangeDTO& change) override;
-
-  /// Read-only, replay-safe projection. Reading never acknowledges, deletes,
-  /// or changes operation ownership.
-  [[nodiscard]] Result<OperationJournalEventPageDTO> ReadEvents(
-      const RequestOwnerEpoch& owner_epoch, std::uint64_t after_sequence,
-      std::size_t limit = kMaximumOperationJournalEventPage);
+  [[nodiscard]] JournalBatchResult WriteBatch(std::span<const JournalRecord> records,
+                                              std::uint64_t records_dropped) override;
 
   /// Read the bounded operational projection consumed by the headless event
-  /// pump. Forensic-only Stop terminal and owner
-  /// lifecycle records remain durable but cannot poison this external page.
+  /// pump (operation, control, Stop event, rule-state and Active TCP rows).
+  /// Owner lifecycle records remain durable but are not on this page.
+  /// Read-only and replay-safe: reading never acknowledges, deletes, or
+  /// changes operation ownership.
   [[nodiscard]] Result<OperationJournalEventPageDTO> ReadOperationalEvents(
-      const RequestOwnerEpoch& owner_epoch, std::uint64_t after_sequence,
+      std::uint64_t after_sequence,
       std::size_t limit = kMaximumOperationJournalEventPage);
 
   void Close();

@@ -66,7 +66,7 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
         server = Node("manyforge_fake_selected_simulator_owner")
         _install_services(server, state)
         executor.add_node(server)
-        worker = threading.Thread(target=executor.spin, daemon=True)
+        worker = threading.Thread(target=executor.spin)
         worker.start()
         client_node = Node("manyforge_selected_simulator_client_test")
 
@@ -85,9 +85,9 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
         )
         program_port.bind(_program_context())
         identity = NodeAttemptIdentity(
-            program_run_id="run.simulation.transport",
+            program_run_id=1,
             node_instance_id="move_soup_can",
-            node_attempt_id="run.simulation.transport/move_soup_can/1",
+            node_attempt_id=1,
         )
         started = program_port.start(
             "simulation.set_entity_pose",
@@ -136,7 +136,7 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
             client_node.destroy_node()
         executor.shutdown()
         if worker is not None:
-            worker.join(timeout=2.0)
+            worker.join()
         if server is not None:
             server.destroy_node()
         if rclpy.ok():
@@ -145,7 +145,7 @@ def test_control_and_scene_clients_share_the_typed_simulator_owner() -> None:
 
 def _program_context() -> ProgramRunPortContext:
     return ProgramRunPortContext(
-        program_run_id="run.simulation.transport",
+        program_run_id=1,
         applied_record_digest="sha256:" + "9" * 64,
         scenario_id="isaac-cell",
         source_document_digest=_DIGEST_A,

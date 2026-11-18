@@ -1,6 +1,7 @@
 #include "manyforge_component_manager/manager_active_runtime_coordinator.hpp"
 
 #include "manyforge_component_manager/manager_runtime_convergence_coordinator.hpp"
+#include <manyforge_core/types/typed_error.hpp>
 
 #include <algorithm>
 #include <exception>
@@ -139,8 +140,9 @@ MakeExpectation(const RuntimeUnitConvergencePlanRowDTO &row) {
       row.runtime_unit_id.value(),
       ToObservationLifecycle(row.lifecycle_control),
       row.product_identity.value(), row.configuration_identity.value(),
-      kManagerRuntimeMaximumPresenceAgeNs, kManagerRuntimeMaximumReportAgeNs,
-      std::nullopt, std::move(dependencies), std::move(roles),
+      // OD-295 (1)(a): no report-age limit; a report's age is information.
+      kManagerRuntimeMaximumPresenceAgeNs, std::nullopt, std::nullopt,
+      std::move(dependencies), std::move(roles),
       ManagedCommandSurfaceState::kClosedNoActiveEffect,
       row.runtime_contract_offer_digest.value());
 }
@@ -188,7 +190,7 @@ ObserveProgress(IRuntimeUnitProgressPort &port,
                 const RuntimeUnitConvergenceQueryDTO &query,
                 const RuntimeEpoch &runtime_epoch) {
   try {
-    return port.ObserveProgress(query, runtime_epoch);
+    return port.ObserveProgress(query, runtime_epoch, 0U);
   } catch (const std::exception &error) {
     Fail("active runtime progress observation failed: " +
          std::string(error.what()));
@@ -421,6 +423,13 @@ ManagerActiveRuntimeCoordinator::Converge(const ConvergenceMode mode) {
         const auto ensured = process_port_.EnsureRunning(query);
         IngestEnsuredPresence(reducer, query, process, ensured);
         process = ensured;
+      } catch (const manyforge::core::TypedError &error) {
+        // A typed answer keeps its code and details (`effect` included).
+        throw manyforge::core::TypedError(
+            error.code(),
+            "active runtime start outcome is uncertain: " +
+                std::string(error.what()),
+            error.details(), error.producer());
       } catch (const std::exception &error) {
         throw ManagerActiveRuntimeProcessEffectUncertainError(
             "active runtime start outcome is uncertain: " +

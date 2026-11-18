@@ -8,7 +8,7 @@
 #include <manyforge_core/types/participant_binding_identity.hpp>
 #include <manyforge_core/types/operation_intent.hpp>
 #include <manyforge_core/types/runtime_scale.hpp>
-#include <manyforge_core/types/stop_certificate.hpp>
+#include <manyforge_core/types/stop_event.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <stdexcept>
@@ -28,7 +28,6 @@ inline constexpr std::size_t kMaximumStopMalformedReasonBytes = 256U;
 inline constexpr std::size_t kMaximumStopStaleDiagnostics = 1U + (3U * kMaximumStopSelectorTargets);
 inline constexpr std::size_t kMaximumStopAcceptedPhases = 64U;
 inline constexpr std::size_t kMaximumStopAcceptedParticipants = 4096U;
-inline constexpr std::size_t kMaximumStopPredecessors = 64U;
 inline constexpr std::int64_t kMaximumStopDurationNs = 9'007'199'254'740'991LL;
 
 enum class OperationStateKind {
@@ -53,10 +52,30 @@ enum class OperationParticipantPayloadKind {
   kCapabilityCommand,
 };
 
+/// One participant's stop state as the operation read shows it (§6.3.1).
+/// Filled by the read projection from the participant's stop state; the
+/// Kernel does not store it on the operation state at Stop acceptance.
+/// Absent while the participant was never covered by a Stop.
+struct ParticipantStopObservationDTO final {
+  StopPhase phase{StopPhase::kRunning};
+  std::uint16_t attempt{};
+  StopEventId stop_event_id{0U};
+  StopMode mode{StopMode::kOrdinary};
+  StopAttributionClass attribution_class{StopAttributionClass::kProgramOwn};
+  /// `participant_stop_invocation_plan_digest` of the executed plan.
+  std::optional<ContentDigest> plan_digest{};
+  /// Read from the executed plan by index; absent when no stage contained it.
+  std::optional<StopEscalationStageId> containing_stage_id{};
+  std::optional<std::uint8_t> containing_stage_index{};
+  bool escalated{};
+
+  friend bool operator==(const ParticipantStopObservationDTO&,
+                         const ParticipantStopObservationDTO&) = default;
+};
+
 struct OperationParticipantStateDTO final {
   OperationParticipantId participant_id;
   ControllerGoalId command_id;
-  ControllerGoalGeneration command_generation;
   ControllableComponentId controllable_component_id;
   CommandTargetId command_target_id;
   CapabilityId capability_id;
@@ -70,25 +89,26 @@ struct OperationParticipantStateDTO final {
   /// Actual participant proof; absence grants no effect/settlement knowledge.
   std::optional<ParticipantExecutionFact> terminal_fact{};
   std::vector<IoMotionRuleOutcomeDTO> io_rule_outcomes{};
+  std::optional<ParticipantStopObservationDTO> stop{};
 
   OperationParticipantStateDTO() = default;
 
   OperationParticipantStateDTO(
-      OperationParticipantId participant, ControllerGoalId goal, ControllerGoalGeneration goal_generation,
+      OperationParticipantId participant, ControllerGoalId goal,
       ControllableComponentId component, CommandTargetId target, CapabilityId capability,
       ParticipantBindingIdentityDTO identity, OperationParticipantPayloadKind kind,
       OperationStateKind phase, double supplied_progress, std::vector<ResourceId> owned_resources,
       std::optional<ErrorDTO> error, std::optional<ProgramNodeExecutionScopeDTO> scope = {},
       std::optional<ParticipantExecutionFact> fact = {}, std::vector<IoMotionRuleOutcomeDTO> rules = {})
-      : participant_id(std::move(participant)), command_id(std::move(goal)),
-        command_generation(goal_generation), controllable_component_id(std::move(component)),
+      : participant_id(participant), command_id(goal),
+        controllable_component_id(std::move(component)),
         command_target_id(std::move(target)), capability_id(std::move(capability)),
         binding_identity(std::move(identity)), payload_kind(kind), state(phase), progress(supplied_progress),
         resources(std::move(owned_resources)), terminal_error(std::move(error)), execution_scope(std::move(scope)),
         terminal_fact(std::move(fact)), io_rule_outcomes(std::move(rules)) {}
 
   OperationParticipantStateDTO(
-      OperationParticipantId participant, ControllerGoalId goal, ControllerGoalGeneration goal_generation,
+      OperationParticipantId participant, ControllerGoalId goal,
       ControllableComponentId component, CommandTargetId target, CapabilityId capability,
       ControlDomainId domain, ControlDomainRevision domain_revision, ControlBindingId control_binding,
       ControlBindingRevision control_revision, std::optional<CapabilityProviderBindingId> provider,
@@ -98,7 +118,7 @@ struct OperationParticipantStateDTO final {
       std::optional<ProgramNodeExecutionScopeDTO> scope = {}, std::optional<ParticipantExecutionFact> fact = {},
       std::vector<IoMotionRuleOutcomeDTO> rules = {})
       : OperationParticipantStateDTO(
-            std::move(participant), std::move(goal), goal_generation, std::move(component), std::move(target),
+            participant, goal, std::move(component), std::move(target),
             std::move(capability),
             ParticipantBindingIdentityDTO{std::move(domain), std::move(domain_revision),
                 ControllerParticipantBindingIdentityDTO{std::move(control_binding), std::move(control_revision),
@@ -132,9 +152,9 @@ enum class OperationPreemptionKind : std::uint8_t {
 }
 
 struct OperationPreemptionActorDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   ProgramNodeInstanceId node_instance_id;
-  std::string node_attempt_id;
+  NodeAttemptNumber node_attempt_id;
 
   friend bool operator==(const OperationPreemptionActorDTO&,
                          const OperationPreemptionActorDTO&) = default;
@@ -168,7 +188,7 @@ enum class MotionTakeoverPathDTO : std::uint8_t {
 }
 
 struct MotionTakeoverDecisionDTO final {
-  OperationId incumbent_operation_id;
+  OperationNumber incumbent_operation_id;
   MotionTakeoverPathDTO path{MotionTakeoverPathDTO::kMovingReplacement};
   std::optional<ErrorDTO> cause{};
   // Kernel monotonic time, never a wall-clock timestamp. Elapsed includes
@@ -176,19 +196,20 @@ struct MotionTakeoverDecisionDTO final {
   std::int64_t decided_at_ns{};
   std::int64_t elapsed_since_acceptance_ns{};
   std::int64_t preparation_budget_ns{};
-  std::optional<StopCertificateRefDTO> stop_certificate{};
+  /// The Stop event that stopped the incumbent (non-moving paths only).
+  std::optional<StopEventId> stop_event_id{};
   // The planning cap that applied: the explicit planning budget, or 4/5 of
   // the preparation budget. This is the deadline a planning timeout trips.
   std::int64_t planning_budget_ns{};
 
   [[nodiscard]] bool locally_valid() const noexcept {
     const bool moving = path == MotionTakeoverPathDTO::kMovingReplacement;
-    return !incumbent_operation_id.empty() && !to_string(path).empty() &&
+    return incumbent_operation_id.nonzero() && !to_string(path).empty() &&
            decided_at_ns >= 0 && elapsed_since_acceptance_ns >= 0 &&
            elapsed_since_acceptance_ns <= decided_at_ns && preparation_budget_ns > 0 &&
            planning_budget_ns >= 0 &&
-           (moving ? !cause && !stop_certificate : cause && !cause->code.empty()) &&
-           (!stop_certificate || stop_certificate->locally_valid());
+           (moving ? !cause && !stop_event_id : cause && !cause->code.empty()) &&
+           (!stop_event_id || stop_event_id->nonzero());
   }
 
   friend bool operator==(const MotionTakeoverDecisionDTO&,
@@ -199,16 +220,18 @@ struct MotionTakeoverDecisionDTO final {
 /// addressed identities rather than subordinate engine handles or legacy
 /// robot/group selectors.
 struct OperationStateDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision operation_revision;
   ProgramBindingId program_binding_id;
-  ProgramRunId program_run_id;
+  /// Absent for manual work (a manual handover has its parent instead).
+  std::optional<ProgramRunNumber> program_run_id;
   OperationCoordinationPolicy coordination_policy{OperationCoordinationPolicy::kIndependent};
   OperationStateKind state{OperationStateKind::kResolving};
   std::vector<OperationParticipantStateDTO> participants;
   std::int64_t updated_at_ns{};
-  std::optional<StopId> active_stop_id;
-  std::optional<StopGeneration> active_stop_generation;
+  /// The Stop event that started the newest attempt on this operation (E6).
+  /// Set when a Stop first covers it and never cleared while it is resident.
+  std::optional<StopEventId> stop_event_id;
   std::optional<RuntimeScaleGeneration> runtime_scale_generation;
   // Private Kernel/journal capture order, never a public control precondition.
   // Zero is reserved for unsequenced historical records; fresh Kernel captures
@@ -230,20 +253,10 @@ struct OperationStateDTO final {
 }
 
 struct StopOperationTargetDTO final {
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision expected_operation_revision;
-  StopGeneration expected_stop_generation;
 
   friend bool operator==(const StopOperationTargetDTO&, const StopOperationTargetDTO&) = default;
-};
-
-/// Internal Program-owner selector. Public transports do not expose this
-/// alternative; the addressed Kernel expands it atomically from its current
-/// operation table so a phase transition cannot escape Program Stop.
-struct StopProgramRunTargetDTO final {
-  ProgramRunId program_run_id;
-
-  friend bool operator==(const StopProgramRunTargetDTO&, const StopProgramRunTargetDTO&) = default;
 };
 
 struct StopComponentTargetDTO final {
@@ -258,24 +271,24 @@ struct StopResourceTargetDTO final {
   ResourceId resource_id;
   GraphRevision expected_graph_revision;
   std::uint64_t expected_operation_resource_generation{};
-  StopGeneration expected_stop_generation;
 
   friend bool operator==(const StopResourceTargetDTO&, const StopResourceTargetDTO&) = default;
 };
 
 using StopSelectorDTO =
     std::variant<std::vector<StopOperationTargetDTO>, std::vector<StopComponentTargetDTO>,
-                 std::vector<StopResourceTargetDTO>, std::vector<StopProgramRunTargetDTO>>;
+                 std::vector<StopResourceTargetDTO>>;
 
-/// Kernel-owned classification of the public Stop selector after bounded
-/// resolution against the current cell snapshot. Stale caller metadata is
-/// diagnostic when the semantic target is still unique; an unsafe or
-/// unresolvable selector is accepted only through the Full-Stop path.
+/// Kernel-owned classification of one Stop target after bounded resolution
+/// against the current operation table. Stale caller metadata is diagnostic
+/// when the semantic target is still unique; an unresolvable target makes the
+/// request invalid and the invalid-Stop rule widens it (PD-1,
+/// `StopWidenReason`).
 enum class StopResolutionDispositionDTO {
   kExact,
   kStaleButUnambiguouslyResolved,
   kAlreadyTerminalNoEffect,
-  kPromotedToFull,
+  kInvalid,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(
@@ -287,8 +300,8 @@ enum class StopResolutionDispositionDTO {
       return "stale_but_unambiguously_resolved";
     case StopResolutionDispositionDTO::kAlreadyTerminalNoEffect:
       return "already_terminal_no_effect";
-    case StopResolutionDispositionDTO::kPromotedToFull:
-      return "promoted_to_full";
+    case StopResolutionDispositionDTO::kInvalid:
+      return "invalid";
   }
   return {};
 }
@@ -301,10 +314,6 @@ enum class StopScopeResolutionReasonDTO {
   kUnknownOperation,
   kUnknownComponent,
   kUnknownResource,
-  kRequestIdentityConflict,
-  kOverlappingStopTransactions,
-  kEmergencyReserveCoalesced,
-  kExplicitFullStop,
   kUnknownProgramRun,
 };
 
@@ -326,67 +335,18 @@ enum class StopScopeResolutionReasonDTO {
       return "unknown_component";
     case StopScopeResolutionReasonDTO::kUnknownResource:
       return "unknown_resource";
-    case StopScopeResolutionReasonDTO::kRequestIdentityConflict:
-      return "request_identity_conflict";
-    case StopScopeResolutionReasonDTO::kOverlappingStopTransactions:
-      return "overlapping_stop_transactions";
-    case StopScopeResolutionReasonDTO::kEmergencyReserveCoalesced:
-      return "emergency_reserve_coalesced";
-    case StopScopeResolutionReasonDTO::kExplicitFullStop:
-      return "explicit_full_stop";
   }
   return {};
 }
 
-enum class StopScopeStaleFieldDTO {
-  kRequestOwnerEpoch,
-  kOperationRevision,
-  kOperationStopGeneration,
-  kGraphRevision,
-  kComponentLifecycleGeneration,
-  kOperationResourceGeneration,
-  kResourceStopGeneration,
-  kCellStopGeneration,
-};
+/// Stale-metadata diagnostic of a Stop reply (K15): only the operation
+/// revision is compared. The named target's current scope was stopped.
+struct StopStaleDiagnosticDTO final {
+  OperationNumber operation_id;
+  OperationRevision expected_operation_revision;
+  OperationRevision current_operation_revision;
 
-[[nodiscard]] constexpr std::string_view to_string(StopScopeStaleFieldDTO field) noexcept {
-  switch (field) {
-    case StopScopeStaleFieldDTO::kRequestOwnerEpoch:
-      return "request_owner_epoch";
-    case StopScopeStaleFieldDTO::kOperationRevision:
-      return "operation_revision";
-    case StopScopeStaleFieldDTO::kOperationStopGeneration:
-      return "operation_stop_generation";
-    case StopScopeStaleFieldDTO::kGraphRevision:
-      return "graph_revision";
-    case StopScopeStaleFieldDTO::kComponentLifecycleGeneration:
-      return "component_lifecycle_generation";
-    case StopScopeStaleFieldDTO::kOperationResourceGeneration:
-      return "operation_resource_generation";
-    case StopScopeStaleFieldDTO::kResourceStopGeneration:
-      return "resource_stop_generation";
-    case StopScopeStaleFieldDTO::kCellStopGeneration:
-      return "cell_stop_generation";
-  }
-  return {};
-}
-
-using StopScopeDiagnosticTargetDTO =
-    std::variant<std::monostate, OperationId, ControllableComponentId, ResourceId>;
-using StopScopeStaleValueDTO =
-    std::variant<std::uint64_t, RequestOwnerEpoch, GraphRevision, OperationRevision,
-                 ComponentLifecycleGeneration, StopGeneration>;
-
-/// Closed mismatch evidence. Field, target, and values retain their semantic
-/// types; implementations do not manufacture free-form diagnostic strings.
-struct StopScopeStaleDiagnosticDTO final {
-  StopScopeStaleFieldDTO field{StopScopeStaleFieldDTO::kRequestOwnerEpoch};
-  StopScopeDiagnosticTargetDTO target{};
-  StopScopeStaleValueDTO expected{};
-  StopScopeStaleValueDTO current{};
-
-  friend bool operator==(const StopScopeStaleDiagnosticDTO&,
-                         const StopScopeStaleDiagnosticDTO&) = default;
+  friend bool operator==(const StopStaleDiagnosticDTO&, const StopStaleDiagnosticDTO&) = default;
 };
 
 /// Ordinary scoped Stop intent. Exactly one selector alternative is present by
@@ -402,26 +362,48 @@ struct StopIntentDTO final {
   friend bool operator==(const StopIntentDTO&, const StopIntentDTO&) = default;
 };
 
+/// Body of the cell-wide Stops that name no target: Stop all, Halt and the
+/// Program node's cell Stop (`stop_all`, `halt`, `cell_stop`). The Kernel
+/// entry, not the body, says which level it is.
 struct FullStopIntentDTO final {
   PublicRequestContextDTO request_context;
-  StopGeneration expected_stop_generation;
   RequestAttributionDTO attribution{};
 
   friend bool operator==(const FullStopIntentDTO&, const FullStopIntentDTO&) = default;
 };
 
+/// Forced Program End (S16): the runner ends its run (Program Reset's first
+/// step). Internal attribution only.
+struct ProgramRunEndIntentDTO final {
+  PublicRequestContextDTO request_context;
+  ProgramRunNumber program_run_id;
+  RequestAttributionDTO attribution{};
+
+  friend bool operator==(const ProgramRunEndIntentDTO&, const ProgramRunEndIntentDTO&) = default;
+};
+
 /// Internal-only value minted after a transport has recognized the exact Stop
-/// method, route, and receiving Kernel but cannot normalize the bounded public
-/// payload. It deliberately carries no caller-selected scope: the Kernel must
-/// conservatively promote it to Full Stop.
-struct MalformedStopIngressDTO final {
-  RequestId request_id;
-  RequestOwnerEpoch receiver_owner_epoch;
+/// method, route, and receiving Kernel for a Stop it does not forward as
+/// asked: its bounded public payload cannot be normalized
+/// (`recognized_stop_payload_invalid`, `recognized_stop_body_oversized`), or
+/// it names another application start or none
+/// (`recognized_stop_start_not_current`). It deliberately carries no
+/// caller-selected scope: the Kernel widens it by the recognized route
+/// (PD-1): a group, operation or Stop-all route becomes Stop all, a Halt
+/// route or an unknown route becomes Halt. The widen reason is `stale_start`
+/// for `recognized_stop_start_not_current`, else `malformed`
+/// (`unreadable_kind` for an unknown route). `source_label` is the caller's
+/// label where the transport has a validated one; without it (or with an
+/// invalid one) the record's label is `recognized_stop_ingress`.
+struct RecognizedStopIngressDTO final {
+  RequestKey request_key;
   RequestAttributionDTO attribution{};
   std::string recognized_route;
   std::string reason;
+  std::optional<std::string> source_label{};
 
-  friend bool operator==(const MalformedStopIngressDTO&, const MalformedStopIngressDTO&) = default;
+  friend bool operator==(const RecognizedStopIngressDTO&,
+                         const RecognizedStopIngressDTO&) = default;
 };
 
 /// Closed local-shape validation for normalized internal Stop values. This
@@ -432,41 +414,47 @@ struct MalformedStopIngressDTO final {
     const StopIntentDTO& intent) noexcept;
 [[nodiscard]] std::optional<std::string_view> full_stop_intent_field_error(
     const FullStopIntentDTO& intent) noexcept;
-[[nodiscard]] std::optional<std::string_view> malformed_stop_ingress_field_error(
-    const MalformedStopIngressDTO& ingress) noexcept;
+[[nodiscard]] std::optional<std::string_view> program_run_end_intent_field_error(
+    const ProgramRunEndIntentDTO& intent) noexcept;
+[[nodiscard]] std::optional<std::string_view> recognized_stop_ingress_field_error(
+    const RecognizedStopIngressDTO& ingress) noexcept;
+/// A Stop request's source label is valid (bounded NFC UTF-8, as in the
+/// request context of every Stop).
+[[nodiscard]] bool stop_source_label_valid(std::string_view label) noexcept;
 
-struct StopAffectedOperationRevisionDTO final {
-  OperationId operation_id;
-  OperationRevision operation_revision_after_acceptance;
+/// One Stop-qualified participant a Stop event covers (K15). `started`:
+/// this event started its stop attempt; false: it was already stopping.
+struct StopCoveredParticipantDTO final {
+  OperationNumber operation_id;
+  /// Index of the participant in its operation (`OperationParticipantId`
+  /// ordinal).
+  std::uint32_t participant_ordinal{};
+  bool started{};
 
-  friend bool operator==(const StopAffectedOperationRevisionDTO&,
-                         const StopAffectedOperationRevisionDTO&) = default;
+  friend bool operator==(const StopCoveredParticipantDTO&,
+                         const StopCoveredParticipantDTO&) = default;
 };
 
-/// Exact immutable acceptance truth inherited by a promoted aggregate Stop.
-struct StopPredecessorAcceptanceRefDTO final {
-  StopId predecessor_stop_id;
-  StopGeneration predecessor_stop_generation;
-  ContentDigest captured_scope_digest;
-
-  friend bool operator==(const StopPredecessorAcceptanceRefDTO&,
-                         const StopPredecessorAcceptanceRefDTO&) = default;
-};
-
+/// The reply to every accepted Stop request (K15, §7.2), built after the
+/// Kernel lock is released from a copy of the event record. A Stop is never
+/// refused: an invalid request is widened and says so (`applied` differs from
+/// `requested`, `widen_reason`).
 struct StopAcceptedDTO final {
-  RequestId request_id;
-  RequestReplayStatusDTO replay_status;
-  StopId stop_id;
-  StopGeneration stop_generation;
-  ContentDigest requested_selector_digest;
-  StopResolutionDispositionDTO resolution_disposition{StopResolutionDispositionDTO::kExact};
-  StopScopeResolutionReasonDTO resolution_reason{StopScopeResolutionReasonDTO::kExactCurrentScope};
-  std::vector<StopScopeStaleDiagnosticDTO> stale_diagnostics;
-  ContentDigest captured_scope_digest;
-  std::vector<StopPredecessorAcceptanceRefDTO> joined_predecessor_stops;
-  std::vector<StopAffectedOperationRevisionDTO> affected_operation_revisions;
-  /// No shared Stop budget is accepted; each robot's own deadlines are
-  /// computed at stage dispatch from its own profile and lane.
+  RequestKey request_key;
+  RequestReplayStatusDTO replay_status{RequestReplayStatusDTO::kAcceptedNew};
+  StopEventId event_id{0U};
+  StopKind requested{StopKind::kOperation};
+  StopKind applied{StopKind::kOperation};
+  StopWidenReason widen_reason{StopWidenReason::kNone};
+  /// The run the Stop names (S1, S10, S16 only).
+  std::optional<ProgramRunNumber> program_run_id{};
+  /// At most the stored diagnostics; `stale_total` counts all of them.
+  std::vector<StopStaleDiagnosticDTO> stale_diagnostics;
+  std::uint32_t stale_total{};
+  /// Every covered participant, including those already stopping.
+  std::vector<StopCoveredParticipantDTO> covered;
+  /// The Kernel's hold revision after this event (G6).
+  std::uint64_t hold_revision{};
   std::int64_t accepted_at_ns{};
 
   friend bool operator==(const StopAcceptedDTO&, const StopAcceptedDTO&) = default;
@@ -485,7 +473,7 @@ enum class OperationControlKind {
 
 struct OperationControlRequestDTO final {
   PublicRequestContextDTO request_context;
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision expected_operation_revision;
   std::optional<std::string> reason;
   /// Receiving-adapter provenance. Public payloads cannot populate this field.
@@ -502,9 +490,9 @@ struct OperationControlRequestDTO final {
     const OperationControlRequestDTO& request) noexcept;
 
 struct OperationControlAcceptedDTO final {
-  RequestId request_id;
+  RequestKey request_key;
   RequestReplayStatusDTO replay_status;
-  OperationId operation_id;
+  OperationNumber operation_id;
   OperationRevision accepted_against_revision;
   OperationControlKind control{OperationControlKind::kReset};
   OperationRevision operation_revision_after_acceptance;

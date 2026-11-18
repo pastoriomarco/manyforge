@@ -27,7 +27,7 @@ def record(
     kind="operation_state_updated",
     clock="kernel.1",
     time_ns=100,
-    operation="op.1",
+    operation=1,
     revision=1,
 ):
     return {
@@ -38,7 +38,7 @@ def record(
         "condition_severity": "INFO",
         "persistence_digest": "sha256:" + "a" * 64,
         "event": {
-            "schema_version": "manyforge.historian_event.v2",
+            "schema_version": "manyforge.historian_event.v3",
             "event_id": f"event.{sequence}",
             "component": "manyforge.runtime",
             "event_type": kind,
@@ -46,12 +46,12 @@ def record(
             "occurred_at_ns": str(time_ns),
             "occurred_at_wall": "2026-09-06T12:00:00Z",
             "payload": {
-                "schema_version": "manyforge.operation_history_event.v1",
+                "schema_version": "manyforge.operation_history_event.v2",
                 "operation_id": operation,
                 "native_sequence": sequence,
                 "operation_revision": revision,
                 "record_kind": kind,
-                "journal_payload": {"operation_state": {"state": state, "program_run_id": "run.1"}},
+                "journal_payload": {"operation_state": {"state": state, "program_run_id": 1}},
             },
         },
     }
@@ -73,7 +73,8 @@ def test_run_latency_pairs_exact_owner_clocks_and_retains_full_causal_facts():
         "scene_id": "scene.at.incident",
         "parent_program_run_id": "parent.1",
     }
-    payload["nested"] = [{"operation_id": "op.1"}, {"operation_id": "op.2"}]
+    # Minted ids are integers (contract 1.5); references show their text.
+    payload["nested"] = [{"operation_id": 1}, {"operation_id": 2}]
     events[2]["condition_severity"] = "ERROR"
     original = deepcopy(events)
     bundle = forensic_bundle(
@@ -92,7 +93,7 @@ def test_run_latency_pairs_exact_owner_clocks_and_retains_full_causal_facts():
     assert bundle["execution_digest"]["incomplete_operation_count"] == 1
     assert bundle["execution_digest"]["operations"][0]["latest_state"]["state"] == "completed"
     incident = bundle["incidents"][0]
-    assert incident["causal_references"]["operation_id"] == ["op.1", "op.2"]
+    assert incident["causal_references"]["operation_id"] == ["1", "2"]
     assert incident["causal_references"]["scene_id"] == ["scene.at.incident"]
     assert bundle["blackboard"]["samples"][0]["values"]["grasp_confirmed"]["value"] is True
     trace = bundle["normalized_trace"]
@@ -132,36 +133,16 @@ def test_same_revision_source_order_survives_late_feedback_and_later_terminal_ac
     assert bundle["latency"]["acceptance_to_terminal"]["p99"] == "11"
 
 
-# A retained v1 original keeps its recorded version and attribution rule.
-@pytest.mark.parametrize(
-    "schema_version",
-    [
-        "manyforge.program_diagnostic.v1",
-        "manyforge.program_diagnostic.v2",
-        "manyforge.program_diagnostic.v3",
-        "manyforge.program_diagnostic.v4",
-    ],
-)
-def test_program_values_export_keeps_partial_capture_and_delivery_gaps_explicit(
-    schema_version,
-):
+# The History file holds only the current diagnostic version (v5).
+def test_program_values_export_keeps_partial_capture_and_delivery_gaps_explicit():
     event = record(1)
     event["event"]["payload"] = {
-        "schema_version": schema_version,
+        "schema_version": "manyforge.program_diagnostic.v5",
         "program_run_id": "run.1",
         "blackboard": {"ready": False, "program_run_id": "foreign.run"},
         "omitted_blackboard_count": 8,
         "delivery_loss_count": 3,
     }
-    if schema_version in {"manyforge.program_diagnostic.v1", "manyforge.program_diagnostic.v2"}:
-        # Retained v1/v2 originals still carry withdrawn runtime-override values;
-        # they are read as recorded but never become identities or samples.
-        event["event"]["payload"].update(
-            {
-                "runtime_overrides": {"program_run_id": "override.run"},
-                "omitted_override_count": 1,
-            }
-        )
     bundle = forensic_bundle(
         {"events": [event], "truncated": False, "next_before_sequence": None},
         program_run_id="run.1",
@@ -296,7 +277,7 @@ def test_unknown_clock_missing_blackboard_and_empty_latency_stay_explicit():
 
 def test_history_queries_pin_server_time_and_validate_identifiers_before_work():
     query = HistorianQueryRequest(
-        recent_seconds=60, minimum_severity="ERROR", parent_node_attempt_id="parent.2"
+        recent_seconds=60, minimum_severity="ERROR", parent_node_attempt_id="2"
     )
     native = query.native_arguments(now_utc_ns=100_000_000_000)
     assert (native["start_utc_ns"], native["end_utc_ns"]) == (
@@ -304,11 +285,16 @@ def test_history_queries_pin_server_time_and_validate_identifiers_before_work():
         100_000_000_000,
     )
     assert native["severities"] == ["ERROR", "CRITICAL"]
-    assert native["correlations"] == {"parent_node_attempt_id": "parent.2"}
-    assert HistorianDebugRequest(run_id="run.1").history_query().program_run_id == "run.1"
+    assert native["correlations"] == {"parent_node_attempt_id": "2"}
+    assert HistorianDebugRequest(run_id="1").history_query().program_run_id == "1"
     for factory, values in (
         (HistorianQueryRequest, {"start_ns": 1}),
-        (HistorianDebugRequest, {"run_id": "run.1", "program_run_id": "run.2"}),
+        (HistorianDebugRequest, {"run_id": "1", "program_run_id": "2"}),
+        (HistorianDebugRequest, {"run_id": "run.1"}),
+        (HistorianQueryRequest, {"operation_id": "op.1"}),
+        (HistorianQueryRequest, {"stop_event_id": "3f9a/op1"}),
+        # The Stop filter is the event id; the old name is gone.
+        (HistorianQueryRequest, {"stop_id": "3f9a/stop1"}),
         (HistorianDiscoveryRequest, {"kind": "component", "after": "e\u0301"}),
         (HistorianQueryRequest, {"minimum_severity": "ERROR", "severities": ["INFO"]}),
         (HistorianQueryRequest, {"search": "xy"}),
@@ -354,7 +340,7 @@ from manyforge_headless_api.service import (
 
 _MEMBER_OVERHEAD = len(',"volatile_motion_trace":') + VOLATILE_MOTION_TRACE_MARGIN_BYTES
 _TRACE = {
-    "schema_version": "manyforge.volatile_motion_trace.v1",
+    "schema_version": "manyforge.volatile_motion_trace.v2",
     "volatile": True,
     "coverage": {"truncated": False, "exported_bytes": 1},
     "goals": [{"goal_key": "g.1", "points": [{"sec": -1, "nanosec": 5}]}],
@@ -375,7 +361,7 @@ class _TraceExecution:
 
 def _export_service(monkeypatch, execution):
     monkeypatch.setattr(service_module.time, "time_ns", lambda: 1_000)
-    service = HeadlessService(object(), object(), execution=execution)
+    service = HeadlessService(object(), object(), execution=execution, application_start_id="3f9a0000000000a1")
     service.history_export = lambda _query: {
         "schema_version": "manyforge.historian_export_page.v1",
         "events": [record(1)],
@@ -477,7 +463,7 @@ def _trace_client(response):
 
 def test_execution_client_reads_volatile_trace_with_attributed_allowance():
     ok = {
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "ok": True,
         "command": "read_volatile_motion_trace",
         "trace": _TRACE,
@@ -486,7 +472,7 @@ def test_execution_client_reads_volatile_trace_with_attributed_allowance():
     assert client.read_volatile_motion_trace(4096) is _TRACE
     assert sent == [
         {
-            "api_version": "manyforge.execution_command.v3",
+            "api_version": "manyforge.execution_command.v4",
             "attribution": {"transport": "internal", "assurance": "unverified", "principal_id": None},
             "command": "read_volatile_motion_trace",
             "allowance_bytes": 4096,
@@ -495,7 +481,7 @@ def test_execution_client_reads_volatile_trace_with_attributed_allowance():
     for bad in (
         {**ok, "command": "status"},
         {**ok, "trace": []},
-        {**ok, "trace": {**_TRACE, "schema_version": "manyforge.volatile_motion_trace.v2"}},
+        {**ok, "trace": {**_TRACE, "schema_version": "manyforge.volatile_motion_trace.v1"}},
         {"api_version": ok["api_version"], "ok": False,
          "error": {"code": "unknown_command", "message": "unsupported"}},
     ):
@@ -506,22 +492,21 @@ def test_execution_client_reads_volatile_trace_with_attributed_allowance():
 
 
 def _file_trace_client(tmp_path):
-    trace = {**deepcopy(_TRACE), "request_owner_epoch": "owner.file"}
+    trace = deepcopy(_TRACE)
     payload = rfc8785.dumps(trace)
     digest = hashlib.sha256(payload).hexdigest()
     path = tmp_path / f"trace-{digest}.json"
     path.write_bytes(payload)
     path.chmod(0o600)
     metadata = {
-        "schema_version": "manyforge.motion_trace_file.v1",
+        "schema_version": "manyforge.motion_trace_file.v2",
         "file": path.name,
         "bytes": len(payload),
         "sha256": f"sha256:{digest}",
-        "request_owner_epoch": "owner.file",
         "status": "complete",
     }
     client, sent = _trace_client({
-        "api_version": "manyforge.execution_command_response.v4",
+        "api_version": "manyforge.execution_command_response.v6",
         "ok": True,
         "command": "read_volatile_motion_trace",
         "trace_file": metadata,
@@ -565,3 +550,45 @@ def test_file_trace_failures_leave_export_available_with_explicit_reason(
     bundle = _export_service(monkeypatch, client).debug_export(HistorianQueryRequest())
     assert bundle["schema_version"] == "manyforge.debug_export.v1"
     assert bundle["volatile_motion_trace"] == {"available": False, "reason": reason}
+
+
+def _stop_row(sequence, kind, journal_payload):
+    stored = record(sequence, kind=kind, operation=None, revision=None)
+    payload = stored["event"]["payload"]
+    payload["journal_payload"] = journal_payload
+    payload["stop_event_id"] = journal_payload["event_id"]
+    return stored
+
+
+def test_stop_latency_comes_from_the_stop_event_completion_row():
+    """H4: one sample per completed Stop event, completion minus acceptance on
+    the Kernel's clock; acceptance rows and stage rows add none."""
+
+    events = [
+        _stop_row(1, "stop_event_accepted", {
+            "schema_version": "manyforge.stop_event.v1", "row": "accepted",
+            "event_id": 3, "accepted_at_ns": 1_000,
+        }),
+        _stop_row(2, "stop_event_completed", {
+            "schema_version": "manyforge.stop_event.v1", "row": "completed",
+            "event_id": 3, "applied": "stop_all", "result": "stopped",
+            "accepted_at_ns": 1_000, "completed_at_ns": 251_000, "covered": [],
+        }),
+        # A completion earlier than its acceptance is no sample.
+        _stop_row(3, "stop_event_completed", {
+            "schema_version": "manyforge.stop_event.v1", "row": "completed",
+            "event_id": 4, "applied": "halt", "result": "some_failed",
+            "accepted_at_ns": 9_000, "completed_at_ns": 8_000, "covered": [],
+        }),
+    ]
+    bundle = forensic_bundle(
+        {"events": events, "truncated": False, "next_before_sequence": None},
+        program_run_id=None,
+        exported_at_ns=1,
+    )
+    latency = bundle["latency"]["stop_to_terminal"]
+    assert latency["sample_count"] == 1
+    assert latency["minimum"] == latency["maximum"] == "250000"
+    # The Stop event id is a causal reference of each row.
+    references = bundle["normalized_trace"]["records"][1]["causal_references"]
+    assert references["stop_event_id"] == ["3"]

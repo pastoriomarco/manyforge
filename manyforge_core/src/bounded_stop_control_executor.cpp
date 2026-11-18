@@ -32,9 +32,9 @@ class BoundedStopControlExecutor::Impl final {
  public:
   Impl(const std::size_t capacity, IClock& clock, IStopControlWorkReceiver& receiver)
       : capacity_(capacity), clock_(clock), receiver_(receiver) {
-    if (capacity < 2U || capacity > kMaximumStopControlWorkSlots) {
+    if (capacity == 0U || capacity > kMaximumStopControlWorkSlots) {
       throw std::invalid_argument(
-          "StopControl executor capacity must contain correlation and Full-Stop slots");
+          "StopControl executor capacity must hold between one and the maximum Stop lanes");
     }
     slots_ = std::make_unique<Slot[]>(capacity_);
     worker_ = std::jthread([this](std::stop_token stop_token) noexcept { Run(stop_token); });

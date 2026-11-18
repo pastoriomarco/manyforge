@@ -2,6 +2,7 @@
 
 #include "../src/execution_motion_target_limits_internal.hpp"
 
+#include <manyforge_core/runtime_collision_monitor.hpp>
 #include <manyforge_roboplan/execution_host_support.hpp>
 #include <manyforge_roboplan/retained_view_predecessor.hpp>
 #include <manyforge_roboplan/writer_preferring_shared_gate.hpp>
@@ -10,7 +11,9 @@
 #include <atomic>
 #include <chrono>
 #include <future>
+#include <iostream>
 #include <map>
+#include <new>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -21,12 +24,52 @@
 #include <vector>
 
 #include <cstdlib>
+#include <filesystem>
 
 #ifdef __linux__
 #include <sched.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #endif
+
+
+// Counts this thread's allocations while enabled (rule 4: a time-critical
+// path's allocation count may not grow).
+namespace {
+thread_local bool count_allocations = false;
+thread_local std::size_t counted_allocations = 0U;
+void* CountedAllocate(const std::size_t size) {
+  if (count_allocations) ++counted_allocations;
+  if (void* memory = std::malloc(size == 0U ? 1U : size); memory != nullptr) return memory;
+  throw std::bad_alloc();
+}
+// Out of line: see test_bounded_stop_control_executor.cpp.
+[[gnu::noinline]] void CountedDeallocate(void* memory) noexcept { std::free(memory); }
+template <typename Call>
+std::size_t AllocationsDuring(Call&& call) {
+  counted_allocations = 0U;
+  count_allocations = true;
+  call();
+  count_allocations = false;
+  return counted_allocations;
+}
+}  // namespace
+void* operator new(const std::size_t size) { return CountedAllocate(size); }
+void* operator new[](const std::size_t size) { return CountedAllocate(size); }
+void* operator new(const std::size_t size, const std::nothrow_t&) noexcept {
+  if (count_allocations) ++counted_allocations;
+  return std::malloc(size == 0U ? 1U : size);
+}
+void* operator new[](const std::size_t size, const std::nothrow_t&) noexcept {
+  if (count_allocations) ++counted_allocations;
+  return std::malloc(size == 0U ? 1U : size);
+}
+void operator delete(void* memory) noexcept { CountedDeallocate(memory); }
+void operator delete[](void* memory) noexcept { CountedDeallocate(memory); }
+void operator delete(void* memory, std::size_t) noexcept { CountedDeallocate(memory); }
+void operator delete[](void* memory, std::size_t) noexcept { CountedDeallocate(memory); }
+void operator delete(void* memory, const std::nothrow_t&) noexcept { CountedDeallocate(memory); }
+void operator delete[](void* memory, const std::nothrow_t&) noexcept { CountedDeallocate(memory); }
 
 using namespace manyforge::roboplan_backend;
 using namespace manyforge::core;
@@ -88,6 +131,64 @@ TEST(NativeSchedulerTest, CancelReleasesCapturedOwnerOutsideWorkerLock) {
   owner.reset();
   EXPECT_TRUE(scheduler.cancel_before_dequeue(handle));
   EXPECT_TRUE(released);
+  scheduler.close_admission_and_discard();
+}
+
+TEST(NativeSchedulerTest, LaneRunsByDeadlineThenScheduleOrderAndCancelRemovesOneTask) {
+  SimpleScheduler scheduler;
+  std::atomic<bool> parked{false};
+  std::atomic<bool> release{false};
+  ReleaseOnExit release_on_exit{release};
+  std::mutex order_mutex;
+  std::vector<int> order;
+  const auto record = [&](int value) {
+    return [&, value] {
+      std::lock_guard lock(order_mutex);
+      order.push_back(value);
+    };
+  };
+  // Park the lane so every task below is queued before the worker picks one.
+  scheduler.schedule(0, [&] {
+    parked.store(true);
+    while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  });
+  ASSERT_TRUE(wait_until_true([&] { return parked.load(); }));
+  scheduler.schedule(30, record(30));
+  scheduler.schedule(10, record(11));
+  const auto cancelled = scheduler.schedule(20, record(20));
+  scheduler.schedule(10, record(12));
+  scheduler.schedule(20, record(21));
+  scheduler.schedule(5, record(5));
+  EXPECT_TRUE(scheduler.cancel_before_dequeue(cancelled));
+  EXPECT_FALSE(scheduler.cancel_before_dequeue(cancelled));
+  release.store(true);
+  // A drain waits only for a running callback, not for queued tasks: wait for
+  // the five that remain (the cancelled one never runs).
+  ASSERT_TRUE(wait_until_true([&] {
+    std::lock_guard lock(order_mutex);
+    return order.size() == 5U;
+  }));
+  std::lock_guard lock(order_mutex);
+  EXPECT_EQ(order, (std::vector<int>{5, 11, 12, 21, 30}));
+}
+
+TEST(NativeSchedulerTest, ScheduleAndCancelAllocationCount) {
+  SimpleScheduler scheduler;
+  const auto future = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      (std::chrono::steady_clock::now() + std::chrono::hours(1)).time_since_epoch()).count();
+  // One round first so only steady-state queue work is counted.
+  scheduler.cancel(scheduler.schedule(future, [] {}));
+  for (int round = 0; round < 3; ++round) {
+    std::function<void()> callback = [] {};
+    ScheduleHandle handle{};
+    const auto scheduled =
+        AllocationsDuring([&] { handle = scheduler.schedule(future, std::move(callback)); });
+    const auto cancelled = AllocationsDuring([&] { scheduler.cancel(handle); });
+    // Reported for the before/after comparison.
+    std::cout << "schedule allocations " << scheduled << " cancel allocations " << cancelled
+              << '\n';
+    EXPECT_EQ(cancelled, 0U);
+  }
   scheduler.close_admission_and_discard();
 }
 
@@ -571,6 +672,45 @@ TEST(NativeSchedulerTest, DestructionWakesParkedWorkersOnAllRoles) {
             std::future_status::ready);
 }
 
+// Every lane's worker exists once the scheduler is built: `schedule()` on any
+// lane creates no thread and waits for none, also while that lane's worker is
+// busy in a callback.
+TEST(NativeSchedulerTest, EveryWorkerStartsAtConstructionAndScheduleCreatesNoThread) {
+#ifdef __linux__
+  const auto threads = [] {
+    std::size_t count = 0U;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/task")) {
+      static_cast<void>(entry);
+      ++count;
+    }
+    return count;
+  };
+  const auto before = threads();
+  SimpleScheduler scheduler;
+  const auto constructed = threads();
+  EXPECT_GE(constructed, before + kSchedulerPriorityCount);
+  std::atomic<bool> busy{false};
+  std::atomic<bool> release{false};
+  ReleaseOnExit release_on_exit{release};
+  scheduler.schedule(0, [&] {
+    busy.store(true);
+    while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  });
+  ASSERT_TRUE(wait_until_true([&] { return busy.load(); }));
+  const auto far_future =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          (std::chrono::steady_clock::now() + std::chrono::hours(1)).time_since_epoch())
+          .count();
+  for (std::size_t i = 0; i < kSchedulerPriorityCount; ++i)
+    scheduler.cancel(scheduler.schedule(far_future, [] {}, scheduler_priority_at(i)));
+  EXPECT_LE(threads(), constructed);
+  release.store(true);
+  scheduler.close_admission_and_discard();
+#else
+  GTEST_SKIP() << "thread count is read from /proc on Linux";
+#endif
+}
+
 TEST(NativeSchedulerTest, BackgroundCallbackExceptionDoesNotStopWorker) {
   SimpleScheduler scheduler;
   std::atomic<bool> followup_fired{false};
@@ -656,6 +796,42 @@ TEST(NativeSchedulerTest,
   }
   EXPECT_TRUE(scheduler.drain_all_for(std::chrono::seconds(1)));
   scheduler.set_safety_path_fault_sink({});
+}
+
+TEST(NativeSchedulerTest,
+     SafetyPathCallbackExceptionWithoutSinkWritesOneTypedLineAndTheLaneContinues) {
+  std::atomic<bool> stop_followup_fired{false};
+  SimpleScheduler scheduler;
+  ::testing::internal::CaptureStderr();
+  const auto now_ns =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count();
+  scheduler.schedule(
+      now_ns, []() { throw std::runtime_error("stop stage failed"); },
+      SchedulerPriority::StopControl);
+  scheduler.schedule(
+      now_ns + 1'000'000LL, [&]() { stop_followup_fired.store(true); },
+      SchedulerPriority::StopControl);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!stop_followup_fired.load() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_TRUE(scheduler.drain_all_for(std::chrono::seconds(1)));
+  const std::string output = ::testing::internal::GetCapturedStderr();
+
+  EXPECT_TRUE(stop_followup_fired.load())
+      << "StopControl lane stopped after an uncontained callback exception";
+  const std::string line =
+      "manyforge_fault code=scheduler_stop_control_callback_exception "
+      "state=uncontained\n";
+  const auto first = output.find(line);
+  ASSERT_NE(first, std::string::npos) << output;
+  EXPECT_EQ(output.find("manyforge_fault"), first) << output;
+  EXPECT_EQ(output.find("manyforge_fault", first + line.size()), std::string::npos)
+      << output;
 }
 
 TEST(NativeSchedulerTest, DrainWaitsForDequeuedRuntimeSafetyCallback) {
@@ -760,6 +936,69 @@ TEST(NativeSchedulerTest, DrainAllSharesOneDeadlineAcrossBlockedLanes) {
   EXPECT_TRUE(completed_in_shared_budget);
   EXPECT_FALSE(drained);
   EXPECT_TRUE(scheduler.drain_all_for(std::chrono::seconds(1)));
+}
+
+// OD-217: each robot's collision checks run on its own thread. Robot A's
+// check is held forever; robot B's checks still run (on a shared thread
+// they never would), and B's monitor
+// detaches without waiting for A.
+TEST(NativeSchedulerTest, RobotCheckThreadsAreIndependent) {
+  auto cell = std::make_shared<SimpleScheduler>();
+  const SimpleSchedulerConfig cell_config;
+  auto lane_a = make_runtime_collision_check_scheduler(cell_config, cell);
+  auto lane_b = make_runtime_collision_check_scheduler(cell_config, cell);
+  WallClock clock;
+  std::atomic<bool> release_a{false};
+  ReleaseOnExit release_on_exit{release_a};
+  std::atomic<bool> a_held{false};
+  std::atomic<int> ticks_b{0};
+  RuntimeCollisionMonitor monitor_a{
+      clock, *lane_a, RuntimeCollisionMonitor::Config{10'000'000},
+      [&]() {
+        a_held.store(true);
+        while (!release_a.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        return Result<void>::Ok();
+      },
+      []() { return false; }};
+  RuntimeCollisionMonitor monitor_b{
+      clock, *lane_b, RuntimeCollisionMonitor::Config{10'000'000},
+      [&]() {
+        ++ticks_b;
+        return Result<void>::Ok();
+      },
+      []() { return true; }};
+  monitor_a.start();
+  ASSERT_TRUE(wait_until_true([&]() { return a_held.load(); }));
+  monitor_b.start();
+  EXPECT_TRUE(wait_until_true([&]() { return ticks_b.load() >= 5; }));
+  auto detached = std::async(std::launch::async, [&]() { return monitor_b.detach(); });
+  EXPECT_EQ(detached.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+  EXPECT_TRUE(detached.get().ok());
+  release_a.store(true);
+  EXPECT_TRUE(monitor_a.detach().ok());
+}
+
+// OD-217: a check that throws on a robot's own thread is contained by the
+// cell's installed sink, as on the cell's own RuntimeSafety lane.
+TEST(NativeSchedulerTest, RobotCheckThreadContainsThroughTheCellSink) {
+  auto cell = std::make_shared<SimpleScheduler>();
+  std::mutex mu;
+  std::vector<std::string> contained;
+  cell->set_safety_path_fault_sink([&](std::string_view reason) {
+    std::lock_guard lock(mu);
+    contained.emplace_back(reason);
+  });
+  auto lane = make_runtime_collision_check_scheduler(SimpleSchedulerConfig{}, cell);
+  (void)lane->schedule(
+      0, []() { throw std::runtime_error("check threw"); }, SchedulerPriority::RuntimeSafety);
+  EXPECT_TRUE(wait_until_true([&]() {
+    std::lock_guard lock(mu);
+    return !contained.empty();
+  }));
+  std::lock_guard lock(mu);
+  ASSERT_EQ(contained.size(), 1U);
+  EXPECT_EQ(contained.front(), "scheduler_runtime_safety_callback_exception");
+  cell->set_safety_path_fault_sink({});
 }
 
 TEST(WriterPreferringSharedGateTest, WaitingWriterBlocksNewReadersAndIsBounded) {

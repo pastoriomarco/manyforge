@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import json
+import secrets
 from tempfile import TemporaryDirectory
 import hashlib
 import os
@@ -31,6 +32,101 @@ NODE_CATALOG = Path("/workspace/manyforge_behavior/resources/node_catalog.yaml")
 NODE_ENVIRONMENT_MANIFEST = Path(
     "/workspace/manyforge_behavior/resources/node_environment_manifest.yaml"
 )
+
+
+def _application_start_id() -> str:
+    """16 lowercase hex, never all zeros (contract 1.1)."""
+
+    while True:
+        value = secrets.token_hex(8)
+        if int(value, 16) != 0:
+            return value
+
+
+def _request_key() -> str:
+    """A client's HTTP request key: 16 random bytes as 32 hex (contract 1.4)."""
+
+    return secrets.token_hex(16)
+
+
+def _command_end(
+    read_status: Callable[[], dict], member: str, row: dict, *, timeout_seconds: float
+) -> tuple[dict, dict]:
+    """Follow one command row (OD-214) by its ``request_key`` in the status
+    ``read_status`` returns, under ``member``, to its end: the ended row and
+    the status that showed it."""
+
+    key = row["request_key"]
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        status = read_status()
+        commands = status[member]
+        current = next(
+            (
+                candidate
+                for candidate in (commands["in_progress"], *commands["ended"])
+                if candidate is not None and candidate["request_key"] == key
+            ),
+            None,
+        )
+        assert current is not None, (key, commands)
+        if current["end"] is not None:
+            return current, status
+        assert time.monotonic() < deadline, f"command did not end: {current!r}"
+        time.sleep(0.01)
+
+
+def _runner_command_end(
+    client: HeadlessHttpClient, reply: dict, *, timeout_seconds: float = 30.0
+) -> tuple[dict, dict]:
+    """A runner command's reply row followed in ``runner_commands`` of the
+    cycle status (Headless or Composer) to its end."""
+
+    assert reply["schema_version"] == "manyforge.program_command_reply.v1", reply
+    return _command_end(
+        client.program_cycle_status,
+        "runner_commands",
+        reply["command"],
+        timeout_seconds=timeout_seconds,
+    )
+
+
+def _runner_command_succeeded(
+    client: HeadlessHttpClient, reply: dict, *, timeout_seconds: float = 30.0
+) -> tuple[dict, dict]:
+    row, cycle = _runner_command_end(client, reply, timeout_seconds=timeout_seconds)
+    assert row["end"]["outcome"] == "succeeded", row
+    return row, cycle
+
+
+def _started_run(row: dict, cycle: dict) -> dict:
+    """The run an Execute started, from the cycle status that showed its
+    ``start`` row ended ``succeeded``."""
+
+    assert row["kind"] == "start" and row["end"]["outcome"] == "succeeded", row
+    run = cycle["run"]
+    assert run is not None and run["capture"]["program_run_id"] == cycle["program_run_id"], cycle
+    return run
+
+
+def _apply_command(
+    composer: HeadlessHttpClient, path: str, body: dict, *, timeout_seconds: float
+) -> dict:
+    """Send one Apply, Revert, Load or New with a fresh key; its row
+    followed in ``apply_commands`` of the Deployment workspace to its end."""
+
+    key = _request_key()
+    reply = composer.request("POST", path, body={**body, "request_key": key})
+    assert reply["schema_version"] == "manyforge.apply_command_reply.v1", reply
+    # The Composer keeps the client's key for its own rows.
+    assert reply["command"]["request_key"] == key, reply
+    row, _ = _command_end(
+        lambda: composer.request("GET", "/api/deployment/workspace"),
+        "apply_commands",
+        reply["command"],
+        timeout_seconds=timeout_seconds,
+    )
+    return row
 
 
 def _required_path(name: str) -> Path:
@@ -110,7 +206,9 @@ class ProcessStack:
         cell_id: str = "c1_build_authority_cell",
         program_path: Path | None = None,
         composer_fs_roots: tuple[Path, ...] | None = None,
-        freshness_milliseconds: int = 200,
+        # The Manager's status tick advances every 500 ms; a budget below it
+        # reports a healthy Manager as not answering. The product's default.
+        freshness_milliseconds: int = 2_000,
         enable_program_runner: bool = False,
     ) -> None:
         self.root = root
@@ -118,21 +216,24 @@ class ProcessStack:
         self.manager_run_root = root / "manager-run"
         self.execution_state_root = root / "execution-state"
         self.execution_run_root = root / "execution-run"
-        self.publication_root = root / "publications"
         self.artifact_root = root / "artifacts"
         for path in (
             self.manager_root,
             self.manager_run_root,
             self.execution_state_root,
             self.execution_run_root,
-            self.publication_root,
             self.artifact_root,
         ):
             path.mkdir()
         self.scene_database = root / "logical-scene.sqlite3"
         self.program_cycle_journal = root / "program-cycle.sqlite3"
         self.program_runner_liveness_socket = self.manager_run_root / "program-runner-liveness.sock"
-        self.history_database = root / "history.sqlite3"
+        self.history_directory = root / "history"
+        self.history_directory.mkdir()
+        # ``A`` handed to every application process this stack starts
+        # (contract 1.1). The Manager mints its own; nothing inside the
+        # application compares the two (BS 0), only Headless checks requests.
+        self.application_start_id = _application_start_id()
         self.manager_executable = _required_path("MANYFORGE_MANAGER_DAEMON")
         self.package_root = package_root or _required_path("MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT")
         self.manager_package_root = _required_path("MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT")
@@ -207,10 +308,16 @@ class ProcessStack:
             shutil.copy2(source, installed_root / installed_name)
         self.manager_executable = installed_root / "manyforge_manager_daemon"
 
-    def start_manager(self, *, publication_root: Path | None = None) -> None:
+    def start_manager(self) -> None:
         assert self.manager is None
-        manager_publication_root = publication_root or self.publication_root
-        manager_publication_root.mkdir(exist_ok=True)
+        # The launcher's process list: this stack starts each process itself.
+        application_processes = self.root / "application-processes.json"
+        application_processes.write_text(
+            json.dumps(
+                {"api_version": "manyforge.application_processes.v1", "processes": []}
+            ),
+            encoding="utf-8",
+        )
         command = [
             str(self.manager_executable),
             "--install-root",
@@ -227,10 +334,8 @@ class ProcessStack:
             str(self.execution_run_root),
             "--logical-scene-database",
             str(self.scene_database),
-            "--program-cycle-journal",
-            str(self.program_cycle_journal),
-            "--projection-root",
-            str(manager_publication_root),
+            "--application-processes",
+            str(application_processes),
             "--reconciliation-period-ms",
             "20",
         ]
@@ -277,8 +382,6 @@ class ProcessStack:
             "127.0.0.1",
             "--port",
             str(self.port),
-            "--projection-root",
-            str(self.publication_root),
             "--install-root",
             str(self.package_root),
             "--artifact-root",
@@ -289,16 +392,16 @@ class ProcessStack:
             str(NODE_ENVIRONMENT_MANIFEST),
             "--alarm-catalog-path",
             str(CATALOG),
-            "--historian-database-path",
-            str(self.history_database),
+            "--historian-directory",
+            str(self.history_directory),
             "--manager-run-root",
             str(self.manager_run_root),
             "--execution-run-root",
             str(self.execution_run_root),
             "--cell-id",
             self.cell_id,
-            "--owner-id",
-            "headless-api.process-test",
+            "--application-start-id",
+            self.application_start_id,
             "--freshness-ms",
             str(self.freshness_milliseconds),
         ]
@@ -359,8 +462,8 @@ class ProcessStack:
                 str(self.program_runner_liveness_socket),
                 "--cell-id",
                 self.cell_id,
-                "--owner-id",
-                "program-runner.process-test",
+                "--application-start-id",
+                self.application_start_id,
                 "--headless-timeout-s",
                 "8",
             ],
@@ -479,6 +582,8 @@ class ProcessStack:
             self.base_url,
             "--headless-api-timeout-s",
             "8",
+            "--application-start-id",
+            self.application_start_id,
         ]
         if self.program_path is not None:
             command.extend(("--program-path", str(self.program_path)))
@@ -546,7 +651,7 @@ class ProcessStack:
         if self.manager is None or self.manager.poll() is not None:
             self.manager = None
             return
-        request = b'{"api_version":"manyforge.manager_command.v1",' b'"command":"shutdown_runtime"}'
+        request = b'{"api_version":"manyforge.manager_command.v2",' b'"command":"shutdown_runtime"}'
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as client:
                 client.settimeout(1.0)
@@ -700,10 +805,9 @@ def _assistant_stack(
             assert origin.scenario_id == scenario_id
             metadata["source_document_digest"] = origin.source_document_digest
             apply_body = {
-                "request_id": "assistant-native.process.apply",
-                "request_owner_epoch": initial["source"]["source_owner_epoch"],
+                "request_key": _request_key(),
+                "application_start_id": stack.application_start_id,
                 "source_label": "assistant_native_process_test",
-                "correlation_id": "assistant-native.process.apply",
                 "deployment_artifact_id": metadata["physical_deployment_artifact_id"],
                 "deployment_revision": metadata["physical_deployment_revision"],
                 "expected_current": {
@@ -727,7 +831,6 @@ def _assistant_stack(
                     "prepared_activation_id": prepared_activation["prepared_activation_id"],
                     "expected_current": apply_body["expected_current"],
                     "expected_admission_generation": apply_body["expected_admission_generation"],
-                    "request_owner_epoch": apply_body["request_owner_epoch"],
                 })
             )
             apply_result = client.manager_apply(
@@ -760,6 +863,7 @@ def _assistant_stack(
         assert admission["admission_generation"] > 0
         assert (stack.execution_run_root / "execution-command.sock").is_socket()
         assert (stack.execution_run_root / "execution-observation.sock").is_socket()
+        assert (stack.execution_run_root / "execution-component.sock").is_socket()
         stack.start_composer()
         stack.wait_composer()
         yield stack
@@ -774,8 +878,12 @@ def _composer_snapshot_stream(stack: ProcessStack, *, client_id: str):
 def _composer_fence(
     snapshot: dict,
     *,
+    application_start_id: str,
     request_id: str,
 ) -> dict:
+    """A fenced Composer mutation: this start's ``A`` and one request key per
+    request label (contract 1.4)."""
+
     workspace = snapshot["authoring_workspace"]
     admission = snapshot["authoring_admission"]
     return {
@@ -784,8 +892,8 @@ def _composer_fence(
         "expectedWorkspaceEpoch": workspace["workspace_epoch"],
         "expectedWorkspaceRevision": workspace["workspace_revision"],
         "expectedAdmissionGeneration": admission["admission_generation"],
-        "requestOwnerEpoch": "composer.process.epoch.1",
-        "requestId": request_id,
+        "applicationStartId": application_start_id,
+        "requestKey": hashlib.sha256(request_id.encode("utf-8")).hexdigest()[:32],
     }
 
 
@@ -825,7 +933,6 @@ def _matching_assistant_context(stack: ProcessStack) -> tuple[dict, dict]:
 def _unavailable_candidate_preview(
     client: HeadlessHttpClient,
     manager_run_root: Path,
-    owner_epoch: str,
     admission_generation: int,
 ) -> dict:
     active = client.manager_status()["status"]["active"]
@@ -843,7 +950,6 @@ def _unavailable_candidate_preview(
                 "retained_bundle_id": active["retained_bundle_id"],
             },
             "expected_admission_generation": admission_generation,
-            "request_owner_epoch": owner_epoch,
         })
     )
 
@@ -941,9 +1047,8 @@ def _read_only_tree(root: Path) -> Iterator[None]:
 
 def _owner_identity(runtime: dict, alarms: dict) -> tuple[object, ...]:
     return (
-        runtime["projection_owner_epoch"],
+        runtime["application_start_id"],
         runtime["projection_generation"],
-        alarms["owner_epoch"],
         alarms["generation"],
         alarms["state_revision"],
     )
@@ -1288,16 +1393,8 @@ def test_program_runner_headless_and_composer_are_independent_processes(
             with pytest.raises(HeadlessClientError) as unavailable:
                 headless.program_runs(active_only=True, limit=1)
         assert unavailable.value.code == "program_runner_unavailable"
-
-        stack.start_program_runner()
-        replacement = stack.wait_program_runner()
-        with HeadlessHttpClient(stack.base_url) as headless:
-            forwarded_replacement = headless.program_runs(
-                active_only=True,
-                limit=1,
-            )
-        assert replacement["owner_epoch"] != initial["owner_epoch"]
-        assert forwarded_replacement == replacement
+        # An in-session runner replacement is gone with the takeover
+        # machinery (BS 5.1, OD-122 (1)): a runner exit ends the application.
 
 
 def test_manager_api_cli_and_replacements_preserve_headless_owners(
@@ -1312,7 +1409,6 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
                 alarms_before_composer,
             )
             status = client.manager_status()
-            first_epoch = status["source"]["source_owner_epoch"]
             assert status["status"]["manager_ready"] is True
             environment = client.node_environment()
             assert environment["retained_bundle_id"] == (
@@ -1329,13 +1425,13 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             assert client.scene()["scene_runtime"]["payload"]["state"]["state"] == ("open")
 
             unavailable = _unavailable_candidate_preview(
-                client, stack.manager_run_root, first_epoch, 1
+                client, stack.manager_run_root, 1
             )
             assert unavailable["ok"] is False
             assert unavailable["error"]["code"] == "deployment_candidate_rejected"
 
         stack.start_composer()
-        assert stack.wait_composer()["projection_owner_epoch"] == owner_identity[0]
+        assert stack.wait_composer()["application_start_id"] == owner_identity[0]
         with HeadlessHttpClient(stack.composer_url) as composer:
             assert composer.manager_graph()["cell_graph"]["cell_id"] == ("c1_build_authority_cell")
             assert (
@@ -1380,12 +1476,12 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
 
         cli_reads = {
             "health": "manyforge.headless_health.v1",
-            "manager-graph": "manyforge.manager_graph_projection.v1",
-            "node-environment": "manyforge.node_environment_projection.v2",
-            "source-model": "manyforge.source_model_projection.v3",
-            "scene": "manyforge.scene_projection.v1",
-            "alarms": "manyforge.operator_alarm_snapshot.v2",
-            "history": "manyforge.historian_summary_page.v2",
+            "manager-graph": "manyforge.manager_graph_projection.v2",
+            "node-environment": "manyforge.node_environment_projection.v3",
+            "source-model": "manyforge.source_model_projection.v4",
+            "scene": "manyforge.scene_projection.v2",
+            "alarms": "manyforge.operator_alarm_snapshot.v3",
+            "history": "manyforge.historian_summary_page.v3",
         }
         cli_payloads: dict[str, dict] = {}
         for cli_operation, expected_schema in cli_reads.items():
@@ -1413,36 +1509,9 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
             environment["environment_digest"]
         )
 
-        stack.kill_manager()
-        stale_runtime = stack.wait_complete(False, unavailable_section="manager")
-        assert "manager" in stale_runtime["unavailable_sections"]
-        with HeadlessHttpClient(stack.composer_url) as composer:
-            assert composer.runtime()["complete"] is False
-            with pytest.raises(HeadlessClientError) as unavailable_environment:
-                composer.request("GET", "/api/catalog")
-            assert unavailable_environment.value.code == ("node_environment_projection_unavailable")
-
-        stack.start_manager()
-        stack.wait_complete(True)
-        with HeadlessHttpClient(stack.base_url) as client:
-            replacement = client.manager_status()
-            replacement_epoch = replacement["source"]["source_owner_epoch"]
-            assert replacement_epoch != first_epoch
-
-            stale = _unavailable_candidate_preview(
-                client, stack.manager_run_root, first_epoch, 1
-            )
-            assert stale["ok"] is False
-            assert stale["error"]["code"] == "stale_request_owner_epoch"
-
-            unavailable = _unavailable_candidate_preview(
-                client,
-                stack.manager_run_root,
-                replacement_epoch,
-                1,
-            )
-            assert unavailable["ok"] is False
-            assert unavailable["error"]["code"] == "deployment_candidate_rejected"
+        # The Manager kill, restart and stale-epoch preview are gone with
+        # Manager epoch replacement (BS 0, 5.1; OD-122 (1)): a Manager loss
+        # ends the application.
 
 
 def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled_command() -> None:
@@ -1610,7 +1679,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
             time.sleep(0.005)
 
     def completed_and_retired(
-        operation_id: str, allowed_states: frozenset[str] | set[str] = frozenset({"completed"}),
+        operation_id: int, allowed_states: frozenset[str] | set[str] = frozenset({"completed"}),
     ) -> dict[str, Any]:
         deadline = time.monotonic() + 5.0
         first_terminal = None
@@ -1640,11 +1709,18 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
         # The bounded journal coalesces earlier state observations. Its control
         # acceptance captures the already clean terminal state and exact CAS;
         # a separate retained terminal row is not required before Reset/ACK.
-        with sqlite3.connect(state_root / "operation-journal.sqlite3") as database:
-            records = [json.loads(row[0]) for row in database.execute(
-                "SELECT payload_json FROM journal_records "
-                "WHERE operation_id=? ORDER BY sequence", (operation_id,),
-            )]
+        # The journal writer writes the rows shortly after the actions.
+        deadline = time.monotonic() + 5.0
+        while True:
+            with sqlite3.connect(state_root / "operation-journal.sqlite3") as database:
+                records = [json.loads(row[0]) for row in database.execute(
+                    "SELECT payload_json FROM journal_records "
+                    "WHERE operation_id=? ORDER BY sequence", (operation_id,),
+                )]
+            if any(record.get("record_kind") == "control_accepted" for record in records):
+                break
+            assert time.monotonic() < deadline, records
+            time.sleep(0.005)
         admissions = [(index, record) for index, record in enumerate(records)
                       if record.get("record_kind") == "operation_accepted"]
         controls = [(index, record) for index, record in enumerate(records)
@@ -1661,16 +1737,16 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
         assert int(terminal_state["journal_capture_order"]) > int(
             accepted_state["journal_capture_order"]
         )
-        owner_epoch = control["owner_epoch"]
-        assert owner_epoch == admission["owner_epoch"]
         intent = control["intent"]
         context = intent["request_context"]
         assert context["source_label"] == "kernel.manual_settlement"
-        assert context["request_owner_epoch"] == owner_epoch
-        assert context["correlation_id"] == intent["operation_id"] == operation_id
+        # A Kernel-internal key: class 1, minter 3 (contract 1.4).
+        assert set(context) == {"request_key", "source_label"}
+        assert context["request_key"][:16] == "40" + "00000000000003"
+        assert intent["operation_id"] == operation_id
         assert intent["request_attribution"]["transport"] == "internal"
         accepted = control["result"]
-        assert accepted["request_id"] == context["request_id"]
+        assert accepted["request_key"] == context["request_key"]
         assert accepted["replay_status"] == "accepted_new"
         assert accepted["control"] == expected_control
         assert accepted["operation_id"] == operation_id
@@ -1683,12 +1759,8 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
         )
         assert terminal_state["updated_at_ns"] == accepted["accepted_at_ns"]
         assert accepted == projection["last_control"]
-        # effect_pending is a durable acceptance flag, not evidence of movement.
-        # Position ACK has no provider effect; normal Stopped Reset retains its
-        # existing scoped invalidation/authorization and retirement contract.
-        assert admission["effect_pending"] is True and control["effect_pending"] is True
         identity_fields = (
-            "participant_id", "command_id", "command_generation",
+            "participant_id", "command_id",
             "controllable_component_id", "command_target_id", "capability_id",
             "control_domain_id", "control_domain_revision", "control_binding_id",
             "control_binding_revision", "capability_provider_binding_id",
@@ -1706,7 +1778,6 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
             if "operation_state" not in record:
                 continue
             state = record["operation_state"]
-            assert record["owner_epoch"] == owner_epoch
             assert state["operation_id"] == operation_id
             for key in ("program_binding_id", "program_run_id"):
                 assert state[key] == accepted_state[key] == operation[key]
@@ -1765,10 +1836,10 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
                 goal = opposite_position(status, target)
                 request = OperationIntentRequest.model_validate(
                     _direct_control_gripper_operation(
-                        status, request_id="gripper-only.command", position=goal
+                        status, label="gripper-only.command", position=goal
                     )
                 )
-                before_preview_events = client.events(status["identity"]["owner_epoch"], 0)["events"]
+                before_preview_events = client.events(0)["events"]
                 preview = client.preview_capability_command(request, trusted_principal_id=None)
                 assert preview["ok"] is True, preview
                 receipt = preview["preview_receipt"]
@@ -1777,12 +1848,12 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
                 assert receipt["program_binding_id"] == target["command"]["manual_control"][
                     "program_binding_id"
                 ]
-                assert receipt["request_owner_epoch"] == status["identity"]["owner_epoch"]
+                assert receipt["request_key"] == request.request_context.request_key
                 assert receipt["source_coordinate_name"] == target["command"]["resource"][
                     "source_coordinate_name"
                 ]
                 assert receipt["coordinate_kind"] == target["command"]["resource"]["coordinate_kind"]
-                assert client.events(status["identity"]["owner_epoch"], 0)["events"] == before_preview_events
+                assert client.events(0)["events"] == before_preview_events
                 after_preview = client.diagnostics()["status"]
                 assert after_preview["identity"] == status["identity"]
                 assert position_target(after_preview)["command"] == target["command"]
@@ -1803,7 +1874,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
                 current = client.diagnostics()["status"]
                 target = position_target(current)
                 stop_intent = _direct_control_gripper_operation(
-                    current, request_id="gripper-only.stop-command",
+                    current, label="gripper-only.stop-command",
                     position=opposite_position(current, target),
                 )
                 stop_intent["participants"][0]["payload"]["caller_options"][0]["value_s"] = 2.0
@@ -1818,55 +1889,42 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
                 stopped = client.stop(
                     StopIntentRequest.model_validate({
                         "request_context": {
-                            "request_id": "gripper-only.stop",
-                            "request_owner_epoch": current["identity"]["owner_epoch"],
+                            "request_key": _request_key(),
                             "source_label": "native-gripper-only-test",
                         },
                         "operations": [{
                             "operation_id": started["accepted"]["operation_id"],
                             "expected_operation_revision": before_stop["operation"]["operation_revision"],
-                            "expected_stop_generation": before_stop["operation"]["active_stop_generation"] or 0,
                         }],
                     }),
                     trusted_principal_id=None,
                 )
                 assert stopped["ok"] is True, stopped
-                resolution = stopped["accepted"]
-                reasons = {"exact": "exact_current_scope",
-                           "stale_but_unambiguously_resolved": "stale_metadata_current_scope",
-                           "already_terminal_no_effect": "known_terminal_or_idle_no_effect"}
-                assert resolution["resolution_disposition"] in reasons, stopped
-                assert resolution["resolution_reason"] == reasons[resolution["resolution_disposition"]]
+                accepted_stop = stopped["accepted"]
+                event_id = accepted_stop["event_id"]
+                # An operation Stop of a known operation is never widened; a
+                # natural completion race leaves it with no effect.
+                assert accepted_stop["requested"] == "operation", stopped
+                assert accepted_stop["applied"] == "operation", stopped
+                assert accepted_stop["widen_reason"] == "none", stopped
                 deadline = time.monotonic() + 3.0
                 while True:
                     after_stop = client.diagnostics()["status"]
                     stop_action = after_stop["control_state"]["cell_stop_action"]
-                    terminal = stop_action["latest_terminal"]
-                    if terminal is not None and terminal["certificate"]["stop_id"] == (
-                        stopped["accepted"]["stop_id"]
-                    ):
+                    terminal = stop_action["last_completed"]
+                    if terminal is not None and terminal["event_id"] == event_id:
                         break
                     assert time.monotonic() < deadline, after_stop
                     time.sleep(0.005)
-                assert terminal["certificate"]["stop_generation"] == stopped["accepted"]["stop_generation"]
-                # The terminal summary exposes a certificate reference; scope
-                # resolution belongs to the checked Stop acceptance above.
-                assert set(terminal["certificate"]) == {
-                    "stop_certificate_id", "stop_certificate_revision", "stop_id", "stop_generation",
-                }
-                assert terminal["certificate"]["stop_certificate_id"]
-                assert terminal["certificate"]["stop_certificate_revision"] > 0
-                assert terminal["result"] == "succeeded_nominal"
+                assert stop_action["last_event_id"] >= event_id
+                assert terminal["applied"] == "operation"
+                assert terminal["result"] in {"stopped", "no_effect"}, terminal
                 assert terminal["escalated"] is False
-                assert terminal["hard_stop_floor_used"] is False
                 stop_operation_id = started["accepted"]["operation_id"]
                 settled = completed_and_retired(stop_operation_id, {"stopped", "completed"})
-                matching_stages = [stage for stage in terminal["executed_stages"]
-                                   if stage["operation_id"] == stop_operation_id]
                 if settled["operation"]["state"] == "stopped":
-                    assert settled["operation"]["active_stop_id"] == stopped["accepted"]["stop_id"]
-                    assert matching_stages, terminal
-                    assert all(stage["outcome"] == "succeeded" for stage in matching_stages)
+                    assert terminal["result"] == "stopped", terminal
+                    assert settled["operation"]["stop_event_id"] == event_id
                     # Core's existing clean manual settlement owns the normal Reset.
                     assert settled["last_control"]["control"] == "reset"
                 else:
@@ -1882,7 +1940,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
                 continued_goal = opposite_position(after_stop, target)
                 continued = client.submit(
                     OperationIntentRequest.model_validate(_direct_control_gripper_operation(
-                        after_stop, request_id="gripper-only.command-after-stop",
+                        after_stop, label="gripper-only.command-after-stop",
                         position=continued_goal,
                     )), trusted_principal_id=None,
                 )
@@ -1900,7 +1958,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
                 refused = client.submit(
                     OperationIntentRequest.model_validate(
                         _direct_control_gripper_operation(
-                            after, request_id="gripper-only.disabled-command",
+                            after, label="gripper-only.disabled-command",
                             position=preset_position(target, "closed_state_ref"),
                         )
                     ), trusted_principal_id=None,
@@ -1921,7 +1979,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
                 retried = client.submit(
                     OperationIntentRequest.model_validate(
                         _direct_control_gripper_operation(
-                            enabled, request_id="gripper-only.command-after-enable",
+                            enabled, label="gripper-only.command-after-enable",
                             position=retried_goal,
                         )
                     ), trusted_principal_id=None,
@@ -1996,10 +2054,13 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
             HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
             HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
         ):
-            # Load waits for the whole Apply.
-            loaded = composer.request("POST", "/api/scenario/load", body={"path": str(scenario)})
-            assert loaded["outcome"] == "succeeded", loaded
-            assert loaded["components"] == [], loaded
+            # Load answers at acceptance; its row is followed to its end.
+            loaded = _apply_command(
+                composer, "/api/scenario/load", {"path": str(scenario)}, timeout_seconds=30.0
+            )
+            assert loaded["end"]["outcome"] == "succeeded", loaded
+            # The Load's component rows are no longer replied: the cell lists none.
+            assert headless.components() == [], loaded
             applied = composer.program_applied()
             assert applied["scenario_id"] == scenario_id, applied
             assert applied["program_id"] == authoring["program_id"], applied
@@ -2024,21 +2085,24 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
             assert binding["target_bindings"] == [], binding
             stack.wait_authoring_admission(expected_allowed=True)
             draft = composer.request("GET", "/api/program/draft")["program"]
-            started = headless.program_run_start({
-                "request_id": "logical.run", "request_owner_epoch": "logical.process.epoch",
-                "source_label": "logical_process_test", "correlation_id": "logical.run",
+            reply = headless.program_run_start({
+                "request_key": _request_key(), "source_label": "logical_process_test",
                 "scenario_id": scenario_id,
                 "source_document_digest": applied["source_document_digest"],
                 "expected_applied_record_digest": applied["source"]["record_digest"],
                 "draft_program_revision": draft["program_revision"],
             })
+            started = _started_run(*_runner_command_end(headless, reply, timeout_seconds=10.0))
             capture = started["capture"]
             assert capture["program_id"] == applied["program_id"], started
             assert capture["program_revision"] == applied["program_revision"], started
             assert capture["program_binding_id"] == applied["program_binding_id"], started
             deadline = time.monotonic() + 10.0
             while True:
-                terminal = headless.program_run(capture["program_run_id"])
+                terminal = headless.program_run(
+                    capture["program_run_id"],
+                    application_start_id=stack.application_start_id,
+                )
                 if terminal["state"] in {"succeeded", "failed", "stopped"}:
                     assert terminal["state"] == "succeeded", terminal
                     break

@@ -12,9 +12,9 @@
 namespace manyforge::headless {
 
 inline constexpr std::string_view kAssistantModeProjectionApiVersion =
-    "manyforge.assistant_mode_projection.v2";
+    "manyforge.assistant_mode_projection.v3";
 inline constexpr std::string_view kAssistantModeIndexApiVersion =
-    "manyforge.assistant_mode_index.v2";
+    "manyforge.assistant_mode_index.v3";
 inline constexpr std::uint64_t kMaximumAssistantModeProjectionBytes = 64ULL * 1024ULL * 1024ULL;
 inline constexpr std::uint64_t kMaximumAssistantModeIndexBytes = 8ULL * 1024ULL * 1024ULL;
 
