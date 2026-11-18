@@ -72,9 +72,16 @@ TEST(ManagerLocalExchange, EndsWhenThePeerClosesTheConnection) {
     ::close(pair.peer);
     pair.peer = -1;
   });
-  EXPECT_EQ(WaitForLocalPeer(pair.manager, POLLIN, stop.fd),
-            LocalPeerWaitEnd::kPeerClosed);
+  // A closed SEQPACKET peer is readable (end of stream) as well as hung up:
+  // the wait ends as ready so a reply sent just before the close is still
+  // read; the read that follows returns 0, which the exchange reports as the
+  // peer having closed. It never waits for the stop.
+  const auto ended = WaitForLocalPeer(pair.manager, POLLIN, stop.fd);
+  EXPECT_TRUE(ended == LocalPeerWaitEnd::kReady ||
+              ended == LocalPeerWaitEnd::kPeerClosed);
   peer.join();
+  char byte = 0;
+  EXPECT_EQ(::recv(pair.manager, &byte, 1U, MSG_DONTWAIT), 0);
 }
 
 TEST(ManagerLocalExchange, EndsOnTheApplicationStopSignal) {
@@ -102,6 +109,8 @@ TEST(ManagerLocalExchange, HaltWaitEndsOnlyOnTheForcedStopNotOnItsSlices) {
   EXPECT_EQ(WaitForLocalPeer(pair.manager, POLLIN, -1, &Forced),
             LocalPeerWaitEnd::kReady);
   peer.join();
+  char reply = 0;
+  ASSERT_EQ(::recv(pair.manager, &reply, 1U, 0), 1);  // The reply is consumed.
 
   // A second stop request forces the stop: the wait on a silent peer ends.
   std::thread forcer([] { g_forced.store(true); });
