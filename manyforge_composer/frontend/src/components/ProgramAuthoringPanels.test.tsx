@@ -1030,9 +1030,10 @@ describe('Program authoring panels', () => {
     expect(bound).toContain('Edge waits are not supported yet; only level waits run.');
     expect(bound).toContain('placeholder="Wait forever"');
     expect(bound).toContain('Empty waits forever. Otherwise the wait fails after 0.01–3600 s');
-    // Without qualified Draft facts no signal is offered; the stored one is kept as unavailable.
+    // Without qualified Draft facts no signal is offered; the stored one is kept, not checked yet.
     const unbound = render(null);
-    expect(unbound).toContain('unavailable in the current Draft candidate');
+    expect(unbound).toContain('not checked yet');
+    expect(unbound).not.toContain('aria-invalid="true"');
     expect(unbound).not.toContain('robot · DO1');
   });
 
@@ -1099,8 +1100,8 @@ describe('Program authoring panels', () => {
     expect(markup).not.toContain('Qualified Draft system signals are unavailable.');
     const unavailableMarkup = render(null);
     expect(unavailableMarkup).toContain('Qualified Draft system signals are unavailable.');
-    expect(unavailableMarkup).toContain('unavailable in the current Draft candidate');
-    expect(unavailableMarkup).toContain('aria-invalid="true"');
+    expect(unavailableMarkup).toContain('not checked yet');
+    expect(unavailableMarkup).not.toContain('aria-invalid="true"');
   });
 
   it('edits the interrupt node rule: structured condition, stage labels until qualified, literal-only fields', () => {

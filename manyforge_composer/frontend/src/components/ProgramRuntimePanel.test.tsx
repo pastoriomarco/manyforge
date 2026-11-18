@@ -2343,6 +2343,73 @@ describe('Halt', () => {
     }
   });
 
+  describe('enabled only when there is something to stop (OD-300)', () => {
+    const allStop = /class="danger-button transport-group-stop"([^>]*)>(?:Stop|Stopping)<\/button>/;
+    const halt = /class="danger-button transport-full-stop transport-unique-control"([^>]*)>(?:Halt|Halting)<\/button>/;
+    const attributes = (markup: string, pattern: RegExp) => markup.match(pattern)?.[1] ?? '';
+    const idleCell = () => {
+      const program = controller('succeeded', 'idle_after_reset');
+      program.state.run = null;
+      program.state.controls = null;
+      program.state.applied = null;
+      return program;
+    };
+    const liveRobot = () => ({ ...robotController(), statusFeedCurrent: true });
+    const render = (program: ProgramRuntimeController, robot: RobotControlController) => renderToStaticMarkup(
+      <ProgramTransportControls enabled program={program} robot={robot} />,
+    );
+
+    it('disables Stop all and Halt with nothing moving and no run, and says why', () => {
+      const markup = render(idleCell(), liveRobot());
+      expect(attributes(markup, allStop)).toContain('disabled=""');
+      expect(attributes(markup, allStop)).toContain('title="Nothing is moving."');
+      expect(attributes(markup, halt)).toContain('disabled=""');
+      expect(attributes(markup, halt)).toContain('title="Nothing is running."');
+    });
+
+    it('keeps both enabled while the status feed is not current', () => {
+      const markup = render(idleCell(), { ...robotController(), statusFeedCurrent: false });
+      expect(attributes(markup, allStop)).not.toContain('disabled');
+      expect(attributes(markup, halt)).not.toContain('disabled');
+    });
+
+    it('enables both for a manual move in the cell; Halt with no run is Stop all, without the question', async () => {
+      const robot = liveRobot();
+      const status = statusFixture();
+      status.manualOperations = [{
+        payloadKind: 'motion', operationId: 7, operationRevision: 1, resident: true,
+        state: 'executing', progress: 0.2, terminalError: null, stopEventId: null,
+      }];
+      robot.currentStatus = status;
+      const program = idleCell();
+      const markup = render(program, robot);
+      expect(attributes(markup, allStop)).not.toContain('disabled');
+      expect(attributes(markup, halt)).not.toContain('disabled');
+      const open = await mountTransport(program, robot);
+      try {
+        await open.press(haltButton);
+        expect(program.stopAll).toHaveBeenCalledTimes(1);
+        expect(program.halt).toHaveBeenCalledTimes(1);
+        expect(open.mounted(dialogOpen)).toBe(false);
+      } finally { await open.unmount(); }
+    });
+
+    it('keeps Halt, not Stop all, for a held run with nothing moving', () => {
+      const program = runningProgram();
+      program.state.run!.state = 'intervention_required';
+      program.state.controls!.executionSelections.groups[0].state = 'held';
+      const markup = render(program, liveRobot());
+      expect(attributes(markup, allStop)).toContain('disabled=""');
+      expect(attributes(markup, halt)).not.toContain('disabled');
+    });
+
+    it('enables both while Program motion runs', () => {
+      const markup = render(runningProgram(), liveRobot());
+      expect(attributes(markup, allStop)).not.toContain('disabled');
+      expect(attributes(markup, halt)).not.toContain('disabled');
+    });
+  });
+
   describe('without confirmation', () => {
     afterEach(() => { composerSettingsOverride.confirmHalt = null; });
 

@@ -18,10 +18,12 @@ import type {
   JsonValue,
   ProgramExecutionSelectionControls,
   ProgramInterventionStopScope,
+  ProgramRunStateName,
   RuntimeControlAuditEvent,
   TakeoverFallbackAuditEvent,
 } from '../types/api';
 import type { ExecutionObservationTransportStatus } from '../types/viewerObservation';
+import type { OperationStateName } from '../types/robotControl';
 import { manualOperationRequiresRecovery, robotControlHasActiveOperation } from '../state/robotControl';
 import {
   appliedExecutionSelectionRows, executionGroupDisplay, executionGroupScopes,
@@ -1533,6 +1535,12 @@ export function resetKeptMessage(options: Required<ProgramResetOptions>): string
   return 'The Scene, carried objects, gripper state and robot positions stay as they are.';
 }
 
+// A manual operation in these states may move or is about to (OD-300).
+const ACTIVE_OPERATION_STATES: ReadonlySet<OperationStateName> = new Set([
+  'queued', 'resolving', 'planning', 'validating', 'prepared', 'dispatching', 'executing', 'stopping',
+]);
+const TERMINAL_RUN_STATES: ReadonlySet<ProgramRunStateName> = new Set(['stopped', 'succeeded', 'failed']);
+
 export function ProgramTransportControls({
   enabled,
   program,
@@ -1738,6 +1746,19 @@ export function ProgramTransportControls({
     && runnerBusy === null
     && program.runnerAllows('program_reset');
   const allMotionQuiesced = state.runnerAvailable && executionSelectionIsQuiescent(allGroup);
+  // OD-300: Stop all and Halt are enabled only when there is something to
+  // stop. A status feed that is not current keeps both enabled: disabled
+  // only ever means the cell said nothing is moving.
+  const statusFeedCurrent = robot.statusFeedCurrent === true;
+  const manualMotionActive = motionActive || (robot.currentStatus?.manualOperations ?? [])
+    .some((operation) => ACTIVE_OPERATION_STATES.has(operation.state));
+  // A claimed run is one Halt acts on: it freezes the Program and blocks new
+  // manual moves. An already halted run has nothing more for Halt to do.
+  const runClaimed = state.run !== null && !TERMINAL_RUN_STATES.has(state.run.state);
+  const programMotionActive = cycleState === 'starting'
+    || (runClaimed && !executionSelectionIsQuiescent(allGroup));
+  const canStopAll = !statusFeedCurrent || manualMotionActive || programMotionActive;
+  const canHalt = canStopAll || (runClaimed && !programHalted);
   // Paused on failed nodes: each active hold has its own offer and owns its
   // motion groups (a hold in no named group: every group no other hold
   // names). A group's Retry (in place of Run/Resume) and Continue (in place
@@ -1924,12 +1945,13 @@ export function ProgramTransportControls({
     // Halt: the question still follows and says so. Cancel leaves the
     // Program's groups stopped, ready for Resume. With the confirmation off,
     // Halt follows at once (both are idempotent; nothing waits).
+    // With no run claimed, Halt equals Stop all (R2): nothing to confirm.
     const request = ++haltRequest.current;
     setHaltStopAllFailed(false);
     void program.stopAll().then((accepted) => {
       if (!accepted && haltRequest.current === request) setHaltStopAllFailed(true);
     });
-    if (preferences.confirmHalt) setHaltIntent('confirm');
+    if (preferences.confirmHalt && runClaimed) setHaltIntent('confirm');
     else void program.halt();
   };
   const nativeStatus = robot.currentStatus;
@@ -2101,7 +2123,7 @@ export function ProgramTransportControls({
             // always available (with no Program it stops manual moves).
             const allColumn = group.groupId === 'all';
             const noProgramColumn = group === NO_PROGRAM_SELECTIONS[0];
-            const canGroupStop = allColumn || (runToStop
+            const canGroupStop = allColumn ? canStopAll : (runToStop
               && group.state !== 'held'
               && group.state !== 'ready');
             // A rule hold whose scope meets this group gates its Run/Resume,
@@ -2220,7 +2242,9 @@ export function ProgramTransportControls({
                     className="danger-button transport-group-stop"
                     disabled={!canGroupStop}
                     title={allColumn
-                      ? 'Stop all motion in the cell, manual moves included, without resetting the Program. Every group stays stopped until Resume.'
+                      ? canStopAll
+                        ? 'Stop all motion in the cell, manual moves included, without resetting the Program. Every group stays stopped until Resume.'
+                        : 'Nothing is moving.'
                       : canGroupStop
                       ? `Stop motion in ${group.groupId} without resetting the Program.`
                       : group.state === 'held'
@@ -2307,7 +2331,10 @@ export function ProgramTransportControls({
             ref={haltButton}
             type="button"
             className="danger-button transport-full-stop transport-unique-control"
-            title="Stop all motion in the cell, then halt Program execution."
+            disabled={!canHalt}
+            title={canHalt
+              ? 'Stop all motion in the cell, then halt Program execution.'
+              : 'Nothing is running.'}
             onClick={requestProgramHalt}
           >{haltIntent !== null || programHalting ? 'Halting' : 'Halt'}</button>
           <button

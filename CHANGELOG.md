@@ -593,6 +593,13 @@ formats; such changes are listed explicitly.
 
 ### Changed
 
+- **Stop all and Halt are enabled only when there is something to stop
+  (OD-300).** The **All groups** row's **Stop** is enabled while a manual
+  move or Program motion can move; **Halt** also while a Program run is
+  active. With nothing to stop both are disabled and say why; while the live
+  status feed is not current both stay enabled. With no Program run, Halt no
+  longer asks for confirmation: it is Stop all.
+
 - **Add and rename initial-scene objects.** In the Scene editor, **Add object**
   (formerly *Add box*) asks for the object's name and shape (box, sphere,
   cylinder, or a mesh from the approved files). **Rename** renames the selected
@@ -1467,6 +1474,18 @@ formats; such changes are listed explicitly.
   *Integrators:* drop handling for the removed codes.
 
 ### Fixed
+
+- **The Composer works from another machine over plain http.** Opened by IP
+  address (for example `http://<host>:3000`), the Program reference check
+  never ran: it hashed the Draft with the browser's `crypto.subtle`, which
+  browsers only offer on HTTPS or `localhost`. The Properties panel then
+  showed every target and frame as unavailable and offered no TCPs. The
+  check no longer hashes in the browser; a stale answer is still discarded
+  by the Draft's generation.
+- **An unchecked reference is no longer an invalid edit.** Until the Draft
+  is validated, a target, frame, body or signal field shows its value as
+  *not checked yet* instead of reporting an invalid local edit that
+  **Discard edit** could not clear.
 
 - **A stop request ends every wait on the execution host at once.** A
   SIGTERM or SIGINT to the Manager (`compose-dev.sh stop`, `docker stop`)

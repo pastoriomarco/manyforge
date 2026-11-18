@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api } from '../api/client';
 import type { ProgramWorkspaceResponse } from '../types/api';
-import { authoringDigest, referenceResult, type ReferenceIssue, type ReferenceSelectorFacts } from '../utils/referenceValidation';
+import { referenceResult, type ReferenceIssue, type ReferenceSelectorFacts } from '../utils/referenceValidation';
 
 export function useReferenceValidation(workspace: ProgramWorkspaceResponse | null) {
   const authoring = workspace?.draft.authoring ?? null;
@@ -29,9 +29,8 @@ export function useReferenceValidation(workspace: ProgramWorkspaceResponse | nul
           workspaceEpoch: string; workspaceRevision: number; programDraftId: string;
           programDraftRevision: number; deploymentDraftId: string; deploymentDraftRevision: number;
         };
-        const digest = await authoringDigest(body);
         const response = await api.programWorkspace.validate(body, abort.signal);
-        const result = referenceResult(response, digest, {
+        const result = referenceResult(response, {
           workspace_epoch: identity.workspaceEpoch, workspace_revision: identity.workspaceRevision,
           program_draft_id: identity.programDraftId, program_draft_revision: identity.programDraftRevision,
           deployment_draft_id: identity.deploymentDraftId, deployment_draft_revision: identity.deploymentDraftRevision,

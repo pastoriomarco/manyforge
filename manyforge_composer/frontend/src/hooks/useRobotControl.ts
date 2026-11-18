@@ -365,6 +365,8 @@ export interface RobotControlController {
   tcpResumeStatus?: ExecutionOwnerStatus | null;
   tcpResumeFresh?: boolean;
   tcpResumeConnectionLost?: boolean;
+  /** The live status feed is connected and current (OD-300: what the panel shows is live). */
+  statusFeedCurrent?: boolean;
   /** Program cycle from that same current Headless snapshot. */
   tcpResumeCycle?: ProgramCycleStatus | null;
   /** Selected addressed robot/tool projection used by all direct-control UI. */
@@ -529,6 +531,7 @@ export function useRobotControl(
   const shell = controlSource?.getShellSnapshot?.();
   const tcpResumeConnectionLost = shell == null || shell.transportStatus === 'connecting'
     || shell.transportStatus === 'disconnected';
+  const statusFeedCurrent = shell?.transportStatus === 'connected' && shell.semanticStatus === 'current';
   const tcpResumeFresh = shell?.transportStatus === 'connected' && shell.semanticStatus === 'current'
     && shell.transportError === null && shell.snapshot === headlessSnapshot;
   const freshStatus = tcpResumeFresh ? headlessSnapshot?.executionControlStatus ?? null : null;
@@ -1414,6 +1417,7 @@ export function useRobotControl(
     tcpResumeStatus,
     tcpResumeFresh,
     tcpResumeConnectionLost,
+    statusFeedCurrent,
     tcpResumeCycle,
     selectedStatus,
     motionTargets,
@@ -1499,6 +1503,7 @@ export function useRobotControl(
     tcpResumeStatus,
     tcpResumeFresh,
     tcpResumeConnectionLost,
+    statusFeedCurrent,
     tcpResumeCycle,
     tcpApplying,
     tcpError,

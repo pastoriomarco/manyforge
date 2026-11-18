@@ -724,7 +724,15 @@ safety controller.
   leaves every group stopped, ready for Resume. After **Execute** the tree
   continues, but motion stays stopped until **Run** or **Resume** on each
   group. With no Program run, Halt stops everything and blocks nothing
-  afterwards.
+  afterwards, so it asks nothing.
+
+The **Stop** of the **All groups** row is enabled while something can move: a
+manual move, or Program motion that is running, starting or stopping. **Halt**
+is enabled then too, and also while a Program run is active, even with all
+its motion stopped. With nothing to stop, both are disabled and their tooltip
+says so (*Nothing is moving*, *Nothing is running*). While the live status feed
+is not connected and current, both stay enabled, since what the panel shows
+may be out of date.
 
 Output writes (**Set output** and a pneumatic gripper's valve writes), Scene
 nodes and **Set TCP** are atomic: a Stop never cuts them off. The node waits

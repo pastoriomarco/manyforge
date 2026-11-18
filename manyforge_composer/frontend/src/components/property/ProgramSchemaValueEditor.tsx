@@ -116,10 +116,11 @@ function referenceKey(value: JsonValue | undefined, fields: readonly string[]): 
 function DirectReferenceEditor({ schema, value, disabled, context, path = 'value', onCommit, onInvalidChange }: ProgramSchemaValueEditorProps) {
   const semanticType = schema['x-manyforge-semantic-type']!;
   const fields = DIRECT_REFERENCE_FIELDS[semanticType];
+  const checked = context.directReferenceChoices !== undefined;
   const choices = context.directReferenceChoices?.[semanticType] ?? [];
   const selected = referenceKey(value, fields);
   const current = choices.find((choice) => referenceKey(choice.value, fields) === selected);
-  const issue = selected && (!current || current.reason) ? current?.reason ?? 'This reference is unavailable in the current Draft candidate.' : null;
+  const issue = checked && selected && (!current || current.reason) ? current?.reason ?? 'This reference is unavailable in the current Draft candidate.' : null;
   useInvalidReport(issue || null, onInvalidChange);
   return <select
     aria-label={`Choose ${semanticType.replaceAll('_', ' ')} for ${path.replaceAll('_', ' ')}`}
@@ -133,7 +134,7 @@ function DirectReferenceEditor({ schema, value, disabled, context, path = 'value
     }}
   >
     {!selected && <option value="" disabled>Select {semanticType.replaceAll('_', ' ')}</option>}
-    {selected && !current && <option value={selected} disabled>{selected} · unavailable in the current Draft candidate</option>}
+    {selected && !current && <option value={selected} disabled>{selected} · {checked ? 'unavailable in the current Draft candidate' : 'not checked yet'}</option>}
     {choices.map((choice) => <option key={referenceKey(choice.value, fields)} value={referenceKey(choice.value, fields)} disabled={Boolean(choice.reason)}>
       {choice.label}{choice.reason ? ` · ${choice.reason}` : ''}
     </option>)}

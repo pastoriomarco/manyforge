@@ -27,4 +27,26 @@ describe('direct reference picker', () => {
     expect(markup).toContain('disabled=""');
     expect(markup).toContain('selected=""');
   });
+
+  it('shows a reference as not checked, not invalid, until the Draft is validated', () => {
+    const render = (choices?: Record<string, []>) => renderToStaticMarkup(<ProgramSchemaValueEditor
+      schema={{ type: 'object', 'x-manyforge-semantic-type': 'target_reference' }}
+      value={{ component_id: 'arm', command_target_id: 'motion' }}
+      disabled={false}
+      context={{
+        entry: {} as CatalogEntry,
+        node: { parameters: {} } as unknown as ProgramTreeNode,
+        parameterId: 'target',
+        program: { scene: [], blackboard: { keys: [] } } as unknown as ProgramAuthoringDocument,
+        ...(choices === undefined ? {} : { directReferenceChoices: choices }),
+      }}
+      onCommit={vi.fn()}
+    />);
+    const unchecked = render();
+    expect(unchecked).toContain('not checked yet');
+    expect(unchecked).not.toContain('aria-invalid');
+    const missing = render({ target_reference: [] });
+    expect(missing).toContain('unavailable in the current Draft candidate');
+    expect(missing).toContain('aria-invalid="true"');
+  });
 });
