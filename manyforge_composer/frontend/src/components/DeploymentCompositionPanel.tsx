@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { managerSectionOutstandingExchanges } from '../api/parsers/manager';
 
 import { displayApplyId } from '../api/applicationIdentity';
 import { api } from '../api/client';
@@ -123,6 +124,9 @@ export function DeploymentCompositionPanel({
     onDismiss: () => setError(null),
   });
   const maintenance = snapshot?.componentOverview.maintenanceOperation ?? null;
+  const managerPayload = snapshot?.runtime.sections.manager.payload ?? null;
+  const outstandingExchanges = useMemo(
+    () => managerSectionOutstandingExchanges(managerPayload), [managerPayload]);
   const inventoryApply = readModel === null
     ? null
     : selectManagerApplyInventoryIdentity(readModel.status.status.apply.records);
@@ -355,6 +359,7 @@ export function DeploymentCompositionPanel({
             rows={rows}
             graph={readModel?.graph ?? null}
             diff={readModel?.diff ?? null}
+            outstandingExchanges={outstandingExchanges}
             onNavigate={setTab}
             onOpenComponents={onOpenComponents}
           />

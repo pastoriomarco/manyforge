@@ -71,4 +71,19 @@ describe('manual fill field previews', () => {
     expect(changes.has('goal[0].position_rad')).toBe(false);
     expect(changes.size).toBe(2);
   });
+
+  it('marks a changed or cleared motion reference as one field, readably', () => {
+    const selected = node({
+      target_mode: 'relative',
+      target_reference: { type: 'component_frame', frame: { component_id: 'arm', frame_id: 'tool' } },
+      offset_reference: { type: 'component_frame', frame: { component_id: 'arm', frame_id: 'tool' } },
+    });
+    const values = manualFillPreviewValues(selected, {
+      target_mode: 'relative',
+      target_reference: { type: 'scene_resource', scene_resource_id: 'graspable' },
+    }, {});
+    expect(values.get('target_reference')).toBe('scene · graspable');
+    expect(values.get('offset_reference')).toBe('default');
+    expect([...values.keys()].some((key) => key.startsWith('target_reference.'))).toBe(false);
+  });
 });

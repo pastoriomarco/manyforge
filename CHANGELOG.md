@@ -591,6 +591,30 @@ formats; such changes are listed explicitly.
   because their contents changed in this cycle. Files and outputs with the
   version 1 ids are not accepted. *Integrators:* accept the version 2 ids.
 
+### Added
+
+- **The Deployment panel shows what the Manager is waiting on.** Under
+  *Desired and active*, *Manager waiting on* lists each exchange with the
+  execution host or the Program Runner that is still outstanding (for
+  example *Execution host · status (management) · 12 s*). No wait has a time
+  limit, so a stalled peer shows here; the row is absent while nothing is
+  outstanding. Information only.
+- **Move To orientation *Face down, source heading* (OD-301).** The TCP points
+  straight down (base −Z) and turns about the vertical so its X axis follows
+  the source's X axis seen from above: a part turned on the table is
+  approached with the gripper turned the same way. *Face down* keeps one
+  fixed heading.
+- **Each Program Reset is a History row (OD-305).** The Program Runner
+  records every Reset once at its end as `program_reset_finished`
+  (component `manyforge.program_runner`): succeeded, refused, failed or
+  unknown with its typed error, the options (*Reload initial scene*, *Reset
+  robot position*), the run it reset, and, when the scene was reloaded, the
+  Applied Program it used (program revision, applied record digest) and the
+  logical-scene revision the verified readback left, for example *Program
+  reset succeeded · reloaded initial scene (scene revision 10)*. New Headless
+  route `POST /api/execution/history/program-reset-outcomes`. A lost History
+  row never changes the Reset's result.
+
 ### Changed
 
 - **Stop all and Halt are enabled only when there is something to stop
@@ -1474,6 +1498,30 @@ formats; such changes are listed explicitly.
   *Integrators:* drop handling for the removed codes.
 
 ### Fixed
+
+- **The scene status never goes back to an older value (OD-302).** The
+  Manager publishes the `logical_scene` and `scene_runtime` status sections
+  from the command strand and from the Apply lane. A slower publication could
+  replace a newer value with the older one it had read, until the next
+  publication; a wait for a Scene commit could then end and a later read
+  still show the revision before it. Each value now carries the number of
+  the read it was built from, and the status board keeps only a value whose
+  number is above the one it holds, decided in the same lock-free swap.
+- **A held Manager is noticed after a reconnect (OD-304).** When the status
+  link dropped and came back while the Manager's loop was held, Headless
+  showed the Manager as answering until its silence bound and then changed
+  to "not answering" without waking the control state and viewer; on-demand
+  reads were right, pushed updates waited for the next frame. The readers are
+  now woken when that silence ends.
+- **Move To "Face down" faces down.** It set the TCP to the base frame's
+  orientation, so the tool's approach axis (Z) pointed up. It is now a half
+  turn about X: Z points straight down.
+- **An omitted `target_reference` or `offset_reference` says what it means.**
+  It showed as "frame · Select a frame", as if a required choice were
+  missing; it now reads *Not set*, or *Same as target_reference* for
+  `offset_reference` (the catalog default).
+- **Hovering Move preview highlights `target_reference` and
+  `offset_reference`** when the copy changes or clears them, as one field.
 
 - **The Composer works from another machine over plain http.** Opened by IP
   address (for example `http://<host>:3000`), the Program reference check

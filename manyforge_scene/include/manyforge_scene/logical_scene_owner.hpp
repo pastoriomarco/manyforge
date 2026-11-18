@@ -115,6 +115,16 @@ struct CanonicalEmptySceneAccessStatus final {
   [[nodiscard]] bool valid() const noexcept;
 };
 
+/// One read of the published logical-scene state (OD-302). `read_sequence`
+/// rises by one with each read and the reads are taken under the owner's
+/// lock, so a higher number holds a state at least as new: the Manager status
+/// board keeps the value of the highest number it was given.
+struct LogicalScenePublicationRead final {
+  std::uint64_t read_sequence;
+  CanonicalEmptySceneAccessStatus access;
+  std::optional<manyforge::core::LogicalSceneSnapshotRoot> snapshot;
+};
+
 struct CanonicalEmptySceneStoreIntegrityReport final {
   manyforge::core::ProjectionBootstrapPrerequisiteQueryDTO fixed_query;
   std::string schema_id;
@@ -362,6 +372,8 @@ public:
   /// public logical-scene truth and the result is empty.
   [[nodiscard]] std::optional<manyforge::core::LogicalSceneSnapshotRoot>
   ReadActiveSnapshot() const;
+  /// ReadAccessStatus and ReadActiveSnapshot of one state, numbered.
+  [[nodiscard]] LogicalScenePublicationRead ReadPublication() const;
   [[nodiscard]] CanonicalEmptySceneStoreIntegrityReport VerifyIntegrity() const;
   /// The file bytes the held rows can take, an over-count; folding and
   /// eviction keep it within the page image less a reserve while anything

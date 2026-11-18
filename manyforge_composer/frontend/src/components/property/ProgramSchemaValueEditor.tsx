@@ -37,6 +37,7 @@ import {
   defaultMotionPoseValue,
   ProgramManualFillPreviewContext,
   ProgramSpecializedEditor,
+  isMotionReferenceSchema,
   supportsProgramSpecializedEditor,
   type ValueCommit,
 } from './ProgramSpecializedEditors';
@@ -44,6 +45,9 @@ import { SourceableLeaf, SourceableValue } from './ValueSourceField';
 import { NamespaceGroupOptions, useNamespaceGroups } from '../common/NamespaceGroupOptions';
 
 /** The node parameter a reference created from a picker is written to. */
+// One stable empty value: the reference editors reset their draft when the value changes.
+const OMITTED_REFERENCE: JsonValue = Object.freeze({}) as JsonValue;
+
 export interface ProgramReferenceSource {
   nodeId: string;
   parameterId: string;
@@ -931,7 +935,7 @@ export function ProgramSchemaValueEditor(props: ProgramSchemaValueEditorProps) {
     return whole(
       <ProgramSpecializedEditor
         schema={schema}
-        value={value === undefined ? fallback : value}
+        value={value === undefined ? (isMotionReferenceSchema(schema) ? OMITTED_REFERENCE : fallback) : value}
         disabled={disabled}
         path={path}
         sourceJointInventory={props.context.sourceJointInventory}

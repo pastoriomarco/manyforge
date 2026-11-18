@@ -23,7 +23,12 @@ from .assistant_instruments import (
     MODE_PROJECTION_VERSION as ASSISTANT_MODE_PROJECTION_VERSION,
     AssistantInstruments,
 )
-from .activity_history import apply_record, component_action_record, record_activity
+from .activity_history import (
+    apply_record,
+    component_action_record,
+    program_reset_record,
+    record_activity,
+)
 from .client import MAX_HTTP_RESPONSE_BYTES
 from .execution import ExecutionPort
 from .manager import ManagerPort
@@ -35,6 +40,7 @@ from .models import (
     ProgramReferenceValidationRequest,
     CallerAttributionRequest,
     ApplyOutcomeRequest,
+    ProgramResetOutcomeRequest,
     IoSignalReadRequest,
     ManagerApplyRequest,
     ManagerApplyAcknowledgementContext,
@@ -3258,6 +3264,16 @@ class HeadlessService:
         body = request.model_dump(mode="json", exclude_none=True)
         return self.core.record_activity(apply_record(
             body["apply_kind"], body["outcome"], body.get("error"), body["components"]
+        ))
+
+    def record_program_reset_outcome(
+        self, request: ProgramResetOutcomeRequest
+    ) -> dict[str, Any]:
+        """One Program Reset terminal into History (``activity_history``)."""
+
+        body = request.model_dump(mode="json")
+        return self.core.record_activity(program_reset_record(
+            body["outcome"], body["error"], body["reset"]
         ))
 
     def manager_deployment_candidate_preview(

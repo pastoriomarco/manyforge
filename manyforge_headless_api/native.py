@@ -709,7 +709,7 @@ class NativeHeadlessCore:
     def apply_manager_status_frame(self, frame: bytes) -> dict[str, Any]:
         """Apply one Manager status stream frame to the one mirror (OD-216).
 
-        Returns ``{changed, tick_advanced}``; raises the frame's own code for
+        Returns ``{control_changed, tick_advanced, viewer_changed}``; raises the frame's own code for
         an ``error`` frame and ``manager_status_stream_invalid`` for an
         invalid one."""
 

@@ -65,6 +65,7 @@ from .history_query import (
 from .models import (
     AcknowledgeAlarmRequest,
     ApplyOutcomeRequest,
+    ProgramResetOutcomeRequest,
     ComponentActionRequest,
     ComponentGroupActionRequest,
     RecoveryPreflightConfirmation,
@@ -2387,6 +2388,15 @@ def create_app(
         """One Scenario Load/New, Deployment or Program Apply/Revert terminal
         (outcome, typed error, component rows), recorded as `apply_finished`."""
         return service.record_apply_outcome(body)
+
+    @app.post("/api/execution/history/program-reset-outcomes")
+    def history_program_reset_outcome(
+        body: ProgramResetOutcomeRequest,
+    ) -> dict[str, Any]:
+        """One Program Reset terminal (outcome, typed error, options, run,
+        Applied Program and reloaded scene revision), recorded by the Program
+        Runner as `program_reset_finished` (OD-305)."""
+        return service.record_program_reset_outcome(body)
 
     return app
 

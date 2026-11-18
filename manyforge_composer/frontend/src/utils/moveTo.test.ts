@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { Euler, Quaternion } from 'three';
+import { Euler, Quaternion, Vector3 } from 'three';
 import type { ProgramBindingDocument } from '../types/api';
 import {
   hasBoundProgramTarget,
@@ -30,7 +30,7 @@ describe('Cartesian move authoring', () => {
   it('round-trips all orientation policies, rotated bases, wrapped and singular offsets without drift', () => {
     const source = { ...entity, quaternion: new Quaternion().setFromEuler(new Euler(0.2, 0.3, -0.6)).toArray() };
     const base = { position: [2, -1, 0.4] as [number, number, number], quaternion: new Quaternion().setFromEuler(new Euler(-0.1, 0.4, 1.3)).toArray() };
-    for (const orientationMode of ['keep-current', 'use-entity', 'face-down'] as const) {
+    for (const orientationMode of ['keep-current', 'use-entity', 'face-down', 'face-down-source'] as const) {
       for (const pitch of [0.8, Math.PI / 2 - 1e-7, Math.PI / 2, -Math.PI / 2]) {
         let options = { orientationMode, offsetXyzM: [0.12, -0.04, 0.03] as [number, number, number], offsetRpyRad: [3.2, pitch, -3.3] as [number, number, number] };
         const expected = computeCartesianMoveDraft(source, entity, options)!;
@@ -193,5 +193,37 @@ describe('stored Move To sources', () => {
     expect(resolveStoredProgramPose({
       target_mode: 'relative', target_reference: { type: 'frame_role', frame_role_id: 'base' }, goal,
     }, context)).toBeNull();
+  });
+
+  it('Face down points the TCP approach axis (Z) straight down', () => {
+    const draft = computeCartesianMoveDraft(entity, null, {
+      orientationMode: 'face-down', offsetXyzM: [0, 0, 0], offsetRpyRad: [0, 0, 0],
+    });
+    const approach = new Vector3(0, 0, 1).applyQuaternion(new Quaternion(...draft!.quaternion));
+    expect(approach.z).toBeCloseTo(-1, 9);
+  });
+
+  it('Face down, source heading: TCP Z straight down, TCP X along the source X seen from above', () => {
+    const turned: PoseTuple = { position: [0.4, 0, 0.1],
+      quaternion: new Quaternion().setFromEuler(new Euler(0.2, 0.1, Math.PI / 6)).toArray() as PoseTuple['quaternion'] };
+    const draft = computeCartesianMoveDraft(turned, null, {
+      orientationMode: 'face-down-source', offsetXyzM: [0, 0, 0], offsetRpyRad: [0, 0, 0],
+    });
+    const tool = new Quaternion(...draft!.quaternion);
+    expect(new Vector3(0, 0, 1).applyQuaternion(tool).z).toBeCloseTo(-1, 9);
+    const toolX = new Vector3(1, 0, 0).applyQuaternion(tool);
+    const sourceX = new Vector3(1, 0, 0).applyQuaternion(new Quaternion(...turned.quaternion));
+    expect(Math.atan2(toolX.y, toolX.x)).toBeCloseTo(Math.atan2(sourceX.y, sourceX.x), 9);
+  });
+
+  it('Face down, source heading uses the source Y axis when its X axis is vertical', () => {
+    const standing: PoseTuple = { position: [0, 0, 0],
+      quaternion: new Quaternion().setFromEuler(new Euler(0, -Math.PI / 2, 0)).toArray() as PoseTuple['quaternion'] };
+    const draft = computeCartesianMoveDraft(standing, null, {
+      orientationMode: 'face-down-source', offsetXyzM: [0, 0, 0], offsetRpyRad: [0, 0, 0],
+    });
+    const tool = new Quaternion(...draft!.quaternion);
+    expect(new Vector3(0, 0, 1).applyQuaternion(tool).z).toBeCloseTo(-1, 9);
+    expect(Number.isFinite(tool.w)).toBe(true);
   });
 });

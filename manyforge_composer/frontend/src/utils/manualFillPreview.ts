@@ -41,6 +41,9 @@ function display(value: JsonValue | undefined): string {
   if (typeof value === 'number') return String(Number(value.toFixed(4)));
   if (typeof value === 'string' || typeof value === 'boolean') return String(value);
   if (Array.isArray(value)) return value.map((item) => display(item)).join(', ');
+  if (value.type === 'scene_resource') return `scene · ${String(value.scene_resource_id ?? '')}`;
+  if (value.type === 'component_frame') return `${frameLabel(value.frame)} frame`;
+  if (value.type === 'cell_frame') return 'cell frame';
   if (value.kind === 'cell_frame') return 'cell frame';
   if (value.kind === 'target_frame') return `${frameLabel(value.frame)} frame`;
   if (value.kind === 'default_of_target') return `${targetLabel(value.target)} default TCP`;
@@ -68,7 +71,8 @@ function walkChanges(
   const key = pathKey(path);
   // Direct target and base-frame references change as one field, like the
   // role names they replace.
-  if (key.endsWith('.frame_ref') || key.endsWith('.tcp_endpoint') || key === 'target' || key === 'base_frame') {
+  if (key.endsWith('.frame_ref') || key.endsWith('.tcp_endpoint') || key === 'target' || key === 'base_frame'
+    || key === 'target_reference' || key === 'offset_reference') {
     changes.set(key, display(after));
     return;
   }

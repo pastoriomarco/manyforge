@@ -358,6 +358,20 @@ function parseManagerOutstandingExchange(
   };
 }
 
+/**
+ * The live Manager section's outstanding exchanges (OD-295, OD-298):
+ * information only; empty when nothing is outstanding or no payload is held.
+ */
+export function managerSectionOutstandingExchanges(
+  payload: Record<string, unknown> | null,
+): ManagerOutstandingExchange[] {
+  const runtime = payload === null ? undefined : objectAt(payload.runtime, 'manager.runtime');
+  if (runtime?.outstanding_exchanges === undefined) return [];
+  return boundedArrayAt(runtime.outstanding_exchanges, 'manager.runtime.outstanding_exchanges', 8)
+    .map((item, index) => parseManagerOutstandingExchange(
+      item, 'manager.runtime.outstanding_exchanges[' + index + ']'));
+}
+
 function parseManagerRuntimeProjection(
   value: unknown,
   path: string,

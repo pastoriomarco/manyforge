@@ -1228,6 +1228,7 @@ export function RobotControlPanelView({
                               <option value="keep-current">Keep current TCP</option>
                               <option value="use-entity">Use source orientation</option>
                               <option value="face-down">Face down</option>
+                              <option value="face-down-source">Face down, source heading</option>
                             </select>
                           </label>
                           <details className="robot-control-offset-details">

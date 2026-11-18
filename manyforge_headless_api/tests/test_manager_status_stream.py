@@ -266,3 +266,44 @@ def test_shutdown_ends_the_follower_within_one_receive_slice(run_root: Path) -> 
         connection.close()
     finally:
         manager.close()
+
+
+class SameStartCore(FakeCore):
+    """A reconnect to the same start: the snapshot advances the tick only above
+    the last seen tick (OD-284 (d))."""
+
+    def apply_manager_status_frame(self, frame: bytes) -> dict[str, Any]:
+        value = json.loads(frame)
+        if value["type"] != "snapshot":
+            return super().apply_manager_status_frame(frame)
+        self.frames.append(value)
+        self._connected = True
+        advanced = value["tick"] > self._tick
+        self._tick = max(self._tick, value["tick"])
+        return {"control_changed": True, "tick_advanced": advanced, "viewer_changed": True}
+
+
+def test_a_reconnect_to_a_held_manager_wakes_the_readers_when_its_silence_ends(run_root: Path) -> None:
+    # OD-304 (a): the Manager loop is held (no new tick); the link drops and
+    # comes back at once. The mirror answers until the last tick's deadline;
+    # the readers are woken again when it passes.
+    manager = FakeManager(run_root)
+    core, wakes = SameStartCore(), Wakes()
+    follower = _follower(core, run_root, wakes, silence=0.6)
+    follower.start()
+    try:
+        first = manager.accept()
+        first.send(_frame("snapshot", 5, generations={
+            "logical_scene": 0, "manager": 1, "scene_runtime": 0, "viewer_pose_sessions": 0}))
+        assert wakes.wait(lambda: wakes.control == 1)
+        first.close()
+        assert wakes.wait(lambda: wakes.control == 2)  # The connection end.
+        second = manager.accept()
+        second.send(_frame("snapshot", 5, generations={
+            "logical_scene": 0, "manager": 1, "scene_runtime": 0, "viewer_pose_sessions": 0}))
+        assert wakes.wait(lambda: wakes.control == 3)  # Answering again.
+        assert wakes.wait(lambda: wakes.control == 4, timeout=2.0)  # Its silence ended.
+        second.close()
+    finally:
+        follower.shutdown()
+        manager.close()

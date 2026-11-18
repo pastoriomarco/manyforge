@@ -2064,6 +2064,43 @@ TEST(CanonicalEmptySceneOwner, UpsertCreatesReplacesAndRecognizesAnExactNoOp) {
   EXPECT_DOUBLE_EQ(relative_fixed->pose_in_cell.position_m.z_m, 0.5);
 }
 
+// OD-302: each publication read is numbered under the owner's lock, so a
+// higher number holds a state at least as new; access and snapshot are of one
+// state.
+TEST(CanonicalEmptySceneOwner, PublicationReadsAreNumberedInStateOrder) {
+  TemporaryDirectory directory("scene-publication-read");
+  const auto admission = LoadAdmission();
+  ControlledPublicationReader publication_reader;
+  TestCellAdmissionPort cell_admission;
+  LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
+                          admission, publication_reader, cell_admission);
+  const auto before = owner.ReadPublication();
+  EXPECT_FALSE(before.snapshot.has_value());
+  const auto active =
+      FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+          .canonical_empty_target;
+  const auto finalized = owner.ReadPublication();
+  EXPECT_GT(finalized.read_sequence, before.read_sequence);
+  ASSERT_TRUE(finalized.snapshot.has_value());
+  ASSERT_TRUE(finalized.access.active_projection.has_value());
+  EXPECT_EQ(finalized.access.active_projection->scene_revision,
+            finalized.snapshot->shared()->revision);
+
+  const auto added = owner.Commit(
+      AddBoxRequest(active, admission.cell_id(), "scene-request-read-order"));
+  ASSERT_TRUE(added.success);
+  ASSERT_TRUE(added.committed_projection_revision.has_value());
+  const auto committed = owner.ReadPublication();
+  EXPECT_GT(committed.read_sequence, finalized.read_sequence);
+  EXPECT_EQ(committed.access.active_projection,
+            added.committed_projection_revision);
+  EXPECT_EQ(committed.snapshot->shared()->revision,
+            added.committed_projection_revision->scene_revision);
+  // An unchanged state still takes a new number: one number is one read.
+  EXPECT_EQ(owner.ReadPublication().read_sequence,
+            committed.read_sequence + 1U);
+}
+
 TEST(CanonicalEmptySceneOwner,
      ProgramResetRestorationUsesExactAuthorizationWithoutOpeningAuthoring) {
   TemporaryDirectory directory("scene-program-reset");

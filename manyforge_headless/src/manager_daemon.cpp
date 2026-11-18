@@ -5059,14 +5059,17 @@ private:
     }
   }
 
+  /// Command strand and Apply lane, with no lock held. One numbered read of
+  /// the scene owner; the board keeps the value of the newest read (OD-302),
+  /// so a slower caller's older value is refused and the generation returned
+  /// is that of a value at least as new as this read.
   std::uint64_t PublishLogicalScene(const std::int64_t observed_at) {
-    const auto access = scene_owner_.ReadAccessStatus();
-    const auto snapshot = scene_owner_.ReadActiveSnapshot();
-    Require(snapshot.has_value(),
+    const auto read = scene_owner_.ReadPublication();
+    Require(read.snapshot.has_value(),
             "Manager daemon cannot publish an absent post-bootstrap scene");
-    const auto generation = status_board_.Publish(
-        ManagerStatusSection::kLogicalScene, observed_at,
-        BuildLogicalSceneSourcePayload(access, snapshot));
+    const auto generation = status_board_.PublishOrdered(
+        ManagerStatusSection::kLogicalScene, read.read_sequence, observed_at,
+        BuildLogicalSceneSourcePayload(read.access, read.snapshot));
     // Also carries a Manager value stored just before under the source lock.
     status_board_.NotifyIfChanged();
     return generation;
@@ -5118,12 +5121,21 @@ private:
     }
   }
 
+  /// Command strand and Apply lane, with no lock held. Every input of the
+  /// value (the runtime owner's snapshot, the pose replays, the configured
+  /// pose sources) is read in one manager_source_mutex_ hold, which numbers
+  /// the read; the board keeps the value of the newest read (OD-302), so a
+  /// slower caller's older value is refused and the generation returned is
+  /// that of a value at least as new as this read.
   std::uint64_t PublishSceneRuntime(const std::int64_t observed_at) {
-    const auto runtime_snapshot = scene_runtime_owner_.Snapshot();
-    auto payload = BuildSceneRuntimeSourcePayload(
-        admission_.cell_id().value(), runtime_snapshot);
+    CanonicalValue payload;
+    std::uint64_t read_sequence = 0U;
     {
       std::lock_guard lock(manager_source_mutex_);
+      read_sequence = ++scene_runtime_read_sequence_;
+      const auto runtime_snapshot = scene_runtime_owner_.Snapshot();
+      payload = BuildSceneRuntimeSourcePayload(admission_.cell_id().value(),
+                                               runtime_snapshot);
       auto payload_object =
           std::get<CanonicalValue::Object>(payload.storage());
       const auto state = std::find_if(
@@ -5218,8 +5230,9 @@ private:
                                   CanonicalValue(std::move(joint_states)));
       payload = CanonicalValue(std::move(payload_object));
     }
-    const auto generation = status_board_.Publish(
-        ManagerStatusSection::kSceneRuntime, observed_at, std::move(payload));
+    const auto generation = status_board_.PublishOrdered(
+        ManagerStatusSection::kSceneRuntime, read_sequence, observed_at,
+        payload);
     status_board_.NotifyIfChanged();
     return generation;
   }
@@ -7226,6 +7239,9 @@ private:
   std::vector<ConfiguredPoseSource> configured_pose_sources_;
   std::map<PoseObservationKey, core::SceneObjectProviderEvidenceDTO>
       pose_provider_origins_;
+  // Guarded by manager_source_mutex_: numbers each scene_runtime read, the
+  // section's order key on the status board (OD-302).
+  std::uint64_t scene_runtime_read_sequence_{};
   SceneRuntimeStateOwner scene_runtime_owner_;
   // OD-216: the four status sections in memory, served on the status
   // stream's own socket and threads; no file is written.

@@ -2663,11 +2663,19 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
 
 CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
   const std::string code = "activity_record_invalid";
-  const std::set<std::string> fields{"schema_version", "kind",   "subject",
-                                     "action",         "outcome", "error",
-                                     "components",     "message"};
-  Require(record.is_object() && record.as_object().size() == fields.size(),
-          code, "activity record fields are invalid");
+  Require(record.is_object(), code, "activity record fields are invalid");
+  // A Program Reset record (OD-305) also carries its `reset` facts.
+  const auto *kind_member = record.find_object_member("kind");
+  const auto *kind_text = kind_member == nullptr
+                              ? nullptr
+                              : std::get_if<std::string>(&kind_member->storage());
+  const bool program_reset = kind_text != nullptr && *kind_text == "program_reset";
+  std::set<std::string> fields{"schema_version", "kind",   "subject",
+                               "action",         "outcome", "error",
+                               "components",     "message"};
+  if (program_reset) fields.insert("reset");
+  Require(record.as_object().size() == fields.size(), code,
+          "activity record fields are invalid");
   for (const auto &[name, value] : record.as_object()) {
     Require(fields.contains(name), code, "activity record field is unknown");
   }
@@ -2708,12 +2716,14 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
   const auto outcome = text("outcome");
   text("message", 4096U);
   const bool component_action = kind == "component_action";
-  Require(component_action || kind == "apply", code,
+  Require(component_action || kind == "apply" || program_reset, code,
           "activity record kind is unsupported");
   const std::set<std::string> outcomes =
       component_action
           ? std::set<std::string>{"succeeded", "failed", "unknown", "refused",
                                   "interrupted"}
+      : program_reset
+          ? std::set<std::string>{"succeeded", "failed", "unknown", "refused"}
           : std::set<std::string>{"succeeded", "accepted", "failed", "refused"};
   Require(outcomes.contains(outcome), code,
           "activity record outcome is unsupported");
@@ -2725,6 +2735,57 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
     text("action", 64U);
     Require(components.as_array().empty(), code,
             "a component action record carries no component rows");
+  } else if (program_reset) {
+    Require(subject == "program_reset", code,
+            "activity record Program Reset subject is unsupported");
+    Require(std::holds_alternative<std::nullptr_t>(action.storage()) &&
+                components.as_array().empty(),
+            code, "a Program Reset record carries no action or component rows");
+    // Its options, the run it reset, the Applied Program it used and the
+    // scene revision the verified readback left (null when not reloaded).
+    const auto &reset = RequiredMember(record, "reset");
+    const std::set<std::string> reset_fields{
+        "reload_initial_scene",  "reset_robot_position", "program_run_id",
+        "program_revision",      "applied_record_digest", "scene_revision_id",
+        "scene_content_hash",    "cause_code"};
+    Require(reset.is_object() &&
+                reset.as_object().size() == reset_fields.size(),
+            code, "activity record reset facts are invalid");
+    for (const auto &[name, value] : reset.as_object()) {
+      Require(reset_fields.contains(name), code,
+              "activity record reset field is unknown");
+    }
+    const auto flag = [&](const std::string_view name) {
+      Require(std::holds_alternative<bool>(RequiredMember(reset, name).storage()),
+              code, "activity record reset option is invalid");
+    };
+    const auto optional_text = [&](const std::string_view name) {
+      const auto &value = RequiredMember(reset, name);
+      if (std::holds_alternative<std::nullptr_t>(value.storage())) return false;
+      const auto *member = std::get_if<std::string>(&value.storage());
+      Require(member != nullptr, code, "activity record reset text is invalid");
+      bounded(*member, 256U);
+      return true;
+    };
+    const auto optional_number = [&](const std::string_view name) {
+      const auto &value = RequiredMember(reset, name);
+      if (std::holds_alternative<std::nullptr_t>(value.storage())) return false;
+      const auto *member = std::get_if<double>(&value.storage());
+      Require(member != nullptr && std::isfinite(*member) && *member >= 1.0 &&
+                  std::floor(*member) == *member &&
+                  *member <= static_cast<double>(kMaximumSafeInteger),
+              code, "activity record reset number is invalid");
+      return true;
+    };
+    flag("reload_initial_scene");
+    flag("reset_robot_position");
+    optional_number("program_run_id");
+    optional_text("program_revision");
+    optional_text("applied_record_digest");
+    optional_text("cause_code");
+    Require(optional_number("scene_revision_id") ==
+                optional_text("scene_content_hash"),
+            code, "activity record reset scene revision is incomplete");
   } else {
     Require(std::holds_alternative<std::nullptr_t>(action.storage()), code,
             "an Apply record carries no action");
@@ -2768,8 +2829,12 @@ CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
   std::lock_guard lock(mutex_);
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   auto event = MakeHistorianEvent(
-      component_action ? subject : std::string("manyforge.composer"),
-      component_action ? "component_action_finished" : "apply_finished",
+      component_action ? subject
+      : program_reset  ? std::string("manyforge.program_runner")
+                       : std::string("manyforge.composer"),
+      component_action ? "component_action_finished"
+      : program_reset  ? "program_reset_finished"
+                       : "apply_finished",
       severity, clocks_.monotonic_time_ns(), clocks_.wall_time_text(),
       CanonicalValue(std::move(payload)));
   const auto event_id = event.event_id;

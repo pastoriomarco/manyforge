@@ -4042,7 +4042,7 @@ def test_reset_keeps_backend_fenced_when_scene_convergence_fails(
         events.append(f"scene:{len(contexts)}")
         if len(contexts) == 1 and not phase_write_failure:
             raise RuntimeError("logical scene owner temporarily unavailable")
-        return ({"source": {"record_digest": _DIGEST_A}}, {"proof": True})
+        return ({"source": {"record_digest": _DIGEST_A}}, {"proof": True}, None)
 
     monkeypatch.setattr(runtime, "_prepare_current_applied_scene", prepare_scene)
     request = ProgramCycleResetRequest.model_validate(
@@ -5163,7 +5163,8 @@ def test_scene_preparation_refuses_not_ready_but_not_a_moved_generation(monkeypa
         if not_ready:
             raise AssertionError("Refused admission must not prepare the Scene")
         prepared.append(kwargs["context_id"])
-        return {"program_revision": "program.rev"}, {"schema_version": "manyforge.prepared_program_scene.v1"}
+        return ({"program_revision": "program.rev"},
+                {"schema_version": "manyforge.prepared_program_scene.v1"}, None)
     monkeypatch.setattr(runtime, "_prepare_current_applied_scene", scene_effect)
     runtime.start()
     try:

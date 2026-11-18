@@ -3,7 +3,7 @@ import type { JsonValue, ProgramBindingDocument, ProgramFrameReference } from '.
 import type { PoseTuple } from './poseTransforms';
 import { rpyDegToXyzw } from './orientation';
 
-export type MoveToOrientationMode = 'keep-current' | 'face-down' | 'use-entity';
+export type MoveToOrientationMode = 'keep-current' | 'face-down' | 'face-down-source' | 'use-entity';
 
 export interface CartesianMoveDraftOptions {
   orientationMode: MoveToOrientationMode;
@@ -49,13 +49,31 @@ function finitePose(pose: PoseTuple | null): pose is PoseTuple {
     && new Quaternion(...pose.quaternion).lengthSq() > 1e-12;
 }
 
+/**
+ * Face down (TCP Z straight down, along base -Z) turned about the vertical so
+ * the TCP X axis follows the source's X axis seen from above. A source whose
+ * X axis is vertical gives its heading by its Y axis instead.
+ */
+function faceDownWithSourceHeading(entityPose: PoseTuple): Quaternion {
+  const source = new Quaternion(...entityPose.quaternion).normalize();
+  const x = new Vector3(1, 0, 0).applyQuaternion(source);
+  const y = new Vector3(0, 1, 0).applyQuaternion(source);
+  const heading = Math.hypot(x.x, x.y) > 1e-6
+    ? Math.atan2(x.y, x.x)
+    : Math.atan2(y.y, y.x) - Math.PI / 2;
+  return new Quaternion().setFromAxisAngle(new Vector3(0, 0, 1), heading)
+    .multiply(new Quaternion(1, 0, 0, 0)).normalize();
+}
+
 function selectedOrientation(
   mode: MoveToOrientationMode,
   entityPose: PoseTuple,
   currentTcpPose: PoseTuple | null,
 ): Quaternion | null {
   if (mode === 'use-entity') return new Quaternion(...entityPose.quaternion).normalize();
-  if (mode === 'face-down') return new Quaternion(0, 0, 0, 1);
+  // TCP Z is the approach axis (out of the flange): face down is a half turn about X.
+  if (mode === 'face-down') return new Quaternion(1, 0, 0, 0);
+  if (mode === 'face-down-source') return faceDownWithSourceHeading(entityPose);
   return finitePose(currentTcpPose)
     ? new Quaternion(...currentTcpPose.quaternion).normalize()
     : null;

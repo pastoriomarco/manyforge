@@ -307,9 +307,10 @@ public:
   CommitProgramModelAttempt(manyforge::content_identity::CanonicalValue record);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RecordProgramDiagnostic(manyforge::content_identity::CanonicalValue record);
-  /// One finished component action or Apply terminal
+  /// One finished component action, Apply or Program Reset terminal
   /// (`manyforge.activity_event.v1`): `component_action_finished` under the
-  /// component's id, `apply_finished` under `manyforge.composer`.
+  /// component's id, `apply_finished` under `manyforge.composer`,
+  /// `program_reset_finished` under `manyforge.program_runner` (OD-305).
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RecordActivity(manyforge::content_identity::CanonicalValue record);
   [[nodiscard]] manyforge::content_identity::CanonicalValue

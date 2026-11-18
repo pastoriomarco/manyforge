@@ -645,6 +645,11 @@ export function completeMotionReferenceTransition(
 }
 
 const FRAME_REFERENCE_TYPES = ['component_frame', 'cell_frame', 'scene_resource'];
+// What an omitted optional motion reference means (catalog: an omitted
+// offset_reference uses the target_reference orientation).
+function omittedMotionReferenceLabel(path: string | undefined): string {
+  return path === 'offset_reference' ? 'Same as target_reference' : 'Not set';
+}
 
 /** The pose frame a motion reference names, or null for a non-frame reference. */
 export function motionReferenceFrame(value: JsonObject): ProgramPoseFrame | null {
@@ -741,6 +746,7 @@ function ScopedMotionReferenceEditor({
             }
           }}
         >
+          {currentType === '' && draftChoice === '' && <option value="" disabled>{omittedMotionReferenceLabel(path)}</option>}
           {frameTypes.length > 0 && <option value="frame">frame</option>}
           {types.filter((type) => !frameTypes.includes(type)).map((option) => (
             <option key={option} value={option}>{option.replaceAll('_', ' ')}</option>
@@ -911,6 +917,7 @@ function UnscopedMotionReferenceEditor({
             if (complete) onCommit(complete);
           }}
         >
+          {currentType === '' && draftType === '' && <option value="" disabled>{omittedMotionReferenceLabel(path)}</option>}
           {enumStrings(schema.properties?.type).map((option) => (
             <option key={option} value={option}>{option.replaceAll('_', ' ')}</option>
           ))}
@@ -1454,6 +1461,12 @@ function specializedKind(schema: CatalogJsonSchema): string | null {
     && coordinateKinds.includes('target_frame')
   ) return 'frame-reference';
   return null;
+}
+
+/** A motion reference: an omitted value stays omitted, never a schema default. */
+export function isMotionReferenceSchema(schema: CatalogJsonSchema): boolean {
+  const variants = enumStrings(schema.properties?.type);
+  return schema.type === 'object' && variants.includes('component_frame') && variants.includes('pose');
 }
 
 export function supportsProgramSpecializedEditor(schema: CatalogJsonSchema): boolean {

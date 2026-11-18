@@ -2657,6 +2657,94 @@ TEST(HeadlessApiCore, ComponentActionAndApplyOutcomesAreRecordedOnce) {
                             {"manyforge.composer/failed", "ERROR"}}));
 }
 
+TEST(HeadlessApiCore, ProgramResetOutcomesAreRecordedWithTheirFacts) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const auto facts = [](CanonicalValue scene_revision_id,
+                        CanonicalValue scene_content_hash) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"reload_initial_scene", CanonicalValue(true)},
+        {"reset_robot_position", CanonicalValue(false)},
+        {"program_run_id", CanonicalValue(7.0)},
+        {"program_revision", CanonicalValue(Digest('1'))},
+        {"applied_record_digest", CanonicalValue(Digest('2'))},
+        {"scene_revision_id", std::move(scene_revision_id)},
+        {"scene_content_hash", std::move(scene_content_hash)},
+        {"cause_code", CanonicalValue(nullptr)}});
+  };
+  const auto reset = [](const std::string &outcome, CanonicalValue failure,
+                        CanonicalValue reset_facts) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+        {"kind", CanonicalValue("program_reset")},
+        {"subject", CanonicalValue("program_reset")},
+        {"action", CanonicalValue(nullptr)},
+        {"outcome", CanonicalValue(outcome)},
+        {"error", std::move(failure)},
+        {"components", CanonicalValue(CanonicalValue::Array{})},
+        {"message", CanonicalValue("Program reset " + outcome)},
+        {"reset", std::move(reset_facts)}});
+  };
+  const auto error = CanonicalValue(CanonicalValue::Object{
+      {"code", CanonicalValue("authoring_not_ready")},
+      {"message", CanonicalValue("authoring admission is not ready")}});
+  EXPECT_TRUE(std::get<bool>(
+      Member(core.RecordActivity(reset(
+                 "succeeded", CanonicalValue(nullptr),
+                 facts(CanonicalValue(10.0), CanonicalValue(Digest('3'))))),
+             "recorded")
+          .storage()));
+  EXPECT_TRUE(std::get<bool>(
+      Member(core.RecordActivity(
+                 reset("refused", error,
+                       facts(CanonicalValue(nullptr), CanonicalValue(nullptr)))),
+             "recorded")
+          .storage()));
+  // A reset record needs its facts, complete scene revisions, its typed
+  // error on a failure, and only the Reset outcomes.
+  auto missing = reset("succeeded", CanonicalValue(nullptr),
+                       facts(CanonicalValue(nullptr), CanonicalValue(nullptr)))
+                     .as_object();
+  std::erase_if(missing, [](const auto &member) { return member.first == "reset"; });
+  for (auto invalid :
+       {CanonicalValue(std::move(missing)),
+        reset("succeeded", CanonicalValue(nullptr),
+              facts(CanonicalValue(10.0), CanonicalValue(nullptr))),
+        reset("succeeded", CanonicalValue(nullptr),
+              facts(CanonicalValue(0.0), CanonicalValue(Digest('3')))),
+        reset("failed", CanonicalValue(nullptr),
+              facts(CanonicalValue(nullptr), CanonicalValue(nullptr))),
+        reset("accepted", CanonicalValue(nullptr),
+              facts(CanonicalValue(nullptr), CanonicalValue(nullptr)))}) {
+    try {
+      static_cast<void>(core.RecordActivity(std::move(invalid)));
+      FAIL() << "an invalid Program Reset record was accepted";
+    } catch (const OperatorAlarmError &failure) {
+      EXPECT_EQ(failure.code(), "activity_record_invalid");
+    }
+  }
+
+  HistorianQuery query;
+  query.event_types = {"program_reset_finished"};
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  CanonicalValue page;
+  do {
+    page = core.HistoryPage(query);
+    if (Array(page, "events").size() == 2U) break;
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(Array(page, "events").size(), 2U);
+  std::map<std::string, std::string> severities;
+  for (const auto &stored : Array(page, "events")) {
+    const auto &event = Member(stored, "event");
+    EXPECT_EQ(Text(event, "component"), "manyforge.program_runner");
+    severities[Text(Member(event, "payload"), "outcome")] =
+        Text(event, "severity");
+  }
+  EXPECT_EQ(severities, (std::map<std::string, std::string>{
+                            {"refused", "WARN"}, {"succeeded", "INFO"}}));
+}
+
 TEST(HeadlessApiCore,
      ProgramHeldDiagnosticIsInformationalAndRetainsExactValues) {
   TemporaryDirectory directory;

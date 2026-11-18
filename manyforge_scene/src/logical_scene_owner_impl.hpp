@@ -291,6 +291,8 @@ public:
   sqlite3 *database_{};
   SceneStoreMemory memory_;
   mutable std::optional<SceneCommitStateCache> scene_commit_state_cache_;
+  // Numbers each ReadPublication under `mutex_` (OD-302).
+  mutable std::uint64_t publication_read_sequence_{};
   std::unique_ptr<persistence::SqliteRecordWriter> owned_writer_;
   persistence::SqliteRecordWriter *writer_{};
   persistence::SqliteRecordWriter::StoreSlot slot_{};

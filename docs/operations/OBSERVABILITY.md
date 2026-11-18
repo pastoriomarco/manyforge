@@ -224,6 +224,17 @@ terminal, with the typed error code and message:
   Program Apply was handed to the Manager), the first `error`, and the Apply's
   component rows, each with its own `error`. A Load records one event; its
   emptying New is part of it.
+- `program_reset_finished` — one per Program Reset, at its end (component
+  `manyforge.program_runner`); a Reset continued by a later confirmation
+  records again at that confirmation's end. The payload has `outcome`
+  (`succeeded`, `refused` before it was accepted, `failed`, `unknown` when its
+  effect needs reconciliation), `error`, and `reset`: the options
+  `reload_initial_scene` and `reset_robot_position`, the `program_run_id` it
+  reset (null without a run), `cause_code` of a failure, and, when this Reset
+  reloaded the scene, the Applied Program it used (`program_revision`,
+  `applied_record_digest`) and the logical-scene revision its verified
+  readback left (`scene_revision_id`, `scene_content_hash`). The line reads
+  like `Program reset succeeded · reloaded initial scene (scene revision 10)`.
 
 The list line reads like `Enable lite6_robot failed: <code>: <message>`; select
 the row for the full payload. Filter with `event_types=component_action_finished`

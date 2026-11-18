@@ -1401,6 +1401,12 @@ class HeadlessHttpClient:
             "POST", "/api/execution/history/apply-outcomes", body=body
         )
 
+    def record_program_reset_outcome(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """One Program Reset terminal into History (OD-305)."""
+        return self.request(
+            "POST", "/api/execution/history/program-reset-outcomes", body=body
+        )
+
     def close(self) -> None:
         if self._owns_client:
             self._client.close()

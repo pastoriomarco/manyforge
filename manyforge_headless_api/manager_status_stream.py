@@ -171,6 +171,12 @@ class ManagerStatusFollower:
             if not self._answering:
                 self._answering = True
                 control = viewer = True
+        elif not self._answering and time.monotonic() < self._deadline:
+            # Reconnected within the last tick's silence bound: the mirror
+            # answers again until that deadline, so count down to it and wake
+            # the readers when it passes (OD-304).
+            self._answering = True
+            control = viewer = True
         if control:
             self._on_control_change()
         if viewer:

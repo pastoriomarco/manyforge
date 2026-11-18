@@ -3745,6 +3745,35 @@ class ApplyOutcomeRequest(StrictRequest):
     )
 
 
+_ResetText = Annotated[str, Field(min_length=1, max_length=256)]
+_ResetNumber = Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+
+
+class ProgramResetFactsRequest(StrictRequest):
+    """What one Program Reset did (OD-305): its options, the run it reset,
+    the Applied Program it used for the scene and the logical-scene revision
+    its verified readback left (null when this Reset reloaded no scene)."""
+
+    reload_initial_scene: bool
+    reset_robot_position: bool
+    program_run_id: _ResetNumber | None = None
+    program_revision: _ResetText | None = None
+    applied_record_digest: _ResetText | None = None
+    scene_revision_id: _ResetNumber | None = None
+    scene_content_hash: _ResetText | None = None
+    # The typed cause of a `program_cycle_recovery_required` failure.
+    cause_code: _ResetText | None = None
+
+
+class ProgramResetOutcomeRequest(StrictRequest):
+    """`POST /api/execution/history/program-reset-outcomes`: one Program Reset
+    terminal, recorded once in History by the Program Runner that ran it."""
+
+    outcome: Literal["succeeded", "refused", "failed", "unknown"]
+    error: ActivityErrorRequest | None = None
+    reset: ProgramResetFactsRequest
+
+
 class SetOutputRequest(StrictRequest):
     """`POST /api/io/{signal_id}/set` body."""
 

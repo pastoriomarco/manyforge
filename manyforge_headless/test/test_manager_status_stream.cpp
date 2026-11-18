@@ -130,6 +130,76 @@ TEST(ManagerStatusBoard, RaisesTheGenerationOnlyWhenTheBytesChange) {
   EXPECT_EQ(signal.Generation(), before + 1U);
 }
 
+// OD-302: a slower producer's older read never replaces a newer one.
+TEST(ManagerStatusBoard, KeepsTheValueOfTheNewestOrderKey) {
+  core::ExecutionEventChangeSignal signal;
+  ManagerStatusBoard board(signal);
+  constexpr auto kScene = ManagerStatusSection::kLogicalScene;
+  constexpr auto kIndex = static_cast<std::size_t>(kScene);
+  EXPECT_EQ(board.PublishOrdered(kScene, 2U, 5, Payload("newer")), 1U);
+  board.NotifyIfChanged();
+  const auto before = signal.Generation();
+  // An older key with other bytes is refused: the newer value, its
+  // generation and its time stay; the writers are not woken.
+  EXPECT_EQ(board.PublishOrdered(kScene, 1U, 9, Payload("older")), 1U);
+  // An equal key is refused too: one key is one read.
+  EXPECT_EQ(board.PublishOrdered(kScene, 2U, 9, Payload("other")), 1U);
+  const auto view = board.Load();
+  EXPECT_EQ(*view->sections[kIndex].payload,
+            content_identity::canonical_json(Payload("newer")));
+  EXPECT_EQ(view->sections[kIndex].generation, 1U);
+  EXPECT_EQ(view->sections[kIndex].observed_at_ns, 5);
+  EXPECT_EQ(view->sections[kIndex].order, 2U);
+  board.NotifyIfChanged();
+  EXPECT_EQ(signal.Generation(), before);
+  // A newer key with the same bytes keeps the generation and time and takes
+  // the key, so a later-arriving read between the two is still refused.
+  EXPECT_EQ(board.PublishOrdered(kScene, 4U, 11, Payload("newer")), 1U);
+  EXPECT_EQ(board.Load()->sections[kIndex].order, 4U);
+  EXPECT_EQ(board.Load()->sections[kIndex].observed_at_ns, 5);
+  EXPECT_EQ(board.PublishOrdered(kScene, 3U, 12, Payload("between")), 1U);
+  EXPECT_EQ(*board.Load()->sections[kIndex].payload,
+            content_identity::canonical_json(Payload("newer")));
+  board.NotifyIfChanged();
+  EXPECT_EQ(signal.Generation(), before);
+  // A newer key with other bytes raises the generation.
+  EXPECT_EQ(board.PublishOrdered(kScene, 5U, 13, Payload("newest")), 2U);
+  EXPECT_EQ(board.Load()->sections[kIndex].observed_at_ns, 13);
+  // Sections keep their own keys.
+  EXPECT_EQ(board.PublishOrdered(ManagerStatusSection::kSceneRuntime, 1U, 14,
+                                 Payload("runtime")),
+            1U);
+}
+
+// OD-302: producers racing on one section end with the value of the highest
+// key, whatever order their swaps land in.
+TEST(ManagerStatusBoard, ConcurrentOrderedProducersEndWithTheHighestKey) {
+  core::ExecutionEventChangeSignal signal;
+  ManagerStatusBoard board(signal);
+  constexpr auto kRuntime = ManagerStatusSection::kSceneRuntime;
+  constexpr std::uint64_t kPerThread = 500U;
+  constexpr std::uint64_t kThreads = 4U;
+  {
+    std::vector<std::jthread> producers;
+    for (std::uint64_t thread = 0U; thread < kThreads; ++thread) {
+      producers.emplace_back([&board, thread] {
+        // Interleaved keys: thread t publishes t+1, t+1+kThreads, ...
+        for (std::uint64_t step = 0U; step < kPerThread; ++step) {
+          const auto key = thread + 1U + step * kThreads;
+          static_cast<void>(board.PublishOrdered(
+              kRuntime, key, static_cast<std::int64_t>(key),
+              Payload(std::to_string(key))));
+        }
+      });
+    }
+  }
+  const auto &section =
+      board.Load()->sections[static_cast<std::size_t>(kRuntime)];
+  EXPECT_EQ(section.order, kThreads * kPerThread);
+  EXPECT_EQ(*section.payload, content_identity::canonical_json(
+                                  Payload(std::to_string(kThreads * kPerThread))));
+}
+
 TEST(ManagerStatusStream, SendsTheFullStateAtConnect) {
   Fixture fixture;
   fixture.Publish(ManagerStatusSection::kManager, "manager");

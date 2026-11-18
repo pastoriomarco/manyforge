@@ -6,6 +6,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from pathlib import Path
 import itertools
+import logging
 import threading
 from typing import Any
 
@@ -22,6 +23,7 @@ from manyforge_behavior.program_scheduling import (
     PROGRAM_TICK_WORKER_FAILED_CODE,
     ProgramSchedulingError,
 )
+from manyforge_headless_api.client import HeadlessClientError
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_program_runner.bbkey_publication import (
     FAULT_CODE,
@@ -985,6 +987,27 @@ def test_runner_start_establishes_the_between_run_source(state: str, expected: i
     runtime._cell_bbkey_union = lambda: ("door",)  # type: ignore[method-assign]  # noqa: SLF001
     runtime._establish_startup_bbkey_source()  # noqa: SLF001
     assert len(hosts) == expected
+
+
+def test_runner_start_before_any_scenario_logs_one_line_without_a_trace(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # OD-305: no Scenario is loaded yet, an expected state: one line, no traceback.
+    applied, journal = _Applied(), _Journal("idle_after_reset")
+
+    def not_loaded() -> dict[str, Any]:
+        raise HeadlessClientError(
+            "program_applied_selection_not_found",
+            "the active configuration was not installed from a Scenario",
+        )
+
+    applied.program_applied = not_loaded  # type: ignore[method-assign]
+    runtime, hosts = _runtime(applied, journal)
+    with caplog.at_level(logging.INFO):
+        runtime._establish_startup_bbkey_source()  # noqa: SLF001
+    assert hosts == []
+    rows = [row for row in caplog.records if "between-Run BB key source" in row.getMessage()]
+    assert len(rows) == 1 and rows[0].levelno == logging.INFO and rows[0].exc_info is None
 
 
 def test_runtime_reset_retires_the_run_sender_without_a_frame() -> None:

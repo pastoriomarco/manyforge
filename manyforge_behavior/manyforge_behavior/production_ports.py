@@ -6771,13 +6771,16 @@ class HeadlessSceneProgramPort:
         context: ProgramRunPortContext,
         initial_scene: Sequence[Mapping[str, Any]],
         proof: Mapping[str, Any],
-    ) -> None:
+    ) -> dict[str, Any]:
+        """Verify the prepared scene; return the readback's scene revision
+        (``scene_id``, ``revision_id``, ``content_hash``)."""
         parsed = self._parse_context(context)
         view = self._read_view(parsed)
         operations = self._initial_scene_operations(parsed, initial_scene, cell_id=view.cell_id)
         desired_scene_digest = self._desired_scene_digest(parsed, operations)
         if not self._proof_identifies(parsed, view, desired_scene_digest, proof):
             raise ProductionPortError("prepared logical scene changed before Program capture")
+        return deepcopy(view.projection_revision["scene_revision"])
 
     def release(self, scene_context: tuple[str, int]) -> None:
         """Release one scene context, named by (kind, number)."""

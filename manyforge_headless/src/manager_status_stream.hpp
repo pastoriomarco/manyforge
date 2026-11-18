@@ -32,6 +32,9 @@
 // (`{runtime_identity, sessions}`, fixed by this stream's version). A
 // section's generation starts at 1 in this start and rises only when its
 // payload bytes change; `observed_at_ns` is the producer's time of that value.
+// `logical_scene` and `scene_runtime` have concurrent producers: each value
+// carries the number of the read it was built from, and the board keeps the
+// value of the highest number (OD-302), so a section never goes back.
 
 #include "manager_response_transport_internal.hpp"
 #include "manyforge_headless/source_contract.hpp"
@@ -46,6 +49,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -80,6 +84,9 @@ public:
     std::int64_t observed_at_ns{};
     /// Canonical JSON of the payload; null while generation is 0.
     std::shared_ptr<const std::string> payload;
+    /// The order key of the held value (PublishOrdered); 0 for a section
+    /// published without one.
+    std::uint64_t order{};
   };
   struct View final {
     std::uint64_t tick{};
@@ -95,26 +102,26 @@ public:
   /// Stores `payload` as the section's newest value and returns its
   /// generation, which rises only when the encoded bytes differ (an
   /// unchanged value keeps its generation and its `observed_at_ns`).
+  /// For a section whose producers are serialized (`manager`,
+  /// `viewer_pose_sessions`).
   std::uint64_t Publish(const ManagerStatusSection section,
                         const std::int64_t observed_at_ns,
                         const content_identity::CanonicalValue &payload) {
-    auto bytes = std::make_shared<const std::string>(
-        content_identity::canonical_json(payload));
-    const auto index = static_cast<std::size_t>(section);
-    auto current = view_.load();
-    for (;;) {
-      const auto &old = current->sections[index];
-      if (old.payload != nullptr && *old.payload == *bytes)
-        return old.generation;
-      auto next = std::make_shared<View>(*current);
-      next->sections[index] = Section{old.generation + 1U, observed_at_ns, bytes};
-      const auto generation = next->sections[index].generation;
-      if (view_.compare_exchange_weak(current,
-                                      std::shared_ptr<const View>(std::move(next)))) {
-        changed_.store(true, std::memory_order_release);
-        return generation;
-      }
-    }
+    return Store(section, std::nullopt, observed_at_ns, payload);
+  }
+
+  /// For a section with concurrent producers (`logical_scene`,
+  /// `scene_runtime`, OD-302): `order` is the key of the read the payload
+  /// was built from, rising with the state read. Stores like Publish only
+  /// when `order` is above the held value's key, decided in the same swap;
+  /// an older or equal key changes nothing and returns the held value's
+  /// generation, whose value is at least as new. A newer key with unchanged
+  /// bytes keeps the generation and time and takes the newer key.
+  std::uint64_t PublishOrdered(const ManagerStatusSection section,
+                               const std::uint64_t order,
+                               const std::int64_t observed_at_ns,
+                               const content_identity::CanonicalValue &payload) {
+    return Store(section, order, observed_at_ns, payload);
   }
 
   /// One status tick of the main loop (only the loop calls it).
@@ -147,6 +154,38 @@ public:
   }
 
 private:
+  std::uint64_t Store(const ManagerStatusSection section,
+                      const std::optional<std::uint64_t> order,
+                      const std::int64_t observed_at_ns,
+                      const content_identity::CanonicalValue &payload) {
+    auto bytes = std::make_shared<const std::string>(
+        content_identity::canonical_json(payload));
+    const auto index = static_cast<std::size_t>(section);
+    auto current = view_.load();
+    for (;;) {
+      const auto &old = current->sections[index];
+      if (order.has_value() && *order <= old.order)
+        return old.generation;
+      const bool unchanged = old.payload != nullptr && *old.payload == *bytes;
+      if (unchanged && !order.has_value())
+        return old.generation;
+      auto next = std::make_shared<View>(*current);
+      auto &slot = next->sections[index];
+      if (unchanged)
+        slot.order = *order;
+      else
+        slot = Section{old.generation + 1U, observed_at_ns, bytes,
+                       order.value_or(0U)};
+      const auto generation = slot.generation;
+      if (view_.compare_exchange_weak(current,
+                                      std::shared_ptr<const View>(std::move(next)))) {
+        if (!unchanged)
+          changed_.store(true, std::memory_order_release);
+        return generation;
+      }
+    }
+  }
+
   core::ExecutionEventChangeSignal &signal_;
   std::atomic<std::shared_ptr<const View>> view_;
   std::atomic<bool> changed_{false};

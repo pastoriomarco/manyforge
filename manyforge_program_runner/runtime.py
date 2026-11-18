@@ -230,6 +230,9 @@ _FAILED_WITH_EFFECT: Final = frozenset({_RECOVERY_REQUIRED, "program_run_started
 # The command carrier of the thread running a command for a reply at
 # acceptance (``run_command``); unset on every other thread.
 _carrier_of_thread = local()
+# The Program Reset this thread runs (OD-305): its command row and the scene
+# its reload left, for the one History row recorded at its end.
+_reset_of_thread = local()
 
 
 @dataclass(frozen=True)
@@ -2315,8 +2318,9 @@ class ProgramRuntime:
         context: Any,
         initial_scene: Sequence[Mapping[str, Any]],
         proof: Mapping[str, Any],
-    ) -> None:
-        self._scene.verify_initial_scene(context, initial_scene, proof)
+    ) -> Mapping[str, Any] | None:
+        """The verified readback's scene revision."""
+        return self._scene.verify_initial_scene(context, initial_scene, proof)
 
     def _prepare_current_applied_scene(
         self,
@@ -2324,12 +2328,14 @@ class ProgramRuntime:
         expected_record_digest: str | None,
         context_id: tuple[str, int],
         program_reset_scene_authorization: Mapping[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
+    ) -> tuple[dict[str, Any], dict[str, Any], Mapping[str, Any] | None]:
         """Converge and verify one exact Applied Program scene.
 
         This is the single idempotent primitive shared by activation and Reset.
         It owns no cycle transition and always releases its temporary scene
         context; callers decide when their exact lifecycle fence permits it.
+        Returns the Applied Program, the proof and the scene revision the
+        verified readback left.
         """
 
         applied = self._headless.program_applied()
@@ -2376,13 +2382,13 @@ class ProgramRuntime:
                         program_reset_scene_authorization
                     ),
                 )
-            self._verify_run_scene(context, initial_scene, proof)
+            scene_revision = self._verify_run_scene(context, initial_scene, proof)
             if self._headless.program_applied() != applied:
                 raise ProgramRunnerError(
                     "program_run_applied_selection_stale",
                     "Applied Program changed during scene preparation",
                 )
-            return deepcopy(applied), deepcopy(proof)
+            return deepcopy(applied), deepcopy(proof), deepcopy(scene_revision)
         finally:
             self._scene.release(context_id)
 
@@ -2415,7 +2421,7 @@ class ProgramRuntime:
         try:
             # Scene context (1.16.5): the run this Reset resets, or the
             # current Apply when no run exists.
-            self._prepare_current_applied_scene(
+            applied, _proof, scene_revision = self._prepare_current_applied_scene(
                 expected_record_digest=None,
                 context_id=(
                     ("run", request.program_run_id)
@@ -2424,6 +2430,14 @@ class ProgramRuntime:
                 ),
                 program_reset_scene_authorization=authorization,
             )
+            # What this Reset's History row names (OD-305).
+            revision = scene_revision or {}
+            _reset_of_thread.scene = {
+                "program_revision": applied.get("program_revision"),
+                "applied_record_digest": applied["source"]["record_digest"],
+                "scene_revision_id": revision.get("revision_id"),
+                "scene_content_hash": revision.get("content_hash"),
+            }
         except ProgramRunnerError as error:
             raise ProgramRunnerError(
                 "program_cycle_reset_scene_preparation_failed",
@@ -2569,7 +2583,7 @@ class ProgramRuntime:
                 # Accepted (OD-214) once the scene work starts; it records no
                 # request, and its reply stays at completion (Headless).
                 self._command_accepted("preparing_scene")
-                applied, proof = self._prepare_current_applied_scene(
+                applied, proof, _scene_revision = self._prepare_current_applied_scene(
                     expected_record_digest=request.expected_applied_record_digest,
                     context_id=("apply", self._current_apply_number()),
                 )
@@ -2640,6 +2654,20 @@ class ProgramRuntime:
                 if not isinstance(document, Mapping):
                     return
                 program = Program.from_dict(deepcopy(dict(document)), self._environment.catalog)
+            except HeadlessClientError as error:
+                if error.code != "program_applied_selection_not_found":
+                    _LOGGER.warning(
+                        "between-Run BB key source not established at start; "
+                        "the next Apply or Run establishes it",
+                        exc_info=True,
+                    )
+                    return
+                # Expected before the first Load (OD-305): one line, no trace.
+                _LOGGER.info(
+                    "between-Run BB key source not established at start: no Scenario "
+                    "is loaded yet; the next Apply or Run establishes it"
+                )
+                return
             except Exception:
                 _LOGGER.warning(
                     "between-Run BB key source not established at start; "
@@ -6690,14 +6718,66 @@ class ProgramRuntime:
         )
 
     def reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]:
+        """Run one Program Reset and record its terminal in History once
+        (Headless ``program_reset_finished``, OD-305). Recording never
+        changes the Reset's result."""
+
         if not isinstance(request, ProgramCycleResetRequest):
             raise TypeError("reset_cycle requires one ProgramCycleResetRequest")
+        _reset_of_thread.row = None
+        _reset_of_thread.scene = None
+        try:
+            result = self._reset_cycle(request)
+        except Exception as error:
+            self._record_reset(request, error)
+            raise
+        self._record_reset(request, None)
+        return result
+
+    def _record_reset(
+        self, request: ProgramCycleResetRequest, error: Exception | None
+    ) -> None:
+        # The outcome its command row ends with; refused before it took the runner.
+        row = _reset_of_thread.row or _CommandRow("reset", request.request_key, 0, None)
+        end = _command_end(row, error)
+        cause = (end["details"] or {}).get("cause_code")
+        body: dict[str, Any] = {
+            "outcome": end["outcome"],
+            "reset": {
+                "reload_initial_scene": request.reload_initial_scene,
+                "reset_robot_position": request.reset_robot_position,
+                "program_run_id": request.program_run_id,
+                # Set only when this Reset reloaded and verified the scene.
+                **(_reset_of_thread.scene or dict.fromkeys((
+                    "program_revision", "applied_record_digest",
+                    "scene_revision_id", "scene_content_hash",
+                ))),
+                "cause_code": cause if isinstance(cause, str) else None,
+            },
+        }
+        if error is not None:
+            body["error"] = {
+                "code": end["code"],
+                # History keeps the first 2 KiB of each text.
+                "message": (str(error) or type(error).__name__)[:2048],
+            }
+        try:
+            self._headless.record_program_reset_outcome(body)
+        except Exception:  # noqa: BLE001 - a lost History line never fails the Reset
+            _LOGGER.warning(
+                "program_reset_outcome_record_failed",
+                extra={"request_key": request.request_key},
+                exc_info=True,
+            )
+
+    def _reset_cycle(self, request: ProgramCycleResetRequest) -> dict[str, Any]:
         if self._closed or not self._started:
             raise ProgramRunnerError(
                 "program_runner_unavailable", "Program runner is not started"
             )
         self._require_manager_current()
         with self._runner_command("reset", request.request_key):
+            _reset_of_thread.row = self._held_command()
             self._require_manager_current()
             admission, journal = self._require_cycle_owner()
             cycle = journal.read()
