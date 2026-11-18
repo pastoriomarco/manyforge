@@ -68,6 +68,11 @@ export function ActivateExecuteDialog({
         })}</ul>
         {recovering && (
           <div data-testid="activation-needs-recovery">
+            {flow?.causesChanged === true && (
+              <p className="inline-message severity-warning" role="status">
+                The causes changed since you confirmed them. Review them and confirm again.
+              </p>
+            )}
             <p>Needs recovery:</p>
             {reading ? <p role="status">Reading the causes…</p>
               : <ul>{causes.map((text) => <li key={text}>{text}</li>)}</ul>}

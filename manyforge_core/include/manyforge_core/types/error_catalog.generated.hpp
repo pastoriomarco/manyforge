@@ -3588,6 +3588,7 @@ inline constexpr std::string_view kWorkerRetirementInProgress{"worker_retirement
 inline constexpr std::string_view kWorkerRetirementSelfThread{"worker_retirement_self_thread"};
 inline constexpr std::string_view kWrongArgumentCount{"wrong_argument_count"};
 inline constexpr std::string_view kWrongState{"wrong_state"};
+inline constexpr std::string_view kXarmArming{"xarm_arming"};
 inline constexpr std::string_view kXarmJointAnglesUnavailable{"xarm_joint_angles_unavailable"};
 inline constexpr std::string_view kXarmMeasuredJointsDisagree{"xarm_measured_joints_disagree"};
 inline constexpr std::string_view kXarmNotReady{"xarm_not_ready"};
@@ -3602,7 +3603,7 @@ inline constexpr std::string_view kXarmStatusUnavailable{"xarm_status_unavailabl
 inline constexpr std::string_view kZeroSpeedHoldTimeout{"zero_speed_hold_timeout"};
 
 /// Every catalogued code, sorted by code text (byte order).
-inline constexpr std::array<std::string_view, 3592> kSortedCodes{
+inline constexpr std::array<std::string_view, 3593> kSortedCodes{
     kAbsoluteMotionHasReference,
     kAbsoluteTargetHasReference,
     kAcceptanceException,
@@ -7183,6 +7184,7 @@ inline constexpr std::array<std::string_view, 3592> kSortedCodes{
     kWorkerRetirementSelfThread,
     kWrongArgumentCount,
     kWrongState,
+    kXarmArming,
     kXarmJointAnglesUnavailable,
     kXarmMeasuredJointsDisagree,
     kXarmNotReady,

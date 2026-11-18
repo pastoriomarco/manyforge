@@ -79,6 +79,8 @@ export interface ActivationFailure {
   /** Null for a refused request or a reason not tied to one component. */
   componentId: string | null;
   text: string;
+  /** The action's error code, when a failed action result carried one. */
+  code?: string;
 }
 
 export function activationStep(
@@ -140,10 +142,14 @@ export function stepProgress(
     } else if (state.action !== undefined) {
       done = false;
     } else if (state.fault !== undefined) {
-      if (ran(state) || groupFinished) failures.push({ componentId, text: codedErrorText(state.fault) });
-      else done = false;
+      // A fault after this step's own failed action keeps that action's code.
+      const failedCode = last !== undefined && last.action === step.action && last.outcome !== 'succeeded'
+        && ran(state) ? last.error?.code : undefined;
+      if (ran(state) || groupFinished) {
+        failures.push({ componentId, text: codedErrorText(state.fault), ...(failedCode ? { code: failedCode } : {}) });
+      } else done = false;
     } else if (last !== undefined && last.action === step.action && last.outcome !== 'succeeded' && ran(state)) {
-      failures.push({ componentId, text: actionResultText(last) });
+      failures.push({ componentId, text: actionResultText(last), ...(last.error ? { code: last.error.code } : {}) });
     } else if (!reached(state)) {
       if (stopped && groupFinished && !ran(state)) {
         failures.push({ componentId, text: codedErrorText({ code: 'component_action_interrupted_by_stop', message: '' }) });

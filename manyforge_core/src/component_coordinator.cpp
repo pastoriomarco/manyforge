@@ -321,8 +321,13 @@ Result<ComponentActionInProgress> ComponentCoordinator::SubmitRecoveryEnable(
     if (owner_adapter) actual.push_back(read_fact(*owner_id, owner_adapter));
     actual.push_back(read_fact(component_id, adapter));
     std::optional<ErrorDTO> refused_by_facts;
-    if (!current || !current() || actual != confirmed) {
+    if (!current || !current()) {
       refused_by_facts = action_error("stale_generation", "Configuration changed; confirm again",
+                                      component_id, ComponentAction::kEnable);
+    } else if (actual != confirmed) {
+      // OD-312: the causes changed, not the configuration: the GUI re-reads them.
+      refused_by_facts = action_error("component_recovery_confirmation_changed",
+                                      "Recovery causes changed; confirm again",
                                       component_id, ComponentAction::kEnable);
     } else {
       const auto& member_fact = actual.back();
@@ -710,7 +715,8 @@ void ComponentCoordinator::RunRecoveryEnable(
         if (observed.eligibility == "ready" && !observed.cause_code && !observed.stop_code) {
           member_fact = observed;
         } else if (observed != member_fact || member_fact.eligibility == "unknown") {
-          refused("stale_generation", "The member has an undisclosed cause; confirm again");
+          refused("component_recovery_confirmation_changed",
+                  "The member has an undisclosed cause; confirm again");
           proceed = false;
         }
       }

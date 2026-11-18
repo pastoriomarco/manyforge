@@ -254,6 +254,53 @@ TEST(XArmArmAdapter, EstopFlagOnlyReplacesStaleForKnownInactiveControllers) {
             core::FaultCode::kStreamStale);
 }
 
+// OD-310 (live 2026-11-18, Real Lite 6): the plugin's controller cycle
+// during its own arming paused `measured_joints` and the lane's
+// `fault_stream_stale` latched the cell. Meanwhile it is `prepared`, reason
+// `xarm_arming` (the stream still shows stale); the Enable verifies the
+// stream and fails typed when it never returns, and the fault shows again.
+TEST(XArmArmAdapter, ItsOwnArmingsStreamPauseIsNotAFault) {
+  World world;
+  world.status->Set(report(world.clock.now(), 0, 0, 4, 0));
+  ASSERT_EQ(world.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  world.on_hardware = [&world](const bool active) {
+    if (!active) return;
+    world.lane->state.streams = {{"measured_joints", core::StreamFreshness::kStale,
+                                  1'000'000'000LL}};
+    world.lane->state.lifecycle = ComponentLifecycle::kFault;
+    world.lane->state.fault = core::Fault{core::FaultCode::kStreamStale,
+        "The measured_joints stream stopped arriving", true,
+        core::FaultOperatorAction::kRecover, {}, {}, {}, world.clock.now()};
+  };
+  std::optional<core::ComponentState> during;
+  bool arming = false;
+  world.on_pause = [&world, &during, &arming] {
+    if (during || !world.lane->state.fault) return;
+    during = world.adapter->State(world.clock.now());
+    arming = world.adapter->Arming();
+  };
+  EXPECT_FALSE(world.adapter->Arming());
+  const auto enabled = world.Run(ComponentAction::kEnable);
+  EXPECT_EQ(enabled.outcome, ActionOutcome::kFailed);
+  EXPECT_EQ(enabled.error->code, "xarm_joint_angles_unavailable");
+
+  ASSERT_TRUE(during.has_value());
+  EXPECT_TRUE(arming);
+  EXPECT_FALSE(during->fault.has_value());
+  EXPECT_EQ(during->lifecycle, ComponentLifecycle::kPrepared);
+  ASSERT_TRUE(during->reason.has_value());
+  EXPECT_EQ(during->reason->code, "xarm_arming");
+  ASSERT_EQ(during->streams.size(), 1U);
+  EXPECT_EQ(during->streams.front().freshness, core::StreamFreshness::kStale);
+
+  // The arming ended without the stream: the lane's fault again.
+  EXPECT_FALSE(world.adapter->Arming());
+  const auto after = world.adapter->State(world.clock.now());
+  ASSERT_TRUE(after.fault.has_value());
+  EXPECT_EQ(after.fault->code, core::FaultCode::kStreamStale);
+  EXPECT_EQ(after.lifecycle, ComponentLifecycle::kFault);
+}
+
 TEST(XArmArmAdapter, ArmActionsClearPriorEstopPresentation) {
   for (const auto action : {ComponentAction::kEnable, ComponentAction::kDisable,
                             ComponentAction::kRecover}) {

@@ -341,7 +341,8 @@ ComponentAdapters make_xarm(const ComponentAdapterContext &context) {
             [owner = machine->parts.owner](const std::int64_t now_ns) {
               return owner->Usable(now_ns);
             },
-            *machine->clock));
+            *machine->clock,
+            [owner = machine->parts.owner] { return owner->Arming(); }));
     owner.AddMember({context.role, id, io, io, {}});
     return {io, nullptr, std::nullopt, std::nullopt,
             context.ros_entity_owner ? machine : nullptr};

@@ -106,7 +106,9 @@ struct XArmArmAdapterPorts final {
 /// - `disable`: the lane's disable, then the hardware off.
 ///
 /// State: the lane's; with the hardware off after its own Prepare, Recover
-/// or Disable it is `prepared` (Enable arms), and all motors off
+/// or Disable it is `prepared` (Enable arms); during its own arming the
+/// lane's `fault_stream_stale` is `prepared` with reason `xarm_arming` (the
+/// streams still show stale); and all motors off
 /// (`mt_able == 0`) is `idle`. A mode or state change from outside while ManyForge has the arm
 /// armed (`ExternalControl`) is the owner's fault. Trust the controller: no
 /// retries and no verification loops; each vendor call is sent once.
@@ -132,6 +134,10 @@ public:
   void ObserveOwnerEstop() const;
   /// The installed transport owner was replaced; prior presentation is stale.
   void ForgetOwnerEstop() noexcept;
+  /// Its own arming runs (Enable's `Arm`, a TCP offset's re-arm): the
+  /// driver's controller cycle pauses the machine's streams meanwhile, which
+  /// is not a fault (the action verifies its streams before it succeeds).
+  [[nodiscard]] bool Arming() const;
 
   [[nodiscard]] core::ComponentState State(std::int64_t now_ns) const override;
   [[nodiscard]] core::ActionResult Run(core::ComponentAction action,
@@ -169,6 +175,7 @@ public:
 
 private:
   class OwnOperation;
+  class ArmingScope;
 
   /// Prepare and Recover: motors off (see the class comment).
   [[nodiscard]] core::ActionResult Prepare(core::ComponentAction action, std::stop_token stop);
@@ -240,6 +247,10 @@ private:
   mutable bool own_settled_{true};
   /// A TCP offset send (with its re-arm) in progress.
   int rearms_{0};
+  /// Its own armings in progress (`Arm`, `ApplyToolContext`): a lane
+  /// `fault_stream_stale` meanwhile is reported as `prepared`, reason
+  /// `xarm_arming`.
+  int arming_{0};
   /// The receipt of the ready report that ended the last confirmed TCP
   /// offset send.
   std::optional<std::int64_t> offset_ready_at_ns_;

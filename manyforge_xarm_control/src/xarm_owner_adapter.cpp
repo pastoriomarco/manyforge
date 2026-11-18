@@ -133,6 +133,16 @@ bool XArmOwnerAdapter::Usable(const std::int64_t now_ns) const {
   return prepared_ && !reason_ && Fresh(observed, now_ns);
 }
 
+bool XArmOwnerAdapter::Arming() const {
+  {
+    std::lock_guard lock(mutex_);
+    if (clearing_ > 0) return true;
+  }
+  for (const auto &member : Members())
+    if (const auto arm = member.arm.lock(); arm && arm->Arming()) return true;
+  return false;
+}
+
 void XArmOwnerAdapter::OnIoStates(const XArmIoStatesSample &sample) {
   for (const auto &member : Members()) {
     const auto io = member.io.lock();
@@ -439,6 +449,22 @@ ActionResult XArmOwnerAdapter::Clear(const ComponentAction action, const std::st
     return failed(action, "controller_manager_unavailable",
                   "the machine's controller manager didn't answer within the lifecycle command time");
   }
+  // The clear pauses the controller's streams: its I/O members' stale
+  // stream is no fault meanwhile (`Arming`), on every return path.
+  struct Clearing final {
+    XArmOwnerAdapter &owner;
+    explicit Clearing(XArmOwnerAdapter &cleared) : owner(cleared) {
+      std::lock_guard lock(owner.mutex_);
+      ++owner.clearing_;
+    }
+    ~Clearing() {
+      std::lock_guard lock(owner.mutex_);
+      --owner.clearing_;
+    }
+    Clearing(const Clearing &) = delete;
+    Clearing &operator=(const Clearing &) = delete;
+  };
+  const Clearing clearing(*this);
   int warning = 0;
   if (auto refused = ClearError(action, stop, warning)) return *refused;
   // A warning left after the clear is cleared too (the arm's

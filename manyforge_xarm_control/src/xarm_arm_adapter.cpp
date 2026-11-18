@@ -100,6 +100,24 @@ private:
   XArmArmAdapter &adapter_;
 };
 
+/// Marks an own arming for its whole duration, on every return path.
+class XArmArmAdapter::ArmingScope final {
+public:
+  explicit ArmingScope(XArmArmAdapter &adapter) : adapter_(adapter) {
+    std::lock_guard lock(adapter_.mutex_);
+    ++adapter_.arming_;
+  }
+  ~ArmingScope() {
+    std::lock_guard lock(adapter_.mutex_);
+    --adapter_.arming_;
+  }
+  ArmingScope(const ArmingScope &) = delete;
+  ArmingScope &operator=(const ArmingScope &) = delete;
+
+private:
+  XArmArmAdapter &adapter_;
+};
+
 XArmArmAdapter::XArmArmAdapter(XArmArmAdapterConfig config, XArmArmAdapterPorts ports)
     : config_(config), ports_(std::move(ports)),
       tool_context_(
@@ -141,6 +159,11 @@ void XArmArmAdapter::ObserveOwnerEstop() const {
 void XArmArmAdapter::ForgetOwnerEstop() noexcept {
   std::lock_guard lock(mutex_);
   stopped_by_estop_.store(false, std::memory_order_release);
+}
+
+bool XArmArmAdapter::Arming() const {
+  std::lock_guard lock(mutex_);
+  return arming_ > 0;
 }
 
 std::int64_t XArmArmAdapter::Now() const { return ports_.clock->now(); }
@@ -211,7 +234,15 @@ core::ComponentState XArmArmAdapter::State(const std::int64_t now_ns) const {
     const bool inactive = ports_.controllers_inactive && ports_.controllers_inactive();
     std::lock_guard lock(mutex_);
     const auto current = ports_.status->observe();
-    if (stopped_by_estop_.load(std::memory_order_acquire) && Fresh(current, now_ns)) {
+    if (arming_ > 0) {
+      // Its own arming: the driver's controller cycle pauses the streams
+      // (they still show stale); the action verifies them before it
+      // succeeds and fails typed if they never return.
+      state.fault.reset();
+      state.lifecycle = ComponentLifecycle::kPrepared;
+      state.reason = core::ComponentStateReason{
+          "xarm_arming", "Arming: the driver restarts its controllers"};
+    } else if (stopped_by_estop_.load(std::memory_order_acquire) && Fresh(current, now_ns)) {
       if (current.error_code >= 1 && current.error_code <= 3) {
         state.fault.reset();
         state.lifecycle = ComponentLifecycle::kPrepared;
@@ -330,6 +361,7 @@ ActionResult XArmArmAdapter::Arm(const std::stop_token stop) {
   // plugin's `clean_error`, `clean_warn`, `motion_enable`, `set_mode(1)`,
   // `set_state(0)`, with the joint state broadcaster.
   constexpr auto action = ComponentAction::kEnable;
+  const ArmingScope arming(*this);
   const auto deadline = Now() + config_.action_timeout.count();
   // The same lifecycle command time bounds the hardware switch's
   // controller-manager calls (they wait on the steady clock): one left
@@ -528,6 +560,7 @@ XArmArmAdapter::ApplyToolContext(const std::optional<core::Pose3DTO> &offset,
                                  const std::optional<core::ToolContextPointMassDTO> &payload,
                                  const bool at_enable, const XArmToolContextBound &bound) {
   OwnOperation own(*this);
+  const ArmingScope arming(*this);
   {
     std::lock_guard lock(mutex_);
     ++rearms_;

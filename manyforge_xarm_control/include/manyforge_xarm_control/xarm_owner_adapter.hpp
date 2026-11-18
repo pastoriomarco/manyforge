@@ -169,6 +169,10 @@ public:
   /// Usable for its members: prepared, connected (a fresh report) and not
   /// deliberately offline.
   [[nodiscard]] bool Usable(std::int64_t now_ns) const;
+  /// Its arming runs: its Recover's clear, or its arm member's own arming
+  /// (`XArmArmAdapter::Arming`). Both pause the controller's streams; its
+  /// I/O members don't raise `fault_stream_stale` meanwhile.
+  [[nodiscard]] bool Arming() const;
 
   /// One `xarm_io_states` sample, handed to every I/O member.
   void OnIoStates(const XArmIoStatesSample &sample);
@@ -214,6 +218,8 @@ private:
   std::vector<XArmMember> members_;
   /// A successful prepare; cleared by the power actions.
   bool prepared_{false};
+  /// Recover's clear in progress (from `clean_error` to its cleared report).
+  int clearing_{0};
   std::optional<core::ComponentStateReason> reason_;
   std::optional<XArmGpioModuleStatus> gpio_;
   /// When the fault currently reported first appeared (code and vendor code).

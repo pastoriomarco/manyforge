@@ -53,7 +53,8 @@ struct World final {
     io = std::make_unique<XArmIoComponent>(
         XArmIoComponentConfig{bank == XArmIoBank::kTool ? "lite6_tool_io" : "lite6_controller_io",
                               bank, signals, XArmIoSettings{}},
-        driver, [this](std::int64_t) { return owner_usable; }, clock);
+        driver, [this](std::int64_t) { return owner_usable; }, clock,
+        [this] { return owner_arming; });
   }
 
   /// One stream sample now, with the controller words (tool words for tool).
@@ -75,6 +76,7 @@ struct World final {
 
   core::FakeClock clock;
   bool owner_usable{true};
+  bool owner_arming{false};
   std::shared_ptr<FakeDriver> driver = std::make_shared<FakeDriver>();
   std::unique_ptr<XArmIoComponent> io;
 };
@@ -272,6 +274,32 @@ TEST(XArmIoComponent, AStaleStreamFaultsTheMemberOnlyWhileItsOwnerIsUsable) {
   state = world.io->State(world.clock.now());
   EXPECT_EQ(state.lifecycle, ComponentLifecycle::kEnabled);
   EXPECT_FALSE(state.fault.has_value());
+}
+
+// OD-310: the owner's arming (its Recover's clear, the arm's Enable or TCP
+// offset re-arm) pauses `xarm_io_states`: no fault meanwhile (the stream
+// still shows stale); once it ended without a fresh sample, the fault, with
+// its stale time from then.
+TEST(XArmIoComponent, TheOwnersArmingPausesTheStreamWithoutAFault) {
+  World world;
+  world.Enable();
+  world.owner_arming = true;
+  world.clock.advance(101 * kMs);
+  auto state = world.io->State(world.clock.now());
+  EXPECT_EQ(state.lifecycle, ComponentLifecycle::kEnabled);
+  EXPECT_FALSE(state.fault.has_value());
+  EXPECT_EQ(state.streams[0].freshness, core::StreamFreshness::kStale);
+
+  world.clock.advance(2'000 * kMs);
+  world.owner_arming = false;
+  state = world.io->State(world.clock.now());
+  ASSERT_EQ(state.lifecycle, ComponentLifecycle::kFault);
+  EXPECT_EQ(state.fault->code, core::FaultCode::kStreamStale);
+  EXPECT_EQ(state.fault->since_ns, world.clock.now());
+
+  // A fresh sample after the arming: no fault.
+  static_cast<void>(world.Sample(0, 0));
+  EXPECT_FALSE(world.io->State(world.clock.now()).fault.has_value());
 }
 
 } // namespace

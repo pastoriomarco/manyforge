@@ -8542,6 +8542,28 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       apply_cleanup.snapshots.push_back(std::move(entry));
     }
 
+    // The installed cell's coordinated components without `leaving`
+    // (SetComponents keeps the staying ones' adapter, action, `last_action`
+    // and reservation). Memory only; called with no lock held.
+    const auto coordinate_installed_without = [&](const std::vector<std::string> &leaving) {
+      std::vector<core::CoordinatedComponent> components;
+      {
+        std::shared_lock execution_lock(execution_composition.mutex);
+        components = CoordinatedComponentsOf(execution_composition.current);
+      }
+      std::erase_if(components, [&](const core::CoordinatedComponent &component) {
+        return std::find(leaving.begin(), leaving.end(), component.component_id) != leaving.end();
+      });
+      // A leaving component has no action (the reservation above refused
+      // one): its worker joins here at once, with no lock held.
+      static_cast<void>(execution_composition.component_runtime->SetComponents(std::move(components)));
+    };
+    // OD-311: the leaving components (removed, replaced, rebuilt) leave the
+    // coordinated, published set before their processes stop, so their
+    // streams stopping is not a fault of a cell member. replace_current
+    // installs the candidate's set; a refusal below puts them back.
+    coordinate_installed_without(changed);
+
     // Stop the processes of removed and replaced components (no clean
     // disable: the refusal above kept every enabled one whose Disable didn't
     // fail), before the candidate starts any: a machine's process moving
@@ -8605,6 +8627,9 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       // A data/setup inconsistency found while composing refuses this
       // Apply only: typed, with its cause, logged once here.
       discard_root(prepared_managed_composition);
+      // The installed cell stays: its components (a stopped one shows its
+      // own state) are coordinated again.
+      coordinate_installed_without({});
       std::cerr << "ERROR native composition refused: apply=" << selection.apply_id.value()
                 << " cause=" << error.what() << '\n';
       return failed(host_detail::ScenarioCompositionRefusal(error).error());
@@ -8882,6 +8907,8 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
         failed_prepared_composition = std::move(prepared_managed_composition);
       }
       if (installed_effect) throw;
+      // No effect: the predecessor stays installed and coordinated.
+      coordinate_installed_without({});
       auto error = host_detail::HostApplyFailureBeforeEffect(std::current_exception());
       std::cerr << "native selected composition failed before effect: " << error.message << '\n';
       return failed(std::move(error));

@@ -1035,6 +1035,27 @@ TEST(ComponentCoordinator, CompositeRefusesWhileSiblingActionIsRunning) {
   f.io->finish(Succeeded());
 }
 
+// OD-312: changed causes refuse with their own code (the GUI re-reads and
+// shows them); a changed configuration stays `stale_generation`.
+TEST(ComponentCoordinator, ChangedCausesAtSubmitAreAConfirmationChangeNotAStaleGeneration) {
+  MachineFixture f;
+  f.owner->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kIdle, MachineFault()));
+  const auto preflight = f.coordinator.RecoveryPreflight("lite6_robot");
+  ASSERT_TRUE(preflight.ok());
+  const auto confirmed = std::vector{RecoveryFact(*preflight.value().owner), RecoveryFact(preflight.value().member)};
+  const auto stale = f.coordinator.SubmitRecoveryEnable("lite6_robot", confirmed, [] { return false; });
+  ASSERT_FALSE(stale.ok());
+  EXPECT_EQ(stale.error().code, "stale_generation");
+  Fault changed{FaultCode::kStreamStale, "stale", true, FaultOperatorAction::kRecover,
+                std::nullopt, std::nullopt, {}, 0};
+  f.arm->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kUnknown, changed));
+  const auto refused = f.coordinator.SubmitRecoveryEnable("lite6_robot", confirmed, [] { return true; });
+  ASSERT_FALSE(refused.ok());
+  EXPECT_EQ(refused.error().code, "component_recovery_confirmation_changed");
+  EXPECT_TRUE(f.owner->runs().empty());
+  EXPECT_TRUE(f.arm->runs().empty());
+}
+
 TEST(ComponentCoordinator, ChangedMemberCauseAfterOwnerRecoveryNeverRunsMember) {
   MachineFixture f;
   f.owner->set_state(Observed(ComponentLifecycle::kFault, ComponentActivity::kIdle, MachineFault()));
@@ -1051,7 +1072,7 @@ TEST(ComponentCoordinator, ChangedMemberCauseAfterOwnerRecoveryNeverRunsMember) 
   ASSERT_TRUE(result);
   EXPECT_EQ(result->outcome, ActionOutcome::kFailed);
   ASSERT_TRUE(result->error);
-  EXPECT_EQ(result->error->code, "stale_generation");
+  EXPECT_EQ(result->error->code, "component_recovery_confirmation_changed");  // OD-312
   EXPECT_TRUE(f.arm->runs().empty());
 }
 

@@ -62,6 +62,7 @@ struct World final {
           auto next = status->observe();
           next.received_timestamp_ns = clock.now();
           status->Set(next);
+          if (on_wait) on_wait();
         },
         &clock,
         [this](const std::string &id, const std::vector<core::IoSignalUpdateDTO> &updates,
@@ -101,6 +102,8 @@ struct World final {
     return core::Result<void>::Ok();
   };
   std::vector<std::pair<std::string, std::size_t>> sunk;
+  /// Called on each of the owner's waits.
+  std::function<void()> on_wait;
 };
 
 // 2026-11-08 (maintainer): Prepare (and the Load that runs it) only
@@ -528,6 +531,51 @@ TEST(XArmOwnerAdapter, ExternalControlOfTheArmIsTheOwnersFaultAndRecoverReleases
 
   EXPECT_EQ(world.Run(ComponentAction::kRecover).outcome, ActionOutcome::kSucceeded);
   EXPECT_NE(world.owner->State(world.clock.now()).lifecycle, ComponentLifecycle::kFault);
+}
+
+// OD-310: its arming (its Recover's clear, its arm member's own arming)
+// pauses the controller's streams; its I/O members read it (`Arming`).
+TEST(XArmOwnerAdapter, ItsArmingIsItsRecoversClearOrItsArmsOwnArming) {
+  World world;
+  ASSERT_EQ(world.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
+  EXPECT_FALSE(world.owner->Arming());
+  bool during_clear = false;
+  world.on_wait = [&world, &during_clear] {
+    during_clear = during_clear || world.owner->Arming();
+  };
+  ASSERT_EQ(world.Run(ComponentAction::kRecover).outcome, ActionOutcome::kSucceeded);
+  EXPECT_TRUE(during_clear);
+  world.on_wait = nullptr;
+  EXPECT_FALSE(world.owner->Arming());
+
+  // The arm member's Enable arms (hardware off): its activation runs inside.
+  auto arm_lane = std::make_shared<FakeLane>();
+  bool during_arm = false;
+  auto arm = std::make_shared<XArmArmAdapter>(
+      XArmArmAdapterConfig{6, kXArmJointAgreementToleranceRad, std::chrono::seconds(10)},
+      XArmArmAdapterPorts{world.status, world.driver, arm_lane,
+                          [&world, &during_arm](const bool active,
+                                                std::optional<std::chrono::steady_clock::time_point>,
+                                                std::stop_token) {
+                            if (active) during_arm = world.owner->Arming();
+                            core::ActionResult made;
+                            made.outcome = ActionOutcome::kSucceeded;
+                            return made;
+                          },
+                          [] { return false; },
+                          [&world] {
+                            world.clock.advance(kXArmReportPeriodNs);
+                            world.status->Set(report(world.clock.now()));
+                          },
+                          [] {
+                            return std::optional<std::vector<double>>(
+                                std::vector<double>{0.1, -0.2, 0.3, 0.0, 0.5, 0.6});
+                          },
+                          &world.clock});
+  world.owner->AddMember({"arm", "lite6_robot_arm", arm, {}, arm});
+  static_cast<void>(arm->Run(ComponentAction::kEnable, {}));
+  EXPECT_TRUE(during_arm);
+  EXPECT_FALSE(world.owner->Arming());
 }
 
 TEST(XArmOwnerAdapter, DetailsShowTheControllersReportForDisplay) {

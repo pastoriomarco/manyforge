@@ -1499,6 +1499,23 @@ formats; such changes are listed explicitly.
 
 ### Fixed
 
+- **No false component fault while the xArm arms (OD-310).** Enabling or
+  recovering a real xArm pauses its joint-state and I/O streams for about
+  3 s while the vendor driver restarts its controllers; the arm and its I/O
+  showed that as a component fault ("stream stopped arriving") that latched
+  the cell and needed an acknowledgement. While the adapter's own arming
+  runs, the arm shows *Arming the robot* instead; its Enable still verifies
+  the streams before it succeeds and fails typed if they never return.
+- **No fault from components leaving the cell (OD-311).** Apply and Load now
+  take leaving components out of the cell before stopping their processes,
+  so their streams stopping (for example the xArm I/O stream) is no longer a
+  fault of a cell member.
+- **Changed recovery causes ask for confirmation again (OD-312).** When the
+  causes to recover change after the operator confirmed them (an e-stop C2
+  appearing), the activation now says *The causes changed since you
+  confirmed them. Review them and confirm again* and offers the confirmation
+  (error code `component_recovery_confirmation_changed`), instead of failing
+  with "Cell state changed".
 - **A loaded machine no longer refuses motion through the alarm-attention
   heartbeat (OD-307).** Headless gave each publication of the operator-alarm
   motion attention to the Kernel 200 ms; six slower answers in a row (about

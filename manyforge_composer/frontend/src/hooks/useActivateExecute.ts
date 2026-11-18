@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api } from '../api/client';
+import { api, apiErrorCode } from '../api/client';
 import type { ApplicationStartId } from '../api/applicationIdentity';
 import { requestErrorText } from '../components/ComponentStatePanel';
 import {
@@ -14,7 +14,7 @@ import {
   type ActivationFailure,
   type ActivationStep,
 } from '../state/activateExecute';
-import { blockedReasonText, enableAllTargets, prepareAllTargets, recoveryCauseText } from '../state/componentPresentation';
+import { blockedReasonText, enableAllTargets, prepareAllTargets } from '../state/componentPresentation';
 import { recoveryBlockers, recoveryConfirmation, withinConfirmed } from '../state/recoverEnable';
 import type { ComponentState, RecoveryPreflight, RunReadiness } from '../types/components';
 
@@ -31,7 +31,12 @@ export interface ActivationFlow {
   failures: ActivationFailure[];
   /** Components that need Recover and enable, with the causes the operator confirms (null while read). */
   recovery: Record<string, RecoveryPreflight | null>;
+  /** Set when the causes changed after the operator confirmed them: offered again with the new causes. */
+  causesChanged?: boolean;
 }
+
+/** OD-312: Recover and enable refused because the causes changed since they were confirmed. */
+export const RECOVERY_CONFIRMATION_CHANGED = 'component_recovery_confirmation_changed';
 
 /**
  * Execute with the components it needs ("Activate components and
@@ -71,6 +76,33 @@ export function useActivateExecute(
     step.current = null;
     recoveryQueue.current = [];
     setFlow((value) => value === null ? null : { ...value, phase: 'failed', failures });
+  }, []);
+
+  /**
+   * Offers the popup: reads the causes of every component that needs Recover
+   * and enable (plus `alsoRecover`, whose causes changed after confirmation).
+   */
+  const offer = useCallback((causesChanged: boolean, alsoRecover: readonly string[] = []) => {
+    token.current += 1;
+    const current = token.current;
+    step.current = null;
+    const cell = latest.current.states ?? [];
+    const targets = [...new Set([...recoveryTargets(cell), ...alsoRecover])];
+    recoveryQueue.current = [];
+    confirmed.current = [];
+    setFlow({ phase: 'offered', componentIds: inactiveComponentIds(cell), failures: [],
+      recovery: Object.fromEntries(targets.map((id) => [id, null])), ...(causesChanged ? { causesChanged } : {}) });
+    for (const id of targets) {
+      api.components.recoverEnablePreflight(id).then((preflight) => {
+        if (token.current !== current) return;
+        setFlow((value) => value === null ? null : { ...value, recovery: { ...value.recovery, [id]: preflight } });
+      }).catch((reason: unknown) => {
+        if (token.current !== current) return;
+        setFlow((value) => value === null ? null : {
+          ...value, failures: [...value.failures, { componentId: id, text: requestErrorText(reason) }],
+        });
+      });
+    }
   }, []);
 
   /** Sends one group action (Prepare all or Enable all); with no target it waits for readiness. */
@@ -113,8 +145,7 @@ export function useActivateExecute(
         return;
       }
       if (!withinConfirmed(fresh, confirmed.current)) {
-        fail(current, [{ componentId: target, text: `The causes changed since you confirmed them: ${fresh.components
-          .filter((row) => row.eligibility !== 'ready').map(recoveryCauseText).join('; ')}` }]);
+        offer(true, [target]);
         return;
       }
       const states = latest.current.states ?? [];
@@ -124,10 +155,12 @@ export function useActivateExecute(
       (start === null
         ? Promise.reject(new Error('Execution owner identity is unavailable.'))
         : api.components.recoverEnable(target, recoveryConfirmation(fresh), start)).catch((reason: unknown) => {
-        fail(current, [{ componentId: target, text: requestErrorText(reason) }]);
+        if (token.current !== current) return;
+        if (apiErrorCode(reason) === RECOVERY_CONFIRMATION_CHANGED) offer(true, [target]);
+        else fail(current, [{ componentId: target, text: requestErrorText(reason) }]);
       });
     }).catch((reason: unknown) => fail(current, [{ componentId: target, text: requestErrorText(reason) }]));
-  }, [fail, sendGroup]);
+  }, [fail, offer, sendGroup]);
 
   /**
    * Prepare all (skipped when nothing needs it), then Recover and enable for
@@ -140,28 +173,7 @@ export function useActivateExecute(
     else recoverNext(current);
   }, [recoverNext, sendGroup]);
 
-  const open = useCallback(() => {
-    token.current += 1;
-    const current = token.current;
-    step.current = null;
-    const cell = latest.current.states ?? [];
-    const targets = recoveryTargets(cell);
-    recoveryQueue.current = [];
-    confirmed.current = [];
-    setFlow({ phase: 'offered', componentIds: inactiveComponentIds(cell), failures: [],
-      recovery: Object.fromEntries(targets.map((id) => [id, null])) });
-    for (const id of targets) {
-      api.components.recoverEnablePreflight(id).then((preflight) => {
-        if (token.current !== current) return;
-        setFlow((value) => value === null ? null : { ...value, recovery: { ...value.recovery, [id]: preflight } });
-      }).catch((reason: unknown) => {
-        if (token.current !== current) return;
-        setFlow((value) => value === null ? null : {
-          ...value, failures: [...value.failures, { componentId: id, text: requestErrorText(reason) }],
-        });
-      });
-    }
-  }, []);
+  const open = useCallback(() => offer(false), [offer]);
 
   const recoveryReady = flow !== null && Object.values(flow.recovery).every((preflight) => preflight !== null
     && recoveryBlockers(preflight).length === 0) && flow.failures.length === 0;
@@ -185,7 +197,11 @@ export function useActivateExecute(
     const current = token.current;
     if ((phase === 'prepare' || phase === 'recover' || phase === 'enable') && step.current !== null && states !== null) {
       const progress = stepProgress(step.current, states, lastStopEventId);
-      if (progress.failures.length > 0) fail(current, progress.failures);
+      const changed = phase === 'recover'
+        ? progress.failures.find((failure) => failure.code === RECOVERY_CONFIRMATION_CHANGED) : undefined;
+      // OD-312: the causes changed after confirmation: read them again and ask.
+      if (changed?.componentId) offer(true, [changed.componentId]);
+      else if (progress.failures.length > 0) fail(current, progress.failures);
       else if (progress.done && (phase === 'prepare' || phase === 'recover')) {
         step.current = null;
         recoverNext(current);
@@ -195,7 +211,7 @@ export function useActivateExecute(
         setFlow((value) => value === null ? null : { ...value, phase: 'waiting' });
       }
     }
-  }, [fail, phase, recoverNext, states, lastStopEventId]);
+  }, [fail, offer, phase, recoverNext, states, lastStopEventId]);
 
   useEffect(() => {
     if (phase !== 'waiting' || readiness === null) return;
