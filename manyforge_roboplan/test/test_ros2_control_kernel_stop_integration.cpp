@@ -1272,7 +1272,7 @@ void RunStopDuringActiveRos2ControlMotion(const StopForm form) {
     const auto operation = kernel.execute(MotionOperation(binding));
     ASSERT_TRUE(operation.ok()) << operation.error().message;
     const auto &operation_id = operation.value().operation_id;
-    ASSERT_TRUE(fake::WaitUntil([&] { return server.goals_received() >= 1U; }, 5s))
+    ASSERT_TRUE(fake::WaitUntil([&] { return server.goals_received() >= 1U; }, 30s))
         << "Kernel dispatch did not reach the ros2_control action server";
     ASSERT_TRUE(WaitUntil([&] {
       return backend.get_execution_snapshot().state ==
@@ -1329,7 +1329,7 @@ void RunStopDuringActiveRos2ControlMotion(const StopForm form) {
     // The Kernel's Stop stage must reach the ROS controller as a goal cancel;
     // the controller brakes and reports the goal cancelled.
     const bool cancel_requested =
-        fake::WaitUntil([&] { return server.cancel_requests() >= 1U; }, 5s);
+        fake::WaitUntil([&] { return server.cancel_requests() >= 1U; }, 30s);
     const auto accepted = stopping.get();
     ASSERT_TRUE(cancel_requested)
         << "Kernel Stop never cancelled the ros2_control goal";

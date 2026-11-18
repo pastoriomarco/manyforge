@@ -24250,25 +24250,26 @@ TEST(ResourceAddressedExecutionKernelTest,
   EXPECT_EQ(engine.addressed_stop_fence_execution_id.load(), successor_execution);
   ASSERT_TRUE(engine.last_stop_stage);
   EXPECT_EQ(engine.last_stop_stage->operation_id, successor.value().operation_id);
+  // State rows are latest-wins in the journal queue (OD-116 (2)): the
+  // transient kStopping row may be replaced by kStopped before the writer
+  // takes it. What is always recorded: the Stop's acceptance and the
+  // successor's newest state, kStopped, carrying the Stop's id.
+  ASSERT_TRUE(drain_journal(kernel));
   std::optional<OperationStateDTO> captured_successor_stop;
-  ASSERT_TRUE(wait_until([&] {
+  {
     std::lock_guard lock(journal.mutex);
-    if (std::find(journal.projected_stop_acceptances.begin(),
-                  journal.projected_stop_acceptances.end(),
-                  stop.event_id) == journal.projected_stop_acceptances.end())
-      return false;
-    const auto captured =
-        std::find_if(journal.states.begin(), journal.states.end(), [&](const auto& state) {
-          return state.operation_id == successor.value().operation_id &&
-                 state.stop_event_id == stop.event_id &&
-                 state.state == OperationStateKind::kStopping;
+    EXPECT_NE(std::find(journal.projected_stop_acceptances.begin(),
+                        journal.projected_stop_acceptances.end(), stop.event_id),
+              journal.projected_stop_acceptances.end());
+    const auto newest =
+        std::find_if(journal.states.rbegin(), journal.states.rend(), [&](const auto& state) {
+          return state.operation_id == successor.value().operation_id;
         });
-    if (captured == journal.states.end()) return false;
-    captured_successor_stop = *captured;
-    return true;
-  })) << "Missing journal capture for successor "
-      << successor.value().operation_id.value() << " and Stop " << stop.event_id.value();
-  ASSERT_TRUE(captured_successor_stop);
+    if (newest != journal.states.rend()) captured_successor_stop = *newest;
+  }
+  ASSERT_TRUE(captured_successor_stop)
+      << "Missing journal state for successor " << successor.value().operation_id.value();
+  EXPECT_EQ(captured_successor_stop->state, OperationStateKind::kStopped);
   EXPECT_EQ(captured_successor_stop->operation_id, successor.value().operation_id);
   EXPECT_EQ(captured_successor_stop->stop_event_id, stop.event_id);
   const auto stopped = kernel.get_operation_state(successor.value().operation_id);
