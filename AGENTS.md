@@ -49,6 +49,7 @@ cd manyforge
 `build` prepares pinned dependencies and builds the full ROS Lyrical image
 (`Dockerfile.ros-lyrical-full`, with the pinned controller overlay and the xArm
 driver); it may recreate stale/modified dependency trees under `.docker/`.
+`pull` fetches the published reference image instead of building it.
 The `dev` Compose service is the ROS-free test toolchain, not the workbench.
 Do not run it over dependency edits you need to preserve. Startup incrementally
 builds required native targets in a separate step, then starts one workbench

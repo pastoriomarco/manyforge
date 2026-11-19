@@ -110,20 +110,33 @@ License: BSD-3-Clause
 Source: https://github.com/coal-library/coal
 
 ### Planning-stack libraries (Python wheels from the cmeel project)
-eigenpy (BSD-2-Clause), urdfdom (BSD-3-Clause), TinyXML-2 (Zlib),
-Assimp (BSD-3-Clause), Boost (BSL-1.0), console_bridge (BSD-3-Clause),
-OctoMap (BSD-3-Clause), Qhull (Qhull license), zlib (Zlib).
+Licences as each wheel declares them: eigenpy (BSD-2-Clause),
+urdfdom (BSD-3-Clause), TinyXML-2 (Zlib), Assimp (BSD-3-Clause),
+Boost (BSL-1.0), OctoMap (BSD-3-Clause), Qhull (Qhull license),
+zlib (Zlib).
+console_bridge: the cmeel-console-bridge wheel declares Zlib; upstream
+ros/console_bridge declares 3-Clause BSD (QUALITY_DECLARATION.md) and
+ships a BSD licence text in its LICENSE file.
 Source: https://github.com/cmake-wheel and each project's upstream
 
 ### ROS 2 Lyrical
 Copyright (c) Open Source Robotics Foundation, Inc. and ROS 2 contributors
-License: Apache-2.0 (most packages; some packages BSD-3-Clause)
-Source: NVIDIA Isaac ROS buildfarm and the ROS 2 apt repository
+License: as each package declares in its package.xml (mostly Apache
+         License 2.0; others BSD, BSD-3-Clause, MIT, BSL-1.0 and the
+         licences of vendored upstream code); see THIRD_PARTY_NOTICES.md
+Source: built from source by default (ROS_BASE=source): the upstream
+        repositories at the release tags of the rosdistro sync recorded in
+        third_party/ros_lyrical/ros-lyrical.repos, plus the version floors
+        in floors.repos. The ROS_BASE=apt variant installs them from the
+        NVIDIA Isaac ROS buildfarm instead.
 
-### ros2_control and ros2_controllers (incl. joint_trajectory_controller 6.10.0)
-License: Apache-2.0
-Source: https://github.com/ros-controls/ros2_control,
-        https://github.com/ros-controls/ros2_controllers
+### ros2_control and ros2_controllers (incl. joint_trajectory_controller 6.10.1)
+License: Apache-2.0 (controller_manager_msgs: BSD, as declared)
+Source: https://github.com/ros-controls/ros2_control (6.10.1),
+        https://github.com/ros-controls/ros2_controllers (6.10.1); built
+        from source with ROS 2 above (the apt variant builds
+        joint_trajectory_controller and parallel_gripper_controller 6.10.1
+        from source over the apt ros2_control)
 
 ### realtime_tools 5.4.0
 License: BSD-3-Clause
@@ -152,6 +165,10 @@ Source: https://github.com/pastoriomarco/xarm_ros2 (branch
 The image is based on Ubuntu 24.04 and copies Node.js 22 (MIT) with npm
 (Artistic-2.0) from the official node:22-slim image. Ubuntu packages are
 under their own licenses; see /usr/share/doc/*/copyright in the image.
+
+The workbench image carries the licence files of the components above
+that their installed products do not, verbatim, in
+/usr/share/licenses/manyforge-image/ (see THIRD_PARTY_NOTICES.md).
 
 ===========================================================================
 3. Main application libraries

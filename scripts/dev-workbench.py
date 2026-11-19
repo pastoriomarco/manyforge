@@ -95,6 +95,11 @@ ALARM_CATALOG = (
     WORKSPACE / "manyforge_headless/resources/operator-alarm-catalog.v1.yaml"
 )
 FRONTEND_ROOT = WORKSPACE / "manyforge_composer/frontend"
+# The built GUI Composer serves without Vite (its first static candidate).
+FRONTEND_DIST = FRONTEND_ROOT / "dist"
+# Inside dist: the frontend source hash it was built from. Vite empties dist
+# when it builds, so a failed build leaves no marker.
+FRONTEND_DIST_SOURCE_HASH = FRONTEND_DIST / ".manyforge-source.sha256"
 # Written by the native build step; serve reports it beside its readiness time.
 NATIVE_BUILD_TIMING = BUILD_ROOT / "native-build-timing.json"
 # How often the wait for the Manager's exit passes further stop requests on.
@@ -391,8 +396,9 @@ def _current_activation_preparer() -> Path:
     return ACTIVATION_PREPARER
 
 
-def build_native() -> None:
-    """The native build step; serve only checks its artifacts."""
+def build_native(*, frontend: bool = False) -> None:
+    """The native build step; serve only checks its artifacts. With
+    ``frontend`` it also builds the GUI that operator mode serves."""
 
     started = time.monotonic()
     _ensure_current_ros_backend()
@@ -404,6 +410,8 @@ def build_native() -> None:
     # readiness within its bounded reconciliation wait.
     _run((sys.executable, "-m", "compileall", "-q", "-j", "0",
           *(str(WORKSPACE / package) for package in SERVED_PYTHON_PACKAGES)))
+    if frontend:
+        _ensure_frontend_build()
     NATIVE_BUILD_TIMING.write_text(
         _json({"build_elapsed_seconds": time.monotonic() - started}) + "\n", encoding="utf-8"
     )
@@ -601,6 +609,32 @@ def _ensure_frontend_dependencies() -> None:
         return
     _run(("npm", "ci"), cwd=FRONTEND_ROOT)
     marker.write_text(digest + "\n", encoding="utf-8")
+
+
+def _frontend_source_hash() -> str:
+    completed = subprocess.run(
+        (sys.executable, str(WORKSPACE / "scripts/lib/frontend_hash.py"), "source", str(FRONTEND_ROOT)),
+        env={**os.environ, "MANYFORGE_FRONTEND_SOURCE_MODE": "worktree"},
+        capture_output=True, text=True, check=False,
+    )
+    if completed.returncode != 0:
+        raise WorkbenchError(f"frontend source hash failed: {completed.stderr.strip()}")
+    return json.loads(completed.stdout)["MANYFORGE_FRONTEND_SOURCE_HASH"]
+
+
+def _ensure_frontend_build() -> None:
+    """Build the mounted frontend source into dist unless dist is current."""
+
+    _ensure_frontend_dependencies()
+    source_hash = _frontend_source_hash()
+    if (
+        (FRONTEND_DIST / "index.html").is_file()
+        and FRONTEND_DIST_SOURCE_HASH.is_file()
+        and FRONTEND_DIST_SOURCE_HASH.read_text(encoding="utf-8").strip() == source_hash
+    ):
+        return
+    _run(("npm", "run", "build"), cwd=FRONTEND_ROOT)
+    FRONTEND_DIST_SOURCE_HASH.write_text(source_hash + "\n", encoding="utf-8")
 
 
 def _port_available(port: int) -> bool:
@@ -825,8 +859,9 @@ class Workbench:
             if package_aggregate_sha256(self.operator_install_root) != self.package_aggregate_digest:
                 raise WorkbenchError("qualified operator package aggregate mismatch")
             _regular_file(self.operator_install_root / self.operator_admission, "qualified operator admission")
-            if self.composer_static_dir is not None:
-                _regular_file(self.composer_static_dir / "index.html", "built Composer frontend")
+            # The build step built FRONTEND_DIST unless a static dir is given.
+            _regular_file((self.composer_static_dir or FRONTEND_DIST) / "index.html",
+                          "built Composer frontend")
         ros_capture: dict[str, Any] | None = None
         if self.ros2_control and not operator_mode:
             intended_project = self.bootstrap_project_path or self.project_path
@@ -1246,7 +1281,9 @@ class Workbench:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dev-workbench.py")
     subcommands = parser.add_subparsers(dest="command", required=True)
-    subcommands.add_parser("build", help="build the native artifacts serve requires")
+    build = subcommands.add_parser("build", help="build the native artifacts serve requires")
+    build.add_argument("--frontend", action="store_true",
+                       help="also build the frontend Composer serves in operator mode")
     for name in ("serve", "status"):
         command = subcommands.add_parser(name)
         projects = command.add_mutually_exclusive_group()
@@ -1279,7 +1316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "build":
-            build_native()
+            build_native(frontend=args.frontend)
             return 0
         if args.command == "status" and args.operator_runtime:
             result = query_operator_status(headless_port=args.headless_port,

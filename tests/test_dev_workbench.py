@@ -1106,6 +1106,23 @@ def test_g_package_mismatch_refuses_before_artifact_checks_or_process_start(tmp_
     assert workbench.manager is None
 
 
+def test_g_refuses_a_missing_built_frontend_before_process_start(tmp_path, monkeypatch):
+    from manyforge_operator.package_aggregate import package_aggregate_sha256
+    install = tmp_path / "package"
+    install.mkdir()
+    (install / "empty.json").write_text("{}")
+    monkeypatch.setattr(dev_workbench, "FRONTEND_DIST", tmp_path / "dist")
+    workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
+        headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        operator_install_root=install, operator_cell_id="fixture_cell",
+        canonical_empty_admission_filename="empty.json",
+        package_aggregate_digest=package_aggregate_sha256(install))
+    monkeypatch.setattr(dev_workbench, "_current_backend", lambda: pytest.fail("must refuse first"))
+    with pytest.raises(dev_workbench.WorkbenchError, match="built Composer frontend"):
+        workbench.start()
+    assert workbench.manager is None
+
+
 def test_g_owner_start(tmp_path, monkeypatch):
     from manyforge_operator.package_aggregate import package_aggregate_sha256
     monkeypatch.setenv("MANYFORGE_STATE_DIR", str(tmp_path / "installation-state"))
@@ -1131,6 +1148,10 @@ def test_g_owner_start(tmp_path, monkeypatch):
     monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
     _built_native_fixture(monkeypatch, extension=extension, preparer=tmp_path / "preparer")
     monkeypatch.setattr(dev_workbench, "_port_available", lambda port: port != 3000)
+    built_frontend = tmp_path / "dist"
+    built_frontend.mkdir()
+    (built_frontend / "index.html").write_text("built fixture frontend")
+    monkeypatch.setattr(dev_workbench, "FRONTEND_DIST", built_frontend)
     monkeypatch.setattr(dev_workbench, "_ensure_frontend_dependencies", lambda: pytest.fail("G must not npm ci"))
     monkeypatch.setattr(dev_workbench, "_ensure_repository_bootstrap_package", lambda: pytest.fail("G must use its qualified package"))
     workbench = dev_workbench.Workbench(project_path=None, ros2_control=True,
@@ -1334,6 +1355,75 @@ def test_build_command_runs_the_native_steps_in_order_and_records_build_time(
     assert json.loads(timing.read_text()) == {"build_elapsed_seconds": 42.5}
     monkeypatch.setattr(dev_workbench, "NATIVE_BUILD_TIMING", tmp_path / "absent.json")
     assert dev_workbench._native_build_elapsed() is None
+
+
+def test_build_command_builds_the_frontend_only_when_asked(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    calls: list[str] = []
+    for build in ("_ensure_current_ros_backend", "_current_backend",
+                  "_current_core_bindings", "_ensure_activation_preparer"):
+        monkeypatch.setattr(dev_workbench, build, lambda: None)
+    monkeypatch.setattr(dev_workbench, "_run", lambda command: None)
+    monkeypatch.setattr(dev_workbench, "_ensure_frontend_build", lambda: calls.append("frontend"))
+    monkeypatch.setattr(dev_workbench, "NATIVE_BUILD_TIMING", tmp_path / "timing.json")
+
+    assert dev_workbench.main(["build"]) == 0
+    assert calls == []
+    assert dev_workbench.main(["build", "--frontend"]) == 0
+    assert calls == ["frontend"]
+
+
+def test_frontend_build_is_skipped_while_dist_matches_the_source(
+    tmp_path: Path, monkeypatch: Any
+) -> None:
+    dist = tmp_path / "frontend/dist"
+    marker = dist / ".manyforge-source.sha256"
+    monkeypatch.setattr(dev_workbench, "FRONTEND_DIST", dist)
+    monkeypatch.setattr(dev_workbench, "FRONTEND_DIST_SOURCE_HASH", marker)
+    monkeypatch.setattr(dev_workbench, "_ensure_frontend_dependencies", lambda: None)
+    source = ["a" * 64]
+    monkeypatch.setattr(dev_workbench, "_frontend_source_hash", lambda: source[0])
+    builds: list[tuple[str, ...]] = []
+
+    def npm(command: Any, *, cwd: Path) -> None:
+        # Vite empties dist before it writes the new build.
+        assert cwd == dev_workbench.FRONTEND_ROOT
+        builds.append(tuple(command))
+        if dist.exists():
+            for child in dist.iterdir():
+                child.unlink()
+        dist.mkdir(parents=True, exist_ok=True)
+        (dist / "index.html").write_text("built")
+
+    monkeypatch.setattr(dev_workbench, "_run", npm)
+
+    dev_workbench._ensure_frontend_build()
+    assert builds == [("npm", "run", "build")]
+    assert marker.read_text().strip() == "a" * 64
+    dev_workbench._ensure_frontend_build()
+    assert len(builds) == 1
+    source[0] = "b" * 64
+    dev_workbench._ensure_frontend_build()
+    assert len(builds) == 2 and marker.read_text().strip() == "b" * 64
+    (dist / "index.html").unlink()
+    dev_workbench._ensure_frontend_build()
+    assert len(builds) == 3
+
+
+def test_frontend_source_hash_ignores_build_outputs(tmp_path: Path, monkeypatch: Any) -> None:
+    frontend = tmp_path / "frontend"
+    (frontend / "src").mkdir(parents=True)
+    (frontend / "src/App.tsx").write_text("export const value = 1;\n")
+    monkeypatch.setattr(dev_workbench, "WORKSPACE", REPOSITORY_ROOT)
+    monkeypatch.setattr(dev_workbench, "FRONTEND_ROOT", frontend)
+    base = dev_workbench._frontend_source_hash()
+    for output in ("dist/index.html", "node_modules/x.js", ".tsbuildinfo/tsconfig.app.tsbuildinfo"):
+        (frontend / output).parent.mkdir(parents=True, exist_ok=True)
+        (frontend / output).write_text("generated\n")
+    assert dev_workbench._frontend_source_hash() == base
+    (frontend / "src/App.tsx").write_text("export const value = 2;\n")
+    assert dev_workbench._frontend_source_hash() != base
 
 
 def test_build_command_failure_exits_unavailable(monkeypatch: Any, capsys: Any) -> None:

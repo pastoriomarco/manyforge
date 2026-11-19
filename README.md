@@ -96,6 +96,8 @@ picks the part and places it.
 - The first build and the first start take a while; later starts are
   incremental. On a Jetson (Thor, Orin), `build` selects NVIDIA's
   `noble-jetpack` package suite by itself.
+- `./scripts/compose-dev.sh pull` fetches the published reference image
+  instead of building it (see the workbench guide).
 - Omit `--project` to start with an empty workspace.
   `./scripts/compose-dev.sh status` inspects the workbench and
   `./scripts/compose-dev.sh stop` stops it. Starting the workbench does not run

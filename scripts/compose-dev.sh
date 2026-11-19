@@ -173,7 +173,7 @@ cleanup_failed_start() {
 trap cleanup_failed_start EXIT
 
 usage() {
-  echo "Usage: $0 build | build-native | start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] | status | stop [--keep-evidence]" >&2
+  echo "Usage: $0 build | pull [<image reference>] | build-native | start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] | status | stop [--keep-evidence]" >&2
 }
 
 # The native build container's image, image-keyed cache, identity, build and
@@ -217,14 +217,19 @@ prepare_native_build() {
       native_container+=(--env "$variable")
     fi
   done
-  native_container+=(-v "$repo_root:/workspace" -v "$cache_root:/runner" -w /workspace)
+  native_container+=(-v "$repo_root:/workspace" -v "$cache_root:/runner" -w /workspace
+    -v "$cache_root/node_modules:/workspace/manyforge_composer/frontend/node_modules")
 }
 
 # The native build step (python3 scripts/dev-workbench.py build). It runs
 # before any readiness deadline; serve only checks the built artifacts. Build
 # output streams to stderr, keeping stdout for the command result.
 run_native_build() {
-  docker run --rm "${native_container[@]}" "$image_id" python3 scripts/dev-workbench.py build >&2 || {
+  local build_args=(build)
+  # Operator mode serves the built GUI from Composer (no Vite): build it from
+  # the mounted source unless an explicit static dir is given.
+  [[ "$operator_mode" != true || -n ${MANYFORGE_DEV_COMPOSER_STATIC_DIR:-} ]] || build_args+=(--frontend)
+  docker run --rm "${native_container[@]}" "$image_id" python3 scripts/dev-workbench.py "${build_args[@]}" >&2 || {
     echo "Native build failed; the development workbench was not started." >&2
     return 69
   }
@@ -405,6 +410,18 @@ case "$command" in
       NVIDIA_ISAAC_ROS_RELEASE_SUITE="${NVIDIA_ISAAC_ROS_RELEASE_SUITE:-$suite}" \
       docker compose -f "$repo_root/docker-compose.yaml" --profile ros-full build ros-jazzy-full
     echo "Built $image. Start the workbench with: $0 start"
+    ;;
+  pull)
+    (($# <= 1)) || { usage; exit 64; }
+    # The reference ROS image that GitHub builds from this repository
+    # (.github/workflows/ros-image.yml): this release's tag by default, or an
+    # explicit reference or digest. It replaces the local image `start` runs.
+    published=ghcr.io/pastoriomarco/manyforge-ros
+    reference=${1:-$published:$(<"$repo_root/VERSION")}
+    [[ $reference != sha256:* ]] || reference=$published@$reference
+    docker pull "$reference"
+    docker image tag "$reference" "$image"
+    echo "Pulled $reference as $image. Start the workbench with: $0 start"
     ;;
   build-native)
     (($# == 0)) || { usage; exit 64; }
@@ -624,7 +641,6 @@ case "$command" in
       -v "$runtime_root:/tmp/manyforge-state" \
       -v "$composer_state:/var/lib/manyforge/composer" \
       -v "$runner_state:/var/lib/manyforge/program-runner" \
-      -v "$cache_root/node_modules:/workspace/manyforge_composer/frontend/node_modules" \
       "$image_id" \
       python3 scripts/dev-workbench.py "${serve_args[@]}")
     started_container=true

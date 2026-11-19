@@ -28,6 +28,14 @@ host-only results are not qualification evidence. Detailed commands, lane
 selection and checkpoint requirements belong in the development workflow
 linked from AGENTS.md.
 
+Keep two public documents current with your change. `THIRD_PARTY_NOTICES.md`
+(and `NOTICE`) must match what the published ROS image redistributes: when you
+add, remove or re-pin anything `Dockerfile.ros-lyrical-full` installs, update
+them, quoting each licence as its owner declares it. The README overview cards
+must stay accurate: when a change affects what they state, edit
+`docs/media/src/overview_cards.py`, run `docs/media/src/render.sh` (needs
+Firefox) and commit the regenerated SVGs and PNGs.
+
 Behavior changes need focused regression coverage. Report checks that were
 not run and why. Review substantial changes before submission, resolve findings
 or document their disposition, and meet applicable CI requirements before merge.

@@ -46,6 +46,22 @@ docker build --build-arg NVIDIA_ISAAC_ROS_RELEASE_SUITE=noble-jetpack \
   -f Dockerfile.ros-lyrical-full -t manyforge-ros-lyrical-full .
 ```
 
+Instead of building, `pull` fetches the reference image that GitHub builds
+from this repository for linux/amd64 and linux/arm64 when the
+`.github/workflows/ros-image.yml` workflow is run by hand, and tags it as the
+image `start` runs:
+
+```bash
+./scripts/compose-dev.sh pull                       # ghcr.io/pastoriomarco/manyforge-ros:<VERSION>
+./scripts/compose-dev.sh pull ghcr.io/pastoriomarco/manyforge-ros@sha256:<digest>
+./scripts/compose-dev.sh start
+```
+
+Without an argument it pulls the tag of the version in `VERSION`; an image
+reference, or a bare `sha256:` digest of that image, selects another one.
+Pulling needs read access to the package. A later `build` replaces the pulled
+image.
+
 Plan for well over half an hour on a first build: on a 14-core arm64 Jetson
 with the ROS and Python layers already cached it took about 19 minutes; the
 resulting image is about 5.4 GB.
@@ -89,7 +105,7 @@ them once, when it creates the container.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `MANYFORGE_DEV_IMAGE` | `manyforge-ros-lyrical-full` (or `MANYFORGE_ROS_FULL_IMAGE`) | Image that `start` runs. |
-| `MANYFORGE_ROS_FULL_IMAGE` | `manyforge-ros-lyrical-full` | Image tag that `build` writes and `start` runs; set it for both. |
+| `MANYFORGE_ROS_FULL_IMAGE` | `manyforge-ros-lyrical-full` | Image tag that `build` and `pull` write and `start` runs; set it for both. |
 | `NVIDIA_ISAAC_ROS_RELEASE_SUITE` | `noble`, or `noble-jetpack` on a Jetson | NVIDIA package suite for `build`. |
 | `MANYFORGE_DEV_CACHE_BASE` | `<checkout>/.manyforge-dev` | Build, npm, state and runtime caches. |
 | `MANYFORGE_DEV_RUNTIME_STATE_ROOT` | `<cache base>/runtime/<container name>` | Absolute host path of the runtime state root. |
@@ -402,7 +418,12 @@ goes to the `start` console (stderr); if it fails,
 builds: it checks these artifacts and refuses, naming the missing file and the
 build step to run, when one is absent. Apply and Load never build.
 `./scripts/compose-dev.sh build-native` runs the same build step on its own,
-for example to build before a timed start. The build
+for example to build before a timed start. In operator mode (the
+[operator runbook](MANYFORGE_OPERATOR_RUNBOOK.md)'s `isaac` profile), where
+Composer serves the built GUI on port 9000 without Vite, the build step also
+builds the frontend from the mounted source into
+`manyforge_composer/frontend/dist` (`npm run build`), skipped while that
+build matches the frontend source; the image carries Node.js and npm only. The build
 step deliberately runs no tests, sanitizers, qualification matrices, package
 materializers, or proof generators. `status` reports the exact owner-issued
 active tuple.
@@ -950,7 +971,7 @@ procedure for physical equipment.
 
 | Symptom | Action |
 | --- | --- |
-| Image missing | Run `./scripts/compose-dev.sh build` (see [Install](#install-one-build-one-start)). |
+| Image missing | Run `./scripts/compose-dev.sh build` or `pull` (see [Install](#install-one-build-one-start)). |
 | Site settings refused at start | See [Site file errors](TROUBLESHOOTING.md#site-file-errors). |
 | Project source missing, invalid or changed | Preserve the diagnostic, inspect the named project/source path, and review changes before retrying. Do not bypass identity checks or delete caches blindly. |
 | Port occupied | Identify the listener on 3000/9010/9011/9020; do not kill an unrelated process. |

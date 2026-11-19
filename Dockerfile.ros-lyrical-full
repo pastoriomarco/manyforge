@@ -18,9 +18,6 @@
 #   source (default) - ROS Lyrical built from source: the release set of the rosdistro
 #       sync recorded in third_party/ros_lyrical/ros-lyrical.repos
 #       (scripts/ros/generate-lyrical-source-repos.sh), plus version floors.
-#       NOT YET BUILDABLE END TO END: upstream Lyrical removed CMake
-#       ament_target_dependencies() (NVIDIA's mirror restores it), which the
-#       xArm driver and two ManyForge packages use.
 # Both are built in clean stages without the ManyForge venv, so no ROS or
 # ROS-workspace library can link against venv/cmeel libraries.
 #
@@ -30,22 +27,22 @@
 #
 # Runtime/product availability is defined by the selected entrypoint, not by
 # this toolchain image or a successful build.
+#
+# Licence files: the owners' licence/notice files that the installed products
+# do not carry themselves are copied verbatim from their sources into
+# /usr/share/licenses/manyforge-image/ (layout in THIRD_PARTY_NOTICES.md):
+#   manyforge/                LICENSE, NOTICE, THIRD_PARTY_NOTICES.md
+#   ros-source/src/<repo>/    ROS source set (paths as in /opt/ros_src)
+#   ros-source/build/<pkg>/   upstream sources fetched by built *_vendor packages
+#   topic_based_ros2_control/, roboplan-closure/<tree>/, cmeel/<project>/, nodejs/
+# Ubuntu packages keep theirs in /usr/share/doc/<package>/copyright.
 
 ARG ROS_BASE=source
 
-# --- Stage 1: Build React frontend ---
-FROM node:22-slim AS frontend-builder
-WORKDIR /workspace/manyforge_composer/frontend
-COPY manyforge_composer/frontend/package.json manyforge_composer/frontend/package-lock.json* ./
-RUN npm ci --ignore-scripts
-COPY manyforge_composer/frontend/ ./
-# TypeScript also checks contract tests against owner-issued fixtures. Preserve
-# the same repository-relative layout as the native development image.
-COPY manyforge_deployment/resources/program_binding_lite6_native.fixture.json \
-     /workspace/manyforge_deployment/resources/program_binding_lite6_native.fixture.json
-COPY manyforge_headless_api/tests/fixtures/control-v2-local-delta.json \
-     /workspace/manyforge_headless_api/tests/fixtures/control-v2-local-delta.json
-RUN npm run build
+# --- Stage 1: Node.js 22 + npm, for building the mounted Composer frontend ---
+# Pinned by digest (Node.js v22.23.5, multi-arch index) so every build gets the
+# same Node; update the digest deliberately and THIRD_PARTY_NOTICES.md with it.
+FROM node:22-slim@sha256:e9f565d32859f0cbfb52125eafe8be39390f24dac302dc3cdf566e8ba3ab21ee AS node
 
 # --- Stage 2: OS base shared by every ROS stage ---
 # LYRICAL: no official ros:lyrical-*-noble image exists (Ubuntu 24.04 is a
@@ -133,6 +130,21 @@ RUN --mount=type=cache,id=manyforge-ros-lyrical-src-ccache,target=/root/.cache/c
       --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
         -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache; \
     ccache -s | head -5; \
+    # Owners' licence files, verbatim: repository roots, built packages (with
+    # their bundled third-party directories) and the upstream sources that
+    # built vendor packages fetched into the build tree.
+    names=( \( -iname LICENSE -o -iname 'LICENSE[._-]*' -o -iname 'LICENCE*' -o -iname COPYING \
+      -o -iname 'COPYING[._-]*' -o -iname NOTICE -o -iname 'NOTICE[._-]*' \) ); \
+    skip=( \( -name .git -o -iname 'test*' -o -iname 'doc*' \) -prune ); \
+    { awk '{print $2}' build-set.txt | cut -d/ -f1-2 | sort -u \
+        | xargs -I{} find {} -maxdepth 1 -type f "${names[@]}"; \
+      awk '{print $2}' build-set.txt \
+        | xargs -I{} find {} -mindepth 1 -maxdepth 3 "${skip[@]}" -o -type f "${names[@]}" -print; \
+      awk '$1 ~ /_vendor$/ {print "build/" $1}' build-set.txt \
+        | xargs -I{} find {} -mindepth 1 -maxdepth 4 "${skip[@]}" -o -type f "${names[@]}" -print; \
+    } | sort -u > licence-files.txt; \
+    mkdir -p /usr/share/licenses/manyforge-image/ros-source; \
+    xargs -a licence-files.txt cp --parents -t /usr/share/licenses/manyforge-image/ros-source; \
     record="/opt/ros/${ROS_DISTRO}/manyforge-source"; mkdir -p "${record}"; \
     cp manifest/ros-lyrical.repos manifest/floors.repos manifest/packages.txt manifest-exact.repos \
       build-set.txt rosdep-apt.txt "${record}/"; \
@@ -141,6 +153,7 @@ RUN --mount=type=cache,id=manyforge-ros-lyrical-src-ccache,target=/root/.cache/c
 
 FROM os-base AS ros-base-source
 COPY --from=ros-source-build /opt/ros/lyrical /opt/ros/lyrical
+COPY --from=ros-source-build /usr/share/licenses/manyforge-image /usr/share/licenses/manyforge-image
 # Runtime/build system dependencies of the source set (rosdep, same sync).
 RUN apt-get update \
     && xargs -a /opt/ros/lyrical/manyforge-source/rosdep-apt.txt \
@@ -282,6 +295,8 @@ RUN set -eux; \
     set -u; \
     colcon build --merge-install --install-base /opt/manyforge/topic_based_ros2_control/install --packages-select topic_based_ros2_control --cmake-args -DBUILD_TESTING=OFF; \
     printf '%s\n' "aa9f9ef9525a60f8becea322537dd1d6d1bf9123" > /opt/manyforge/topic_based_ros2_control/install/UPSTREAM_COMMIT; \
+    install -D -m 0644 /tmp/topic_based_ros2_control_ws/src/topic_based_ros2_control/LICENSE \
+      /usr/share/licenses/manyforge-image/topic_based_ros2_control/LICENSE; \
     rm -rf /tmp/topic_based_ros2_control_ws
 
 # Description data only, for the test lanes' data overlay (scripts/test-all.sh).
@@ -475,9 +490,38 @@ RUN set -eux; \
       done; \
     done; \
     ldconfig; \
+    install -D -m 0644 /tmp/cmeel_tinyxml2-11.0.0/tinyxml2/LICENSE.txt \
+      /usr/share/licenses/manyforge-image/cmeel/tinyxml2/LICENSE.txt; \
+    install -D -m 0644 /tmp/cmeel_urdfdom-6.0.0/urdfdom/LICENSE \
+      /usr/share/licenses/manyforge-image/cmeel/urdfdom/LICENSE; \
     find /opt/manyforge \( ! -uid 1000 -o ! -gid 1000 \) -exec chown -h 1000:1000 {} +; \
     rm -rf /tmp/native-tinyxml* /tmp/native-urdfdom* /tmp/cmeel_tinyxml2-11.0.0 \
       /tmp/cmeel_urdfdom-6.0.0 /tmp/cmeel_urdfdom_headers-3.0.0
+
+# Licence files of the other cmeel wheels that ship none, verbatim from the
+# upstream source of the same version: the console_bridge and OctoMap sdists;
+# for Assimp (no sdist) the cmeel-assimp v6.0.5.c0 submodule commit (assimp
+# v6.0.5); for Boost and zlib, whose sdists hold only build scripts, the
+# upstream release tags they build (boost-1.90.0, zlib v1.3.1).
+RUN set -euxo pipefail; \
+    lic=/usr/share/licenses/manyforge-image/cmeel; tmp=/tmp/cmeel-licences; \
+    mkdir -p "${tmp}" "${lic}/assimp" "${lic}/boost" "${lic}/zlib"; \
+    fetch() { curl -fsSL --retry 5 --retry-all-errors "$1" -o "$2"; echo "$3  $2" | sha256sum -c -; }; \
+    fetch https://files.pythonhosted.org/packages/83/13/2e9e9d23db8548aef975564055bdb4fb6da8a397a1e7df8cb61f5afebefb/cmeel_console_bridge-1.0.2.3.tar.gz \
+      "${tmp}/console_bridge.tar.gz" 3b2837da7ab408e9d1a775c83c0a7772356062b3a3672e4ce247f2da71a8ecd9; \
+    fetch https://files.pythonhosted.org/packages/89/ab/2fed2dbee13e4b39949591685419f1dbb691295e32a6bbbaf87edc005922/cmeel_octomap-1.10.0.tar.gz \
+      "${tmp}/octomap.tar.gz" bd79d1d17adede534de242e42e13ef0d9f04bdd27daf7d56c57f7c43670c9b05; \
+    tar -xzf "${tmp}/console_bridge.tar.gz" -C "${tmp}" cmeel_console_bridge-1.0.2.3/console_bridge/LICENSE; \
+    tar -xzf "${tmp}/octomap.tar.gz" -C "${tmp}" cmeel_octomap-1.10.0/octomap/octomap/LICENSE.txt; \
+    install -D -m 0644 "${tmp}/cmeel_console_bridge-1.0.2.3/console_bridge/LICENSE" "${lic}/console_bridge/LICENSE"; \
+    install -D -m 0644 "${tmp}/cmeel_octomap-1.10.0/octomap/octomap/LICENSE.txt" "${lic}/octomap/LICENSE.txt"; \
+    fetch https://raw.githubusercontent.com/assimp/assimp/392a658f9c271be965271f45e7521a1b80ea4392/LICENSE \
+      "${lic}/assimp/LICENSE" 21195d410708b82757d3e34c3a40c427f6e59339da862e9480d4fcdc79b7a1bd; \
+    fetch https://raw.githubusercontent.com/boostorg/boost/1bed2b0712b2119f20d66c5053def9173c8462a5/LICENSE_1_0.txt \
+      "${lic}/boost/LICENSE_1_0.txt" c9bff75738922193e67fa726fa225535870d2aa1059f91452c411736284ad566; \
+    fetch https://raw.githubusercontent.com/madler/zlib/51b7f2abdade71cd9bb0e7a373ef2610ec6f9daf/LICENSE \
+      "${lic}/zlib/LICENSE" 845efc77857d485d91fb3e0b884aaa929368c717ae8186b66fe1ed2495753243; \
+    rm -rf "${tmp}"
 
 # Exact RoboPlan 0.8 source closure with source-built ProxSuite (configured by
 # exact jrl-cmakemodules, no serialization) and TOPPRA, and exact nanoflann.
@@ -564,6 +608,11 @@ RUN --mount=type=bind,source=.docker/roboplan,target=/tmp/roboplan,rw \
            echo "Native XML symbols escaped private linkage: $native_xml_consumer" >&2; exit 1; \
          fi; \
        done \
+    && install -d /usr/share/licenses/manyforge-image/roboplan-closure \
+    && (cd /tmp && cp --parents -t /usr/share/licenses/manyforge-image/roboplan-closure \
+         roboplan/LICENSE \
+         proxsuite/LICENSE toppra/LICENSE nanoflann/COPYING \
+         jrl-cmakemodules/LICENSE jrl-cmakemodules/v2/LICENSE) \
     && find /opt/manyforge \( ! -uid 1000 -o ! -gid 1000 \) -exec chown -h 1000:1000 {} + \
     && rm -rf /tmp/roboplan-manifest \
          /tmp/roboplan-build-closure /tmp/roboplan-install-closure \
@@ -575,6 +624,8 @@ RUN --mount=type=bind,source=.docker/roboplan,target=/tmp/roboplan,rw \
 COPY --from=ros-workspaces --chown=1000:1000 /opt/manyforge/topic_based_ros2_control /opt/manyforge/topic_based_ros2_control
 COPY --from=ros-workspaces --chown=1000:1000 /opt/manyforge/xarm_description /opt/manyforge/xarm_description
 COPY --from=ros-workspaces --chown=1000:1000 /opt/manyforge/xarm_ws /opt/manyforge/xarm_ws
+COPY --from=ros-workspaces /usr/share/licenses/manyforge-image/topic_based_ros2_control \
+     /usr/share/licenses/manyforge-image/topic_based_ros2_control
 
 # The venv distributions are the sole RoboPlan runtime/CMake prefix. The
 # disconnected C++ closure is removed in the same layer and cannot compete at
@@ -595,16 +646,17 @@ RUN set -eux; \
         useradd --create-home --shell /bin/bash --uid 1000 --gid 1000 manyforge; \
     fi; \
     user_home="$(getent passwd 1000 | cut -d: -f6)"; \
-    mkdir -p /tmp/manyforge-build /workspace /opt/manyforge-frontend/dist "${user_home}"; \
+    mkdir -p /tmp/manyforge-build /workspace "${user_home}"; \
     chown -R 1000:1000 /tmp/manyforge-build /workspace "${user_home}"
 
-# Node.js 22 for Composer frontend builds in the full ROS image.
-COPY --from=frontend-builder /usr/local/bin/node /usr/local/bin/node
-COPY --from=frontend-builder /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+# Node.js 22 for building the Composer frontend from the mounted source
+# (the workbench build step); ManyForge's frontend is not in the image.
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+COPY --from=node /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+# Node's own LICENSE (with the notices of its bundled components).
+COPY --from=node /usr/local/LICENSE /usr/share/licenses/manyforge-image/nodejs/LICENSE
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
-
-COPY --from=frontend-builder --chown=1000:1000 /workspace/manyforge_composer/frontend/dist/ /opt/manyforge-frontend/dist/
 
 # LYRICAL: the Jazzy entrypoint is reused unchanged; it sources
 # /opt/ros/${ROS_DISTRO} and ROS_DISTRO=lyrical is set above.
@@ -616,6 +668,9 @@ RUN chmod +x /usr/local/bin/docker-entrypoint.ros-jazzy-full.sh \
     && /usr/bin/python3 -m pip install --break-system-packages --no-cache-dir \
         --no-deps rfc8785==0.1.4 \
     && /usr/bin/python3 -c "import rfc8785"
+
+# ManyForge's licence, NOTICE and the image's third-party notices.
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md /usr/share/licenses/manyforge-image/manyforge/
 
 USER 1000:1000
 

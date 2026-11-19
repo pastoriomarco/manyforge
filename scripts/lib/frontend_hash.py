@@ -28,6 +28,7 @@ from typing import Iterable, Mapping
 _SOURCE_EXCLUDES = {
     ".git",
     ".pytest_cache",
+    ".tsbuildinfo",
     ".vite",
     "dist",
     "dist-ssr",

@@ -200,7 +200,7 @@ the runtime host with
 | `--remote-simulation-control-config` | Required. Isaac simulation-control site file. |
 | `--cell-id`, `--canonical-empty-admission-filename` | Set both to a cell in the package. |
 | `--package-aggregate-sha256`, `--compiler-build-manifest-sha256`, `--node-environment-sha256` | Required digests (see above). |
-| `--remote-composer-static-dir` | Optional. Built frontend with `index.html`; default is the one in the image. |
+| `--remote-composer-static-dir` | Optional. Built frontend with `index.html`. Default: the build step builds `manyforge_composer/frontend/dist` from the remote checkout. |
 | `--remote-python-executable` | Python on the runtime host, used for the source check (default `python3`). |
 | `--remote-manager-executable`, `--remote-state-root`, `--remote-bridge-state-root`, `--remote-ros-setup-script`, `--remote-ros-environment-script` | Required absolute paths that are validated and recorded but not used by the container, which builds and stages its own runtime and gets ROS from the image. Pass paths on your runtime host. |
 | `--control-host` | Recorded name of the controlling machine (default: its hostname). |
@@ -216,7 +216,8 @@ Isaac Sim on the Isaac host and open the scene before you Load the Scenario.
 
 `start` checks the local and remote source identities, runs the incremental
 native build step as its own call (`compose-dev.sh build-native`, allowed 45
-minutes for a cold build), then starts the container with `compose-dev.sh
+minutes for a cold build; it also builds the frontend Composer serves, skipped
+while the existing build matches the frontend source), then starts the container with `compose-dev.sh
 start` (this call allows about 15 minutes for readiness only), waits
 for Manager, Headless, Program runner and Composer to report ready, and checks
 the remote source again. The container carries the labels
@@ -256,7 +257,7 @@ manyforge-operator --state-root "$STATE_ROOT" --instance-id workbench --json \
 | digests | Required (see above). |
 | `--cell-id`, `--canonical-empty-admission-filename` | Set both to a cell in the package. |
 | `--advertised-host` | Address used in the Composer URL (default `localhost`). |
-| `--composer-static-dir` | Optional built frontend with `index.html`. |
+| `--composer-static-dir` | Optional built frontend with `index.html`. Default: `manyforge_composer/frontend/dist` in the source tree, if built (`npm ci && npm run build` there); without one Composer serves only its API. |
 | `--simulation-control-config` | Optional simulation-control site file for the Program runner. |
 | `--expected-source-fingerprint`, `--expected-head-commit`, `--expected-head-tree` | Optional; start refuses a source that differs. Also accepted by `isaac`. |
 | `--poll-interval-s` (0.25), `--reconciliation-period-ms` (500), `--manager-timeout-s` (60, max 60) | Timeouts. `--readiness-timeout-s` is accepted but not used by `standard`. |

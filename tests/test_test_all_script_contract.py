@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -548,6 +549,29 @@ def test_current_build_lanes_use_fresh_container_local_products() -> None:
     assert '"${image_id}" \\' in local_ci
     assert 'cache_volume="manyforge-local-ci-build-' not in local_ci
 
+
+
+def test_ros_image_workflow_is_manual_and_hashes_existing_inputs() -> None:
+    script = _REPO_ROOT / "scripts" / "ci" / "ros-image-inputs.sh"
+    paths = subprocess.run(["bash", str(script), "--paths"], check=True,
+        capture_output=True, text=True).stdout.split()
+    workflow = yaml.safe_load(
+        (_REPO_ROOT / ".github/workflows/ros-image.yml").read_text(encoding="utf-8"))
+    # PyYAML reads the `on:` key as True. Manual only until the package is
+    # public (OD-315); a returning push trigger needs a paths filter equal to
+    # `--paths`.
+    assert set(workflow[True]) == {"workflow_dispatch"}
+    for path in paths:
+        assert (_REPO_ROOT / path).exists(), path
+    # Every repository file the image COPYs is hashed (bind mounts come from
+    # setup-docker.sh); ManyForge's own frontend is not in the image.
+    dockerfile = (_REPO_ROOT / "Dockerfile.ros-lyrical-full").read_text(encoding="utf-8")
+    copied = re.findall(r"^COPY (?!--from)(\S+)", dockerfile, re.MULTILINE)
+    assert copied and all(any(source.rstrip("/").startswith(path) for path in paths)
+                          for source in copied), copied
+    assert "manyforge_composer" not in dockerfile and "/opt/manyforge-frontend" not in dockerfile
+    integration = (_REPO_ROOT / ".github/workflows/ros-integration.yml").read_text(encoding="utf-8")
+    assert "scripts/ci/ros-image-inputs.sh" in integration
 
 def test_hermes_gateway_matrix_cannot_activate_the_deleted_bridge() -> None:
     matrix_path = _REPO_ROOT / "scripts" / "hermes" / "managed-tool-gateway-matrix.json"

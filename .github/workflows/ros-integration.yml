@@ -1,0 +1,142 @@
+name: ros-integration
+
+# ROS tier (OD-315): nightly (on dev) and on demand. Runs the ROS integration
+# graph (`test-all.sh ros`) and the ros2_control Mock-lane cell (`test-all.sh
+# ros-e2e`) in the reference ROS image that ros-image.yml published for this
+# commit's inputs, pulled by digest. It never builds that image.
+on:
+  schedule:
+    - cron: "0 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dev-changed:
+    uses: ./.github/workflows/nightly-dev-changed.yml
+    permissions:
+      contents: read
+      actions: read
+
+  ros:
+    name: ROS ${{ matrix.suite }} (AMD64 Docker)
+    needs: dev-changed
+    if: needs.dev-changed.outputs.run == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [ros, ros-e2e]
+    env:
+      CCACHE_HOST_DIR: ${{ github.workspace }}/../ccache-ros
+      BUILD_HOST_DIR: ${{ github.workspace }}/../manyforge-build
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
+
+      - name: Free runner disk before image pull
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker image prune -af
+          df -h
+          free -h
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull the reference ROS image by digest
+        id: image
+        run: |
+          set -euo pipefail
+          ref="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/manyforge-ros:$(scripts/ci/ros-image-inputs.sh)"
+          if ! manifest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}'); then
+            echo "::error::No reference ROS image $ref for this commit's image inputs. Run the ros-image workflow on this ref first."
+            exit 1
+          fi
+          pinned="${ref%:*}@$(jq -r .digest <<<"$manifest")"
+          docker pull --platform linux/amd64 "$pinned"
+          echo "Reference image: $pinned"
+          echo "pinned=$pinned" >> "$GITHUB_OUTPUT"
+
+      # The image has no ccache (its contents are fixed by ros-image.yml); the
+      # repository's cache derivative adds pinned ccache on top, locally.
+      - name: Add ccache to the reference image
+        env:
+          PINNED: ${{ steps.image.outputs.pinned }}
+        run: |
+          MANYFORGE_DIAGNOSTIC_IMAGE="manyforge-ros-ci:${GITHUB_SHA}" \
+            scripts/ros/build-jazzy-cache-image.sh "$PINNED"
+
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_HOST_DIR }}
+          key: ccache-ros-${{ matrix.suite }}-${{ github.run_id }}
+          restore-keys: ccache-ros-${{ matrix.suite }}-
+
+      # Same environment as the ros-jazzy-full Compose service: the image
+      # entrypoint, host networking and IPC for DDS, the image user (UID 1000).
+      - name: Run ROS ${{ matrix.suite }} suite in immutable image
+        shell: bash
+        env:
+          SUITE: ${{ matrix.suite }}
+        run: |
+          set -euo pipefail
+          image_id="$(docker image inspect "manyforge-ros-ci:${GITHUB_SHA}" --format '{{.Id}}')"
+          if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve immutable ROS image identity" >&2
+            exit 1
+          fi
+          echo "Qualified image: ${image_id}"
+          mkdir -p "$CCACHE_HOST_DIR" "$BUILD_HOST_DIR"
+          sudo chown -R 1000:1000 "$CCACHE_HOST_DIR" "$BUILD_HOST_DIR"
+          docker run --rm --platform linux/amd64 \
+            --network host --ipc host \
+            -e CMAKE_C_COMPILER_LAUNCHER=ccache \
+            -e CMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -e CCACHE_DIR=/ccache -e CCACHE_MAXSIZE=2G -e CCACHE_COMPILERCHECK=content \
+            -e MANYFORGE_BUILD_DIR=/tmp/manyforge-build \
+            -e SUITE \
+            -v "${GITHUB_WORKSPACE}:/workspace:ro" \
+            -v "${CCACHE_HOST_DIR}:/ccache" \
+            -v "${BUILD_HOST_DIR}:/tmp/manyforge-build" \
+            -w /workspace \
+            "${image_id}" \
+            /usr/local/bin/docker-entrypoint.ros-jazzy-full.sh \
+            env -u CCACHE_DISABLE bash -c 'ccache --zero-stats; scripts/test-all.sh "$SUITE"; status=$?; ccache --show-stats; exit "$status"'
+
+      - name: Save ccache
+        if: ${{ !cancelled() }}
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.CCACHE_HOST_DIR }}
+          key: ccache-ros-${{ matrix.suite }}-${{ github.run_id }}
+
+      - name: Upload Mock-cell evidence
+        if: ${{ failure() && matrix.suite == 'ros-e2e' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ros-e2e-evidence
+          path: ${{ env.BUILD_HOST_DIR }}/ros-e2e-evidence
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Report runner resources after ROS run
+        if: always()
+        run: |
+          df -h
+          free -h
+          dmesg 2>/dev/null | grep -Ei 'out of memory|oom-kill|killed process' || true

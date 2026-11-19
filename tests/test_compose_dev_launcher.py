@@ -453,6 +453,7 @@ esac
     for shared in (f"--user {os.getuid()}:{os.getgid()}", "--env HOME=/runner/home",
                    "--env MANYFORGE_BUILD_DIR=/runner/build", f"-v {workspace}:/workspace",
                    f"-v {tmp_path / 'cache/images/test'}:/runner", "--network host",
+                   f"-v {tmp_path / 'cache/images/test/node_modules'}:/workspace/manyforge_composer/frontend/node_modules",
                    "--env MANYFORGE_ROS2_CONTROL_BUILD_TESTING",
                    "--env MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS", "-e MANYFORGE_DEV_BUILD_JOBS="):
         assert shared in build and shared in command
@@ -961,6 +962,9 @@ def test_g_failed_start_returns_exact_metadata_and_leaves_ros_client_for_owner_c
     assert f"-v {persistent}:/tmp/manyforge-state" in command
     assert "--operator-runtime" in command and "--composer-port 9000 --composer-bind-host 0.0.0.0" in command
     assert "--project" not in command and "npm" not in command and "Vite" not in command
+    # Composer serves the built GUI: the build step builds it from the source.
+    build = next(c for c in calls if c.startswith("run --rm "))
+    assert build.endswith("python3 scripts/dev-workbench.py build --frontend")
     assert not any(c.startswith(("stop ", "cp ", "rm ")) for c in calls)
 
 
@@ -1373,6 +1377,42 @@ def test_build_prepares_sources_then_builds_the_default_full_ros_image(tmp_path:
     ]
     assert "compose-dev.sh start" in completed.stdout
 
+
+
+@pytest.mark.parametrize("argument, reference", [
+    (None, "ghcr.io/pastoriomarco/manyforge-ros:9.8.7"),
+    ("registry.example/ros:custom", "registry.example/ros:custom"),
+    ("sha256:" + "a" * 64, "ghcr.io/pastoriomarco/manyforge-ros@sha256:" + "a" * 64),
+])
+def test_pull_tags_the_published_image_as_the_image_start_runs(
+    tmp_path: Path, argument: str | None, reference: str
+) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    (launcher.parents[1] / "VERSION").write_text("9.8.7\n")
+    calls = tmp_path / "calls"
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    docker = fake_bin / "docker"
+    docker.write_text(f'#!/usr/bin/env bash\nprintf "docker %s\\n" "$*" >> {calls}\n')
+    docker.chmod(0o755)
+    environment = {key: value for key, value in os.environ.items()
+                   if key not in ("MANYFORGE_DEV_IMAGE", "MANYFORGE_ROS_FULL_IMAGE")}
+    environment["PATH"] = f"{fake_bin}:{environment['PATH']}"
+    arguments = ["pull"] if argument is None else ["pull", argument]
+    completed = subprocess.run(["bash", str(launcher), *arguments], cwd=tmp_path,
+        env=environment, capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+    assert calls.read_text().splitlines() == [
+        f"docker pull {reference}",
+        f"docker image tag {reference} manyforge-ros-lyrical-full",
+    ]
+    assert "compose-dev.sh start" in completed.stdout
+
+
+def test_pull_refuses_extra_arguments(tmp_path: Path) -> None:
+    completed, environment = _run_launcher(tmp_path, "pull", "one", "two")
+    assert completed.returncode == 64
+    assert not Path(environment["FAKE_DOCKER_CALLS"]).exists()
 
 def test_start_native_build_failure_exits_before_session_or_serve_container(tmp_path: Path) -> None:
     launcher = _copy_writable_launcher(tmp_path)
