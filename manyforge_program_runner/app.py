@@ -121,7 +121,12 @@ class ProgramControlStateSource:
                 loop.call_soon_threadsafe(subscription.wake.set)
 
     def snapshot(self) -> tuple[dict[str, Any], int]:
-        return self._runtime.cycle_status(), self._clock_ns()
+        """The cycle for classification; it lacks the Reset-position read."""
+        return self._runtime.cycle_projection(), self._clock_ns()
+
+    def complete(self, cycle: dict[str, Any]) -> dict[str, Any]:
+        """Add the Reset-position availability to the frame about to be sent."""
+        return self._runtime.add_reset_robot_position(cycle)
 
     def clock_ns(self) -> int:
         return self._clock_ns()
@@ -200,6 +205,7 @@ async def _serve_program_control_state(
                     )
                 cycle, observed_ns = await asyncio.to_thread(source.snapshot)
                 event_class = program_cycle_event_class(previous_cycle, cycle)
+            cycle = await asyncio.to_thread(source.complete, cycle)
             sequence += 1
             payload = json.dumps(
                 {
@@ -415,7 +421,7 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
 
     app = FastAPI(
         title="ManyForge Program Runner",
-        version="0.3.0",
+        version="0.3.1",
         lifespan=lifespan,
     )
     app.add_middleware(

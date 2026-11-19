@@ -6,10 +6,10 @@ ARG MANYFORGE_DEV_BASE_ID
 LABEL manyforge.dev-cache.base-image-id="${MANYFORGE_DEV_BASE_ID}"
 
 USER root
-# Debian Bookworm package pin; do not use this layer for ROS/Jazzy images.
+# Ubuntu 24.04 (noble) package pin, the dev image's base.
 RUN test -n "${MANYFORGE_DEV_BASE_ID}" \
     && apt-get update \
-    && apt-get install -y --no-install-recommends ccache=4.8+really4.7.5-1 \
+    && apt-get install -y --no-install-recommends ccache=4.9.1-1 \
     && ccache --version \
     && rm -rf /var/lib/apt/lists/*
 

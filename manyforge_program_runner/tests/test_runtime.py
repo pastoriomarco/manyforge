@@ -71,6 +71,7 @@ from manyforge_program_runner.persistent_keys import (
 )
 from manyforge_headless_api.client import HeadlessClientError
 from manyforge_headless_api.program_cycle import ProgramCycleFrameDTO
+from manyforge_headless_api.component_model import run_cycle_facts
 from manyforge_headless_api.cell_admission import CellAdmissionError
 from manyforge_program_runner.bbkey_publication import (
     FAULT_CODE as BBKEY_PUBLICATION_FAULT_CODE,
@@ -352,7 +353,7 @@ def test_run_readiness_refuses_with_its_first_reason() -> None:
     headless = _Headless()
     runtime = ProgramRuntime.__new__(ProgramRuntime)
     runtime._headless = headless  # type: ignore[assignment]
-    runtime.cycle_status = lambda: _cycle_status("idle_after_reset")  # type: ignore[method-assign]
+    runtime.cycle_projection = lambda: _cycle_status("idle_after_reset")  # type: ignore[method-assign]
     runtime._require_run_readiness("can_execute")
     headless.readiness = {
         "can_execute": False,
@@ -415,7 +416,7 @@ def test_run_readiness_is_asked_with_the_runners_current_cycle_facts() -> None:
     runtime = ProgramRuntime.__new__(ProgramRuntime)
     runtime._headless = headless  # type: ignore[assignment]
     cycle = {"status": _cycle_status("terminal_awaiting_reset")}
-    runtime.cycle_status = lambda: cycle["status"]  # type: ignore[method-assign]
+    runtime.cycle_projection = lambda: cycle["status"]  # type: ignore[method-assign]
     # A Reset completes; Execute right after it asks with the idle cycle.
     cycle["status"] = _cycle_status("idle_after_reset")
     runtime._require_run_readiness("can_execute")
@@ -5399,7 +5400,7 @@ def test_resume_motion_reads_run_readiness_before_host_effect():
                              "rule_id": "guard"}],
     }
     runtime._headless = headless  # type: ignore[assignment]  # noqa: SLF001
-    runtime.cycle_status = lambda: _cycle_status("running")  # type: ignore[method-assign]
+    runtime.cycle_projection = lambda: _cycle_status("running")  # type: ignore[method-assign]
     runtime._host = SimpleNamespace(  # noqa: SLF001
         resume_motion=lambda *_args, **_kwargs: pytest.fail(
             "a readiness refusal must precede the host Resume effect"
@@ -6217,6 +6218,31 @@ def _busy(error: ProgramRunnerError, kind: str) -> bool:
         error.code == "execution_control_ingress_busy"
         and error.details == {"command_in_progress": kind}
     )
+
+
+def test_reset_position_is_read_only_where_it_is_consumed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """The projection and the readiness facts read no Reset-position
+    availability from the host; ``cycle_status()`` reads it once and equals
+    the projection completed with it."""
+
+    runtime, _owner = _running_control_runtime(monkeypatch, tmp_path)
+    reads: list[int] = []
+    runtime._execution_transport.reset_robot_position_capability = lambda: (  # noqa: SLF001
+        reads.append(1) or {"reset_robot_position": {"available": True, "reason": None}})
+    status = runtime.cycle_status()
+    assert len(reads) == 1
+    assert status["reset_robot_position"] == {"available": True, "reason": None}
+    projection = runtime.cycle_projection()
+    assert len(reads) == 1
+    assert {**projection, "reset_robot_position": status["reset_robot_position"]} == status
+    assert runtime.add_reset_robot_position(projection) == status
+    assert len(reads) == 2
+    runtime._require_run_readiness("can_execute")  # noqa: SLF001
+    assert len(reads) == 2
+    assert runtime._headless.readiness_cycles[-1] == run_cycle_facts(status)  # noqa: SLF001
+    runtime.shutdown()
 
 
 def _running_control_runtime(monkeypatch: pytest.MonkeyPatch, tmp_path):

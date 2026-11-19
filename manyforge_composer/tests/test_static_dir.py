@@ -30,3 +30,15 @@ def test_create_app_rejects_invalid_explicit_static_dir(tmp_path):
 
     with pytest.raises(RuntimeError, match="Explicit frontend static dir"):
         create_app(state, static_dir=str(tmp_path / "missing"))
+
+
+def test_default_static_dir_is_only_the_source_tree_build(tmp_path, monkeypatch):
+    from manyforge_composer.backend import app as app_module
+
+    monkeypatch.setattr(app_module, "__file__", str(tmp_path / "backend" / "app.py"))
+    assert _find_static_dir(None) is None
+
+    dist = tmp_path / "frontend" / "dist"
+    dist.mkdir(parents=True)
+    (dist / "index.html").write_text("<!doctype html>\n", encoding="utf-8")
+    assert _find_static_dir(None) == dist

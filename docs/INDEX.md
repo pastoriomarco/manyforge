@@ -7,7 +7,8 @@ workbench.
 
 | Task | Guide |
 | --- | --- |
-| Prepare, start, inspect and stop the workbench | [Development workbench](operations/DEVELOPMENT_WORKBENCH.md) |
+| Install ManyForge (pull or build the image), check it, update, fall back | [Development workbench: Install](operations/DEVELOPMENT_WORKBENCH.md#install) |
+| Start, inspect and stop the workbench | [Development workbench](operations/DEVELOPMENT_WORKBENCH.md) |
 | Connect a real robot (xArm, Lite 6) | [Real robot setup](operations/REAL_ROBOT_SETUP.md) |
 | Check a fresh-checkout setup | [Fresh-checkout checklist](operations/FRESH_CHECKOUT_CHECKLIST.md) |
 | Overview of lanes, dependencies and the assistant | [Stack setup](operations/STACK_SETUP.md) |
@@ -15,7 +16,7 @@ workbench.
 | Find logs, status endpoints and capture a bug report | [Observability](operations/OBSERVABILITY.md) |
 | Mirror an Isaac Sim stage in a Scene | [Isaac scene authoring](operations/ISAAC_SCENE_AUTHORING.md) |
 | Run the Isaac Lite 6 trocar FoundationPose workflow | [Trocar FoundationPose runbook](operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md) |
-| Run from a digest-checked package or a remote host | [Operator launcher](operations/MANYFORGE_OPERATOR_RUNBOOK.md) |
+| Run from a digest-checked package or a remote host (advanced) | [Operator launcher](operations/MANYFORGE_OPERATOR_RUNBOOK.md) |
 | Use Program data | [Blackboard keys](authoring/BLACKBOARD_KEYS.md) and [Expressions](authoring/EXPRESSIONS.md) |
 | Set Program speeds and tolerances, override them per node, copy nodes | [Motion defaults](authoring/MOTION_DEFAULTS.md) |
 | Author signal and interrupt rules | [Interrupts](authoring/INTERRUPTS.md) |

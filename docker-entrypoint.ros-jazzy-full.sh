@@ -34,7 +34,7 @@ if [ -f "/opt/manyforge/topic_based_ros2_control/install/setup.bash" ]; then
 fi
 
 # Pinned ROS dependency overlays of the full Lyrical image: xArm driver, then
-# the controller overlay (stock JTC 6.10.0) and the rmw_fastrtps 9.4.11 overlay
+# the controller overlay (stock JTC 6.10.1) and the rmw_fastrtps 9.4.11 overlay
 # last so that their packages take precedence. Local setups keep the order above
 # unchanged.
 for overlay in /opt/manyforge/xarm_ws/install /opt/manyforge/control_overlay /opt/manyforge/rmw_fastrtps_overlay; do

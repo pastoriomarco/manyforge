@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 
@@ -338,6 +339,7 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
         ("ros2", 'case "$*" in\n'
                  '  "pkg prefix topic_based_ros2_control") printf "%s\\n" "$FAKE_TOPIC_INSTALL";;\n'
                  '  "pkg prefix xarm_description") printf "%s/xarm_description\\n" "$FAKE_DATA_INSTALL";;\n'
+                 '  "pkg prefix rmw_test_fixture_implementation") printf "%s\\n" "$FAKE_RMW_FIXTURE";;\n'
                  '  *) exit 98;;\nesac\n'),
         ("colcon", 'printf "ros-overlay-build\\n" >> "$FAKE_LOG"\n'
                    'while [ "$1" != "--install-base" ]; do shift; done\n'
@@ -377,6 +379,11 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
     (fake_bin / "python3").chmod(0o755)
     (fake_bin / "pytest").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     (fake_bin / "pytest").chmod(0o755)
+    rmw_fixture = tmp_path / "rmw_test_fixture"
+    wrapper = rmw_fixture / "lib/rmw_test_fixture_implementation/run_rmw_isolated"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text('#!/bin/sh\nexec "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
 
     environment = {
         **os.environ,
@@ -388,6 +395,7 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
         "FAKE_TOPIC_INSTALL": str(topic),
         "FAKE_DATA_INSTALL": str(data),
         "FAKE_PINOCCHIO_CONFIG": str(tmp_path / "cmeel.prefix/lib/cmake/pinocchio"),
+        "FAKE_RMW_FIXTURE": str(rmw_fixture),
     }
     environment.pop("CMAKE_GENERATOR", None)
     if generator is not None:
@@ -541,6 +549,29 @@ def test_current_build_lanes_use_fresh_container_local_products() -> None:
     assert '"${image_id}" \\' in local_ci
     assert 'cache_volume="manyforge-local-ci-build-' not in local_ci
 
+
+
+def test_ros_image_workflow_is_manual_and_hashes_existing_inputs() -> None:
+    script = _REPO_ROOT / "scripts" / "ci" / "ros-image-inputs.sh"
+    paths = subprocess.run(["bash", str(script), "--paths"], check=True,
+        capture_output=True, text=True).stdout.split()
+    workflow = yaml.safe_load(
+        (_REPO_ROOT / ".github/workflows/ros-image.yml").read_text(encoding="utf-8"))
+    # PyYAML reads the `on:` key as True. Manual only until the package is
+    # public (OD-315); a returning push trigger needs a paths filter equal to
+    # `--paths`.
+    assert set(workflow[True]) == {"workflow_dispatch"}
+    for path in paths:
+        assert (_REPO_ROOT / path).exists(), path
+    # Every repository file the image COPYs is hashed (bind mounts come from
+    # setup-docker.sh); ManyForge's own frontend is not in the image.
+    dockerfile = (_REPO_ROOT / "Dockerfile.ros-lyrical-full").read_text(encoding="utf-8")
+    copied = re.findall(r"^COPY (?!--from)(\S+)", dockerfile, re.MULTILINE)
+    assert copied and all(any(source.rstrip("/").startswith(path) for path in paths)
+                          for source in copied), copied
+    assert "manyforge_composer" not in dockerfile and "/opt/manyforge-frontend" not in dockerfile
+    integration = (_REPO_ROOT / ".github/workflows/ros-integration.yml").read_text(encoding="utf-8")
+    assert "scripts/ci/ros-image-inputs.sh" in integration
 
 def test_hermes_gateway_matrix_cannot_activate_the_deleted_bridge() -> None:
     matrix_path = _REPO_ROOT / "scripts" / "hermes" / "managed-tool-gateway-matrix.json"
@@ -760,6 +791,12 @@ def test_ros_selector_builds_and_tests_the_ros_integration_graph() -> None:
     assert '--topic-install "$ROS_INTEGRATION_TOPIC_INSTALL"' in body
     assert '--data-overlay "$ROS_INTEGRATION_DATA_OVERLAY"' in body
     assert "MANYFORGE_ROS2_CONTROL_BUILD_TESTING=ON" in body
+    # The graph itself supplies the expression engine binding; no second
+    # Headless tree recompiles Core and Deployment for it.
+    assert "--target manyforge_headless_py" in body
+    assert "--cmake-arg -DMANYFORGE_BUILD_PYTHON_MODULES=ON" in body
+    assert 'export PYTHONPATH="$build/headless:${PYTHONPATH:-}"' in body
+    assert "setup_expression_binding" not in body
     # Keep-going follows the configured tree's generator, in the same ROS
     # environment the helper configured it with.
     assert 'set_build_keep_going_args "$build"' in body

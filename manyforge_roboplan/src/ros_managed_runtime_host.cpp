@@ -134,6 +134,7 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <pthread.h>
 #include <thread>
 #include <tuple>
 #include <type_traits>
@@ -8135,6 +8136,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
       &manager_liveness_admission,
       config.application_start_id);
   std::jthread execution_surface([&](const std::stop_token stop_token) {
+    static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_cmd_lane"));
     RunManagedExecutionCommandSurface(execution_surface_control, stop_token);
   });
   {
@@ -9081,6 +9083,7 @@ RunManagedRuntimeChild(const ManagedRuntimeChildConfig &config) {
     }
   };
   manager_liveness_lane = std::jthread([&](const std::stop_token stop_token) {
+    static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_mgr_liveness"));
     try {
       bool ordinary_status_available = true;
       while (!stop_token.stop_requested()) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <deque>
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace manyforge::ros2_control_execution {
@@ -39,9 +41,17 @@ public:
   using Garbage = std::vector<std::shared_ptr<const Goal>>;
   static constexpr std::size_t kGoalLimit = 16U;
   static constexpr std::size_t kGoalBytes = 4U * 1024U * 1024U;
-  static constexpr std::size_t kSampleLimit = 1024U;
+  // Controller samples live in a ring of compact rows reserved at
+  // construction: `Sample` never allocates, frees or blocks.
   static constexpr std::size_t kSampleBytes = 1024U * 1024U;
-  static constexpr std::size_t kMaximumTraceBytes = 3U * 1024U * 1024U;
+  /// Joints per sampled vector (xArm 7, the largest supported arm); a sample
+  /// with more is counted as a capture failure.
+  static constexpr std::size_t kTraceJoints = 7U;
+  /// Longest action name a sample or scale event keeps; longer is counted as
+  /// a capture failure.
+  static constexpr std::size_t kActionBytes = 255U;  // fits the uint8_t length
+  static constexpr std::size_t kScaleLimit = 256U;
+  static constexpr std::size_t kMaximumTraceBytes = 5U * 1024U * 1024U;
 
   void Preregister(
       const std::string &action, core::ExecutionBindingEpoch epoch,
@@ -91,19 +101,65 @@ private:
     bool replacement{};
     std::optional<core::ExecutionReplacementStartDTO> replacement_start{};
   };
-  struct SampleEntry {
-    std::string action;
-    core::ExecutionControllerSampleDTO sample;
-    std::size_t bytes;
+  struct ActionName {
+    std::array<char, kActionBytes> chars{};
+    std::uint8_t size{};
+    std::string_view view() const noexcept { return {chars.data(), size}; }
+    void assign(std::string_view text) noexcept;
+  };
+  // Fixed-capacity ring; `Push` overwrites the oldest entry when full.
+  template <typename T> struct Ring {
+    explicit Ring(std::size_t capacity) : slots(capacity) {}
+    bool full() const noexcept { return size == slots.size(); }
+    // i-th retained entry, oldest first.
+    const T &operator[](std::size_t i) const noexcept {
+      return slots[(next + slots.size() - size + i) % slots.size()];
+    }
+    T &Push() noexcept {
+      T &slot = slots[next];
+      next = (next + 1U) % slots.size();
+      size += full() ? 0U : 1U;
+      return slot;
+    }
+    std::vector<T> slots;
+    std::size_t next{}, size{};
+  };
+  static constexpr std::size_t kSampleVectors = 7U;
+  static constexpr std::uint8_t kAbsentVector = 0xFFU;
+  static constexpr std::size_t kActionSlots = 16U;
+  // Exported fields only. Vectors in export order: reference p/v/a,
+  // commanded p/v, measured p/v; `lengths[i]` is `kAbsentVector` for an
+  // absent optional vector.
+  struct SampleRow {
+    std::uint64_t epoch;
+    core::TimePoint source_stamp_ns, local_receipt_stamp_ns;
+    double cursor_s, applied_factor;
+    std::array<double, kSampleVectors * kTraceJoints> values;
+    std::array<std::uint8_t, kSampleVectors> lengths;
+    std::uint8_t action;
+    bool has_applied_factor;
+  };
+  // A sample row names its action by slot; a slot is free when no row names it.
+  struct ActionSlot {
+    ActionName name;
+    std::uint32_t rows{};
   };
   struct ScaleEntry {
-    std::string action;
-    core::ExecutionBindingEpoch epoch;
+    ActionName action;
+    std::uint64_t epoch;
     core::TimePoint when;
     double factor;
     bool published;
   };
+
+public:
+  static constexpr std::size_t kSampleCapacity = kSampleBytes / sizeof(SampleRow);
+
+private:
   static bool Matches(const Token &a, const Token &b) noexcept;
+  std::size_t ActionIndex(std::string_view action) noexcept;
+  void PushScale(std::string_view action, std::uint64_t epoch,
+                 core::TimePoint when, double factor, bool published) noexcept;
   void Evict(Garbage &garbage);
   std::shared_ptr<void> Charge(std::size_t bytes);
   // Includes callback tokens, evicted garbage and snapshot-pinned payloads.
@@ -114,9 +170,10 @@ private:
   mutable std::mutex snapshot_mutex_;
   std::deque<Pending> pending_;
   std::deque<Entry> goals_;
-  std::deque<SampleEntry> samples_;
-  std::deque<ScaleEntry> scales_;
-  std::size_t goal_bytes_{}, sample_bytes_{};
+  Ring<SampleRow> samples_{kSampleCapacity};
+  std::array<ActionSlot, kActionSlots> actions_{};
+  Ring<ScaleEntry> scales_{kScaleLimit};
+  std::size_t goal_bytes_{};
   std::uint64_t evicted_{}, omitted_{}, dropped_samples_{}, evicted_scales_{};
   mutable std::atomic<std::uint64_t> failures_{0};
 };

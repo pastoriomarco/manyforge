@@ -2642,97 +2642,123 @@ FilesystemVerifiedRetainedProductArtifactSource::get_verified(
       "read-only retained-product");
   const ReadOnlyRetentionPaths paths =
       require_read_only_retention_paths(current_root);
-  const auto bundle =
-      read_verified_bundle_entry(paths.bundle_data, query.retained_bundle_id);
-  if (bundle == nullptr) {
-    return std::nullopt;
-  }
-  const core::RetainedProductDTO *product =
-      find_exact_product(bundle->value(), query);
-  if (product == nullptr) {
-    return std::nullopt;
-  }
-  const auto artifact = std::find_if(
-      product->artifact_refs.begin(), product->artifact_refs.end(),
-      [&query](const core::RetainedArtifactRefDTO &candidate) {
-        return candidate.artifact_role_id == query.artifact_role_id;
-      });
-  if (artifact == product->artifact_refs.end()) {
-    return std::nullopt;
-  }
+  // The verified artifact is a pure function of the content-addressed bundle,
+  // the exact query and the raw and catalog files its verification reads;
+  // reuse it while every one of those files is unchanged.
+  static detail::VerifiedReadMemo<
+      std::optional<VerifiedRetainedProductArtifact>>
+      memo(8U);
+  auto verified = memo.get(
+      detail::verified_read_key(
+          current_root.string(), query.retained_bundle_id.value(),
+          query.product_id.value(), core::to_string(query.product_kind),
+          query.artifact_role_id.value()),
+      kPosixErrors, kReadMessages,
+      [&]() -> std::optional<VerifiedRetainedProductArtifact> {
+        const auto bundle = read_verified_bundle_entry(
+            paths.bundle_data, query.retained_bundle_id);
+        if (bundle == nullptr) {
+          return std::nullopt;
+        }
+        const core::RetainedProductDTO *product =
+            find_exact_product(bundle->value(), query);
+        if (product == nullptr) {
+          return std::nullopt;
+        }
+        const auto artifact = std::find_if(
+            product->artifact_refs.begin(), product->artifact_refs.end(),
+            [&query](const core::RetainedArtifactRefDTO &candidate) {
+              return candidate.artifact_role_id == query.artifact_role_id;
+            });
+        if (artifact == product->artifact_refs.end()) {
+          return std::nullopt;
+        }
 
-  std::string bytes = read_verified_raw_reference(
-      paths.raw_data, artifact->content_addressed_store_key,
-      artifact->content_digest, artifact->byte_size,
-      "selected retained product artifact");
-  if (product->product_kind == core::RetainedProductKind::kSymbolRoleMap) {
-    if (artifact->artifact_role_id.value() !=
-            detail::kComposedModelSymbolRoleMapArtifactRole ||
-        artifact->media_type != detail::kComposedModelSymbolRoleMapMediaType) {
-      detail::fail_retained_bundle(
-          "selected symbol/role-map artifact has an incoherent contract");
-    }
-    const CanonicalValue map =
-        detail::parse_and_verify_composed_model_symbol_role_map(
-            bytes, bundle->value().cell_graph.model_instances.empty());
-    detail::require_symbol_role_map_matches_retained_bundle(map,
-                                                            bundle->value());
-  } else if (product->product_kind ==
-             core::RetainedProductKind::kControlDomainControl) {
-    const core::ControlDomainId *subject = nullptr;
-    for (const auto &group :
-         bundle->value().compiled_products.control_domain_products) {
-      if (std::any_of(
-              group.products.begin(), group.products.end(),
-              [&](const auto &candidate) { return &candidate == product; })) {
-        subject = &group.control_domain_id;
-        break;
-      }
-    }
-    if (subject == nullptr) {
-      detail::fail_retained_bundle(
-          "selected control-domain artifact lost its envelope subject");
-    }
-    const RetainedControlCatalogClosure control_catalogs =
-        load_retained_control_catalog_closure(
-            require_read_only_catalog_data(current_root),
-            bundle->value().catalogs.records);
-    const RetainedControlCatalogClosure domain_catalogs =
-        select_control_catalogs_for_domain(
-            control_catalogs, bundle->value().cell_graph, *subject);
-    const auto model_map =
-        read_control_source_model_map(paths.raw_data, *bundle);
-    const auto coordinate_maps =
-        model_map.has_value()
-            ? std::span<const CompositionControlBindingCoordinateMap>(
-                  model_map->control_bindings())
-            : std::span<const CompositionControlBindingCoordinateMap>{};
-    require_verified_product_artifacts(
-        paths.raw_data, *product, bundle->value(), subject, nullptr,
-        domain_catalogs.stop_policies, domain_catalogs.controller_topologies,
-        domain_catalogs.provider_manifests, coordinate_maps);
-  } else if (product->product_kind ==
-             core::RetainedProductKind::kRuntimeUnitConfiguration) {
-    const core::RuntimeUnitId *subject = nullptr;
-    for (const auto &group :
-         bundle->value().compiled_products.runtime_unit_products) {
-      if (std::any_of(
-              group.products.begin(), group.products.end(),
-              [&](const auto &candidate) { return &candidate == product; })) {
-        subject = &group.runtime_unit_id;
-        break;
-      }
-    }
-    if (subject == nullptr) {
-      detail::fail_retained_bundle(
-          "selected runtime-unit artifact lost its envelope subject");
-    }
-    require_verified_product_artifacts(paths.raw_data, *product,
-                                       bundle->value(), nullptr, subject);
+        std::string bytes = read_verified_raw_reference(
+            paths.raw_data, artifact->content_addressed_store_key,
+            artifact->content_digest, artifact->byte_size,
+            "selected retained product artifact");
+        if (product->product_kind ==
+            core::RetainedProductKind::kSymbolRoleMap) {
+          if (artifact->artifact_role_id.value() !=
+                  detail::kComposedModelSymbolRoleMapArtifactRole ||
+              artifact->media_type !=
+                  detail::kComposedModelSymbolRoleMapMediaType) {
+            detail::fail_retained_bundle(
+                "selected symbol/role-map artifact has an incoherent contract");
+          }
+          const CanonicalValue map =
+              detail::parse_and_verify_composed_model_symbol_role_map(
+                  bytes, bundle->value().cell_graph.model_instances.empty());
+          detail::require_symbol_role_map_matches_retained_bundle(
+              map, bundle->value());
+        } else if (product->product_kind ==
+                   core::RetainedProductKind::kControlDomainControl) {
+          const core::ControlDomainId *subject = nullptr;
+          for (const auto &group :
+               bundle->value().compiled_products.control_domain_products) {
+            if (std::any_of(group.products.begin(), group.products.end(),
+                            [&](const auto &candidate) {
+                              return &candidate == product;
+                            })) {
+              subject = &group.control_domain_id;
+              break;
+            }
+          }
+          if (subject == nullptr) {
+            detail::fail_retained_bundle(
+                "selected control-domain artifact lost its envelope subject");
+          }
+          const RetainedControlCatalogClosure control_catalogs =
+              load_retained_control_catalog_closure(
+                  require_read_only_catalog_data(current_root),
+                  bundle->value().catalogs.records);
+          const RetainedControlCatalogClosure domain_catalogs =
+              select_control_catalogs_for_domain(
+                  control_catalogs, bundle->value().cell_graph, *subject);
+          const auto model_map =
+              read_control_source_model_map(paths.raw_data, *bundle);
+          const auto coordinate_maps =
+              model_map.has_value()
+                  ? std::span<const CompositionControlBindingCoordinateMap>(
+                        model_map->control_bindings())
+                  : std::span<const CompositionControlBindingCoordinateMap>{};
+          require_verified_product_artifacts(
+              paths.raw_data, *product, bundle->value(), subject, nullptr,
+              domain_catalogs.stop_policies,
+              domain_catalogs.controller_topologies,
+              domain_catalogs.provider_manifests, coordinate_maps);
+        } else if (product->product_kind ==
+                   core::RetainedProductKind::kRuntimeUnitConfiguration) {
+          const core::RuntimeUnitId *subject = nullptr;
+          for (const auto &group :
+               bundle->value().compiled_products.runtime_unit_products) {
+            if (std::any_of(group.products.begin(), group.products.end(),
+                            [&](const auto &candidate) {
+                              return &candidate == product;
+                            })) {
+              subject = &group.runtime_unit_id;
+              break;
+            }
+          }
+          if (subject == nullptr) {
+            detail::fail_retained_bundle(
+                "selected runtime-unit artifact lost its envelope subject");
+          }
+          require_verified_product_artifacts(paths.raw_data, *product,
+                                             bundle->value(), nullptr, subject);
+        }
+        return VerifiedRetainedProductArtifact(
+            query, product->product_contract_id,
+            product->product_contract_revision, *artifact, std::move(bytes));
+      });
+  // A reused control-domain artifact keeps the catalog-store directory check
+  // its full verification makes.
+  if (verified.has_value() &&
+      query.product_kind == core::RetainedProductKind::kControlDomainControl) {
+    (void)require_read_only_catalog_data(current_root);
   }
-  return VerifiedRetainedProductArtifact(query, product->product_contract_id,
-                                         product->product_contract_revision,
-                                         *artifact, std::move(bytes));
+  return verified;
 }
 
 std::optional<VerifiedRetainedRuntimeUnitProduct> verify_runtime_unit_product(

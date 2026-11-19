@@ -107,9 +107,9 @@ Pick the apply policy per object (the object's
 - `continuous_relative_to_attached` behaves like `continuous_unattached`
   while the object is detached. While it is attached, the source must also
   report the object relative to a gripper reference measured at the same
-  source instant (`simulation.relative_reference` on the pose-source
-  component: the reference `entity`, its `source_header_frame_id`, and the
-  model `link` it shows). The Scene owner sets the attachment offset from that relative
+  source instant (an entry of `simulation.relative_references` on the
+  pose-source component: the reference `entity`, its
+  `source_header_frame_id`, and the model `link` it shows). The Scene owner sets the attachment offset from that relative
   pose and the fixed model transform from the link to the carrier frame; no
   commanded or measured robot pose is used. The Isaac observer reads both
   in the same simulator read; an observation that is not from one

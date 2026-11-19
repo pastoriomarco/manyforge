@@ -5,11 +5,12 @@ materialized, digest-checked package, and serves Composer on the network at
 port 9000. It keeps a launch record so that `status` and `stop` act only on the
 processes or container it started.
 
-For everyday use, follow the
-[workbench guide](DEVELOPMENT_WORKBENCH.md) instead. The workbench builds from
-your checkout, serves Composer with hot reload at `http://localhost:3000`,
-covers the Mock, Isaac and Real lanes, and needs no package preparation. This
-page covers only what differs for the operator launcher.
+This is install option 3 of the
+[workbench guide](DEVELOPMENT_WORKBENCH.md#install). For everyday use, follow
+that guide's option 1 or 2 instead: the workbench builds from your checkout,
+serves Composer with hot reload at `http://localhost:3000`, covers the Mock,
+Isaac and Real lanes, and needs no package preparation. This page covers only
+what differs for the operator launcher.
 
 Use the operator launcher when you need one of these:
 
@@ -19,6 +20,24 @@ Use the operator launcher when you need one of these:
   checked at start, with Composer reachable from the LAN at port 9000;
 - `status` and `stop` must be authenticated against a recorded launch (exact
   container ID, image and labels, or exact process identities).
+
+In short:
+
+1. **Install.** Meet the [prerequisites](#prerequisites). For the `isaac`
+   profile, get the workbench image on the runtime host first, with
+   `./scripts/compose-dev.sh pull` or `build` in its checkout
+   ([workbench guide](DEVELOPMENT_WORKBENCH.md#install)); the launcher neither
+   pulls nor builds images. Then
+   [prepare the package root](#prepare-the-package-root).
+1. **Start** with the [command of your profile](#commands).
+1. **Verify.** `manyforge-operator … status` reports `ready`
+   ([Status and failures](#status-and-failures)); then open
+   `http://<advertised-host>:9000/`.
+1. **Update.** `stop`, move every checkout to the new commit, update the
+   image on the runtime host (`pull` or `build`) and pass its new ID, prepare
+   a new package root and digest with the new build, then `start`.
+1. **Fall back.** The workbench (`./scripts/compose-dev.sh start`) runs the
+   same application from the checkout, without a package.
 
 ManyForge Stops are not safety-rated. The software Stop is not an emergency
 stop; a robot installation needs its own safety system.
@@ -31,7 +50,7 @@ file (`--site-settings`), so robot addresses can't be configured here. Use the w
 
 | Profile | Where the stack runs | Requirements |
 |---|---|---|
-| `isaac` | In a container on a remote runtime host, started over SSH through `scripts/compose-dev.sh` in operator mode. Isaac Sim runs on its own host; ManyForge attaches to it. | Docker on the runtime host; the `manyforge-ros-lyrical-full` image (ROS 2 Lyrical) built there; SSH key login. No ROS install on either host. |
+| `isaac` | In a container on a remote runtime host, started over SSH through `scripts/compose-dev.sh` in operator mode. Isaac Sim runs on its own host; ManyForge attaches to it. | Docker on the runtime host; the `manyforge-ros-lyrical-full` image (ROS 2 Lyrical) pulled or built there; SSH key login. No ROS install on either host. |
 | `standard` | As host processes on the machine that runs the command. | **A host ROS 2 install** matching the build, a host build of ManyForge, and systemd journald. |
 
 The `standard` profile needs ROS on the host: the Manager starts the ROS
@@ -92,35 +111,34 @@ shutdown was unclean or could not be verified.
 
 ## Prepare the package root
 
-The package is produced by the maintained materializer
-`manyforge_maintained_deployment_occurrences`, built with `manyforge_deployment`.
-It requires one prepared model root for each model family listed in
-`manyforge_deployment/resources/maintained/maintained_deployment_sources.v1.json`
-(`model_families`). Robots and the grippers mounted on them are separate
-families: for example `lite6` with the tool `lite_gripper`, `ur10e` with
-`robotiq_2f_140`, `ur5e` with `robotiq_2f_85`. A `manyforge_deployment`
-build configured with `BUILD_TESTING` creates every root under
-`generated/<family>_structural` in its build directory.
+The package root is an empty-cell package for one cell. It is written by
+`manyforge_generate_canonical_empty_package`, a `manyforge_deployment` tool.
+The workbench build step builds it: after `./scripts/compose-dev.sh
+build-native` it is
+`<cache base>/images/<image id>/build/deployment-authoring/manyforge_generate_canonical_empty_package`
+(`<cache base>` is `.manyforge-dev` in the checkout unless
+`MANYFORGE_DEV_CACHE_BASE` is set). A host build of `manyforge_deployment`
+builds the same target.
 
 ```bash
 PACKAGE_ROOT=/absolute/path/to/new-empty-package-root
+CELL_ID=lite6_pick_place_cell
 mkdir "$PACKAGE_ROOT"
-PREPARED=()
-for family in $(python3 -c 'import json, sys; print(" ".join(row["model_family_id"] for row in json.load(open(sys.argv[1]))["model_families"]))' \
-    "$MANYFORGE_ROOT/manyforge_deployment/resources/maintained/maintained_deployment_sources.v1.json"); do
-  PREPARED+=(--prepared "$family=$GENERATED/${family}_structural")
-done
-"$MATERIALIZER" --check \
-  --workspace-root "$MANYFORGE_ROOT" --package-root "$PACKAGE_ROOT" \
-  "${PREPARED[@]}"
+"$GENERATOR" --output-root "$PACKAGE_ROOT" --cell-id "$CELL_ID" \
+  --ros-runtime-profile "$MANYFORGE_ROOT/manyforge_deployment/resources/maintained/catalog/runtime_profile/manyforge.ros2_control_execution_runtime.json"
 PACKAGE_SHA256=$(python3 -m manyforge_operator.package_aggregate \
   --package-root "$PACKAGE_ROOT")
 ```
 
-Discard a root whose materialization failed. Do not change a root after
+`GENERATOR` is the path of the tool and `MANYFORGE_ROOT` the checkout; run
+the last command from the repository root. `CELL_ID` is a name you choose: a
+lowercase letter, then lowercase letters, digits, `_`, `-` or `.`, at most
+128 characters.
+
+Discard a root whose generation failed. Do not change a root after
 taking its digest: `start` recomputes the aggregate and refuses a mismatch.
-The package holds one empty-cell admission file per cell,
-`canonical-empty-admission.<cell_id>.json`. Pass one of them with
+The package holds the empty-cell admission file of its cell,
+`canonical-empty-admission.<cell_id>.json`. Pass it with
 `--canonical-empty-admission-filename` and the same cell with `--cell-id`.
 
 `--compiler-build-manifest-sha256` and `--node-environment-sha256` are
@@ -200,7 +218,7 @@ the runtime host with
 | `--remote-simulation-control-config` | Required. Isaac simulation-control site file. |
 | `--cell-id`, `--canonical-empty-admission-filename` | Set both to a cell in the package. |
 | `--package-aggregate-sha256`, `--compiler-build-manifest-sha256`, `--node-environment-sha256` | Required digests (see above). |
-| `--remote-composer-static-dir` | Optional. Built frontend with `index.html`; default is the one in the image. |
+| `--remote-composer-static-dir` | Optional. Built frontend with `index.html`. Default: the build step builds `manyforge_composer/frontend/dist` from the remote checkout. |
 | `--remote-python-executable` | Python on the runtime host, used for the source check (default `python3`). |
 | `--remote-manager-executable`, `--remote-state-root`, `--remote-bridge-state-root`, `--remote-ros-setup-script`, `--remote-ros-environment-script` | Required absolute paths that are validated and recorded but not used by the container, which builds and stages its own runtime and gets ROS from the image. Pass paths on your runtime host. |
 | `--control-host` | Recorded name of the controlling machine (default: its hostname). |
@@ -216,7 +234,8 @@ Isaac Sim on the Isaac host and open the scene before you Load the Scenario.
 
 `start` checks the local and remote source identities, runs the incremental
 native build step as its own call (`compose-dev.sh build-native`, allowed 45
-minutes for a cold build), then starts the container with `compose-dev.sh
+minutes for a cold build; it also builds the frontend Composer serves, skipped
+while the existing build matches the frontend source), then starts the container with `compose-dev.sh
 start` (this call allows about 15 minutes for readiness only), waits
 for Manager, Headless, Program runner and Composer to report ready, and checks
 the remote source again. The container carries the labels
@@ -256,7 +275,7 @@ manyforge-operator --state-root "$STATE_ROOT" --instance-id workbench --json \
 | digests | Required (see above). |
 | `--cell-id`, `--canonical-empty-admission-filename` | Set both to a cell in the package. |
 | `--advertised-host` | Address used in the Composer URL (default `localhost`). |
-| `--composer-static-dir` | Optional built frontend with `index.html`. |
+| `--composer-static-dir` | Optional built frontend with `index.html`. Default: `manyforge_composer/frontend/dist` in the source tree, if built (`npm ci && npm run build` there); without one Composer serves only its API. |
 | `--simulation-control-config` | Optional simulation-control site file for the Program runner. |
 | `--expected-source-fingerprint`, `--expected-head-commit`, `--expected-head-tree` | Optional; start refuses a source that differs. Also accepted by `isaac`. |
 | `--poll-interval-s` (0.25), `--reconciliation-period-ms` (500), `--manager-timeout-s` (60, max 60) | Timeouts. `--readiness-timeout-s` is accepted but not used by `standard`. |
@@ -327,9 +346,9 @@ with `journalctl -t manyforge-<instance-id>-<component>` (`manager`,
 
 ## Using Composer
 
-In the live Scene, a carried-object card offers **Detach here** while the
-Program is idle or held. Confirm "Detach <part> from <gripper> at its current
-pose?" to detach it at that pose. The action is disabled while the Program is
+In the live Scene, a carried-object card offers **Detach** while the
+Program is idle or held. Confirm "Detach <object> from <component> / <target>
+at its current pose?" to detach it at that pose. The action is disabled while the Program is
 running and reports a typed Scene refusal if the detach cannot be completed.
 The availability check uses the current run status; another client can start a
 Run between that check and the Scene commit.

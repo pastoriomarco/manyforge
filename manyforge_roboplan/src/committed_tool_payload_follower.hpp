@@ -5,6 +5,7 @@
 #include <functional>
 #include <mutex>
 #include <stop_token>
+#include <pthread.h>
 #include <thread>
 #include <utility>
 
@@ -15,6 +16,7 @@ class CommittedToolPayloadFollower final {
 public:
   explicit CommittedToolPayloadFollower(std::function<void()> apply)
       : apply_(std::move(apply)), worker_([this](std::stop_token stop) {
+          static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_tool_payload"));
           std::uint64_t seen = 0U;
           for (;;) {
             {

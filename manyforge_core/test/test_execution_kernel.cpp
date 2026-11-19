@@ -37,6 +37,10 @@
 #include <manyforge_core/types/reason_codes.hpp>
 #include <map>
 #include <memory>
+
+// Kernels in tests live on the heap: libstdc++'s std::mutex has no destructor
+// TSan sees, so a stack slot reused by a later test would alias its mutexes
+// and report false lock-order inversions.
 #include <mutex>
 #include <optional>
 #include <set>
@@ -2921,8 +2925,9 @@ TEST_F(ExecutionKernelTest, IndependentGripperParticipantHasNoMotionLifecycleOrW
   const auto observed = gripper.get_gripper_status(request.gripper_id);
   const auto invalidations = context.gripper_invalidation_count.load();
   {
-    ExecutionKernel arm(planner_owner, test_execution_kernel_ports(context_owner), execution_owner,
+    const auto arm_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner), execution_owner,
                         clock_owner, scheduler, cache_owner);
+    ExecutionKernel& arm = *arm_storage;
     configure_authoritative_collision_validation(arm, collision_world_publisher_owner,
                                                  collision_engine);
     EXPECT_FALSE(arm.command_gripper(request).accepted);
@@ -4582,8 +4587,9 @@ TEST_F(ExecutionKernelTest, RecoveryObservationPollAllowsReentrantLifecycleAdmis
         ::alarm(10U);
         const auto verify = [&] {
           // Destroy and join this child-owned Kernel before the death-test exit.
-          ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner),
+          const auto owner_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner),
                                 execution_owner, clock_owner, scheduler, cache_owner);
+          ExecutionKernel& owner = *owner_storage;
           owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
           owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                         {collision_engine});
@@ -4971,10 +4977,11 @@ TEST_F(ExecutionKernelTest, DeclaredValidationWorkerCapacityRejectsInsufficientR
   ExecutionKernelConfig config;
   config.validation_collision_workers = 2;
   config.validation_collision_workers_declared = true;
-  ExecutionKernel declared_kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+  const auto declared_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,   test_execution_kernel_ports(context_owner),
                                   execution_owner, clock_owner,
                                   scheduler,       cache_owner,
-                                  config};
+                                  config);
+  ExecutionKernel& declared_kernel = *declared_kernel_storage;
 
   EXPECT_THROW(declared_kernel.set_collision_resources(collision_world_publisher_owner,
                                                        std::make_shared<MockCollisionEngine>(),
@@ -5790,8 +5797,9 @@ TEST_F(ExecutionKernelTest, Execute_SynchronizesExternalSceneBeforeRetainingPlan
   MockPlanningSceneSynchronizer& scene_synchronizer = *scene_synchronizer_owner;
   auto ports = test_execution_kernel_ports(context_owner);
   ports.planning_scene_synchronizer = scene_synchronizer_owner;
-  ExecutionKernel synchronized_kernel{planner_owner, ports,     execution_owner,
-                                      clock_owner,   scheduler, cache_owner};
+  const auto synchronized_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner, ports,     execution_owner,
+                                      clock_owner,   scheduler, cache_owner);
+  ExecutionKernel& synchronized_kernel = *synchronized_kernel_storage;
   configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
@@ -5815,8 +5823,9 @@ TEST_F(ExecutionKernelTest,
   collision_world_publisher.lease_projection_revision = retained_revision;
   auto ports = test_execution_kernel_ports(context_owner);
   ports.planning_scene_synchronizer = scene_synchronizer_owner;
-  ExecutionKernel synchronized_kernel{planner_owner, ports,     execution_owner,
-                                      clock_owner,   scheduler, cache_owner};
+  const auto synchronized_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner, ports,     execution_owner,
+                                      clock_owner,   scheduler, cache_owner);
+  ExecutionKernel& synchronized_kernel = *synchronized_kernel_storage;
   configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
@@ -5839,8 +5848,9 @@ TEST_F(ExecutionKernelTest, Execute_SceneSynchronizationFailureBlocksPlanningAnd
       "scene_runtime_pose_observation_stale", "before-planning pose observation is stale", {}});
   auto ports = test_execution_kernel_ports(context_owner);
   ports.planning_scene_synchronizer = scene_synchronizer_owner;
-  ExecutionKernel synchronized_kernel{planner_owner, ports,     execution_owner,
-                                      clock_owner,   scheduler, cache_owner};
+  const auto synchronized_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner, ports,     execution_owner,
+                                      clock_owner,   scheduler, cache_owner);
+  ExecutionKernel& synchronized_kernel = *synchronized_kernel_storage;
   configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
@@ -5862,8 +5872,9 @@ TEST_F(ExecutionKernelTest, Execute_RejectsProjectionChangeAfterSceneSynchroniza
   scene_synchronizer.next_result = Result<ProjectionRevisionDTO>::Ok(successor);
   auto ports = test_execution_kernel_ports(context_owner);
   ports.planning_scene_synchronizer = scene_synchronizer_owner;
-  ExecutionKernel synchronized_kernel{planner_owner, ports,     execution_owner,
-                                      clock_owner,   scheduler, cache_owner};
+  const auto synchronized_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner, ports,     execution_owner,
+                                      clock_owner,   scheduler, cache_owner);
+  ExecutionKernel& synchronized_kernel = *synchronized_kernel_storage;
   configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
@@ -5886,8 +5897,9 @@ TEST_F(ExecutionKernelTest,
   scene_synchronizer.next_result = Result<ProjectionRevisionDTO>::Ok(floor);
   auto ports = test_execution_kernel_ports(context_owner);
   ports.planning_scene_synchronizer = scene_synchronizer_owner;
-  ExecutionKernel synchronized_kernel{planner_owner, ports,     execution_owner,
-                                      clock_owner,   scheduler, cache_owner};
+  const auto synchronized_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner, ports,     execution_owner,
+                                      clock_owner,   scheduler, cache_owner);
+  ExecutionKernel& synchronized_kernel = *synchronized_kernel_storage;
   configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
@@ -5910,8 +5922,9 @@ TEST_F(ExecutionKernelTest,
   scene_synchronizer.next_result = Result<ProjectionRevisionDTO>::Ok(floor);
   auto ports = test_execution_kernel_ports(context_owner);
   ports.planning_scene_synchronizer = scene_synchronizer_owner;
-  ExecutionKernel synchronized_kernel{planner_owner, ports,     execution_owner,
-                                      clock_owner,   scheduler, cache_owner};
+  const auto synchronized_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner, ports,     execution_owner,
+                                      clock_owner,   scheduler, cache_owner);
+  ExecutionKernel& synchronized_kernel = *synchronized_kernel_storage;
   configure_authoritative_collision_validation(synchronized_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
@@ -6033,10 +6046,11 @@ TEST_F(ExecutionKernelTest, Execute_CollisionRejectionOmitsDiagnosticCompareByDe
 TEST_F(ExecutionKernelTest, Execute_CollisionRejectionAppendsDiagnosticCompareWhenEnabled) {
   ExecutionKernelConfig config;
   config.enable_collision_diagnostic_compare = true;
-  ExecutionKernel gated_kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+  const auto gated_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,   test_execution_kernel_ports(context_owner),
                                execution_owner, clock_owner,
                                scheduler,       cache_owner,
-                               config};
+                               config);
+  ExecutionKernel& gated_kernel = *gated_kernel_storage;
   configure_authoritative_collision_validation(gated_kernel, collision_world_publisher_owner,
                                                collision_engine);
   store_cache("diagnostic_compare_on", make_test_trajectory());
@@ -6198,10 +6212,11 @@ TEST_F(ExecutionKernelTest, Execute_PerMoveClearanceReplacesTheDeploymentClearan
   // pre-dispatch check carry 0.5 mm; 0 turns the clearance off for the move.
   ExecutionKernelConfig config;
   config.collision_clearance_m = 0.003;
-  ExecutionKernel cell_kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+  const auto cell_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,   test_execution_kernel_ports(context_owner),
                               execution_owner, clock_owner,
                               scheduler,       cache_owner,
-                              config};
+                              config);
+  ExecutionKernel& cell_kernel = *cell_kernel_storage;
   configure_authoritative_collision_validation(cell_kernel, collision_world_publisher_owner,
                                                collision_engine);
   Pose3DTO reference;
@@ -6602,10 +6617,11 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionUsesConfiguredValidati
   auto local_engine = std::make_shared<MockCollisionEngine>();
   ExecutionKernelConfig config;
   config.validation_collision_query_timeout_ns = 125'000'000;
-  ExecutionKernel local_kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+  const auto local_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,   test_execution_kernel_ports(context_owner),
                                execution_owner, clock_owner,
                                scheduler,       cache_owner,
-                               config};
+                               config);
+  ExecutionKernel& local_kernel = *local_kernel_storage;
   configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
   store_cache("validation_timeout", make_test_trajectory());
 
@@ -6638,9 +6654,10 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionUsesPublisherPolicySna
 }
 
 TEST_F(ExecutionKernelTest, Execute_MissingAuthoritativeCollisionPipelineFailsClosed) {
-  ExecutionKernel unconfigured_kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+  const auto unconfigured_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,   test_execution_kernel_ports(context_owner),
                                       execution_owner, clock_owner,
-                                      scheduler,       cache_owner};
+                                      scheduler,       cache_owner);
+  ExecutionKernel& unconfigured_kernel = *unconfigured_kernel_storage;
 
   auto result = prepare_and_dispatch(unconfigured_kernel, make_test_request("missing_pipeline"));
   ASSERT_FALSE(result.ok());
@@ -6672,13 +6689,14 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplansAndDispatchesSe
   auto local_context_owner = std::make_shared<MockFocusedPorts>(context);
   auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{local_planner_owner,
+  const auto local_kernel_storage = std::make_unique<ExecutionKernel>(local_planner_owner,
                                test_execution_kernel_ports(local_context_owner),
                                controlled_execution_owner,
                                local_clock_owner,
                                local_scheduler,
                                local_cache_owner,
-                               config};
+                               config);
+  ExecutionKernel& local_kernel = *local_kernel_storage;
   configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
   local_engine->result_for_query =
       [](const CollisionQuery& query) -> std::optional<CollisionResult> {
@@ -6751,13 +6769,14 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplanBudgetExhaustedF
   auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   MockCollisionWorldPublisher& local_publisher = *local_publisher_owner;
   auto local_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{local_planner_owner,
+  const auto local_kernel_storage = std::make_unique<ExecutionKernel>(local_planner_owner,
                                test_execution_kernel_ports(local_context_owner),
                                controlled_execution_owner,
                                local_clock_owner,
                                local_scheduler,
                                local_cache_owner,
-                               config};
+                               config);
+  ExecutionKernel& local_kernel = *local_kernel_storage;
   configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
   // An active support contact: each fresh plan is collision-validated.
   local_publisher.current_policy = make_support_contact_test_policy();
@@ -6796,13 +6815,14 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeContactPolicyViolationRetainsRe
   auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   MockCollisionWorldPublisher& local_publisher = *local_publisher_owner;
   auto local_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{local_planner_owner,
+  const auto local_kernel_storage = std::make_unique<ExecutionKernel>(local_planner_owner,
                                test_execution_kernel_ports(local_context_owner),
                                controlled_execution_owner,
                                local_clock_owner,
                                local_scheduler,
                                local_cache_owner,
-                               config};
+                               config);
+  ExecutionKernel& local_kernel = *local_kernel_storage;
   configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
 
   const CollisionPairId pair{"scene/insert/shape/0", "scene/fixture/shape/0"};
@@ -6850,13 +6870,14 @@ TEST_F(ExecutionKernelTest,
   ExecutionKernelConfig config;
   config.authoritative_validation_collision_replan_attempts = 0;
   config.validation_collision_workers = 1;
-  ExecutionKernel local_kernel{local_planner_owner,
+  const auto local_kernel_storage = std::make_unique<ExecutionKernel>(local_planner_owner,
                                test_execution_kernel_ports(local_context_owner),
                                local_execution_owner,
                                local_clock_owner,
                                local_scheduler,
                                local_cache_owner,
-                               config};
+                               config);
+  ExecutionKernel& local_kernel = *local_kernel_storage;
   configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
 
   auto world = make_test_collision_world_snapshot();
@@ -6938,13 +6959,14 @@ TEST_F(ExecutionKernelTest, Execute_DoesNotPromoteDetachedCollisionOrNoncollidin
   ExecutionKernelConfig config;
   config.authoritative_validation_collision_replan_attempts = 0;
   config.validation_collision_workers = 1;
-  ExecutionKernel local_kernel{local_planner_owner,
+  const auto local_kernel_storage = std::make_unique<ExecutionKernel>(local_planner_owner,
                                test_execution_kernel_ports(local_context_owner),
                                local_execution_owner,
                                local_clock_owner,
                                local_scheduler,
                                local_cache_owner,
-                               config};
+                               config);
+  ExecutionKernel& local_kernel = *local_kernel_storage;
   configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
 
   auto world = make_test_collision_world_snapshot();
@@ -7011,13 +7033,14 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeValidationNonOkCollisionReplans
   auto local_context_owner = std::make_shared<MockFocusedPorts>(context);
   auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{local_planner_owner,
+  const auto local_kernel_storage = std::make_unique<ExecutionKernel>(local_planner_owner,
                                test_execution_kernel_ports(local_context_owner),
                                controlled_execution_owner,
                                local_clock_owner,
                                local_scheduler,
                                local_cache_owner,
-                               config};
+                               config);
+  ExecutionKernel& local_kernel = *local_kernel_storage;
   configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
   auto non_ok_collision = make_authoritative_collision_result();
   non_ok_collision.engine_status = CollisionEngineStatus::kTimeout;
@@ -7139,13 +7162,14 @@ TEST_F(ExecutionKernelTest,
   config.runtime_observed_state_max_age_ns = 0;
   auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto shared_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{planner_owner,
+  const auto local_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                test_execution_kernel_ports(context_owner),
                                controlled_execution_owner,
                                local_clock_owner,
                                local_scheduler,
                                local_cache_owner,
-                               config};
+                               config);
+  ExecutionKernel& local_kernel = *local_kernel_storage;
   configure_runtime_collision_monitoring(local_kernel, local_publisher_owner, shared_engine,
                                          shared_engine);
 
@@ -7189,13 +7213,14 @@ TEST_F(ExecutionKernelTest, RuntimeCollisionPublishedBundleFailureFailsClosedWit
   auto runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel local_kernel{planner_owner,
+  const auto local_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                test_execution_kernel_ports(context_owner),
                                controlled_execution_owner,
                                local_clock_owner,
                                local_scheduler,
                                local_cache_owner,
-                               config};
+                               config);
+  ExecutionKernel& local_kernel = *local_kernel_storage;
   configure_runtime_collision_monitoring(local_kernel, local_publisher_owner, validation_engine,
                                          runtime_engine);
 
@@ -7309,13 +7334,14 @@ TEST_F(ExecutionKernelTest, RuntimeProtectionLeaseIsActiveBeforeBackendExecuteSt
   config.runtime_observed_state_max_age_ns = 0;
   auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto shared_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{planner_owner,
+  const auto local_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                test_execution_kernel_ports(context_owner),
                                controlled_execution_owner,
                                local_clock_owner,
                                local_scheduler,
                                local_cache_owner,
-                               config};
+                               config);
+  ExecutionKernel& local_kernel = *local_kernel_storage;
   configure_runtime_collision_monitoring(local_kernel, local_publisher_owner, shared_engine,
                                          shared_engine);
 
@@ -7368,13 +7394,14 @@ TEST_F(ExecutionKernelTest, RuntimeCollisionIsAFactAndCertifiedRetirementIsMotio
   std::mutex events_mu;
   std::condition_variable events_cv;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
                                     local_cache_owner,
-                                    config};
+                                    config);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
@@ -7466,13 +7493,14 @@ TEST_F(ExecutionKernelTest, AddressedStopFenceWinsLookaheadHandoffBeforeInterrup
   std::condition_variable events_changed;
   std::vector<KernelEvent> events;
   std::atomic<std::uint64_t> addressed_execution_id{0U};
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
                                     local_cache_owner,
-                                    config};
+                                    config);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_validation_engine, local_runtime_engine,
                                          {local_lookahead_engine});
@@ -7568,13 +7596,14 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   std::mutex events_mu;
   std::condition_variable events_cv;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
                                     local_cache_owner,
-                                    config};
+                                    config);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_validation_engine, local_runtime_engine,
                                          {local_lookahead_engine});
@@ -7708,13 +7737,14 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_NaturalCompletionTerminalHandoffF
   };
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
                                     local_cache_owner,
-                                    config};
+                                    config);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_validation_engine, local_runtime_engine,
                                          {local_lookahead_engine});
@@ -7767,13 +7797,14 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ExpandsObservedStateBeforeEngine
   MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
                                     local_cache_owner,
-                                    config};
+                                    config);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
@@ -7843,12 +7874,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesBackendObservedStateForRunti
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
@@ -7894,12 +7926,13 @@ TEST_F(ExecutionKernelTest,
   auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
@@ -7944,12 +7977,13 @@ TEST_F(ExecutionKernelTest,
   auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
@@ -7986,13 +8020,14 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_StaleObservedStateFailsClosedBef
   auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
                                     local_cache_owner,
-                                    config};
+                                    config);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
@@ -8038,13 +8073,14 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_SampleReceivedAfterTickBoundaryI
   auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
                                     local_cache_owner,
-                                    config};
+                                    config);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
@@ -8081,13 +8117,14 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ReadsDedicatedPublicationWithout
   auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
                                     local_cache_owner,
-                                    config};
+                                    config);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
@@ -8125,13 +8162,14 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_RefreshesRuntimeSnapshotOnWorldR
   MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
                                     local_cache_owner,
-                                    config};
+                                    config);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
@@ -8187,12 +8225,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleaseAllowsBoundedOngoi
   MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
@@ -8246,12 +8285,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleasePenetrationIncreas
   // kernel.
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
@@ -8340,12 +8380,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_BoundedPenetrationEvaluatesLater
   // kernel.
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
@@ -8421,12 +8462,13 @@ TEST_F(ExecutionKernelTest,
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   controlled_kernel.subscribe_events([&](const KernelEvent& event) {
@@ -8596,12 +8638,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspAllowsBoundedRuntime
   MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
@@ -8651,12 +8694,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspPenetrationExceededF
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
@@ -8739,12 +8783,13 @@ TEST_F(ExecutionKernelTest,
   MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
@@ -8811,12 +8856,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspMissingClearanceFail
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
@@ -8905,12 +8951,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspUnexpectedPairFailsC
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
   std::mutex events_mutex;
   std::vector<KernelEvent> events;
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
@@ -8981,12 +9028,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactGraspHeldAcrossTicks) {
   MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
@@ -9043,12 +9091,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_ContactReleaseKeepsItsSupportCon
   MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
@@ -9106,12 +9155,13 @@ TEST_F(ExecutionKernelTest,
   MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
@@ -9197,12 +9247,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_NonContactMoveFollowsThePublishe
   MockCollisionWorldPublisher& local_collision_world = *local_collision_world_owner;
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
   CollisionDetailsRecorder collisions(controlled_kernel);
@@ -9271,13 +9322,14 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_UsesConfiguredPeriod) {
   local_runtime_engine->on_check = [&](const CollisionQuery& query) {
     observed_timeout_budget_ns = query.timeout_budget_ns;
   };
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
                                     local_cache_owner,
-                                    config};
+                                    config);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
@@ -9318,12 +9370,13 @@ TEST_F(ExecutionKernelTest, CollisionMonitoring_StartDoesNotWaitForOtherSharedLa
   auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
   auto local_runtime_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_runtime_collision_monitoring(controlled_kernel, local_collision_world_owner,
                                          local_collision_engine, local_runtime_engine);
 
@@ -9494,12 +9547,13 @@ TEST_F(ExecutionKernelTest, GetExecutionSnapshot_DuringExecuting_ServesLiveBacke
   auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   auto local_collision_world_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_collision_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel controlled_kernel{planner_owner,
+  const auto controlled_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                     test_execution_kernel_ports(context_owner),
                                     controlled_execution_owner,
                                     local_clock_owner,
                                     local_scheduler,
-                                    local_cache_owner};
+                                    local_cache_owner);
+  ExecutionKernel& controlled_kernel = *controlled_kernel_storage;
   configure_authoritative_collision_validation(controlled_kernel, local_collision_world_owner,
                                                local_collision_engine);
 
@@ -10184,9 +10238,10 @@ TEST_F(ExecutionKernelTest, Events_CollisionDetectedEvent) {
   auto clock_owner = std::make_shared<FakeClock>();
   ManualScheduler scheduler;
   auto cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
-  ExecutionKernel kernel{slow_planner_owner, test_execution_kernel_ports(context_owner),
+  const auto kernel_storage = std::make_unique<ExecutionKernel>(slow_planner_owner, test_execution_kernel_ports(context_owner),
                          execution_owner,    clock_owner,
-                         scheduler,          cache_owner};
+                         scheduler,          cache_owner);
+  ExecutionKernel& kernel = *kernel_storage;
   configure_authoritative_collision_validation(kernel, collision_world_publisher_owner,
                                                collision_engine);
 
@@ -10306,9 +10361,10 @@ TEST_F(ExecutionKernelTest, Metrics_CollisionDetections) {
   auto clock_owner = std::make_shared<FakeClock>();
   ManualScheduler scheduler;
   auto cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
-  ExecutionKernel kernel{slow_planner_owner, test_execution_kernel_ports(context_owner),
+  const auto kernel_storage = std::make_unique<ExecutionKernel>(slow_planner_owner, test_execution_kernel_ports(context_owner),
                          execution_owner,    clock_owner,
-                         scheduler,          cache_owner};
+                         scheduler,          cache_owner);
+  ExecutionKernel& kernel = *kernel_storage;
   configure_authoritative_collision_validation(kernel, collision_world_publisher_owner,
                                                collision_engine);
 
@@ -10425,9 +10481,10 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_UsesFinalManualDurationAndAppliedSc
     ThreadSafeFakeClock& ts_clock = *ts_clock_owner;
     ThreadSafeManualScheduler ts_scheduler;
     auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
-    ExecutionKernel timed_kernel{planner_owner, test_execution_kernel_ports(context_owner),
+    const auto timed_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner),
                                  timed_owner,   ts_clock_owner,
-                                 ts_scheduler,  local_cache_owner};
+                                 ts_scheduler,  local_cache_owner);
+    ExecutionKernel& timed_kernel = *timed_kernel_storage;
     configure_authoritative_collision_validation(timed_kernel, collision_world_publisher_owner,
                                                  collision_engine);
     planner.next_result.trajectory = make_test_trajectory();
@@ -10531,9 +10588,10 @@ TEST_F(ExecutionKernelTest, ZeroSpeedHoldTimeoutAsksTheAddressedOwnerToStopOnce)
     ThreadSafeFakeClock& ts_clock = *ts_clock_owner;
     ThreadSafeManualScheduler ts_scheduler;
     auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
-    ExecutionKernel held_kernel{planner_owner, test_execution_kernel_ports(context_owner),
+    const auto held_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner),
                                 held_owner,    ts_clock_owner,
-                                ts_scheduler,  local_cache_owner};
+                                ts_scheduler,  local_cache_owner);
+    ExecutionKernel& held_kernel = *held_kernel_storage;
     configure_authoritative_collision_validation(held_kernel, collision_world_publisher_owner,
                                                  collision_engine);
     std::mutex events_mu;
@@ -10630,9 +10688,10 @@ TEST_F(ExecutionKernelTest, RuntimeChecksDeadmanJudgesTheVerifiedSampleTime) {
     auto world = std::make_shared<MockCollisionWorldPublisher>();
     auto validation_engine = std::make_shared<MockCollisionEngine>();
     auto runtime_engine = std::make_shared<MockCollisionEngine>();
-    ExecutionKernel deadman_kernel{planner_owner,   test_execution_kernel_ports(context_owner),
+    const auto deadman_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,   test_execution_kernel_ports(context_owner),
                                    execution_owner, clock_owner,
-                                   scheduler,       cache};
+                                   scheduler,       cache);
+    ExecutionKernel& deadman_kernel = *deadman_kernel_storage;
     configure_runtime_collision_monitoring(deadman_kernel, world, validation_engine,
                                            runtime_engine);
     std::mutex events_mu;
@@ -10746,9 +10805,10 @@ TEST_F(ExecutionKernelTest, WorkerExceptionAfterDispatchIssuesTheLaneHardStop) {
   auto ts_clock_owner = std::make_shared<ThreadSafeFakeClock>();
   ThreadSafeManualScheduler ts_scheduler;
   auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
-  ExecutionKernel throwing_kernel{planner_owner,  test_execution_kernel_ports(context_owner),
+  const auto throwing_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,  test_execution_kernel_ports(context_owner),
                                   throwing_owner, ts_clock_owner,
-                                  ts_scheduler,   local_cache_owner};
+                                  ts_scheduler,   local_cache_owner);
+  ExecutionKernel& throwing_kernel = *throwing_kernel_storage;
   configure_authoritative_collision_validation(throwing_kernel, collision_world_publisher_owner,
                                                collision_engine);
   ASSERT_TRUE(prepare_and_dispatch(throwing_kernel, make_test_request("worker_exception")).ok());
@@ -10771,9 +10831,10 @@ TEST_F(ExecutionKernelTest, BackendStoppedWithoutAddressedStopFails) {
   auto ts_clock_owner = std::make_shared<ThreadSafeFakeClock>();
   ThreadSafeManualScheduler ts_scheduler;
   auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
-  ExecutionKernel stopping_kernel{planner_owner,  test_execution_kernel_ports(context_owner),
+  const auto stopping_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,  test_execution_kernel_ports(context_owner),
                                   stopping_owner, ts_clock_owner,
-                                  ts_scheduler,   local_cache_owner};
+                                  ts_scheduler,   local_cache_owner);
+  ExecutionKernel& stopping_kernel = *stopping_kernel_storage;
   configure_authoritative_collision_validation(stopping_kernel, collision_world_publisher_owner,
                                                collision_engine);
   ASSERT_TRUE(prepare_and_dispatch(stopping_kernel, make_test_request("backend_stopped")).ok());
@@ -10797,9 +10858,10 @@ TEST_F(ExecutionKernelTest, CertifiedResetHardStopsAWindingDownBackendThenComple
   auto ts_clock_owner = std::make_shared<ThreadSafeFakeClock>();
   ThreadSafeManualScheduler ts_scheduler;
   auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
-  ExecutionKernel winding_kernel{planner_owner, test_execution_kernel_ports(context_owner),
+  const auto winding_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner),
                                  winding_owner, ts_clock_owner,
-                                 ts_scheduler,  local_cache_owner};
+                                 ts_scheduler,  local_cache_owner);
+  ExecutionKernel& winding_kernel = *winding_kernel_storage;
   configure_authoritative_collision_validation(winding_kernel, collision_world_publisher_owner,
                                                collision_engine);
   const auto result = prepare_and_dispatch(winding_kernel, make_test_request("reset_winding"));
@@ -10829,12 +10891,13 @@ TEST_F(ExecutionKernelTest, ExecutionTimeout_TransitionsToFailed) {
   ThreadSafeFakeClock& ts_clock = *ts_clock_owner;
   ThreadSafeManualScheduler ts_scheduler;
   auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
-  ExecutionKernel timeout_kernel{planner_owner,
+  const auto timeout_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                  test_execution_kernel_ports(context_owner),
                                  controlled_execution_owner,
                                  ts_clock_owner,
                                  ts_scheduler,
-                                 local_cache_owner};
+                                 local_cache_owner);
+  ExecutionKernel& timeout_kernel = *timeout_kernel_storage;
   configure_authoritative_collision_validation(timeout_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
@@ -10883,9 +10946,10 @@ TEST_F(ExecutionKernelTest, PlanningTimeout_IsPlanningFailureNotStop) {
   ThreadSafeFakeClock& ts_clock = *ts_clock_owner;
   ThreadSafeManualScheduler ts_scheduler;
   auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
-  ExecutionKernel timeout_kernel{slow_planner_owner, test_execution_kernel_ports(context_owner),
+  const auto timeout_kernel_storage = std::make_unique<ExecutionKernel>(slow_planner_owner, test_execution_kernel_ports(context_owner),
                                  execution_owner,    ts_clock_owner,
-                                 ts_scheduler,       local_cache_owner};
+                                 ts_scheduler,       local_cache_owner);
+  ExecutionKernel& timeout_kernel = *timeout_kernel_storage;
   configure_authoritative_collision_validation(timeout_kernel, collision_world_publisher_owner,
                                                collision_engine);
 
@@ -11102,12 +11166,13 @@ TEST_F(ExecutionKernelTest, KernelEventSequenceIsContiguousAcrossLifecycle) {
   auto local_cache_owner = std::make_shared<TrajectoryCache>(CacheConfig{10});
   auto local_publisher_owner = std::make_shared<MockCollisionWorldPublisher>();
   auto local_engine = std::make_shared<MockCollisionEngine>();
-  ExecutionKernel local_kernel{planner_owner,
+  const auto local_kernel_storage = std::make_unique<ExecutionKernel>(planner_owner,
                                test_execution_kernel_ports(context_owner),
                                controlled_execution_owner,
                                local_clock_owner,
                                local_scheduler,
-                               local_cache_owner};
+                               local_cache_owner);
+  ExecutionKernel& local_kernel = *local_kernel_storage;
   configure_authoritative_collision_validation(local_kernel, local_publisher_owner, local_engine);
 
   std::mutex sequences_mutex;
@@ -15655,8 +15720,9 @@ TEST_F(ExecutionKernelTest,
   auto backend_owner = std::make_shared<ReplacementObservationExecution>();
   ReplacementObservationExecution& backend = *backend_owner;
   backend.enable_execution_progress_publication();
-  ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+  const auto owner_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
                         clock_owner, scheduler, cache_owner);
+  ExecutionKernel& owner = *owner_storage;
   owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
   owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                 {collision_engine});
@@ -15794,8 +15860,9 @@ TEST_F(ExecutionKernelTest, MovingReplacementPlansOneUnscaledPeriodAheadAcrossRa
         auto result = planned.get_future();
         std::promise<void> release;
         auto released = release.get_future().share();
-        ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner),
+        const auto owner_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner),
                               backend_owner, clock_owner, scheduler, cache_owner);
+        ExecutionKernel& owner = *owner_storage;
         owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
         owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                       {collision_engine});
@@ -15902,8 +15969,9 @@ TEST_F(ExecutionKernelTest,
         std::promise<void> release;
         auto released = release.get_future().share();
         bool release_needed = boundary_offset_ns < 0;
-        ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner),
+        const auto owner_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner),
                               backend_owner, clock_owner, scheduler, cache_owner);
+        ExecutionKernel& owner = *owner_storage;
         struct ReleasePlanner {
           std::promise<void>& release;
           bool& needed;
@@ -16115,8 +16183,9 @@ TEST_F(ExecutionKernelTest,
     KernelReplacementCommitExecution& backend = *backend_owner;
     backend.watchdog_clock = &clock;
     backend.enable_execution_progress_publication();
-    ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+    const auto owner_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
                           clock_owner, scheduler, cache_owner);
+    ExecutionKernel& owner = *owner_storage;
     owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
     owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                   {collision_engine});
@@ -16372,8 +16441,9 @@ TEST_F(ExecutionKernelTest, MovingReplacementHoldHoldsNoKernelLockAndAStopDuring
   HeldReplacementCommitExecution& backend = *backend_owner;
   backend.watchdog_clock = &clock;
   backend.enable_execution_progress_publication();
-  ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+  const auto owner_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
                         clock_owner, scheduler, cache_owner);
+  ExecutionKernel& owner = *owner_storage;
   owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
   owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                 {collision_engine});
@@ -16580,8 +16650,9 @@ TEST_F(ExecutionKernelTest,
     ScaleReplacementCommitExecution& backend = *backend_owner;
     backend.watchdog_clock = &clock;
     backend.enable_execution_progress_publication();
-    ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+    const auto owner_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
                           clock_owner, scheduler, cache_owner);
+    ExecutionKernel& owner = *owner_storage;
     owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
     owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                   {collision_engine});
@@ -16942,8 +17013,9 @@ TEST_F(ExecutionKernelTest,
   execution.snapshot.error = ErrorDTO{kErrorExecutionAborted, "Controller aborted",
                                      {{"reason", "aborted_path_tolerance"}}};
   execution.execution_generation = 1U;
-  ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), execution_owner,
+  const auto owner_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner), execution_owner,
                         clock_owner, scheduler, cache_owner);
+  ExecutionKernel& owner = *owner_storage;
   owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
   owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                 {collision_engine});
@@ -17064,8 +17136,9 @@ TEST_F(ExecutionKernelTest, AddressedNominalStopWaitsForTerminalCleanupThenIsClo
   auto backend_owner = std::make_shared<HeldCleanupExecution>();
   HeldCleanupExecution& backend = *backend_owner;
   backend.enable_execution_progress_publication();
-  ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+  const auto owner_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
                         clock_owner, scheduler, cache_owner);
+  ExecutionKernel& owner = *owner_storage;
   // Release the held callback before owner destruction joins its worker.
   struct ReleaseOnExit {
     HeldCleanupExecution& backend;
@@ -17138,8 +17211,9 @@ TEST_F(ExecutionKernelTest, SpringColdProductWaitsBeyondPreparationBudgetWithout
   auto backend_owner = std::make_shared<ColdPreparationExecution>();
   ColdPreparationExecution& backend = *backend_owner;
   backend.enable_execution_progress_publication();
-  ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+  const auto owner_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
                         clock_owner, scheduler, cache_owner);
+  ExecutionKernel& owner = *owner_storage;
   owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
   owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                 {collision_engine});
@@ -17372,8 +17446,9 @@ TEST_F(ExecutionKernelTest, SpringFallbackCommitRequiresSettledAttemptOfItsEvent
   auto backend_owner = std::make_shared<ColdPreparationExecution>();
   ColdPreparationExecution& backend = *backend_owner;
   backend.enable_execution_progress_publication();
-  ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+  const auto owner_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
                         clock_owner, scheduler, cache_owner);
+  ExecutionKernel& owner = *owner_storage;
   owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
   owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                 {collision_engine});
@@ -17602,8 +17677,9 @@ TEST_F(ExecutionKernelTest, SentSpringColdResultSharesOwnerUntilExactRetirementA
     StrictSentSpringExecution& backend = *backend_owner;
     backend.source_clock = &clock;
     backend.enable_execution_progress_publication();
-    ExecutionKernel owner(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
+    const auto owner_storage = std::make_unique<ExecutionKernel>(planner_owner, test_execution_kernel_ports(context_owner), backend_owner,
                           clock_owner, scheduler, cache_owner);
+    ExecutionKernel& owner = *owner_storage;
     owner.set_collision_validation_policy_snapshot(make_test_collision_policy_snapshot());
     owner.set_collision_resources(collision_world_publisher_owner, collision_runtime_engine,
                                   {collision_engine});

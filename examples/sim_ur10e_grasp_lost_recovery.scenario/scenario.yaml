@@ -13,7 +13,7 @@
   "saved_status": {
     "checked_content_digest": "sha256:ff1ffbd71acf85547b4bd0842e2fc6cc84644826ea6be6b3e9906b4bf8afbd6f",
     "last_known_status": "unknown",
-    "manyforge_version": "0.3.0"
+    "manyforge_version": "0.3.1"
   },
   "scenario_id": "sim_ur10e_grasp_lost_recovery",
   "source_snapshot": {

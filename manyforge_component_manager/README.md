@@ -177,7 +177,7 @@ predecessor public pointer; exact replay cannot change their plan or reuse
 foreign evidence. Later records can only advance the same transaction forward
 through the selected candidate and exact public receipt. Its resource envelope
 is at most 256 intents/fence
-attempts, 64 domains, 256 bindings, and 1,024 resources per attempt, with at
+attempts, 64 domains, 128 components, 128 bindings, and 384 resources per attempt, with at
 most 4,096 staged-ready sets globally and one per Apply, bounded text fields,
 and a 64 MiB main database page image.
 

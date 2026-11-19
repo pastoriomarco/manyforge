@@ -87,6 +87,12 @@ require_ctest_tests() {
     return 0
 }
 
+# Runs a command in its own ROS domain (Fast DDS #6599), with the wrapper of the
+# sourced ROS environment.
+run_rmw_isolated() {
+    "$(ros2 pkg prefix rmw_test_fixture_implementation)/lib/rmw_test_fixture_implementation/run_rmw_isolated" "$@"
+}
+
 setup_pythonpath() {
     export PYTHONPATH="$WORKSPACE:$WORKSPACE/manyforge_behavior:${PYTHONPATH:-}"
 }
@@ -593,7 +599,7 @@ run_headless_python_tests() {
         MANYFORGE_ROBOPLAN_CANDIDATE_WORKER="$BUILD_DIR/roboplan/manyforge_roboplan_candidate_worker" \
         MANYFORGE_ROBOPLAN_FAKE_WORKER="$BUILD_DIR/roboplan/fake_process_candidate_worker" \
         ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
-        "/opt/ros/${ROS_DISTRO:-lyrical}/lib/rmw_test_fixture_implementation/run_rmw_isolated" \
+        run_rmw_isolated \
         pytest \
             manyforge_headless_api/tests/ \
             manyforge_headless_api/process_tests/ \
@@ -813,16 +819,22 @@ source_ros_integration_environment() {
 
 # One ROS integration graph (Core, deployment, the JTC adapter and gripper,
 # the ROS execution host) built by the ROS image's helper, then its CTest.
+# The same graph supplies the expression engine binding (manyforge_headless_py).
 run_ros_tests() {
     section "ROS integration graph (Core, deployment, JTC adapter, ROS host)"
     local build_root="$BUILD_DIR/ros-integration"
     local build="$build_root/roboplan"
     local helper_status=0
+    local pybind11_cmake_dir
+    pybind11_cmake_dir="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')"
     MANYFORGE_ROS2_CONTROL_BUILD_TESTING=ON \
     MANYFORGE_ROS2_CONTROL_BUILD_ROOT="$build_root" \
     CMAKE_BUILD_PARALLEL_LEVEL="$BUILD_PARALLEL_LEVEL" \
         bash "$WORKSPACE/scripts/ros/build-ros2-control-runtime.sh" \
             --source-dir "$WORKSPACE/scripts/ros/ros-integration" --target all \
+            --target manyforge_headless_py \
+            --cmake-arg -DMANYFORGE_BUILD_PYTHON_MODULES=ON \
+            --cmake-arg "-Dpybind11_DIR=$pybind11_cmake_dir" \
             --topic-install "$ROS_INTEGRATION_TOPIC_INSTALL" \
             --data-overlay "$ROS_INTEGRATION_DATA_OVERLAY" || helper_status=$?
     if (( helper_status != 0 )); then
@@ -837,7 +849,8 @@ run_ros_tests() {
         return
     fi
     cd "$build"
-    if ! setup_expression_binding; then
+    export PYTHONPATH="$build/headless:${PYTHONPATH:-}"
+    if ! python_has_modules manyforge_headless_py; then
         echo -e "${RED}  FAIL: the expression engine binding (manyforge_headless_py) is unavailable${NC}"
         FAIL=$((FAIL + 1))
     elif ! ( source_ros_integration_environment
@@ -963,7 +976,7 @@ PY_LAUNCH
          printf '%s\n' "$manager_apply_status" > "$evidence/empty-ros-apply-ctest.status"
          # The run gets its own ROS domain (Fast DDS #6599).
          ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
-             "/opt/ros/${ROS_DISTRO:-lyrical}/lib/rmw_test_fixture_implementation/run_rmw_isolated" \
+             run_rmw_isolated \
              pytest "${MOCK_CELL_ROS_PROCESS_TESTS[@]}" -p no:cacheprovider -v ); then
         PASS=$((PASS + 1))
     else

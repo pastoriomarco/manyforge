@@ -222,6 +222,46 @@ def test_encode_execution_observation_frame_is_one_canonical_payload() -> None:
     assert encoded.startswith('{"application_start_id":')
 
 
+def test_offer_keeps_the_retained_frame_byte_identical_without_mutating_it() -> None:
+    frame = stream.project_execution_observation(
+        _status(position=1 / 3), received_at_monotonic_us=123_456
+    )
+    retained = json.loads(stream.encode_execution_observation_frame(frame))
+    source = stream.ExecutionObservationSource(SimpleNamespace(), monotonic=lambda: 12.5)
+    source._last_frame = frame
+    source._last_identity = stream.observation_identity(frame)
+    source._delivery_sequence = 3
+    source._outside_received = 12.0
+    source._outside_sources = [
+        {"source": {"source_id": "arm", "position": 0.1}, "age_at_delivery_ns": 7,
+         "freshness_budget_ns": 1_000_000_000},
+        {"source": {"source_id": "tool"}, "age_at_delivery_ns": stream._MAXIMUM_SAFE_INTEGER},
+    ]
+
+    def previous_encoding() -> str:
+        # The former path: decode the retained payload, replace the
+        # per-delivery fields, encode again.
+        old = json.loads(stream.encode_execution_observation_frame(frame))
+        identity = {key: old[key] for key in ("cell_id", "retained_bundle_id", "graph_revision")}
+        old["outside_pose_sources"] = [
+            {**row, "age_at_delivery_ns": min(
+                stream._MAXIMUM_SAFE_INTEGER, row["age_at_delivery_ns"] + 500_000_000)}
+            for row in source._outside_sources
+        ] if identity == source._outside_identity else []
+        old["delivery_sequence"] = source._delivery_sequence
+        return stream.encode_execution_observation_frame(old)
+
+    for outside_identity in (
+        {"cell_id": "cell-1", "retained_bundle_id": "bundle-1", "graph_revision": "graph-1"},
+        {"cell_id": "cell-1", "retained_bundle_id": "bundle-1", "graph_revision": "other"},
+    ):
+        source._outside_identity = outside_identity
+        subscription = stream.ExecutionObservationSubscription(asyncio.Event(), credit=True)
+        assert source._offer_current_locked(subscription)
+        assert stream.encode_execution_observation_frame(subscription.payload) == previous_encoding()
+        assert frame == retained and "delivery_sequence" not in frame
+
+
 def test_failed_source_invalidates_every_subscriber_and_never_replays_cache() -> None:
     async def exercise() -> None:
         client = _Client()

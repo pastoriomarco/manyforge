@@ -1185,6 +1185,7 @@ struct ControllerLaunchSupervisor::Spawner final {
   }
 
   void run() {
+    static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_ctrl_spawn"));
     sigset_t blocked;
     ::sigemptyset(&blocked);
     ::sigaddset(&blocked, SIGPIPE);

@@ -626,22 +626,23 @@ export function ProgramTreeCanvas({
   );
   const edgeStatusProjector = useMemo(() => projectEdgeStatuses(baseGraphEdges), [baseGraphEdges]);
   const graphEdges = useMemo(() => edgeStatusProjector(nodeStatuses), [edgeStatusProjector, nodeStatuses]);
+  // Status projection only recolours; positions and extents follow the layout.
   const positions = useMemo(
-    () => new Map(graphNodes.map((node) => [node.id, node.position])),
-    [graphNodes],
+    () => new Map(baseGraphNodes.map((node) => [node.id, node.position])),
+    [baseGraphNodes],
   );
-  const graphWidth = Math.max(
+  const graphWidth = useMemo(() => Math.max(
     720,
-    ...graphNodes.map((node) => node.position.x
+    ...baseGraphNodes.map((node) => node.position.x
       + (nodeMeasurements[node.id]?.width ?? NODE_SIZE.width)
       + STAGE_PADDING),
-  );
-  const graphHeight = Math.max(
+  ), [baseGraphNodes, nodeMeasurements]);
+  const graphHeight = useMemo(() => Math.max(
     320,
-    ...graphNodes.map((node) => node.position.y
+    ...baseGraphNodes.map((node) => node.position.y
       + (nodeMeasurements[node.id]?.height ?? NODE_SIZE.height)
       + STAGE_PADDING),
-  );
+  ), [baseGraphNodes, nodeMeasurements]);
 
   const onNodesChange = useCallback((
     changes: NodeChange<ProgramFlowNode>[],
@@ -703,7 +704,7 @@ export function ProgramTreeCanvas({
     const nextPositions = new Map(positions);
     nextPositions.set(node.id, node.position);
     if (row?.parentId !== null && row?.parentId !== undefined) {
-      const displayedNodes = graphNodes.map((candidate) => ({
+      const displayedNodes = baseGraphNodes.map((candidate) => ({
         ...candidate,
         position: nextPositions.get(candidate.id) ?? candidate.position,
       }));
@@ -730,7 +731,7 @@ export function ProgramTreeCanvas({
     onMutate('tree_draft_update_positions', {
       positions: { [node.id]: { x: node.position.x, y: node.position.y } },
     });
-  }, [authoringDisabled, collapseActive, edges, flatById, graphDirection, graphNodes, onMutate, positions]);
+  }, [authoringDisabled, baseGraphNodes, collapseActive, edges, flatById, graphDirection, onMutate, positions]);
 
   const onConnect = useCallback((connection: Connection) => {
     if (authoringDisabled) {
@@ -751,7 +752,7 @@ export function ProgramTreeCanvas({
     const index = parentId === null
       ? result.intent.index
       : authoringSiblingInsertionIndex(
-        graphNodes,
+        baseGraphNodes,
         edges,
         parentId,
         result.intent.instance_id,
@@ -766,10 +767,10 @@ export function ProgramTreeCanvas({
     onMutate(mutation.mutation, mutation.args);
   }, [
     authoringDisabled,
+    baseGraphNodes,
     collapseActive,
     edges,
     graphDirection,
-    graphNodes,
     laidOut,
     onMutate,
     positions,

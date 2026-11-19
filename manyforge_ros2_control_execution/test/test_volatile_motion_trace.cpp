@@ -8,6 +8,47 @@
 #include <unistd.h>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_ros2_control_execution/volatile_motion_trace.hpp>
+#include <cstdlib>
+#include <new>
+
+// Counts this thread's allocations and frees while enabled: the sample
+// capture path may do neither.
+namespace {
+thread_local bool count_heap = false;
+thread_local std::size_t heap_calls = 0U;
+void *CountedAllocate(std::size_t size) {
+  if (count_heap) ++heap_calls;
+  if (void *memory = std::malloc(size == 0U ? 1U : size)) return memory;
+  throw std::bad_alloc();
+}
+[[gnu::noinline]] void CountedFree(void *memory) noexcept {
+  if (count_heap && memory) ++heap_calls;
+  std::free(memory);
+}
+template <typename Call> std::size_t HeapCallsDuring(Call &&call) {
+  heap_calls = 0U;
+  count_heap = true;
+  call();
+  count_heap = false;
+  return heap_calls;
+}
+} // namespace
+void *operator new(std::size_t size) { return CountedAllocate(size); }
+void *operator new[](std::size_t size) { return CountedAllocate(size); }
+void *operator new(std::size_t size, const std::nothrow_t &) noexcept {
+  if (count_heap) ++heap_calls;
+  return std::malloc(size == 0U ? 1U : size);
+}
+void *operator new[](std::size_t size, const std::nothrow_t &) noexcept {
+  if (count_heap) ++heap_calls;
+  return std::malloc(size == 0U ? 1U : size);
+}
+void operator delete(void *memory) noexcept { CountedFree(memory); }
+void operator delete[](void *memory) noexcept { CountedFree(memory); }
+void operator delete(void *memory, std::size_t) noexcept { CountedFree(memory); }
+void operator delete[](void *memory, std::size_t) noexcept { CountedFree(memory); }
+void operator delete(void *memory, const std::nothrow_t &) noexcept { CountedFree(memory); }
+void operator delete[](void *memory, const std::nothrow_t &) noexcept { CountedFree(memory); }
 
 namespace manyforge::ros2_control_execution {
 namespace {
@@ -510,7 +551,7 @@ TEST(VolatileMotionTraceTest,
   sample.reference_positions_rad = {1.0};
   sample.command_positions_rad = {1.0};
   sample.measured_positions_rad = {0.99};
-  for (std::size_t i = 0; i < VolatileMotionTrace::kSampleLimit + 3U; ++i) {
+  for (std::size_t i = 0; i < VolatileMotionTrace::kSampleCapacity + 3U; ++i) {
     sample.local_receipt_stamp_ns = static_cast<TimePoint>(i);
     trace.Sample("/arm/fjt", sample);
   }
@@ -518,8 +559,8 @@ TEST(VolatileMotionTraceTest,
   const auto result = trace.Snapshot(ApplicationStartId{1U},
                                      VolatileMotionTrace::kMaximumTraceBytes);
   ASSERT_TRUE(result.ok());
-  EXPECT_LE(Member(result.value(), "controller_samples").as_array().size(),
-            VolatileMotionTrace::kSampleLimit);
+  EXPECT_EQ(Member(result.value(), "controller_samples").as_array().size(),
+            VolatileMotionTrace::kSampleCapacity);
   EXPECT_GE(
       Member(Member(result.value(), "coverage"), "dropped_samples").as_number(),
       3.0);
@@ -527,6 +568,209 @@ TEST(VolatileMotionTraceTest,
   ASSERT_EQ(events.size(), 2U);
   EXPECT_EQ(Member(events.front(), "kind").as_string(), "published");
   EXPECT_EQ(Member(events.back(), "kind").as_string(), "applied_observed");
+}
+// The encoding of a retained `ExecutionControllerSampleDTO` before samples
+// became compact rows, kept verbatim as the export reference.
+V ReferenceNumber(double value) { return V(value == 0.0 ? 0.0 : value); }
+V ReferenceNs(TimePoint n) {
+  return n >= 0 ? content_identity::nonnegative_int64_value(n)
+                : V(std::to_string(n));
+}
+V ReferenceCount(std::uint64_t n) {
+  return n <= 9007199254740991ULL ? V(static_cast<double>(n))
+                                  : V(std::to_string(n));
+}
+V ReferenceNumbers(const std::vector<double> &input) {
+  V::Array out;
+  for (double value : input)
+    out.emplace_back(ReferenceNumber(value));
+  return V(std::move(out));
+}
+V ReferenceRow(const std::string &action, const ExecutionControllerSampleDTO &s) {
+  return V(V::Object{
+      {"action", V(action)},
+      {"binding_epoch", ReferenceCount(s.binding_epoch.value())},
+      {"source_stamp_ns", ReferenceNs(s.source_stamp_ns)},
+      {"local_receipt_stamp_ns", ReferenceNs(s.local_receipt_stamp_ns)},
+      {"cursor_s", ReferenceNumber(s.cursor_s)},
+      {"reference_p", ReferenceNumbers(s.reference_positions_rad)},
+      {"reference_v", ReferenceNumbers(s.reference_velocities_rad_s)},
+      {"reference_a", ReferenceNumbers(s.reference_accelerations_rad_s2)},
+      {"commanded_p", ReferenceNumbers(s.command_positions_rad)},
+      {"commanded_v", s.command_velocities_rad_s
+                          ? ReferenceNumbers(*s.command_velocities_rad_s)
+                          : V(nullptr)},
+      {"measured_p", ReferenceNumbers(s.measured_positions_rad)},
+      {"measured_v", s.measured_velocities_rad_s
+                         ? ReferenceNumbers(*s.measured_velocities_rad_s)
+                         : V(nullptr)},
+      {"applied_factor",
+       s.applied_factor ? ReferenceNumber(*s.applied_factor) : V(nullptr)}});
+}
+std::vector<double> Joints(std::size_t count, double base) {
+  std::vector<double> values;
+  for (std::size_t i = 0; i < count; ++i)
+    values.push_back(base + static_cast<double>(i) * 0.1234567890123);
+  return values;
+}
+ExecutionControllerSampleDTO VariedSample(std::size_t i) {
+  const std::size_t joints = i % 3U == 0U ? 7U : 6U;
+  ExecutionControllerSampleDTO s;
+  s.binding_epoch = ExecutionBindingEpoch(i % 5U == 0U ? 9007199254740993ULL : 3U);
+  s.source_stamp_ns = static_cast<TimePoint>(i) * 6666667 - 3;
+  s.local_receipt_stamp_ns = 1700000000123456789LL + static_cast<TimePoint>(i);
+  s.local_receipt_count = ExecutionReceiptCount(i + 1U);
+  s.cursor_s = i % 4U == 0U ? -0.0 : static_cast<double>(i) / 3.0;
+  if (i % 2U == 0U)
+    s.applied_factor = i % 6U == 0U ? -0.0 : 0.1 * static_cast<double>(i % 10U);
+  s.reference_positions_rad = Joints(joints, -1.0 / 3.0 - static_cast<double>(i));
+  s.reference_velocities_rad_s = Joints(joints, 1e-300);
+  if (i % 7U != 0U)
+    s.reference_accelerations_rad_s2 = Joints(joints, -2.5e7);
+  s.command_positions_rad = Joints(joints, 0.7);
+  s.reference_positions_rad.front() = -0.0;
+  if (i % 3U == 1U)
+    s.command_velocities_rad_s = Joints(joints, -0.25);
+  else if (i % 3U == 2U)
+    s.command_velocities_rad_s = std::vector<double>{};
+  s.measured_positions_rad = Joints(joints, std::numeric_limits<double>::min());
+  if (i % 2U == 1U)
+    s.measured_velocities_rad_s = Joints(joints, std::numeric_limits<double>::max() / 2.0);
+  s.error_positions_rad = Joints(joints, 0.001);
+  return s;
+}
+TEST(VolatileMotionTraceTest, CompactSamplesExportLikeTheRetainedSampleEncoding) {
+  VolatileMotionTrace trace;
+  std::vector<std::pair<std::string, ExecutionControllerSampleDTO>> captured;
+  for (std::size_t i = 0; i < 60U; ++i) {
+    captured.emplace_back(i % 2U == 0U ? "/left/fjt" : "/right_arm_controller/follow_joint_trajectory",
+                          VariedSample(i));
+    trace.Sample(captured.back().first, captured.back().second);
+  }
+  const auto result = trace.Snapshot(ApplicationStartId{1U},
+                                     VolatileMotionTrace::kMaximumTraceBytes);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const auto &rows = Member(result.value(), "controller_samples").as_array();
+  ASSERT_EQ(rows.size(), captured.size());
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    const auto &[action, sample] = captured[captured.size() - 1U - i];
+    EXPECT_EQ(content_identity::canonical_json(rows[i]),
+              content_identity::canonical_json(ReferenceRow(action, sample)))
+        << i;
+  }
+  const auto &coverage = Member(result.value(), "coverage");
+  EXPECT_EQ(Member(coverage, "capture_failures").as_number(), 0.0);
+  EXPECT_EQ(Member(coverage, "dropped_samples").as_number(), 0.0);
+  EXPECT_EQ(Member(Member(result.value(), "retention"), "sample_limit").as_number(),
+            static_cast<double>(VolatileMotionTrace::kSampleCapacity));
+}
+TEST(VolatileMotionTraceTest, OptionalVectorsKeepAbsentApartFromEmpty) {
+  VolatileMotionTrace trace;
+  ExecutionControllerSampleDTO sample;
+  sample.binding_epoch = ExecutionBindingEpoch(1U);
+  sample.reference_positions_rad = {0.5};
+  sample.command_velocities_rad_s = std::vector<double>{};
+  sample.measured_velocities_rad_s = std::nullopt;
+  trace.Sample("/arm/fjt", sample);
+  const auto result = trace.Snapshot(ApplicationStartId{1U}, 4000U);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const auto &row = Member(result.value(), "controller_samples").as_array().front();
+  EXPECT_TRUE(Member(row, "commanded_v").is_array());
+  EXPECT_TRUE(Member(row, "commanded_v").as_array().empty());
+  EXPECT_TRUE(Member(row, "measured_v").is_null());
+  EXPECT_TRUE(Member(row, "reference_a").as_array().empty());
+  EXPECT_TRUE(Member(row, "applied_factor").is_null());
+  EXPECT_EQ(content_identity::canonical_json(row),
+            content_identity::canonical_json(ReferenceRow("/arm/fjt", sample)));
+}
+TEST(VolatileMotionTraceTest, RingKeepsArrivalOrderAndEvictsOldestFirst) {
+  static_assert(VolatileMotionTrace::kSampleCapacity >= 2000U);
+  static_assert(VolatileMotionTrace::kTraceJoints >= 7U);
+  VolatileMotionTrace trace;
+  ExecutionControllerSampleDTO sample;
+  sample.binding_epoch = ExecutionBindingEpoch(1U);
+  sample.reference_positions_rad = Joints(6U, 0.0);
+  constexpr std::size_t extra = 5U;
+  const auto total = VolatileMotionTrace::kSampleCapacity + extra;
+  for (std::size_t i = 0; i < total; ++i) {
+    sample.local_receipt_stamp_ns = static_cast<TimePoint>(i);
+    trace.Sample(i < extra ? "/old/fjt" : "/arm/fjt", sample);
+  }
+  const auto result = trace.Snapshot(ApplicationStartId{1U},
+                                     VolatileMotionTrace::kMaximumTraceBytes);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const auto &rows = Member(result.value(), "controller_samples").as_array();
+  ASSERT_EQ(rows.size(), VolatileMotionTrace::kSampleCapacity);
+  for (std::size_t i = 0; i < rows.size(); ++i) {
+    EXPECT_EQ(Member(rows[i], "local_receipt_stamp_ns").as_number(),
+              static_cast<double>(total - 1U - i));
+    EXPECT_EQ(Member(rows[i], "action").as_string(), "/arm/fjt");
+  }
+  EXPECT_EQ(Member(Member(result.value(), "coverage"), "dropped_samples").as_number(),
+            static_cast<double>(extra));
+}
+TEST(VolatileMotionTraceTest, OversizedSamplesAndUnknownActionsAreCountedNotKept) {
+  VolatileMotionTrace trace;
+  ExecutionControllerSampleDTO sample;
+  sample.binding_epoch = ExecutionBindingEpoch(1U);
+  sample.reference_positions_rad = Joints(VolatileMotionTrace::kTraceJoints + 1U, 0.0);
+  trace.Sample("/arm/fjt", sample);
+  sample.reference_positions_rad = Joints(1U, 0.0);
+  sample.measured_velocities_rad_s = Joints(VolatileMotionTrace::kTraceJoints + 1U, 0.0);
+  trace.Sample("/arm/fjt", sample);
+  sample.measured_velocities_rad_s.reset();
+  trace.Sample(std::string(VolatileMotionTrace::kActionBytes + 1U, 'a'), sample);
+  // Sixteen distinct retained actions fill the identity table.
+  for (std::size_t i = 0; i < 17U; ++i)
+    trace.Sample("/arm" + std::to_string(i) + "/fjt", sample);
+  const auto result = trace.Snapshot(ApplicationStartId{1U},
+                                     VolatileMotionTrace::kMaximumTraceBytes);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(Member(result.value(), "controller_samples").as_array().size(), 16U);
+  EXPECT_EQ(Member(Member(result.value(), "coverage"), "capture_failures").as_number(), 4.0);
+  // Once the ring no longer names an action its slot is reused.
+  for (std::size_t i = 0; i < VolatileMotionTrace::kSampleCapacity; ++i)
+    trace.Sample("/arm0/fjt", sample);
+  trace.Sample("/arm16/fjt", sample);
+  const auto later = trace.Snapshot(ApplicationStartId{1U}, 4000U);
+  ASSERT_TRUE(later.ok()) << later.error().message;
+  EXPECT_EQ(Member(Member(later.value(), "controller_samples").as_array().front(),
+                   "action").as_string(), "/arm16/fjt");
+  EXPECT_EQ(Member(Member(later.value(), "coverage"), "capture_failures").as_number(), 4.0);
+}
+TEST(VolatileMotionTraceTest, SampleCaptureNeitherAllocatesNorFrees) {
+  VolatileMotionTrace trace;
+  ExecutionControllerSampleDTO sample;
+  sample.binding_epoch = ExecutionBindingEpoch(1U);
+  sample.reference_positions_rad = Joints(7U, 0.1);
+  sample.reference_velocities_rad_s = Joints(7U, 0.2);
+  sample.reference_accelerations_rad_s2 = Joints(7U, 0.3);
+  sample.command_positions_rad = Joints(7U, 0.4);
+  sample.command_velocities_rad_s = Joints(7U, 0.5);
+  sample.measured_positions_rad = Joints(7U, 0.6);
+  sample.measured_velocities_rad_s = Joints(7U, 0.7);
+  sample.error_positions_rad = Joints(7U, 0.8);
+  const std::string left = "/left_arm_controller/follow_joint_trajectory";
+  const std::string right = "/right_arm_controller/follow_joint_trajectory";
+  // First use of each action, ring wrap, scale-event ring wrap and published
+  // scale events all inside the counted window.
+  const auto calls = HeapCallsDuring([&] {
+    for (std::size_t i = 0; i < VolatileMotionTrace::kSampleCapacity + 300U; ++i) {
+      sample.local_receipt_stamp_ns = static_cast<TimePoint>(i);
+      sample.applied_factor = static_cast<double>((i / 2U) % 2U);
+      trace.Sample(i % 2U == 0U ? left : right, sample);
+      if (i % 3U == 0U)
+        trace.PublishedScale(left, ExecutionBindingEpoch(1U), static_cast<TimePoint>(i), 0.5);
+    }
+  });
+  EXPECT_EQ(calls, 0U);
+  const auto result = trace.Snapshot(ApplicationStartId{1U},
+                                     VolatileMotionTrace::kMaximumTraceBytes);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  const auto &coverage = Member(result.value(), "coverage");
+  EXPECT_EQ(Member(coverage, "dropped_samples").as_number(), 300.0);
+  EXPECT_GT(Member(coverage, "evicted_scale_events").as_number(), 0.0);
+  EXPECT_EQ(Member(coverage, "capture_failures").as_number(), 0.0);
 }
 } // namespace
 } // namespace manyforge::ros2_control_execution

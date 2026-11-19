@@ -11,6 +11,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include <pthread.h>
 
 namespace manyforge::core {
 
@@ -333,6 +334,7 @@ class BoundedStopStageAttemptExecutor::Impl final {
   }
 
   void Run(Slot& slot, const std::uint32_t slot_index, const std::stop_token worker_stop) noexcept {
+    static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_stop_stage"));
     ready_workers_.fetch_add(1U, std::memory_order_acq_rel);
     ready_workers_.notify_all();
     SignalStateChange();

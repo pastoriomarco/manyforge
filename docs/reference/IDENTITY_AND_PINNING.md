@@ -66,7 +66,7 @@ python3 scripts/regen.py --check  --build-dir <build>/ros-integration --require-
 ```
 
 - Steps, in order: `project-snapshots`, `catalog-pin`, `node-catalog`,
-  `closed-schemas`, `alarm-catalog`, `maintained-sources`,
+  `closed-schemas`, `alarm-catalog`, `maintained-sources`, `robot-defaults`,
   `program-binding-transport`, `node-environment`,
   `program-revisions`*, `model-assets`*, `maintained-occurrences`, `scenario-pins`,
   `rest-contracts`. `--list` prints them; `--only a,b` runs a subset.
@@ -82,7 +82,8 @@ python3 scripts/regen.py --check  --build-dir <build>/ros-integration --require-
 - The C++ tools embed the catalog, closed schemas and node environment at
   build time. After changing any of those, or when regen reports that C++ pins
   moved: run `--update`, rebuild, run `--update` again, then `--check`.
-- `--update` repeats the steps until nothing changes. When a digest moves, regen
+- `--update` repeats the steps until nothing changes, at most three passes
+  (it fails if outputs still change). When a digest moves, regen
   replaces the old value in every source and test file that holds a copy. It
   never edits `docs/`, `examples/` (other than its own outputs), `*.md`, sealed
   `*.deployment.yaml` files or another generator's outputs; it lists any old

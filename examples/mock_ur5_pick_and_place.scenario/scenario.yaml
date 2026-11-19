@@ -13,7 +13,7 @@
   "saved_status": {
     "checked_content_digest": "sha256:04e93d5d4ced5c83d40050bc626eb067f80dd2d0ad8088148ac51377c4b5015e",
     "last_known_status": "unknown",
-    "manyforge_version": "0.3.0"
+    "manyforge_version": "0.3.1"
   },
   "scenario_id": "mock_ur5_pick_and_place",
   "source_snapshot": {

@@ -54,12 +54,18 @@ REMOVED_DISK_VARIABLES = {
     "MANYFORGE_LOG_EVIDENCE_MAX_DISK_PERCENT": "disk_max_percent",
     "MANYFORGE_LOG_EVIDENCE_MIN_FREE_BYTES": "disk_always_free_bytes",
 }
-HEADLESS_BUILD = BUILD_ROOT / "headless"
-DEPLOYMENT_AUTHORING_BUILD = BUILD_ROOT / "deployment-authoring"
+# The one CMake graph of the native closure: the ROS execution host and
+# planner worker, the Manager and the Headless and Core Python modules.
+HEADLESS_BUILD = BUILD_ROOT / "ros-integration/headless"
 # The Core Python module (manyforge_core_py): Headless reference validation
 # (the GUI's and the assistant's) prepares candidates with it.
-CORE_BINDINGS_CORE_BUILD = BUILD_ROOT / "core-bindings-core"
-CORE_PYTHON_BUILD = BUILD_ROOT / "core-python"
+CORE_PYTHON_BUILD = BUILD_ROOT / "ros-integration/core-python"
+# The activation and empty-bootstrap tools stay statically linked in their
+# own tree: the bootstrap package caches below are keyed by their bytes.
+DEPLOYMENT_AUTHORING_BUILD = BUILD_ROOT / "deployment-authoring"
+# Release code with debug symbols (readable crash backtraces, same -O3 code),
+# identical in both trees: the embedded build evidence hashes these flags.
+RELEASE_CXX_FLAGS = "-O3 -DNDEBUG -g"
 # Python packages the workbench services import from the source tree.
 SERVED_PYTHON_PACKAGES = (
     "manyforge_behavior/manyforge_behavior",
@@ -89,6 +95,11 @@ ALARM_CATALOG = (
     WORKSPACE / "manyforge_headless/resources/operator-alarm-catalog.v1.yaml"
 )
 FRONTEND_ROOT = WORKSPACE / "manyforge_composer/frontend"
+# The built GUI Composer serves without Vite (its first static candidate).
+FRONTEND_DIST = FRONTEND_ROOT / "dist"
+# Inside dist: the frontend source hash it was built from. Vite empties dist
+# when it builds, so a failed build leaves no marker.
+FRONTEND_DIST_SOURCE_HASH = FRONTEND_DIST / ".manyforge-source.sha256"
 # Written by the native build step; serve reports it beside its readiness time.
 NATIVE_BUILD_TIMING = BUILD_ROOT / "native-build-timing.json"
 # How often the wait for the Manager's exit passes further stop requests on.
@@ -200,57 +211,17 @@ def _build_jobs() -> str:
     return jobs
 
 
-def _ensure_current_backend() -> Path:
-    """Build only the stale current Manager/Headless production closure."""
+def _pybind11_cmake_dir() -> str:
+    """The pybind11 package of the interpreter that serves the modules."""
 
-    cache = HEADLESS_BUILD / "CMakeCache.txt"
-    if not cache.is_file():
-        completed = subprocess.run(
-            (
-                sys.executable,
-                "-c",
-                "import pybind11; print(pybind11.get_cmake_dir())",
-            ),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        pybind11_dir = completed.stdout.strip()
-        if completed.returncode != 0 or not pybind11_dir:
-            raise WorkbenchError(
-                "cannot resolve the development pybind11 CMake package"
-            )
-        _run(
-            (
-                "cmake",
-                "-G",
-                "Ninja",
-                "-S",
-                str(WORKSPACE / "manyforge_headless"),
-                "-B",
-                str(HEADLESS_BUILD),
-                "-DCMAKE_BUILD_TYPE=RelWithDebInfo",
-                "-DBUILD_TESTING=OFF",
-                "-DMANYFORGE_HEADLESS_BUILD_PYTHON=ON",
-                f"-Dpybind11_DIR={pybind11_dir}",
-            )
-        )
-    _run(
-        (
-            "cmake",
-            "--build",
-            str(HEADLESS_BUILD),
-            "--parallel",
-            _build_jobs(),
-            "--target",
-            "manyforge_manager_daemon",
-            "manyforge_headless_py",
-            "--",
-            "-k",
-            "0",
-        )
+    completed = subprocess.run(
+        (sys.executable, "-c", "import pybind11; print(pybind11.get_cmake_dir())"),
+        check=False, capture_output=True, text=True,
     )
-    return _current_backend()
+    pybind11_dir = completed.stdout.strip()
+    if completed.returncode != 0 or not pybind11_dir:
+        raise WorkbenchError("cannot resolve the development pybind11 CMake package")
+    return pybind11_dir
 
 
 def _current_backend() -> Path:
@@ -313,14 +284,30 @@ def _ros_backend_environment() -> dict[str, str]:
 
 
 def _ensure_current_ros_backend() -> tuple[Path, Path]:
-    """Build the separately installed ROS product; never launch a provider."""
+    """Build the native closure in the one ROS graph; never launch a provider."""
 
     environment = _ros_backend_environment()
+    # Report every failing target, not only the first.
+    environment["MANYFORGE_ROS2_CONTROL_BUILD_KEEP_GOING"] = "ON"
+    targets = (
+        "manyforge_ros2_control_execution_host",
+        "manyforge_roboplan_candidate_worker",
+        "manyforge_manager_daemon",
+        "manyforge_headless_py",
+        "manyforge_core_py",
+    )
     _run(
         (
             str(WORKSPACE / "scripts/ros/build-ros2-control-runtime.sh"),
             "--source-dir",
             str(WORKSPACE / "scripts/ros/ros-integration"),
+            *(argument for target in targets for argument in ("--target", target)),
+            "--cmake-arg",
+            "-DMANYFORGE_BUILD_PYTHON_MODULES=ON",
+            "--cmake-arg",
+            f"-DCMAKE_CXX_FLAGS_RELEASE={RELEASE_CXX_FLAGS}",
+            "--cmake-arg",
+            f"-Dpybind11_DIR={_pybind11_cmake_dir()}",
         ),
         env=environment,
     )
@@ -359,56 +346,6 @@ def _stage_runtime_targets(sources: Sequence[Path], installed: Path) -> None:
         _regular_file(target, f"installed {source.name}", executable=True)
 
 
-def _ensure_core_bindings() -> Path:
-    """Build the Core Python module against the authoring Deployment build.
-
-    Same inputs as scripts/ci/run-core-bindings.sh: the Core and Deployment
-    static archives, then the module itself.
-    """
-
-    if not (CORE_BINDINGS_CORE_BUILD / "CMakeCache.txt").is_file():
-        _run((
-            "cmake", "-G", "Ninja", "-S", str(WORKSPACE / "manyforge_core"),
-            "-B", str(CORE_BINDINGS_CORE_BUILD),
-            "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_TESTING=OFF",
-        ))
-    _run((
-        "cmake", "--build", str(CORE_BINDINGS_CORE_BUILD), "--parallel", _build_jobs(),
-        "--target", "manyforge_content_identity", "manyforge_core",
-    ))
-    _run((
-        "cmake", "--build", str(DEPLOYMENT_AUTHORING_BUILD), "--parallel", _build_jobs(),
-        "--target", "manyforge_content_identity", "manyforge_deployment",
-        "manyforge_deployment_admission", "manyforge_deployment_canonical_package_generator",
-        "manyforge_deployment_verification_core", "manyforge_expression",
-        "manyforge_preparation_support",
-    ))
-    if not (CORE_PYTHON_BUILD / "CMakeCache.txt").is_file():
-        completed = subprocess.run(
-            (sys.executable, "-c", "import pybind11; print(pybind11.get_cmake_dir())"),
-            check=False, capture_output=True, text=True,
-        )
-        pybind11_dir = completed.stdout.strip()
-        if completed.returncode != 0 or not pybind11_dir:
-            raise WorkbenchError("cannot resolve the development pybind11 CMake package")
-        _run((
-            "cmake", "-G", "Ninja", "-S", str(WORKSPACE / "manyforge_core/python"),
-            "-B", str(CORE_PYTHON_BUILD), "-DCMAKE_BUILD_TYPE=Release",
-            f"-DPython3_EXECUTABLE={sys.executable}", f"-DPython_EXECUTABLE={sys.executable}",
-            f"-Dpybind11_DIR={pybind11_dir}",
-            f"-DMANYFORGE_CORE_DIR={CORE_BINDINGS_CORE_BUILD}",
-            f"-DMANYFORGE_CORE_INCLUDE_DIR={WORKSPACE / 'manyforge_core/include'}",
-            f"-DMANYFORGE_DEPLOYMENT_DIR={DEPLOYMENT_AUTHORING_BUILD}",
-            f"-DMANYFORGE_DEPLOYMENT_INCLUDE_DIR={WORKSPACE / 'manyforge_deployment/include'}",
-            f"-DMANYFORGE_CONTENT_IDENTITY_SOURCE_DIR={WORKSPACE / 'manyforge_content_identity'}",
-        ))
-    _run((
-        "cmake", "--build", str(CORE_PYTHON_BUILD), "--parallel", _build_jobs(),
-        "--target", "manyforge_core_py",
-    ))
-    return _current_core_bindings()
-
-
 def _current_core_bindings() -> Path:
     return _built_extension(CORE_PYTHON_BUILD, "manyforge_core_py", "current Core Python extension")
 
@@ -416,7 +353,11 @@ def _current_core_bindings() -> Path:
 def _ensure_activation_preparer() -> Path:
     """Build repository-owned activation and empty-bootstrap tools."""
 
-    if not (DEPLOYMENT_AUTHORING_BUILD / "CMakeCache.txt").is_file():
+    cache = DEPLOYMENT_AUTHORING_BUILD / "CMakeCache.txt"
+    if not cache.is_file() or (
+        f"CMAKE_CXX_FLAGS_RELEASE:STRING={RELEASE_CXX_FLAGS}\n"
+        not in cache.read_text(encoding="utf-8")
+    ):
         _run(
             (
                 "cmake",
@@ -427,6 +368,7 @@ def _ensure_activation_preparer() -> Path:
                 "-B",
                 str(DEPLOYMENT_AUTHORING_BUILD),
                 "-DCMAKE_BUILD_TYPE=Release",
+                f"-DCMAKE_CXX_FLAGS_RELEASE={RELEASE_CXX_FLAGS}",
                 "-DBUILD_TESTING=OFF",
             )
         )
@@ -454,19 +396,22 @@ def _current_activation_preparer() -> Path:
     return ACTIVATION_PREPARER
 
 
-def build_native() -> None:
-    """The native build step; serve only checks its artifacts."""
+def build_native(*, frontend: bool = False) -> None:
+    """The native build step; serve only checks its artifacts. With
+    ``frontend`` it also builds the GUI that operator mode serves."""
 
     started = time.monotonic()
-    _ensure_current_backend()
     _ensure_current_ros_backend()
+    _current_backend()
+    _current_core_bindings()
     _ensure_activation_preparer()
-    _ensure_core_bindings()
     # Bytecode for the served Python packages, compiled by the same
     # interpreter the services use: a cold first start then reaches
     # readiness within its bounded reconciliation wait.
     _run((sys.executable, "-m", "compileall", "-q", "-j", "0",
           *(str(WORKSPACE / package) for package in SERVED_PYTHON_PACKAGES)))
+    if frontend:
+        _ensure_frontend_build()
     NATIVE_BUILD_TIMING.write_text(
         _json({"build_elapsed_seconds": time.monotonic() - started}) + "\n", encoding="utf-8"
     )
@@ -664,6 +609,32 @@ def _ensure_frontend_dependencies() -> None:
         return
     _run(("npm", "ci"), cwd=FRONTEND_ROOT)
     marker.write_text(digest + "\n", encoding="utf-8")
+
+
+def _frontend_source_hash() -> str:
+    completed = subprocess.run(
+        (sys.executable, str(WORKSPACE / "scripts/lib/frontend_hash.py"), "source", str(FRONTEND_ROOT)),
+        env={**os.environ, "MANYFORGE_FRONTEND_SOURCE_MODE": "worktree"},
+        capture_output=True, text=True, check=False,
+    )
+    if completed.returncode != 0:
+        raise WorkbenchError(f"frontend source hash failed: {completed.stderr.strip()}")
+    return json.loads(completed.stdout)["MANYFORGE_FRONTEND_SOURCE_HASH"]
+
+
+def _ensure_frontend_build() -> None:
+    """Build the mounted frontend source into dist unless dist is current."""
+
+    _ensure_frontend_dependencies()
+    source_hash = _frontend_source_hash()
+    if (
+        (FRONTEND_DIST / "index.html").is_file()
+        and FRONTEND_DIST_SOURCE_HASH.is_file()
+        and FRONTEND_DIST_SOURCE_HASH.read_text(encoding="utf-8").strip() == source_hash
+    ):
+        return
+    _run(("npm", "run", "build"), cwd=FRONTEND_ROOT)
+    FRONTEND_DIST_SOURCE_HASH.write_text(source_hash + "\n", encoding="utf-8")
 
 
 def _port_available(port: int) -> bool:
@@ -888,8 +859,9 @@ class Workbench:
             if package_aggregate_sha256(self.operator_install_root) != self.package_aggregate_digest:
                 raise WorkbenchError("qualified operator package aggregate mismatch")
             _regular_file(self.operator_install_root / self.operator_admission, "qualified operator admission")
-            if self.composer_static_dir is not None:
-                _regular_file(self.composer_static_dir / "index.html", "built Composer frontend")
+            # The build step built FRONTEND_DIST unless a static dir is given.
+            _regular_file((self.composer_static_dir or FRONTEND_DIST) / "index.html",
+                          "built Composer frontend")
         ros_capture: dict[str, Any] | None = None
         if self.ros2_control and not operator_mode:
             intended_project = self.bootstrap_project_path or self.project_path
@@ -1182,8 +1154,7 @@ class Workbench:
                             "scenario_id": self.scenario_id,
                             "project_path": self.project_path,
                             "classification": (
-                                "development workbench; repository source; "
-                                "simulated execution only"
+                                "development workbench; repository source"
                             ),
                         }
                     ),
@@ -1309,7 +1280,9 @@ class Workbench:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="dev-workbench.py")
     subcommands = parser.add_subparsers(dest="command", required=True)
-    subcommands.add_parser("build", help="build the native artifacts serve requires")
+    build = subcommands.add_parser("build", help="build the native artifacts serve requires")
+    build.add_argument("--frontend", action="store_true",
+                       help="also build the frontend Composer serves in operator mode")
     for name in ("serve", "status"):
         command = subcommands.add_parser(name)
         projects = command.add_mutually_exclusive_group()
@@ -1342,7 +1315,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
         if args.command == "build":
-            build_native()
+            build_native(frontend=args.frontend)
             return 0
         if args.command == "status" and args.operator_runtime:
             result = query_operator_status(headless_port=args.headless_port,

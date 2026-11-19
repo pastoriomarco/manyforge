@@ -28,6 +28,14 @@ host-only results are not qualification evidence. Detailed commands, lane
 selection and checkpoint requirements belong in the development workflow
 linked from AGENTS.md.
 
+Keep two public documents current with your change. `THIRD_PARTY_NOTICES.md`
+(and `NOTICE`) must match what the published ROS image redistributes: when you
+add, remove or re-pin anything `Dockerfile.ros-lyrical-full` installs, update
+them, quoting each licence as its owner declares it. The README overview cards
+must stay accurate: when a change affects what they state, edit
+`docs/media/src/overview_cards.py`, run `docs/media/src/render.sh` (needs
+Firefox) and commit the regenerated SVGs and PNGs.
+
 Behavior changes need focused regression coverage. Report checks that were
 not run and why. Review substantial changes before submission, resolve findings
 or document their disposition, and meet applicable CI requirements before merge.
@@ -57,6 +65,14 @@ GitHub Actions runs in two tiers. Superseded runs on the same ref are cancelled.
   `nightly-dev-changed`, and skips its jobs unless `dev` was pushed after that
   workflow's previous scheduled run started. A failure is therefore reported
   once, not every night. Manual, tag, push and pull-request runs always run.
+- **ROS tier**, nightly on `dev` and on demand: `ros-integration` runs the
+  ROS integration and ros2_control Mock-lane suites (`test-all.sh ros` and
+  `ros-e2e`) in the reference ROS image published for the commit's image
+  inputs; it never builds that image. `ros-image` builds and publishes that
+  image, `ghcr.io/pastoriomarco/manyforge-ros`, for amd64 and arm64. It is
+  started by hand (`gh workflow run ros-image.yml --ref <ref>`); a run whose
+  image inputs are already published builds nothing, and a run on a `v*` tag
+  also tags the image with the release version.
 - **`local-ci`** runs every lane, including the ROS integration and e2e
   suites, in the development containers on a self-hosted runner labelled
   `manyforge-local`. It starts on release tags and on demand only, never on
@@ -94,12 +110,17 @@ without explicit authorization.
 3. Check the companion pins: the xArm driver fork commit
    (`XARM_SOURCE_COMMIT` in `Dockerfile.ros-lyrical-full`, the same commit in
    `manyforge_xarm_control/vendor/driver.yaml`) is on the fork's
-   `lyrical-no-gazebo` branch. For `v0.3.0`:
+   `lyrical-no-gazebo` branch. For `v0.3.1`:
    `3654c9afef9c51c3bd6723d65ccecca166bc38b0`.
 4. Run the applicable gates, squash-merge `dev` into `main` and tag
-   `vX.Y.Z` (for this release `v0.3.0`; `v0.2.1` is `main` at `34bb5f4a`,
-   `v0.2.0` is `main` at `3cc3e5d5`, `v0.1.0` is `main` at `8ae05265`).
-5. Tag the maintainer's private specification repository with the same `vX.Y.Z`
+   `vX.Y.Z` (for this release `v0.3.1`; `v0.3.0` is `main` at `3fc751bc`,
+   `v0.2.1` is `main` at `34bb5f4a`, `v0.2.0` is `main` at `3cc3e5d5`,
+   `v0.1.0` is `main` at `8ae05265`).
+5. Publish the reference ROS image for the release: run the `ros-image`
+   workflow on the tag (`gh workflow run ros-image.yml --ref vX.Y.Z`). It
+   publishes `ghcr.io/pastoriomarco/manyforge-ros:<VERSION>`, the image
+   `./scripts/compose-dev.sh pull` fetches.
+6. Tag the maintainer's private specification repository with the same `vX.Y.Z`
    at the commit that matches the release.
 
 ## Reporting issues

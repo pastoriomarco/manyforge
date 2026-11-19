@@ -1,7 +1,7 @@
 # ManyForge roadmap
 
-> **Status (2026-11-02):** `v0.1.0` is tagged on the old `main` (`8ae05265`).
-> `0.2.0` is in validation: component model v2, every lane on ROS 2 Lyrical
+> **Status (2026-11-19):** the current release line is `0.3.x`
+> ([VERSION](VERSION)): component model v2, every lane on ROS 2 Lyrical
 > with `ros2_control` and the stock joint trajectory controller (Mock, Isaac
 > Sim attach-only, Real for UFACTORY xArm-family robots), and RoboPlan 0.8
 > planning. See [CHANGELOG.md](CHANGELOG.md). Physical execution is not

@@ -105,8 +105,8 @@ of three forms:
 | A specific TCP | One TCP entry, for example `gripper · cup_edge` or the robot's flange. |
 
 A move with the second or third form also makes that TCP the robot's Active
-TCP, so later **Current** moves use it. **Use current robot pose** captures
-the pose of the move's TCP. Planning nodes use their own selector and do not
+TCP, so later **Current** moves use it. The goal's **Robot pose** button
+captures the pose of the move's TCP. Planning nodes use their own selector and do not
 change the Active TCP.
 
 **Set TCP** (Motion) sets a robot's Active TCP without moving, from the

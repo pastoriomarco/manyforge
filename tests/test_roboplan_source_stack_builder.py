@@ -37,10 +37,13 @@ def test_native_and_ros_images_use_the_checked_manyforge_builder() -> None:
         assert "COPY scripts/ci/build-roboplan-source-stack.sh" in source
         assert "COPY scripts/ci/build-roboplan-source-closure.sh" in source
         assert "COPY scripts/ci/verify-external-source-closure.py" in source
-        assert "COPY .docker/proxsuite/ /tmp/proxsuite/" in source
-        assert "COPY .docker/jrl-cmakemodules/ /tmp/jrl-cmakemodules/" in source
-        assert "COPY .docker/toppra/ /tmp/toppra/" in source
-        assert "COPY .docker/nanoflann/ /tmp/nanoflann/" in source
+        for tree in ("roboplan", "proxsuite", "jrl-cmakemodules", "toppra", "nanoflann"):
+            if dockerfile.name == "Dockerfile.ros-lyrical-full":
+                # Build-only mounts: the source trees never land in a layer.
+                assert f"--mount=type=bind,source=.docker/{tree},target=/tmp/{tree},rw" in source
+                assert f"COPY .docker/{tree}/" not in source
+            else:
+                assert f"COPY .docker/{tree}/ /tmp/{tree}/" in source
         assert "-DFETCHCONTENT_SOURCE_DIR_NANOFLANN=/tmp/nanoflann" in source
         assert (
             "COPY third_party/external_delta_ledger.v1.json"

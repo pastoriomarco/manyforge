@@ -10,6 +10,7 @@ import threading
 from typing import Any, TYPE_CHECKING
 import uuid
 
+import anyio
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
@@ -337,10 +338,14 @@ def create_pointcloud_router(
         except WebSocketDisconnect:
             pass
         finally:
-            await service.detach(client_id)
-            for task in (send_task, receive_task):
-                task.cancel()
-            await asyncio.gather(send_task, receive_task, return_exceptions=True)
+            # Cleanup must finish even when the handler is cancelled: an
+            # unshielded await here could skip detach (stale demand) and turns
+            # the canceller's CancelledError into gather's own.
+            with anyio.CancelScope(shield=True):
+                await service.detach(client_id)
+                for task in (send_task, receive_task):
+                    task.cancel()
+                await asyncio.gather(send_task, receive_task, return_exceptions=True)
 
     return router
 

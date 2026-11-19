@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <utility>
+#include <pthread.h>
 
 namespace manyforge::core {
 
@@ -519,6 +520,7 @@ void ParallelCollisionValidationWorkerPool::release_abandoned_worker_threads() {
 
 void ParallelCollisionValidationWorkerPool::worker_loop(
     std::shared_ptr<WorkerSlot> slot) {
+  static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_coll_valid"));
   for (;;) {
     std::function<void()> job;
     {

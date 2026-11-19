@@ -43,6 +43,7 @@
 #include <thread>
 #include <type_traits>
 #include <unordered_map>
+#include <pthread.h>
 
 namespace manyforge::core {
 namespace {
@@ -5166,6 +5167,7 @@ Result<void> ExecutionKernel::launch_motion_replacement_preparation(
     const std::shared_ptr<PreparedMotionSession>& session) {
   try {
     replacement_preparation_thread_ = std::jthread([this, session](std::stop_token token) {
+      static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_replace_prep"));
       ExecutionWorkerScope worker_scope(this);
       std::stop_callback cancellation(token,
                                       [&]() { session->replacement_cancellation.request_stop(); });
@@ -6760,6 +6762,7 @@ Result<uint64_t> ExecutionKernel::execute_impl(
        retained_scene = std::move(retained_scene),
        prepared_session = std::move(prepared_session),
        worker_start_gate](std::stop_token st) mutable {
+        static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_exec_worker"));
         ExecutionWorkerScope worker_scope(this);
         MotionWorkerScope motion_worker_scope(this);
         if (!worker_start_gate->wait(st)) {

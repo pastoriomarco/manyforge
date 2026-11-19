@@ -97,6 +97,7 @@ def test_help_needs_no_ros_or_build_inputs(build_fixture: dict[str, str]) -> Non
 
 @pytest.mark.parametrize("args,setting", [
     (("--target", "bad;target"), {}), (("--source-dir",), {}), (("--unknown",), {}),
+    (("--cmake-arg", "BUILD_TESTING=ON"), {}), (("--cmake-arg", "-Dbad;name=1"), {}),
     ((), {"CMAKE_BUILD_PARALLEL_LEVEL": "0"}),
     ((), {"MANYFORGE_ROS2_CONTROL_BUILD_TYPE": "unknown"}),
     ((), {"MANYFORGE_ROS2_CONTROL_BUILD_TESTING": "yes"}),
@@ -124,11 +125,15 @@ def test_default_targets_and_single_graph(build_fixture: dict[str, str]) -> None
 def test_aggregate_and_explicit_data_install(build_fixture: dict[str, str]) -> None:
     source = build_fixture["WORKSPACE"] + "/aggregate"
     result = run(build_fixture, "--topic-install", build_fixture["TOPIC_PREFIX"],
-                 "--source-dir", source, "--target", "all", "--data-overlay", build_fixture["DATA_ROOT"])
+                 "--source-dir", source, "--target", "all", "--data-overlay", build_fixture["DATA_ROOT"],
+                 "--cmake-arg", "-DMANYFORGE_BUILD_PYTHON_MODULES=ON",
+                 "--cmake-arg", "-Dpybind11_DIR=/pybind 11/cmake")
     assert result.returncode == 0, result.stderr
     commands = calls(build_fixture)
     configured = next(call for call in commands if call["tool"] == "cmake" and call["args"][0] == "-S")
     assert configured["args"][1] == source and "-DBUILD_TESTING=ON" in configured["args"]
+    assert configured["args"][-2:] == [
+        "-DMANYFORGE_BUILD_PYTHON_MODULES=ON", "-Dpybind11_DIR=/pybind 11/cmake"]
     built = next(call["args"] for call in commands if call["tool"] == "cmake" and call["args"][0] == "--build")
     assert built[built.index("--target") + 1:built.index("--parallel")] == ["all"]
     assert ["pkg", "prefix", "xarm_description"] in [call["args"] for call in commands]
@@ -189,7 +194,8 @@ def test_graph_library_types_survive_identical_reconfigure(
     targets = []
     # The graph adds these packages; RoboPlan adds the adapter packages itself.
     for package in ("manyforge_core", "manyforge_deployment",
-                    "manyforge_ros2_control_execution", "manyforge_roboplan"):
+                    "manyforge_ros2_control_execution", "manyforge_roboplan",
+                    "manyforge_headless"):
         directory = source / package
         directory.mkdir()
         (directory / "source.cpp").write_text("int main() { return 0; }\n")

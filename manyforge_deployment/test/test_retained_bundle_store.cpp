@@ -2,6 +2,7 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <sys/inotify.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -18,6 +19,7 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <memory>
 #include <optional>
@@ -29,6 +31,7 @@
 #include <thread>
 #include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
 #include <manyforge_deployment/artifact_codec.hpp>
@@ -1225,6 +1228,41 @@ void wait_until_settled(const std::filesystem::path& root) {
   }
 }
 
+/// Reports whether a file's bytes were read while it was watched: a memo hit
+/// only re-stats the files a verification read, a full verification reads
+/// them.
+class FileReadWatch final {
+ public:
+  explicit FileReadWatch(const std::filesystem::path& path)
+      : descriptor_(::inotify_init1(IN_NONBLOCK | IN_CLOEXEC)) {
+    if (descriptor_ < 0 ||
+        ::inotify_add_watch(descriptor_, path.c_str(), IN_ACCESS) < 0) {
+      throw std::logic_error("test could not watch file reads");
+    }
+  }
+  ~FileReadWatch() { ::close(descriptor_); }
+  FileReadWatch(const FileReadWatch&) = delete;
+  FileReadWatch& operator=(const FileReadWatch&) = delete;
+
+  [[nodiscard]] bool read() const {
+    alignas(inotify_event) char buffer[4096];
+    bool accessed = false;
+    ssize_t count = 0;
+    while ((count = ::read(descriptor_, buffer, sizeof(buffer))) > 0) {
+      for (ssize_t offset = 0; offset < count;) {
+        const auto* event =
+            reinterpret_cast<const inotify_event*>(buffer + offset);
+        accessed = accessed || (event->mask & IN_ACCESS) != 0U;
+        offset += static_cast<ssize_t>(sizeof(inotify_event) + event->len);
+      }
+    }
+    return accessed;
+  }
+
+ private:
+  int descriptor_;
+};
+
 TEST(VerifiedReadMemoTest,
      ReusesOnlySettledUnchangedNonEmptyResultsAndPropagatesNestedReads) {
   namespace posix = detail::posix_durability;
@@ -1493,6 +1531,106 @@ TEST(FilesystemVerifiedRetainedProductArtifactSourceTest,
   const FilesystemVerifiedRetainedProductArtifactSource reopened(root.path());
   EXPECT_THROW(static_cast<void>(reopened.get_verified(query)),
                RetainedBundleError);
+}
+
+TEST(FilesystemVerifiedRetainedProductArtifactSourceTest,
+     ControlArtifactIsReusedUntilAnyFileItsVerificationReadChanges) {
+  ScopedTrustedRoot root;
+  const auto materialized =
+      materialize_durable_controllable_lite6_bundle(root.path());
+  const auto& value = materialized.bundle->value();
+  ASSERT_EQ(value.compiled_products.control_domain_products.size(), 1U);
+  ASSERT_EQ(value.compiled_products.control_domain_products.front()
+                .products.size(),
+            1U);
+  const auto& control =
+      value.compiled_products.control_domain_products.front().products.front();
+  ASSERT_EQ(control.artifact_refs.size(), 1U);
+  ASSERT_EQ(value.compiled_products.symbol_role_maps.size(), 1U);
+  ASSERT_EQ(value.compiled_products.symbol_role_maps.front()
+                .artifact_refs.size(),
+            1U);
+  ASSERT_FALSE(value.catalogs.records.empty());
+  const RetainedProductArtifactQuery query{
+      materialized.bundle->retained_bundle_id(), control.product_id,
+      control.product_kind, control.artifact_refs.front().artifact_role_id};
+  const auto control_file = raw_path(root.path(), control.artifact_refs.front());
+  const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
+
+  // Every full verification reads the control artifact's bytes; a reuse
+  // only re-stats it.
+  const auto get = [&](std::optional<VerifiedRetainedProductArtifact>& out) {
+    const FileReadWatch watch(control_file);
+    out = source.get_verified(query);
+    return watch.read();
+  };
+  std::optional<VerifiedRetainedProductArtifact> first;
+  ASSERT_TRUE(get(first));
+  ASSERT_TRUE(first.has_value());
+  const auto expect_same = [&](
+      const std::optional<VerifiedRetainedProductArtifact>& other) {
+    ASSERT_TRUE(other.has_value());
+    EXPECT_EQ(other->query(), first->query());
+    EXPECT_EQ(other->product_contract_id(), first->product_contract_id());
+    EXPECT_EQ(other->product_contract_revision(),
+              first->product_contract_revision());
+    EXPECT_EQ(other->artifact_ref(), first->artifact_ref());
+    EXPECT_EQ(other->bytes(), first->bytes());
+  };
+
+  // One file of each kind the verification reads: the bundle entry, the
+  // control artifact, a catalog record and the model-map artifact.
+  const std::vector<std::filesystem::path> inputs{
+      bundle_path(root.path(), materialized.bundle->retained_bundle_id()),
+      control_file,
+      catalog_path(root.path(),
+                   std::visit(
+                       [](const auto& record) {
+                         return record.content_addressed_store_key;
+                       },
+                       value.catalogs.records.front())),
+      raw_path(root.path(), value.compiled_products.symbol_role_maps.front()
+                                .artifact_refs.front()),
+  };
+  for (const auto& file : inputs) {
+    SCOPED_TRACE(file.string());
+    // A settled, unchanged closure is reused without reading its files.
+    wait_until_settled(root.path());
+    std::optional<VerifiedRetainedProductArtifact> verified;
+    EXPECT_TRUE(get(verified));
+    expect_same(verified);
+    std::optional<VerifiedRetainedProductArtifact> reused;
+    EXPECT_FALSE(get(reused));
+    expect_same(reused);
+
+    // A replaced version of this one file, even with identical bytes, is
+    // verified in full again.
+    std::ifstream stream(file, std::ios::binary);
+    const std::string original{std::istreambuf_iterator<char>(stream),
+                               std::istreambuf_iterator<char>()};
+    stream.close();
+    ASSERT_FALSE(original.empty());
+    const auto replacement = file.string() + ".replacement";
+    write_file(replacement, original);
+    std::filesystem::rename(replacement, file);
+    std::optional<VerifiedRetainedProductArtifact> reverified;
+    EXPECT_TRUE(get(reverified));
+    expect_same(reverified);
+
+    // An in-place rewrite to other bytes fails closed exactly as an
+    // uncached read does, and the failure is not remembered.
+    std::filesystem::permissions(file, std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::add);
+    write_file(file, file == inputs.front()
+                         ? std::string("{}")
+                         : std::string(original.size(), 'x'));
+    EXPECT_THROW(static_cast<void>(source.get_verified(query)),
+                 RetainedBundleError);
+    write_file(file, original);
+    std::optional<VerifiedRetainedProductArtifact> restored;
+    EXPECT_TRUE(get(restored));
+    expect_same(restored);
+  }
 }
 
 TEST(FilesystemVerifiedRetainedModelMapSourceTest,

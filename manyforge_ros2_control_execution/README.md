@@ -18,7 +18,7 @@ it owns no planning, Stop policy, lifecycle action or recovery.
 | `ros2_control_capability` | Backend configuration and the pure capability evaluation for ros2_control components (no ROS runtime dependency). |
 | `Ros2TransportResources` | The ROS node and executor shared by the arm and gripper backends of the host. |
 | `SelectedRosEndpointFacts` | Counts the publishers of each lane-owned, exclusive ROS topic: an action needs exactly one (0 not established, 2+ `duplicate_component_instance`). |
-| `VolatileMotionTrace` | A diagnostic in-memory trace of motion commands and feedback, capped at 3 MiB. |
+| `VolatileMotionTrace` | A diagnostic in-memory trace of motion commands and feedback: the last 16 goals and the last 2,340 controller samples (about 15 s at 150 Hz for one arm, about 8 s for two); exports are capped at 5 MiB. |
 | Scene projection worker | Pushes observed arm and gripper states to the Scene off the controller path. |
 | `lane/` | The Mock lane folder (`driver.yaml`, `manyforge_settings.yaml`, [`README.md`](lane/README.md)): stock `mock_components/GenericSystem` hardware. |
 

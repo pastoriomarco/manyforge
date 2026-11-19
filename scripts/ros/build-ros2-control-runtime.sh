@@ -20,12 +20,14 @@ TOPIC_INSTALL=/opt/manyforge/topic_based_ros2_control/install
 DATA_OVERLAY=
 BUILD_TARGETS=(manyforge_ros2_control_execution_host manyforge_roboplan_candidate_worker)
 targets_selected=false
+CMAKE_EXTRA_ARGS=()
 
 usage() {
     cat <<'EOF'
 Usage: build-ros2-control-runtime.sh [OPTIONS]
   --source-dir DIR     CMake entrypoint (default: WORKSPACE/manyforge_roboplan)
   --target TARGET      Build target; repeat for several (default: host + worker)
+  --cmake-arg ENTRY    Extra configure cache entry -DNAME=VALUE; repeat for several
   --topic-install DIR  Pinned stock PickNik install (default: image install)
   --data-overlay DIR   Verified isolated data install root containing xarm_description
   --help              Show this help without sourcing ROS or configuring
@@ -38,7 +40,7 @@ EOF
 while (( $# )); do
     case "$1" in
         --help) usage; exit 0 ;;
-        --source-dir|--target|--topic-install|--data-overlay)
+        --source-dir|--target|--cmake-arg|--topic-install|--data-overlay)
             if (( $# < 2 )) || [[ -z "$2" || "$2" == --* ]]; then
                 printf 'Missing value for %s\n' "$1" >&2
                 exit 2
@@ -47,6 +49,13 @@ while (( $# )); do
                 --source-dir) CMAKE_SOURCE=$2 ;;
                 --topic-install) TOPIC_INSTALL=$2 ;;
                 --data-overlay) DATA_OVERLAY=$2 ;;
+                --cmake-arg)
+                    if [[ ! "$2" =~ ^-D[A-Za-z_][A-Za-z0-9_]*(:[A-Z]+)?= ]]; then
+                        printf 'Invalid CMake cache entry: %s\n' "$2" >&2
+                        exit 2
+                    fi
+                    CMAKE_EXTRA_ARGS+=("$2")
+                    ;;
                 --target)
                     if [[ ! "$2" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.+-]*$ ]]; then
                         printf 'Invalid build target: %s\n' "$2" >&2
@@ -157,7 +166,8 @@ fi
 cmake -S "${CMAKE_SOURCE}" -B "${ROBOPLAN_BUILD}" "${CMAKE_GENERATOR_ARGS[@]}" \
     -DCMAKE_BUILD_TYPE="${MANYFORGE_ROS2_CONTROL_BUILD_TYPE:-Release}" \
     -DBUILD_TESTING="${MANYFORGE_ROS2_CONTROL_BUILD_TESTING:-OFF}" \
-    -DMANYFORGE_BUILD_ROS2_CONTROL_RUNTIME=ON
+    -DMANYFORGE_BUILD_ROS2_CONTROL_RUNTIME=ON \
+    "${CMAKE_EXTRA_ARGS[@]}"
 BUILD_KEEP_GOING_ARGS=()
 if [[ "${MANYFORGE_ROS2_CONTROL_BUILD_KEEP_GOING:-OFF}" == ON ]]; then
     configured_generator=$(sed -n 's/^CMAKE_GENERATOR:INTERNAL=//p' "${ROBOPLAN_BUILD}/CMakeCache.txt")

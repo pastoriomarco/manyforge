@@ -141,9 +141,9 @@ periods it overran are skipped, not caught up. The first late check of a run
 of late checks writes one `manyforge_fault code=runtime_collision_checks_late`
 line to the log. `GET /api/execution/diagnostics` (MCP `manyforge_kernel`,
 action `diagnostics`) shows the counts per robot in
-`status.runtime_collision_checks`: `checks_run`, `checks_late`,
-`periods_skipped` and `check_period_ns`, keyed by
-`controllable_component_id`. They are totals since the robot's motion
+`status.runtime_collision_checks`, one row per robot: its
+`controllable_component_id`, `checks_run`, `checks_late`, `periods_skipped`
+and `check_period_ns`. They are totals since the robot's motion
 runtime in the execution host was last built.
 
 ### Program tick timing

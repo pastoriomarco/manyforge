@@ -2935,6 +2935,7 @@ class ResourceAddressedExecutionKernel::JournalWriter final {
   void ReportUndrained() noexcept { ReportShutdown(); }
 
   void Run(const std::stop_token stop_token) noexcept {
+    static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_journal"));
     // Never inherit a real-time class from the constructing thread.
     const sched_param ordinary{};
     static_cast<void>(pthread_setschedparam(pthread_self(), SCHED_OTHER, &ordinary));

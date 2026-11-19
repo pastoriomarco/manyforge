@@ -146,8 +146,8 @@ services:
       dockerfile: Dockerfile.ros-lyrical-full
       args:
         ROBOPLAN_SOURCE_MODE: ${ROBOPLAN_SOURCE_MODE:-qualified}
-        # ROS base: apt (NVIDIA Isaac ROS mirror plus overlays, default) or
-        # source (ROS Lyrical built from source).
+        # ROS base: source (ROS Lyrical built from source, default) or apt
+        # (NVIDIA Isaac ROS mirror plus overlays).
         ROS_BASE: ${MANYFORGE_ROS_BASE:-source}
         # apt base only: noble on x86_64, noble-jetpack on Jetson (compose-dev.sh build selects it).
         NVIDIA_ISAAC_ROS_RELEASE_SUITE: ${NVIDIA_ISAAC_ROS_RELEASE_SUITE:-noble}

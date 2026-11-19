@@ -54,7 +54,7 @@ when any of them exits:
 | Manager | `manyforge_manager_daemon` | (local sockets) | The application's one supervisor: mints the application start identity, starts and stops the other processes and the execution host; Apply journal and convergence |
 | Execution host | `manyforge_ros2_control_execution_host` (started by the Manager) | — | Kernel, planner, collision, component adapters and their processes (`ros2_control.launch.py`, drivers, bridges, the AI assistant's host and bridge) |
 | Composer backend | `python -m manyforge_composer` (started by the Manager) | 9020 | GUI/REST/MCP shell: Drafts, Scenario files, Apply/Load/New orchestration, proxies to the Headless API |
-| Composer frontend | Vite (`npm run dev`) | 3000 | Browser GUI |
+| Composer frontend | Vite (started by `scripts/dev-workbench.py`) | 3000 | Browser GUI |
 
 The execution host also runs the candidate planner as a separate worker
 process (`manyforge_roboplan_candidate_worker`). Isaac Sim runs outside the
@@ -552,8 +552,8 @@ member action is refused (`owner_not_prepared`) while the owner isn't
 prepared. The owner has `prepare`, `recover` and its capabilities, no Enable.
 Controller faults are the owner's, with the members they concern. Members can
 be deactivated (`active: false`) but are never removed. On the real xArm,
-Prepare and Recover connect and clear errors with the motors off; the motors
-switch on only at the arm's Enable.
+Prepare connects and Recover also clears the controller's errors, both with
+the motors off; the motors switch on only at the arm's Enable.
 
 ### Adapters and the registry
 

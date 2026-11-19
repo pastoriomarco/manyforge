@@ -20,12 +20,6 @@ set(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME ON)
 
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_core" core)
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_deployment" deployment)
-option(MANYFORGE_BUILD_CORE_PYTHON_BINDINGS
-  "Register the existing Core Python module against this graph's targets" OFF)
-if(MANYFORGE_BUILD_CORE_PYTHON_BINDINGS)
-  add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_core/python"
-    core-python EXCLUDE_FROM_ALL)
-endif()
 add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_ros2_control_execution" adapter)
 # RoboPlan builds the execution host and, against its adapter runtime, the
 # adapter families (Mock, simulation_interfaces, xArm, Isaac) with their
@@ -49,6 +43,24 @@ endforeach()
 
 # The projection fixture keeps its own directory because its output basename
 # is the production host name. Never overwrite the production host here.
+
+# The Manager and, on request, the Headless and Core Python modules on this
+# graph's targets: the development workbench's whole native closure in one
+# tree. Built only when named. Headless keeps its package tests in its own
+# standalone tree.
+option(MANYFORGE_BUILD_PYTHON_MODULES
+  "Register the Headless and Core Python modules against this graph's targets" OFF)
+set(MANYFORGE_HEADLESS_BUILD_PYTHON ${MANYFORGE_BUILD_PYTHON_MODULES})
+set(_MANYFORGE_INTEGRATION_BUILD_TESTING "${BUILD_TESTING}")
+set(BUILD_TESTING OFF)
+add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_headless"
+  headless EXCLUDE_FROM_ALL)
+set(BUILD_TESTING "${_MANYFORGE_INTEGRATION_BUILD_TESTING}")
+unset(_MANYFORGE_INTEGRATION_BUILD_TESTING)
+if(MANYFORGE_BUILD_PYTHON_MODULES)
+  add_subdirectory("${MANYFORGE_INTEGRATION_SOURCE_DIR}/manyforge_core/python"
+    core-python EXCLUDE_FROM_ALL)
+endif()
 
 # Report-only ROS hot-path measurement, invoked explicitly after cutover.
 # EXCLUDE_FROM_ALL keeps measurement out of ordinary builds and tests.

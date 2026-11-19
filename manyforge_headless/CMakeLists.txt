@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_headless VERSION 0.3.0 LANGUAGES CXX)
+project(manyforge_headless VERSION 0.3.1 LANGUAGES CXX)
 
 cmake_policy(SET CMP0077 NEW)
 
@@ -219,7 +219,10 @@ target_link_libraries(manyforge_manager_daemon PRIVATE
   # The one writer of the Manager's store files.
   manyforge::persistence
   # Apply acceptance recompiles the stored prepared Program outcome.
-  manyforge::deployment)
+  manyforge::deployment
+  # The Manager owns the logical Scene and encodes its snapshots.
+  manyforge::scene
+  manyforge::scene_value_codec)
 
 option(BUILD_TESTING "Build unit tests" ON)
 set(

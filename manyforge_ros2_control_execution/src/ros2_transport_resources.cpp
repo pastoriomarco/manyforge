@@ -20,6 +20,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <pthread.h>
 #include <exception>
 #include <stdexcept>
 #include <utility>
@@ -368,6 +369,7 @@ bool Ros2TransportResources::on_time_critical_thread() {
 }
 
 void Ros2TransportResources::run_time_critical_thread() noexcept {
+  static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_comp_tc"));
   {
     std::lock_guard<std::mutex> lock(dispatch_mutex_);
     time_critical_thread_id_ = std::this_thread::get_id();
@@ -475,6 +477,7 @@ void Ros2TransportResources::start() {
       throw core::TypedError("component_not_ready", "ROS transport is closing",
                              {{"reason", "owner_closing"}});
     spin_thread_ = std::thread([this]() {
+    static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_comp_owner"));
     {
       std::lock_guard<std::mutex> lock(dispatch_mutex_);
       owner_thread_id_ = std::this_thread::get_id();

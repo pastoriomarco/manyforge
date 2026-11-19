@@ -17,7 +17,7 @@ from manyforge_headless_api.execution import ExecutionCommandClient, EXECUTION_S
 from manyforge_headless_api.native import HeadlessApiError
 
 
-_MAX_BYTES = 3 * 1024 * 1024
+_MAX_BYTES = 5 * 1024 * 1024
 
 
 def _normal_trace():

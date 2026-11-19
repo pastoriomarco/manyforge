@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <pthread.h>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -1144,6 +1145,7 @@ private:
       inserted->second.worker = JoinedWorker{std::thread(
           [job, projection, request, binding,
            snapshot_changed = snapshot_changed_, progress = std::move(progress)]() {
+            static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_proj_rebuild"));
             try {
               progress->Advance("collision_world_construction");
               const auto before = projection->logical_snapshot();

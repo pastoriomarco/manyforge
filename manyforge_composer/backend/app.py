@@ -729,11 +729,9 @@ def _find_static_dir(explicit: str | None) -> Path | None:
             return candidate
         return None
 
-    candidates = (
-        Path(__file__).parent.parent / "frontend" / "dist",
-        Path("/opt/manyforge-frontend/dist"),
-    )
-    for candidate in candidates:
-        if candidate.is_dir() and (candidate / "index.html").exists():
-            return candidate
+    # The frontend built from this source tree (the workbench build step or
+    # `npm run build`); without one Composer serves its API only.
+    candidate = Path(__file__).parent.parent / "frontend" / "dist"
+    if candidate.is_dir() and (candidate / "index.html").exists():
+        return candidate
     return None

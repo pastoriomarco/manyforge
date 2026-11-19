@@ -13,6 +13,7 @@
 #include <stdexcept>
 #include <string_view>
 #if defined(MANYFORGE_ENABLE_NATIVE_PROJECTION_CONSTRUCTION_TEST_BOUNDARY)
+#include <pthread.h>
 #include <thread>
 #endif
 #include <type_traits>
@@ -169,6 +170,7 @@ RetainedPlannerSceneProjection::~RetainedPlannerSceneProjection() {
 }
 
 void RetainedPlannerSceneProjection::RunCollisionWorldBuilds() {
+  static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_scene_build"));
   std::uint64_t seen = 0U;
   for (;;) {
     build_wake_.wait(seen, std::memory_order_acquire);

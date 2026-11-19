@@ -1789,8 +1789,20 @@ class ProgramRuntime:
                 self._accepted_reset_context(journal, cycle, pending_commands))
 
     def cycle_status(self) -> dict[str, Any]:
+        return self.add_reset_robot_position(self.cycle_projection())
+
+    def add_reset_robot_position(self, cycle: dict[str, Any]) -> dict[str, Any]:
+        """Complete a ``cycle_projection()`` with the host's Reset-position
+        availability (one execution-host round trip)."""
+
+        cycle["reset_robot_position"] = self._reset_robot_position_availability()
+        return cycle
+
+    def cycle_projection(self) -> dict[str, Any]:
+        """The complete ``cycle_status()`` except ``reset_robot_position``,
+        which keeps the private unsampled value: no execution-host read."""
+
         result = self._cycle_status_core()
-        result["reset_robot_position"] = self._reset_robot_position_availability()
         program_run_id = result["program_run_id"]
         controls = (
             None if program_run_id is None else self._optional_controls(program_run_id)
@@ -3907,7 +3919,7 @@ class ProgramRuntime:
 
         request = {
             "schema_version": RUN_READINESS_REQUEST_SCHEMA,
-            "program_cycle": run_cycle_facts(self.cycle_status()),
+            "program_cycle": run_cycle_facts(self.cycle_projection()),
         }
         try:
             readiness = self._headless.request(

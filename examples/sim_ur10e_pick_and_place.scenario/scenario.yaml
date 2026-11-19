@@ -13,7 +13,7 @@
   "saved_status": {
     "checked_content_digest": "sha256:2adfea97bab49ba1a20040f3fbf0ad068d67f78bb37dec1b0108619530dcdfb8",
     "last_known_status": "unknown",
-    "manyforge_version": "0.3.0"
+    "manyforge_version": "0.3.1"
   },
   "scenario_id": "sim_ur10e_pick_and_place",
   "source_snapshot": {

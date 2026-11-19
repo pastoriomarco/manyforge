@@ -645,7 +645,7 @@ node rule on Move until signal / Probe search.
 Each robot has an ordered chain of qualified Stop stages, shown in the GUI
 as:
 
-1. Controlled stop (including spring-back);
+1. Controlled stop (incl. spring-back);
 1. Controller goal cancel;
 1. Software hard stop.
 

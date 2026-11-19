@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <limits>
+#include <span>
 #include <manyforge_core/types/operation_member_id_json.hpp>
 #include <manyforge_ros2_control_execution/volatile_motion_trace.hpp>
 
@@ -20,7 +21,7 @@ V count(std::uint64_t n) {
   return n <= 9007199254740991ULL ? V(static_cast<double>(n))
                                   : V(std::to_string(n));
 }
-V numbers(const std::vector<double> &input) {
+V numbers(std::span<const double> input) {
   V::Array out;
   out.reserve(input.size());
   for (double value : input)
@@ -301,86 +302,113 @@ void VolatileMotionTrace::Observe(
     ++failures_;
   }
 }
+void VolatileMotionTrace::ActionName::assign(std::string_view text) noexcept {
+  std::copy(text.begin(), text.end(), chars.begin());
+  size = static_cast<std::uint8_t>(text.size());
+}
+std::size_t VolatileMotionTrace::ActionIndex(std::string_view action) noexcept {
+  std::size_t free = kActionSlots;
+  for (std::size_t i = 0; i < kActionSlots; ++i) {
+    if (actions_[i].rows == 0U)
+      free = std::min(free, i);
+    else if (actions_[i].name.view() == action)
+      return i;
+  }
+  if (free != kActionSlots)
+    actions_[free].name.assign(action);
+  return free;
+}
+void VolatileMotionTrace::PushScale(std::string_view action,
+                                    std::uint64_t epoch, core::TimePoint when,
+                                    double factor, bool published) noexcept {
+  if (scales_.full())
+    ++evicted_scales_;
+  auto &entry = scales_.Push();
+  entry.action.assign(action);
+  entry.epoch = epoch;
+  entry.when = when;
+  entry.factor = factor;
+  entry.published = published;
+}
+// Controller-state callback path: fixed-size copies into reserved rows only.
 void VolatileMotionTrace::Sample(
     const std::string &action,
     const core::ExecutionControllerSampleDTO &sample) noexcept {
-  try {
-    if (action.size() > 2048U) {
-      ++failures_;
-      return;
-    }
-    std::size_t bytes = sizeof(SampleEntry) + action.size();
-    for (const auto *v :
-         {&sample.reference_positions_rad, &sample.reference_velocities_rad_s,
-          &sample.reference_accelerations_rad_s2, &sample.command_positions_rad,
-          &sample.measured_positions_rad, &sample.error_positions_rad})
-      bytes += v->size() * sizeof(double);
-    if (sample.command_velocities_rad_s)
-      bytes += sample.command_velocities_rad_s->size() * sizeof(double);
-    if (sample.measured_velocities_rad_s)
-      bytes += sample.measured_velocities_rad_s->size() * sizeof(double);
-    // Reserve allocator/copy capacity overhead conservatively for this bounded
-    // copy.
-    if (bytes > kSampleBytes / 2U) {
-      ++failures_;
-      return;
-    }
-    bytes *= 2U;
-    std::unique_lock lock(mutex_, std::try_to_lock);
-    if (!lock.owns_lock()) {
-      ++failures_;
-      return;
-    }
-    while (!samples_.empty() && (samples_.size() >= kSampleLimit ||
-                                 bytes > kSampleBytes - sample_bytes_)) {
-      sample_bytes_ -= samples_.front().bytes;
-      samples_.pop_front();
-      ++dropped_samples_;
-    }
-    samples_.push_back({action, sample, bytes});
-    sample_bytes_ += bytes;
-    if (sample.applied_factor) {
-      auto found = std::find_if(scales_.rbegin(), scales_.rend(),
-                                [&](const ScaleEntry &e) {
-                                  return !e.published && e.action == action &&
-                                         e.epoch == sample.binding_epoch;
-                                });
-      if (found == scales_.rend() || found->factor != *sample.applied_factor) {
-        if (scales_.size() == 256U) {
-          scales_.pop_front();
-          ++evicted_scales_;
-        }
-        scales_.push_back({action, sample.binding_epoch,
-                           sample.local_receipt_stamp_ns,
-                           *sample.applied_factor, false});
-      }
-    }
-  } catch (...) {
+  const std::array<const std::vector<double> *, kSampleVectors> vectors{
+      &sample.reference_positions_rad,
+      &sample.reference_velocities_rad_s,
+      &sample.reference_accelerations_rad_s2,
+      &sample.command_positions_rad,
+      sample.command_velocities_rad_s ? &*sample.command_velocities_rad_s
+                                      : nullptr,
+      &sample.measured_positions_rad,
+      sample.measured_velocities_rad_s ? &*sample.measured_velocities_rad_s
+                                       : nullptr};
+  if (action.size() > kActionBytes ||
+      std::any_of(vectors.begin(), vectors.end(), [](const auto *v) {
+        return v && v->size() > kTraceJoints;
+      })) {
     ++failures_;
+    return;
   }
+  std::unique_lock lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    ++failures_;
+    return;
+  }
+  const auto index = ActionIndex(action);
+  if (index == kActionSlots) {
+    ++failures_;
+    return;
+  }
+  if (samples_.full()) {
+    --actions_[samples_[0].action].rows;
+    ++dropped_samples_;
+  }
+  auto &row = samples_.Push();
+  ++actions_[index].rows;
+  row.action = static_cast<std::uint8_t>(index);
+  row.epoch = sample.binding_epoch.value();
+  row.source_stamp_ns = sample.source_stamp_ns;
+  row.local_receipt_stamp_ns = sample.local_receipt_stamp_ns;
+  row.cursor_s = sample.cursor_s;
+  row.has_applied_factor = sample.applied_factor.has_value();
+  row.applied_factor = sample.applied_factor.value_or(0.0);
+  for (std::size_t i = 0; i < kSampleVectors; ++i) {
+    row.lengths[i] = vectors[i] ? static_cast<std::uint8_t>(vectors[i]->size())
+                                : kAbsentVector;
+    if (vectors[i])
+      std::copy(vectors[i]->begin(), vectors[i]->end(),
+                row.values.begin() + static_cast<std::ptrdiff_t>(i * kTraceJoints));
+  }
+  if (!sample.applied_factor)
+    return;
+  for (std::size_t i = scales_.size; i > 0U; --i) {
+    const auto &entry = scales_[i - 1U];
+    if (!entry.published && entry.epoch == row.epoch &&
+        entry.action.view() == action) {
+      if (entry.factor == *sample.applied_factor)
+        return;
+      break;
+    }
+  }
+  PushScale(action, row.epoch, sample.local_receipt_stamp_ns,
+            *sample.applied_factor, false);
 }
 void VolatileMotionTrace::PublishedScale(const std::string &action,
                                          core::ExecutionBindingEpoch epoch,
                                          core::TimePoint when,
                                          double factor) noexcept {
-  try {
-    if (action.size() > 2048U) {
-      ++failures_;
-      return;
-    }
-    std::unique_lock lock(mutex_, std::try_to_lock);
-    if (!lock.owns_lock()) {
-      ++failures_;
-      return;
-    }
-    if (scales_.size() == 256U) {
-      scales_.pop_front();
-      ++evicted_scales_;
-    }
-    scales_.push_back({action, epoch, when, factor, true});
-  } catch (...) {
+  if (action.size() > kActionBytes) {
     ++failures_;
+    return;
   }
+  std::unique_lock lock(mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    ++failures_;
+    return;
+  }
+  PushScale(action, epoch.value(), when, factor, true);
 }
 core::Result<V>
 VolatileMotionTrace::Snapshot(core::ApplicationStartId application_start_id,
@@ -396,16 +424,23 @@ VolatileMotionTrace::Snapshot(core::ApplicationStartId application_start_id,
     if (!snapshot_lock.owns_lock())
       return error("another bounded trace snapshot is in progress");
     std::deque<Entry> goals;
-    std::deque<SampleEntry> samples;
-    std::deque<ScaleEntry> scales;
+    // Reserved before the capture lock: the copy under it never allocates.
+    std::vector<SampleRow> samples;
+    samples.reserve(kSampleCapacity);
+    std::array<ActionSlot, kActionSlots> actions;
+    std::vector<ScaleEntry> scales;
+    scales.reserve(kScaleLimit);
     std::uint64_t evicted, omitted, dropped, evicted_scales;
     {
       std::unique_lock lock(mutex_, std::try_to_lock);
       if (!lock.owns_lock())
         return error("trace capture is busy");
       goals = goals_;
-      samples = samples_;
-      scales = scales_;
+      for (std::size_t i = 0; i < samples_.size; ++i)
+        samples.push_back(samples_[i]);
+      actions = actions_;
+      for (std::size_t i = 0; i < scales_.size; ++i)
+        scales.push_back(scales_[i]);
       evicted = evicted_;
       omitted = omitted_;
       dropped = dropped_samples_;
@@ -423,9 +458,9 @@ VolatileMotionTrace::Snapshot(core::ApplicationStartId application_start_id,
           {"volatile", V(true)},
           {"retention", V(V::Object{{"goal_limit", count(kGoalLimit)},
                                     {"goal_byte_limit", count(kGoalBytes)},
-                                    {"sample_limit", count(kSampleLimit)},
+                                    {"sample_limit", count(kSampleCapacity)},
                                     {"sample_byte_limit", count(kSampleBytes)},
-                                    {"scale_event_limit", count(256U)}})},
+                                    {"scale_event_limit", count(kScaleLimit)}})},
           {"coverage",
            V(V::Object{{"truncated", V(truncated)},
                        {"evicted_goals", count(evicted)},
@@ -532,26 +567,28 @@ VolatileMotionTrace::Snapshot(core::ApplicationStartId application_start_id,
       truncated = !omission_values.empty();
     }
     for (auto it = samples.rbegin(); it != samples.rend(); ++it) {
-      const auto &s = it->sample;
+      const auto &s = *it;
+      const auto vector = [&](std::size_t i) {
+        return s.lengths[i] == kAbsentVector
+                   ? V(nullptr)
+                   : numbers({s.values.data() + i * kTraceJoints, s.lengths[i]});
+      };
       V row(
-          V::Object{{"action", V(it->action)},
-                    {"binding_epoch", count(s.binding_epoch.value())},
+          V::Object{{"action", V(std::string(actions[s.action].name.view()))},
+                    {"binding_epoch", count(s.epoch)},
                     {"source_stamp_ns", ns(s.source_stamp_ns)},
                     {"local_receipt_stamp_ns", ns(s.local_receipt_stamp_ns)},
                     {"cursor_s", number(s.cursor_s)},
-                    {"reference_p", numbers(s.reference_positions_rad)},
-                    {"reference_v", numbers(s.reference_velocities_rad_s)},
-                    {"reference_a", numbers(s.reference_accelerations_rad_s2)},
-                    {"commanded_p", numbers(s.command_positions_rad)},
-                    {"commanded_v", s.command_velocities_rad_s
-                                        ? numbers(*s.command_velocities_rad_s)
-                                        : V(nullptr)},
-                    {"measured_p", numbers(s.measured_positions_rad)},
-                    {"measured_v", s.measured_velocities_rad_s
-                                       ? numbers(*s.measured_velocities_rad_s)
-                                       : V(nullptr)},
-                    {"applied_factor",
-                     s.applied_factor ? number(*s.applied_factor) : V(nullptr)}});
+                    {"reference_p", vector(0U)},
+                    {"reference_v", vector(1U)},
+                    {"reference_a", vector(2U)},
+                    {"commanded_p", vector(3U)},
+                    {"commanded_v", vector(4U)},
+                    {"measured_p", vector(5U)},
+                    {"measured_v", vector(6U)},
+                    {"applied_factor", s.has_applied_factor
+                                           ? number(s.applied_factor)
+                                           : V(nullptr)}});
       const auto bytes = content_identity::canonical_json(row).size() + 1U;
       if (used > allowance || bytes > allowance - used) {
         truncated = true;
@@ -562,8 +599,8 @@ VolatileMotionTrace::Snapshot(core::ApplicationStartId application_start_id,
     }
     for (auto it = scales.rbegin(); it != scales.rend(); ++it) {
       V row(V::Object{
-          {"action", V(it->action)},
-          {"binding_epoch", count(it->epoch.value())},
+          {"action", V(std::string(it->action.view()))},
+          {"binding_epoch", count(it->epoch)},
           {"local_receipt_stamp_ns", ns(it->when)},
           {"kind", V(it->published ? "published" : "applied_observed")},
           {"factor", number(it->factor)}});

@@ -2,9 +2,9 @@
 
 This is the current strict wire between Composer and the in-tree assistant
 bridge. The model endpoint side is described in
-[`ASSISTANT_PROVIDER_CONTRACT.md`](ASSISTANT_PROVIDER_CONTRACT.md). Normative authority and mode semantics live in ManyForge specs 480 and
-485; the closed runtime models in `manyforge_assistant_bridge/contracts.py` are
-the executable field authority.
+[`ASSISTANT_PROVIDER_CONTRACT.md`](ASSISTANT_PROVIDER_CONTRACT.md). The
+closed runtime models in `manyforge_assistant_bridge/contracts.py` are the
+executable field authority.
 
 ## Ownership boundary
 

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_roboplan VERSION 0.3.0 LANGUAGES CXX)
+project(manyforge_roboplan VERSION 0.3.1 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -589,25 +589,65 @@ target_link_libraries(manyforge_roboplan_cell_admission_command_codec
 install(TARGETS manyforge_roboplan_candidate_worker RUNTIME DESTINATION bin)
 
 if(MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME)
-  add_executable(manyforge_ros2_control_execution_host
+  # The host's units, compiled once with the installed host's flags and
+  # shared with its test variants below. The common units read no fixture
+  # macro; the production units read one (directly or through
+  # ros_host_composition.hpp), so each fixture compiles its own copies.
+  add_library(manyforge_ros2_control_execution_host_common_objects OBJECT
     src/product_backed_runtime_participant_resolver.cpp
     src/sealed_program_execution_capture.cpp
+    src/execution_host_posix.cpp
+    src/execution_host_commands.cpp
+    src/execution_host_responses.cpp
+    src/execution_host_scene_bridge.cpp
+    src/execution_host_planning_jobs.cpp
+    src/applied_program_owner_reader.cpp
+    src/selected_program_products.cpp
+    src/host_io_output_channels.cpp)
+  add_library(manyforge_ros2_control_execution_host_production_objects OBJECT
     src/managed_projection_registry.cpp
-  src/execution_host_posix.cpp
-  src/execution_host_commands.cpp
-  src/execution_host_responses.cpp
-  src/execution_host_scene_bridge.cpp
-  src/execution_host_surface.cpp
-  src/execution_host_planning_jobs.cpp
-  src/applied_program_owner_reader.cpp
-  src/applied_program_blackboard_installation.cpp
-  src/applied_global_io_rule_installation.cpp
-  src/selected_program_products.cpp
-  src/host_io_output_channels.cpp
-  src/host_io_provider_installation.cpp
-  src/ros_host_composition.cpp
-  src/ros_managed_runtime_host.cpp
-  src/ros_execution_host_main.cpp)
+    src/execution_host_surface.cpp
+    src/applied_program_blackboard_installation.cpp
+    src/applied_global_io_rule_installation.cpp
+    src/host_io_provider_installation.cpp
+    src/ros_host_composition.cpp
+    src/ros_managed_runtime_host.cpp)
+  foreach(_MANYFORGE_HOST_OBJECTS
+      manyforge_ros2_control_execution_host_common_objects
+      manyforge_ros2_control_execution_host_production_objects)
+    # Same flags as the executables: -fPIE, not an OBJECT library's -fPIC.
+    set_target_properties(${_MANYFORGE_HOST_OBJECTS} PROPERTIES
+      POSITION_INDEPENDENT_CODE OFF)
+    target_compile_options(${_MANYFORGE_HOST_OBJECTS} PRIVATE
+      ${CMAKE_CXX_COMPILE_OPTIONS_PIE})
+    target_include_directories(${_MANYFORGE_HOST_OBJECTS} PRIVATE
+      "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
+    target_compile_definitions(${_MANYFORGE_HOST_OBJECTS} PRIVATE
+      COAL_DISABLE_HPP_FCL_WARNINGS
+      MANYFORGE_ROS2_CONTROL_EXECUTION_HOST=1)
+    target_link_libraries(${_MANYFORGE_HOST_OBJECTS} PRIVATE
+      manyforge_roboplan_managed_kernel_apply_fence
+      manyforge_deployment_program_io_condition_compiler
+      manyforge_roboplan_cell_admission_command_codec
+      manyforge_roboplan_ros2_control_runtime
+      manyforge_roboplan_process_candidate_client
+      manyforge_roboplan_retained_consumer
+      manyforge_roboplan_scene_factory
+      manyforge_component_manager
+      manyforge::content_identity
+      manyforge::private_stream
+      manyforge::scene
+      manyforge::scene_value_codec
+      manyforge_deployment
+      manyforge::persistence
+      SQLite::SQLite3
+      Threads::Threads)
+  endforeach()
+
+  add_executable(manyforge_ros2_control_execution_host
+    $<TARGET_OBJECTS:manyforge_ros2_control_execution_host_common_objects>
+    $<TARGET_OBJECTS:manyforge_ros2_control_execution_host_production_objects>
+    src/ros_execution_host_main.cpp)
   target_include_directories(manyforge_ros2_control_execution_host PRIVATE
     "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src")
   target_compile_definitions(manyforge_ros2_control_execution_host PRIVATE
@@ -669,23 +709,14 @@ if(BUILD_TESTING)
     # qualified without introducing a second production scene or runtime
     # owner. The installed host above never compiles this fixture.
     add_executable(manyforge_ros2_control_execution_host_pick_place_planning_fixture
-      src/product_backed_runtime_participant_resolver.cpp
-      src/sealed_program_execution_capture.cpp
+      $<TARGET_OBJECTS:manyforge_ros2_control_execution_host_common_objects>
       src/managed_projection_registry.cpp
-      src/execution_host_posix.cpp
-      src/execution_host_commands.cpp
-      src/execution_host_responses.cpp
-      src/execution_host_scene_bridge.cpp
       src/execution_host_surface.cpp
-      src/execution_host_planning_jobs.cpp
-      src/applied_program_owner_reader.cpp
-  src/applied_program_blackboard_installation.cpp
-  src/applied_global_io_rule_installation.cpp
-  src/selected_program_products.cpp
-  src/host_io_output_channels.cpp
-  src/host_io_provider_installation.cpp
-  src/ros_host_composition.cpp
-  src/ros_managed_runtime_host.cpp
+      src/applied_program_blackboard_installation.cpp
+      src/applied_global_io_rule_installation.cpp
+      src/host_io_provider_installation.cpp
+      src/ros_host_composition.cpp
+      src/ros_managed_runtime_host.cpp
       src/ros_execution_host_main.cpp
       test/focused_pick_place_planning_fixture.cpp)
     target_include_directories(
@@ -724,23 +755,14 @@ if(BUILD_TESTING)
     # output name lives in a dedicated directory consumed only by the focused
     # native adapter cases that request injection.
     add_executable(manyforge_ros2_control_execution_host_projection_fixture
-      src/product_backed_runtime_participant_resolver.cpp
-      src/sealed_program_execution_capture.cpp
+      $<TARGET_OBJECTS:manyforge_ros2_control_execution_host_common_objects>
       src/managed_projection_registry.cpp
-      src/execution_host_posix.cpp
-      src/execution_host_commands.cpp
-      src/execution_host_responses.cpp
-      src/execution_host_scene_bridge.cpp
       src/execution_host_surface.cpp
-      src/execution_host_planning_jobs.cpp
-      src/applied_program_owner_reader.cpp
-  src/applied_program_blackboard_installation.cpp
-  src/applied_global_io_rule_installation.cpp
-  src/selected_program_products.cpp
-  src/host_io_output_channels.cpp
-  src/host_io_provider_installation.cpp
-  src/ros_host_composition.cpp
-  src/ros_managed_runtime_host.cpp
+      src/applied_program_blackboard_installation.cpp
+      src/applied_global_io_rule_installation.cpp
+      src/host_io_provider_installation.cpp
+      src/ros_host_composition.cpp
+      src/ros_managed_runtime_host.cpp
       src/ros_execution_host_main.cpp
       src/retained_planner_scene_projection.cpp)
     set_target_properties(
@@ -1337,23 +1359,8 @@ if(BUILD_TESTING)
       # over its ordinary socket: the output lane.
       add_executable(test_execution_host_io_output_lane
         test/test_execution_host_io_output_lane.cpp
-        src/product_backed_runtime_participant_resolver.cpp
-        src/sealed_program_execution_capture.cpp
-        src/managed_projection_registry.cpp
-        src/execution_host_posix.cpp
-        src/execution_host_commands.cpp
-        src/execution_host_responses.cpp
-        src/execution_host_scene_bridge.cpp
-        src/execution_host_surface.cpp
-        src/execution_host_planning_jobs.cpp
-        src/applied_program_owner_reader.cpp
-        src/applied_program_blackboard_installation.cpp
-        src/applied_global_io_rule_installation.cpp
-        src/selected_program_products.cpp
-        src/host_io_output_channels.cpp
-        src/host_io_provider_installation.cpp
-        src/ros_host_composition.cpp
-        src/ros_managed_runtime_host.cpp)
+        $<TARGET_OBJECTS:manyforge_ros2_control_execution_host_common_objects>
+        $<TARGET_OBJECTS:manyforge_ros2_control_execution_host_production_objects>)
       target_include_directories(test_execution_host_io_output_lane PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
         "${_MANYFORGE_REPOSITORY_SOURCE_ROOT}/manyforge_component_manager/src"

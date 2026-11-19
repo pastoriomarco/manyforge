@@ -2002,7 +2002,7 @@ class ExecutionCommandClient:
                 or not isinstance(metadata.get("file"), str)
                 or re.fullmatch(r"trace-[0-9a-f]{64}\.json", metadata["file"]) is None
                 or type(metadata.get("bytes")) is not int
-                or not 0 < metadata["bytes"] <= min(allowance_bytes, 3 * 1024 * 1024)
+                or not 0 < metadata["bytes"] <= min(allowance_bytes, 5 * 1024 * 1024)
                 or metadata.get("sha256") != "sha256:" + metadata["file"][6:-5]
                 or not isinstance(metadata.get("status"), str)
                 or metadata.get("status") not in {"complete", "partial"}):

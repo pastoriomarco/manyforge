@@ -35,7 +35,9 @@ COPY manyforge_headless_api/tests/fixtures/control-v2-local-delta.json \
 RUN npm run build
 
 # --- Stage 2: Python/C++ runtime ---
-FROM python:3.12-slim-bookworm
+# Same pinned base as the ROS image (Dockerfile.ros-lyrical-full): one compiler
+# (GCC 13) and one system library set for every lane and CI job.
+FROM ubuntu:24.04@sha256:534baea6a22c03a63003dbc8dbe78fe34bc0d7e595d9a9dc9834884ff530eb55
 
 ARG ROBOPLAN_SOURCE_MODE=qualified
 ENV DEBIAN_FRONTEND=noninteractive
@@ -53,10 +55,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libeigen3-dev libyaml-cpp-dev libyaml-dev liburdfdom-dev \
         libdouble-conversion-dev libexpat1-dev libssl-dev libutf8proc-dev \
         liboctomap-dev libsqlite3-dev \
+        python3 python3-dev python3-venv \
         git curl ca-certificates \
     && cd /usr/src/googletest && cmake . && make \
     && cp lib/*.a /usr/lib/ \
     && rm -rf /var/lib/apt/lists/*
+
+# Python 3.12 environment at /usr/local (Ubuntu's system Python takes no pip
+# installs): the same site-packages paths as before, first on PATH.
+RUN python3 -m venv /usr/local
 
 # Python packages: testing, behavior trees, bindings, visualization
 # Pin the cmeel/pinocchio dependency set to a self-consistent Pinocchio 4 stack.
@@ -203,7 +210,8 @@ WORKDIR /workspace
 # available to `docker exec` operator workflows as well as PID 1.
 ENV PATH="/workspace/scripts:${PATH}"
 
-RUN useradd --create-home --shell /bin/bash --uid 1000 manyforge \
+RUN userdel --remove ubuntu \
+    && useradd --create-home --shell /bin/bash --uid 1000 manyforge \
     && mkdir -p /tmp/manyforge-build /workspace \
     && chown -R manyforge:manyforge /tmp/manyforge-build /home/manyforge /workspace
 
