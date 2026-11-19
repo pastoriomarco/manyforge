@@ -390,7 +390,7 @@ any of these holds:
 Otherwise the cancel is sent. Every gripper action server ManyForge uses holds
 the fingers before it answers ACCEPT: the stock controller's cancel callback
 holds the current position, and the Isaac gripper bridge
-(`manyforge_ros_bringup/isaac_gripper_action_bridge.py`) publishes the
+(`manyforge_ros_bringup/manyforge_ros_bringup/isaac_gripper_action_bridge.py`) publishes the
 current finger position as Isaac's target and stops republishing the goal's
 target. So the cancel's ACCEPT ends the stopped command, like the goal's own
 terminal result; whichever comes first settles it and a later result for that

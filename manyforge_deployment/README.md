@@ -142,13 +142,13 @@ The command always performs a fresh Release build, selects only
 `linux-amd64` or `linux-arm64` from the generated compiler-build manifest, and
 rejects a non-Release or unsupported target before reading or writing a golden.
 
-Maintained `manyforge.program.v2` sources use the C++ authoring target
+Maintained `manyforge.program.v3` sources use the C++ authoring target
 `manyforge_program_revision` for their opaque identities. After editing one
 Program, run:
 
 ```bash
-manyforge_program_revision --update --input examples/example.program.yaml
-manyforge_program_revision --check --input examples/example.program.yaml
+manyforge_program_revision --update --input examples/pick_and_place.program.yaml
+manyforge_program_revision --check --input examples/pick_and_place.program.yaml
 ```
 
 `--update` regenerates embedded contact-policy revisions first and then the
@@ -161,8 +161,8 @@ Maintained `manyforge.deployment.v1` sources use the corresponding C++
 producer/verifier command:
 
 ```bash
-manyforge_deployment_revision --update --input examples/example.deployment.yaml
-manyforge_deployment_revision --check --input examples/example.deployment.yaml
+manyforge_deployment_revision --update --input <name>.deployment.yaml
+manyforge_deployment_revision --check --input <name>.deployment.yaml
 ```
 
 The update path seals graph-owned nested revisions, capability-provider-binding
@@ -171,27 +171,6 @@ the pretty JSON source before replacing it atomically. It supplies the exact
 build-owned execution host profile only when the graph selects that profile.
 It does not qualify catalog referents, compile retained products, or admit a
 deployment to runtime.
-
-For pre-explicit-jerk controlled-Stop contracts, use the same offline tool with
-an explicit choice after reviewing the machine's operating limits:
-
-```bash
-manyforge_deployment_revision --print --input example.deployment.yaml --migrate-controlled-stop-jerk on
-manyforge_deployment_revision --update --input example.deployment.yaml --migrate-controlled-stop-jerk on
-manyforge_deployment_revision --check --input example.deployment.yaml
-```
-
-Choose `on` to enforce controlled-Stop jerk, or `off` to disable that shaping.
-The flag fills only missing choices and upgrades the recognized pre-choice
-contract schema. Existing explicit choices, numeric limits, natural-completion
-and fallback settings are preserved. Unknown schema revisions and invalid
-profiles reject. `--print` computes the resulting revision without writing;
-`--update` explicitly replaces the source after independent verification.
-Back up or version the file before updating. Review the resulting diff, then
-open/Save/Apply through the normal workflow. This does not update a running
-deployment, waive equipment limits, enable ordinary-motion jerk, or qualify
-the artifact's external catalog referents. There is no implicit migration on
-normal load, compilation, or runtime startup.
 
 The one human/LLM authoring input for the seven maintained deployments is
 `resources/maintained/maintained_deployment_sources.v1.json`. Its strict check

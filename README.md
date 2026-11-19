@@ -71,33 +71,47 @@ controller, so what you rehearse in Mock or Isaac is what the robot executes.
 - **UFACTORY**: Lite 6 and UF850 in Mock, Lite 6 in Isaac, and
   xArm-family robots on Real through the vendor driver (Lite 6 tested on
   hardware), with their controller and tool I/O.
-- **Universal Robots**: UR5 and UR10e in Mock, UR10e in Isaac; a UR5e model
-  is included.
+- **Universal Robots**: UR5e and UR10e in Mock, UR10e in Isaac.
 - **Grippers**: UFACTORY Lite gripper (pneumatic) and xArm gripper, Robotiq
   2F-85 and 2F-140, and generic valve-driven pneumatic grippers.
+
+The Real lane drives UFACTORY robots only; Universal Robots arms and Robotiq
+grippers run in Mock and Isaac.
 
 Other robots are added as components with a vendor adapter; see
 [Adding a component](docs/authoring/ADDING_A_COMPONENT.md).
 
 ## Quick start
 
-Follow the [workbench guide](docs/operations/DEVELOPMENT_WORKBENCH.md) for
-host prerequisites. From the repository root, build the ROS image once (and
-again after Dockerfile changes), then start:
+You need a Linux host (amd64 or arm64, Jetson AGX Thor and Orin included)
+with Docker, Git and Python 3; see the
+[prerequisites](docs/operations/DEVELOPMENT_WORKBENCH.md#prerequisites).
 
 ```bash
-./scripts/compose-dev.sh build
+git clone https://github.com/pastoriomarco/manyforge.git
+cd manyforge
+./scripts/compose-dev.sh pull
 ./scripts/compose-dev.sh start --project examples/mock_lite6_pick_and_place.scenario
 ```
 
 Open **http://localhost:3000**, press **Execute**, then **Run**: the Lite 6
 picks the part and places it.
 
-- The first build and the first start take a while; later starts are
-  incremental. On a Jetson (Thor, Orin), `build` selects NVIDIA's
-  `noble-jetpack` package suite by itself.
-- `./scripts/compose-dev.sh pull` fetches the published reference image
-  instead of building it (see the workbench guide).
+`pull` fetches the ROS image published for this release
+(`ghcr.io/pastoriomarco/manyforge-ros:<VERSION>`, ROS 2 and dependencies,
+about 4.1 GB). `start` then builds ManyForge's own programs from the
+checkout, so the first start takes a while; later starts are incremental.
+
+| Install option | Commands (from the repository root) | Use it when |
+| --- | --- | --- |
+| **1. Pull the published image** (default) | `./scripts/compose-dev.sh pull`, then `start` | You want to run ManyForge. |
+| **2. Build the image from source** | `./scripts/compose-dev.sh build` (about an hour), then `start` | You changed the Dockerfile, run a checkout that is not a release, or cannot reach `ghcr.io`. |
+| **3. Operator launcher** (advanced) | [Operator runbook](docs/operations/MANYFORGE_OPERATOR_RUNBOOK.md) | The stack must run from a digest-checked package, served on the LAN at port 9000. |
+
+The [workbench guide](docs/operations/DEVELOPMENT_WORKBENCH.md#install) has
+each option in full: what to check after the first start, how to update to a
+new version and how to fall back.
+
 - Omit `--project` to start with an empty workspace.
   `./scripts/compose-dev.sh status` inspects the workbench and
   `./scripts/compose-dev.sh stop` stops it. Starting the workbench does not run
@@ -194,6 +208,11 @@ stop the runtime.
   `manyforge_xarm_control/vendor/driver.yaml`; for `v0.3.1` that is
   `3654c9afef9c51c3bd6723d65ccecca166bc38b0`. The release procedure is in
   [CONTRIBUTING.md](CONTRIBUTING.md#releases).
+- **Reference image:** each release publishes the workbench's ROS image as
+  `ghcr.io/pastoriomarco/manyforge-ros:<VERSION>` for amd64 and arm64
+  (`./scripts/compose-dev.sh pull`). It holds ROS 2 and dependencies only;
+  [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) lists what it
+  redistributes.
 - **Security:** report vulnerabilities as described in
   [SECURITY.md](SECURITY.md), not in public issues.
 

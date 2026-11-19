@@ -12,69 +12,195 @@ Browser mount, reload, and disconnect are read-only reconstruction events.
 ## Prerequisites
 
 This public runbook is sufficient for operation; no private documentation
-checkout is needed. The supported host path uses Linux host networking, Docker
-Engine with Compose v2/BuildKit, Git and Python 3. Allow network access for pinned
-dependency downloads and enough disk/RAM for the ROS build. This is source-based
-workbench setup, not a packaged production installer.
+checkout is needed. This is a source-based workbench, not a packaged
+production installer.
 
-### Install: one build, one start
+- **Host**: Linux with Docker host networking, x86_64 (amd64) or arm64.
+  Ubuntu 24.04 is the reference; Jetson AGX Thor and Orin run JetPack 7.2.1.
+  Docker Desktop on macOS or Windows is not supported.
+- **Software**: Docker Engine, Git and Python 3. Building the image
+  ([option 2](#option-2-build-the-image-from-source)) also needs the Compose
+  v2 plugin and BuildKit.
+- **Network**: to pull or build the image, and at the first start, which
+  downloads the frontend's npm packages.
+- **Memory**: 16 GB for the C++ build at the first start; lower
+  `MANYFORGE_DEV_BUILD_JOBS` if compilation runs out of memory.
+- **Disk**: the image is about 4.1 GB; build caches and runtime state grow
+  under `.manyforge-dev/` in the checkout. `start` refuses to run with less
+  than 10 GB free ([Disk limits](#disk-limits)).
 
-From a fresh checkout, at the repository root:
+<a id="install-one-build-one-start"></a>
+
+## Install
+
+Get the source. `main` holds the latest release (`dev` is the integration
+branch). Run every command in this guide from the repository root:
 
 ```bash
-./scripts/compose-dev.sh build   # once, and again after Dockerfile changes
-./scripts/compose-dev.sh start   # empty authoring workspace
+git clone https://github.com/pastoriomarco/manyforge.git
+cd manyforge
 ```
 
-Then open **http://localhost:3000**. The first start also compiles the
-ManyForge C++ targets into the image-keyed cache under `.manyforge-dev/`, which
-takes a while; later starts are incremental. This build runs before the
-workbench starts, so it never counts against the startup timeout.
+ManyForge runs in one container image, tagged locally
+`manyforge-ros-lyrical-full`. Options 1 and 2 differ only in where that image
+comes from; both then use the same `start`.
 
-`build` prepares the pinned RoboPlan sources under `.docker/`
-(`scripts/setup-docker.sh --prepare-only`), then builds
-`Dockerfile.ros-lyrical-full` through the `ros-jazzy-full` Compose service into
-the image `manyforge-ros-lyrical-full`. It works on x86_64 and arm64. The build
-argument `NVIDIA_ISAAC_ROS_RELEASE_SUITE` selects NVIDIA's ROS package suite:
-`noble` on x86_64, `noble-jetpack` on a Jetson (Thor, Orin). `build` picks
-`noble-jetpack` by itself when `/etc/nv_tegra_release` exists; export the
-variable to override it. Building the image by hand needs the same argument:
+| Option | Use it when | Commands | Before the first start |
+| --- | --- | --- | --- |
+| **1. Pull the published image** (default) | You want to run ManyForge on amd64 or arm64 (Jetson AGX Thor and Orin included). | `./scripts/compose-dev.sh pull`, then `./scripts/compose-dev.sh start` | The download (the image is about 4.1 GB). |
+| **2. Build the image from source** | You changed `Dockerfile.ros-lyrical-full` or what it installs, your checkout is not a release (for example `dev` after such a change), or the host cannot reach `ghcr.io`. | `./scripts/compose-dev.sh build`, then `./scripts/compose-dev.sh start` | About an hour of building. |
+| **3. Operator launcher** (advanced) | The stack must run from a digest-checked package with Composer served on the LAN at port 9000, or on a remote Docker host next to Isaac Sim. | `manyforge-operator start …` ([operator runbook](MANYFORGE_OPERATOR_RUNBOOK.md)) | The image from option 1 or 2, plus the package preparation in the runbook. |
 
-```bash
-./scripts/setup-docker.sh --prepare-only
-docker build --build-arg NVIDIA_ISAAC_ROS_RELEASE_SUITE=noble-jetpack \
-  -f Dockerfile.ros-lyrical-full -t manyforge-ros-lyrical-full .
-```
+### Option 1: pull the published image
 
-Instead of building, `pull` fetches the reference image that GitHub builds
-from this repository for linux/amd64 and linux/arm64 when the
-`.github/workflows/ros-image.yml` workflow is run by hand, and tags it as the
-image `start` runs:
+GitHub builds the reference image from this repository with each release,
+for linux/amd64 and linux/arm64 (Jetson AGX Thor and Orin, JetPack 7.2.1),
+and publishes it as `ghcr.io/pastoriomarco/manyforge-ros:<VERSION>`. Pulling
+needs Docker and network access to `ghcr.io`; no login.
 
 ```bash
-./scripts/compose-dev.sh pull                       # ghcr.io/pastoriomarco/manyforge-ros:<VERSION>
-./scripts/compose-dev.sh pull ghcr.io/pastoriomarco/manyforge-ros@sha256:<digest>
+./scripts/compose-dev.sh pull
 ./scripts/compose-dev.sh start
 ```
 
-Without an argument it pulls the tag of the version in `VERSION`; an image
-reference, or a bare `sha256:` digest of that image, selects another one.
-Pulling needs read access to the package. A later `build` replaces the pulled
-image.
+`pull` fetches the tag named by the checkout's `VERSION` file (for example
+`ghcr.io/pastoriomarco/manyforge-ros:0.3.1`) and tags it as
+`manyforge-ros-lyrical-full`, the image `start` runs. To pin one exact image,
+pass its reference or its digest:
 
-Plan for well over half an hour on a first build: on a 14-core arm64 Jetson
-with the ROS and Python layers already cached it took about 19 minutes; the
-resulting image is about 5.4 GB.
+```bash
+docker image inspect --format '{{index .RepoDigests 0}}' manyforge-ros-lyrical-full
+./scripts/compose-dev.sh pull ghcr.io/pastoriomarco/manyforge-ros@sha256:<digest>
+./scripts/compose-dev.sh pull sha256:<digest>
+```
 
-The one image serves every lane. It contains ROS 2 Lyrical, the pinned
-controller overlay (stock joint_trajectory_controller 6.10.0 with
-realtime_tools 5.4.0 and ros2_control_cmake 1.0.0), `topic_based_ros2_control`
-for Isaac, and the UFACTORY xArm driver. The driver comes from the fork
+The first command prints the digest of the image a `pull` fetched; the other
+two (equivalent) fetch exactly that image again, on this or another machine.
+
+### Option 2: build the image from source
+
+```bash
+./scripts/compose-dev.sh build
+./scripts/compose-dev.sh start
+```
+
+`build` takes about an hour. It prepares the pinned RoboPlan sources under
+`.docker/` (`scripts/setup-docker.sh --prepare-only`; this may recreate stale
+or modified dependency directories there, so preserve wanted local edits
+first), then builds `Dockerfile.ros-lyrical-full` through the
+`ros-jazzy-full` Compose service into the same tag,
+`manyforge-ros-lyrical-full`. It needs the Compose v2 plugin, BuildKit and
+network access. It is the Dockerfile and default build arguments the
+published image is built from, and it works on x86_64 and arm64. Run it
+again after a Dockerfile change; unchanged layers come from Docker's cache.
+
+ROS 2 Lyrical is built from source by default (`ROS_BASE=source`), the same
+way on every host, a Jetson included. `MANYFORGE_ROS_BASE=apt` installs ROS
+from NVIDIA's Isaac ROS apt mirror instead and adds the pinned controller and
+`rmw_fastrtps` overlays. Only that apt base reads
+`NVIDIA_ISAAC_ROS_RELEASE_SUITE`: `noble` on x86_64, `noble-jetpack` on a
+Jetson, which `build` selects by itself when `/etc/nv_tegra_release` exists
+(export the variable to override it).
+
+Building the default image by hand (BuildKit required):
+
+```bash
+./scripts/setup-docker.sh --prepare-only
+docker build -f Dockerfile.ros-lyrical-full -t manyforge-ros-lyrical-full .
+```
+
+### Option 3: operator launcher (advanced)
+
+`manyforge-operator` starts the same application from a digest-checked
+package and serves the built Composer on the network at port 9000, without
+Vite. Use it only for the cases in the table above; it needs the image from
+option 1 or 2 on its runtime host (`isaac` profile) or a host ROS install
+(`standard` profile), and it cannot configure real-robot addresses. Follow
+the [operator runbook](MANYFORGE_OPERATOR_RUNBOOK.md).
+
+### First start and what to check
+
+```bash
+./scripts/compose-dev.sh start --project examples/mock_lite6_pick_and_place.scenario
+./scripts/compose-dev.sh status
+```
+
+Omit `--project` for an empty authoring workspace. The image holds no
+ManyForge program: before it starts the workbench, `start` compiles
+ManyForge's C++ programs and Python modules from the checkout into the
+image-keyed cache under `.manyforge-dev/images/<image id>/`, and the first
+start also installs the frontend's npm packages. The first start therefore
+takes much longer than later ones (a cached start takes about half a
+minute); the build output streams to the console and does not count against
+the startup timeout.
+
+Check that it works:
+
+1. `start` ends by printing the current Scenario with `"ready": true` and
+   `"unavailable_reasons": []`, then `Development workbench:
+   http://localhost:3000`. `./scripts/compose-dev.sh status` prints the same
+   JSON at any time.
+1. Open **http://localhost:3000**. With the example project, press
+   **Execute**, then **Run**: the Lite 6 picks the part and places it.
+1. `docker image inspect --format '{{.Id}}' manyforge-ros-lyrical-full`
+   names the image in use.
+
+Starting the workbench runs no tests and authorizes no robot motion. Stop it
+with `./scripts/compose-dev.sh stop`. The
+[fresh-checkout checklist](FRESH_CHECKOUT_CHECKLIST.md) is a recorded
+version of these checks.
+
+### Update to a new version
+
+```bash
+./scripts/compose-dev.sh stop
+git pull
+./scripts/compose-dev.sh pull     # option 2: ./scripts/compose-dev.sh build
+./scripts/compose-dev.sh start
+```
+
+`git pull` on `main` moves to the latest release; `pull` then fetches that
+version's image. With option 2, `build` is needed only when the Dockerfile
+or what it installs changed. A new image has a new ID, so the first start
+on it compiles ManyForge's programs again into its own cache folder; the
+previous image's folder stays in `.manyforge-dev/images/` and can be deleted
+while the workbench is stopped. Saved Scenarios are kept, and so are the
+Composer settings and runtime state under `.manyforge-dev/`.
+
+### Fall back
+
+- **`pull` fails** (no network, `ghcr.io` unreachable, or no image published
+  for the checkout's `VERSION`): use option 2. `pull` and `build` write the
+  same tag, so the one run last is the image `start` uses.
+- **`start` fails after an image change**: read the start output first
+  ([troubleshooting table](#operation-and-troubleshooting)). To return to
+  the image you had, pull it again by its digest (option 1), or check out the
+  previous source and `build`. Each image keeps its own build cache, so going
+  back reuses it.
+- **To return to an earlier release**: stop the workbench, check out its tag
+  (`git checkout vX.Y.Z`) and follow the guide in that checkout. Releases
+  before 0.3.1 have no published image and are built with option 2.
+
+### What the image holds
+
+The one image serves every lane. It holds Ubuntu 24.04, ROS 2 Lyrical built
+from source with ros2_control and the stock joint_trajectory_controller
+6.10.1, `topic_based_ros2_control` for Isaac, the UFACTORY xArm driver,
+RoboPlan with its dependencies, the Python environment, and Node.js with
+npm. It holds no ManyForge program and no built frontend: both are built
+from the mounted checkout. The owners' licence files are in the image under
+`/usr/share/licenses/manyforge-image/`, and
+[THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md) lists every component
+it redistributes.
+
+The xArm driver comes from the fork
 `https://github.com/pastoriomarco/xarm_ros2`, branch `lyrical-no-gazebo`
 (upstream `lyrical` plus the `xarm_io_states` topic and the `system_control`
 service, Gazebo removed), pinned by `XARM_SOURCE_COMMIT` in the Dockerfile and
 `manyforge_xarm_control/vendor/driver.yaml`. It covers xArm 5/6/7, Lite 6 and
 UF850. The Real lane needs no extra install step.
+
+## Lanes and configuration
 
 ### Lanes
 
@@ -104,9 +230,10 @@ them once, when it creates the container.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `MANYFORGE_DEV_IMAGE` | `manyforge-ros-lyrical-full` (or `MANYFORGE_ROS_FULL_IMAGE`) | Image that `start` runs. |
-| `MANYFORGE_ROS_FULL_IMAGE` | `manyforge-ros-lyrical-full` | Image tag that `build` and `pull` write and `start` runs; set it for both. |
-| `NVIDIA_ISAAC_ROS_RELEASE_SUITE` | `noble`, or `noble-jetpack` on a Jetson | NVIDIA package suite for `build`. |
+| `MANYFORGE_DEV_IMAGE` | `manyforge-ros-lyrical-full` (or `MANYFORGE_ROS_FULL_IMAGE`) | Local image tag that `build` and `pull` write and `start` runs; set it for all three. |
+| `MANYFORGE_ROS_FULL_IMAGE` | `manyforge-ros-lyrical-full` | The same tag, used when `MANYFORGE_DEV_IMAGE` is unset. |
+| `MANYFORGE_ROS_BASE` | `source` | ROS base that `build` uses: `source` (ROS 2 Lyrical built from source) or `apt` (NVIDIA's Isaac ROS apt mirror). |
+| `NVIDIA_ISAAC_ROS_RELEASE_SUITE` | `noble`, or `noble-jetpack` on a Jetson | NVIDIA package suite for `build`, read only with `MANYFORGE_ROS_BASE=apt`. |
 | `MANYFORGE_DEV_CACHE_BASE` | `<checkout>/.manyforge-dev` | Build, npm, state and runtime caches. |
 | `MANYFORGE_DEV_RUNTIME_STATE_ROOT` | `<cache base>/runtime/<container name>` | Absolute host path of the runtime state root. |
 | `MANYFORGE_DEV_SITE_SETTINGS` | unset | Absolute host path of the [site settings](#site-settings) file. |
@@ -181,8 +308,6 @@ was started with.
 The launcher builds current C++ owners, the activation preparer and a small
 canonical-empty bootstrap from this checkout. It does not import a maintained
 package or installed Scenario catalog, and it does not run tests or proofs.
-The setup script may recreate stale or modified dependency directories under
-`.docker/`; preserve wanted local dependency edits before running it.
 Selected projects are read through the ordinary Scenario-project loader and
 validated before activation.
 
@@ -228,7 +353,7 @@ mutually exclusive. Either accepts a Scenario with at least one ros2_control
 execution component; I/O provider, pose source and AI model components may sit
 next to it. Startup refuses any other component kind.
 
-For example, with the built image:
+For example:
 
 ```bash
 ./scripts/compose-dev.sh start \
@@ -236,7 +361,7 @@ For example, with the built image:
 ```
 
 The image entrypoint supplies the ROS and Python environment, including the
-image's xArm driver and controller overlays. Startup builds the
+image's xArm driver. Startup builds the
 mechanical ROS overlay and imports its setup into the service environment;
 Manager children inherit that environment. Optional: to add separately
 installed ROS dependencies on top of the image, set
@@ -244,7 +369,7 @@ installed ROS dependencies on top of the image, set
 absolute setup-script paths inside the container. Startup sources them before
 the backend build and imports the application overlay last for services.
 Missing configured scripts fail startup with their exact path. Leave it unset
-with the image built above.
+with the standard image.
 
 The ROS option runs with the launching host user's UID/GID and uses the
 image-keyed `/runner/home` and `/runner/build` bind mounts for writable home
@@ -816,10 +941,10 @@ Removed in Draft; a machine's members sit under it. Above the list,
 **Prepare all** and **Enable all**; below it, **Add component**. On the right,
 the selected component's page:
 
-- what it is: model, mount or mounted tool, Deployment status and the Program
-  roles assigned to it, with **Open in Robot Control** (jogging and gripper
-  commands stay in the viewer's Robot panel), **Roles in Deployment** and, for
-  an unapplied change, **Review in Deployment Changes**;
+- what it is: profile, machine and member role, mount or mounted tool and
+  Deployment status, with **Open in Robot Control** (jogging and gripper
+  commands stay in the viewer's Robot panel) and, for an unapplied change,
+  **Review in Deployment Changes**;
 - its status: lifecycle (Offline, Not prepared, Prepared, Enabled, Fault),
   fault, reason, stream freshness, the last action's result, and the actions
   it offers (Prepare, Enable, Disable, Recover, plus Reset position, Power
@@ -847,8 +972,8 @@ current state. See [Observability](OBSERVABILITY.md#workbench-console).
 - **Overview**: the runtime status summary, the Deployment Draft against
   Manager Applied (components to add or remove, runtime convergence, Program
   roles) and the Manager Apply inventory.
-- **Roles**: each Program role (satisfied, unbound or incompatible) and the
-  Program Binding.
+- **Program binding**: each Program role (satisfied, unbound or
+  incompatible) and the Program Binding.
 - **Cell settings**: motion takeover timing, global interrupt rules, the AI
   model aliases, pose links and stream overrides that no current component
   owns, and the read-only compiled artifact.
@@ -971,7 +1096,11 @@ procedure for physical equipment.
 
 | Symptom | Action |
 | --- | --- |
-| Image missing | Run `./scripts/compose-dev.sh build` or `pull` (see [Install](#install-one-build-one-start)). |
+| `start` says `Development image is unavailable: manyforge-ros-lyrical-full` (exit 69) | No local image yet: run `./scripts/compose-dev.sh pull` or `build` ([Install](#install)). |
+| `pull` fails (`manifest unknown`, `denied`, or a network error) | No image is published for the version in `VERSION` (a checkout that is not a release), or `ghcr.io` is unreachable. Check `cat VERSION` and the network, or use `./scripts/compose-dev.sh build` ([Fall back](#fall-back)). |
+| The first start on a new image compiles everything again | Expected: each image has its own build cache under `.manyforge-dev/images/<image id>/` ([Update](#update-to-a-new-version)). |
+| Start fails with `command failed with exit …: npm ci` | The first start on an image downloads the frontend's npm packages: check the network, then start again. |
+| Operator-mode start refused with `built Composer frontend is not a regular file: …/index.html` | The frontend build is missing: run the build step (`./scripts/compose-dev.sh build-native` in operator mode, which the operator launcher runs itself), or pass a built frontend with `--composer-static-dir` ([operator runbook](MANYFORGE_OPERATOR_RUNBOOK.md)). |
 | Site settings refused at start | See [Site file errors](TROUBLESHOOTING.md#site-file-errors). |
 | Project source missing, invalid or changed | Preserve the diagnostic, inspect the named project/source path, and review changes before retrying. Do not bypass identity checks or delete caches blindly. |
 | Port occupied | Identify the listener on 3000/9010/9011/9020; do not kill an unrelated process. |
@@ -1001,4 +1130,5 @@ When a project is active, `status` reports its owner-issued current identity and
 convergence. It reports a `development_workbench` using repository source, while
 `physical_execution_authorized` remains false. The Workbench prepares ROS
 execution adapters and does not authorize physical equipment. There is no
-installer or official AMD64/ARM64 package; the workbench runs from source.
+installer or packaged ManyForge release: the published image holds ROS and
+dependencies only, and the workbench builds and runs ManyForge from source.

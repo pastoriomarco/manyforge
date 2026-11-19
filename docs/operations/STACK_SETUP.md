@@ -18,23 +18,27 @@ For runtime/operator-facing reference docs see:
 
 ## Clean Machine Install Order
 
-On a Jetson with a small eMMC root, place the workbench caches on the NVMe
-(`MANYFORGE_DEV_CACHE_BASE`) as described in
-[`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md). On a Jetson, `build`
-selects NVIDIA's `noble-jetpack` package suite by itself.
+The [workbench guide's Install section](DEVELOPMENT_WORKBENCH.md#install)
+is the reference for the install options, what to check, updating and
+falling back; this is the short order. On a Jetson with a small eMMC root,
+place the workbench caches on the NVMe (`MANYFORGE_DEV_CACHE_BASE`) as
+described in [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md).
 
-1. Prepare the host: Docker Engine with Compose v2 and BuildKit, `git`,
-   Python 3, and enough disk for the image and build caches.
+1. Prepare the host ([Prerequisites](#prerequisites) below): Docker Engine,
+   `git`, Python 3, and enough disk for the image and build caches.
 1. Clone `manyforge` and change into the checkout.
 1. Optional: write the [site settings](DEVELOPMENT_WORKBENCH.md#site-settings)
    file (robot addresses, project folders) and export
    `MANYFORGE_DEV_SITE_SETTINGS` with its absolute path.
-1. Build the image once, then start the workbench:
+1. Get the image, then start the workbench:
    ```bash
-   ./scripts/compose-dev.sh build
+   ./scripts/compose-dev.sh pull
    ./scripts/compose-dev.sh start
    ```
-   Open `http://localhost:3000`.
+   `pull` fetches the image published for this release (amd64 and arm64);
+   `./scripts/compose-dev.sh build` builds the same image from source instead
+   (about an hour). Open `http://localhost:3000` and check
+   `./scripts/compose-dev.sh status`.
 1. Optional, for the AI tab: run your own OpenAI-compatible model server and
    add an `ai_model` component and an AI assistant component to the
    Deployment ([`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md)).
@@ -111,9 +115,9 @@ robot address in the site settings (`device_addresses`), set
 `examples/real_lite6_arm_observation.scenario`. The robot is a machine: its
 owner component carries the lane (`real`) and, on its machine card, the
 address key (`configuration.device_address_ref`); the adapter comes from the
-machine model's `lanes.real` row. Load and Prepare connect and clear the
-controller's errors with the motors off; the motors switch on only at the
-arm's **Enable**. See [Real robot setup](REAL_ROBOT_SETUP.md) for the full
+machine model's `lanes.real` row. Load and Prepare only connect, with the
+motors off, and clear no controller error; Recover on the machine clears
+errors, and the motors switch on only at the arm's **Enable**. See [Real robot setup](REAL_ROBOT_SETUP.md) for the full
 procedure, what each action does and troubleshooting.
 
 Execute, Run, Resume and Robot Control motion stay unavailable until the arm
@@ -246,14 +250,17 @@ Setup and checks: [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md).
 - **Architecture**: x86_64 or arm64 (including Jetson). Isaac Sim itself runs
   on a separate x86_64 host or the same x86_64 host, with an NVIDIA driver and
   RTX-class GPU.
-- **Docker**: Docker Engine with BuildKit, plus the Compose v2 plugin
-  (`docker compose ...`, not the legacy `docker-compose`).
+- **Docker**: Docker Engine. Building the image (`build`) also needs BuildKit
+  and the Compose v2 plugin (`docker compose ...`, not the legacy
+  `docker-compose`); `pull` and `start` do not.
 - **GPU**: not required by ManyForge. A local model server for the AI
   assistant usually needs one; it runs outside ManyForge.
 - **RAM**: 16 GB minimum for the C++ build; lower `MANYFORGE_DEV_BUILD_JOBS`
   if compilation exhausts memory.
-- **Disk**: the image is about 5.4 GB; build caches and runtime state live
-  under `.manyforge-dev/`. Model files live outside the manyforge tree.
+- **Disk**: the image is about 4.1 GB; build caches and runtime state live
+  under `.manyforge-dev/`, and `start` needs at least 10 GB free
+  ([Disk limits](DEVELOPMENT_WORKBENCH.md#disk-limits)). Model files live
+  outside the manyforge tree.
 
 ### Repositories
 
@@ -262,12 +269,16 @@ Setup and checks: [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md).
 
 ### External dependencies
 
-`./scripts/compose-dev.sh build` downloads and builds the pinned dependencies;
-you do not install them yourself. The pins live in `scripts/setup-docker.sh`
-(RoboPlan, ProxSuite, TOPPRA) and `Dockerfile.ros-lyrical-full` (ROS 2
-Lyrical, controller overlay, `topic_based_ros2_control`, xArm driver,
+The image holds the pinned dependencies; you do not install them yourself.
+`./scripts/compose-dev.sh pull` fetches the published image, and
+`./scripts/compose-dev.sh build` downloads and builds them from source. The
+pins live in `scripts/setup-docker.sh` (RoboPlan, ProxSuite, TOPPRA),
+`third_party/ros_lyrical/` (the ROS 2 Lyrical source set) and
+`Dockerfile.ros-lyrical-full` (`topic_based_ros2_control`, xArm driver,
 Python packages).
-[`../../NOTICE`](../../NOTICE) lists them with their licences, and
+[`../../THIRD_PARTY_NOTICES.md`](../../THIRD_PARTY_NOTICES.md) lists what the
+image redistributes, [`../../NOTICE`](../../NOTICE) lists them with their
+licences, and
 `third_party/roboplan/README.md` records the RoboPlan source identity and
 patches.
 

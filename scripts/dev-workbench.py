@@ -1154,8 +1154,7 @@ class Workbench:
                             "scenario_id": self.scenario_id,
                             "project_path": self.project_path,
                             "classification": (
-                                "development workbench; repository source; "
-                                "simulated execution only"
+                                "development workbench; repository source"
                             ),
                         }
                     ),

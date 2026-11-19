@@ -181,7 +181,7 @@ usage() {
 prepare_native_build() {
   image_id=$(docker image inspect -f '{{.Id}}' "$image" 2>/dev/null) || {
     echo "Development image is unavailable: $image" >&2
-    echo "Build it once with: ./scripts/compose-dev.sh build" >&2
+    echo "Get it once with: ./scripts/compose-dev.sh pull (published image) or ./scripts/compose-dev.sh build (from source)" >&2
     return 69
   }
   image_key=${image_id#sha256:}

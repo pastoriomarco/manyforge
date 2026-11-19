@@ -91,8 +91,8 @@ enabled.
 
 | Component | Action | What happens |
 | --- | --- | --- |
-| Machine | Prepare | If not connected (no recent status report) or after Power off / Reboot: restart the machine's driver process and wait for its first report, at most the component's lifecycle timeout. Then `clean_error`, read back three times 150 ms apart, and `clean_warn` if a warning is left. The motors are not switched on. A servo error (C10–C17) isn't cleared: power-cycle the robot. An arm taken over from UFACTORY Studio or the pendant is released. |
-| Machine | Recover | As Prepare. |
+| Machine | Prepare | If not connected (no recent status report) or after Power off / Reboot: restart the machine's driver process and wait for its first report, at most the component's lifecycle timeout. Prepare only connects: it clears no controller error (an e-stop and the error it leaves stay as reported), and the motors are not switched on. An arm taken over from UFACTORY Studio or the pendant is released. |
+| Machine | Recover | Connects as Prepare, then `clean_error`, read back three times 150 ms apart, and `clean_warn` if a warning is left. The motors are not switched on. An error that stays (an e-stop still pressed) fails the action. A servo error (C10–C17) isn't cleared: power-cycle the robot. |
 | Machine | Power off | Members are disabled first, then the controller shuts down (`system_control(1)`). The machine shows offline ("shut down by the operator"), not a fault. Switch it on at the control box, then Prepare. The Composer asks for confirmation first. |
 | Machine | Reboot | Members disabled first, `system_control(2)`, wait for the controller to go down and come back, then as Prepare. Offline ("rebooting") meanwhile. The Composer asks for confirmation first. |
 | Arm | Prepare, Recover | **The motors stay off.** Wait for the arm controller to be loaded (Recover switches it off), keep the arm's hardware off, and wait for a recent status report. The Scene shows the real pose from the driver's joint topic. |

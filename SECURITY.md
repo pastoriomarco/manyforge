@@ -31,13 +31,14 @@ attacker a head start before a fix is available.
 
 Only the latest 0.x line receives security fixes at this stage:
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 0.1.x   | ✅ Yes             |
-| < 0.1   | ❌ Pre-publication |
+| Version | Supported                              |
+| ------- | -------------------------------------- |
+| 0.3.x   | ✅ Yes                                 |
+| 0.2.x   | Critical fixes only, until 0.4 ships   |
+| < 0.2   | ❌ No                                  |
 
-When 0.2 ships, 0.1.x will continue to receive critical security
-fixes for one minor version cycle (≈ until 0.3 ships).
+When a new minor version ships, the previous one continues to receive
+critical security fixes for one minor version cycle.
 
 ## Threat model
 
@@ -77,8 +78,8 @@ If you're deploying ManyForge against real hardware:
 
 - ✅ Run the workbench on an isolated network — do not expose its ports
   (3000, 9010, 9011, 9020) or your model server to the public internet.
-  The AI assistant's bridge listens on loopback only, on a port picked at
-  Enable.
+  The AI assistant's bridge listens on loopback only, on a port its host
+  process picks (no fixed port).
 - ✅ Review AI assistant edits in the Draft before Applying them.
 - ✅ Connect the robot's e-stop and safety chain *outside* the
   ManyForge command path. ManyForge Stops are software stops, not

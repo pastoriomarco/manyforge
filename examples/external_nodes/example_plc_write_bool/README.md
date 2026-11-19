@@ -9,11 +9,10 @@ deployment-owned PLC client from the blackboard. That mechanism was deleted
 with the v1 path loader and `runtime_resources` registry. It must not be copied
 back into production code.
 
-For current portable authoring, the built-in v2 `io.set_output` entry already
-represents the same intent:
+For current portable authoring, the built-in `io.set_output` entry (**Set
+output**) already represents the same intent:
 
-- select a `target_role` from the Program Binding;
-- select a semantic `resource_role` on that target;
+- select the output `signal` (a component and one of its signal names);
 - provide the boolean `value`;
 - require `io.gpio.set_output` at `target_binding` scope; and
 - invoke the `kernel.command_target` owner.

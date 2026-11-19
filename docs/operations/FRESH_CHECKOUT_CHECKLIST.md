@@ -7,8 +7,12 @@ prerequisites, commands and troubleshooting.
 
 1. Start from a fresh clone. Record the checked-out commit, host architecture,
    Linux version and Docker/Compose versions with the test result.
-2. Follow the guide's prerequisites and image-build instructions exactly.
-   Record the command and whether the image build succeeds.
+2. Follow the guide's prerequisites and one of its
+   [install options](DEVELOPMENT_WORKBENCH.md#install) exactly: option 1
+   (`./scripts/compose-dev.sh pull`) or option 2 (`./scripts/compose-dev.sh
+   build`). Record the option, the command, the image ID
+   (`docker image inspect --format '{{.Id}}' manyforge-ros-lyrical-full`) and
+   whether it succeeds.
 3. Follow the guide to start an empty workbench. Record the start result and
    verify that `./scripts/compose-dev.sh status` reports it ready.
 4. Open `http://localhost:3000`. Verify that the page opens with an empty

@@ -41,7 +41,7 @@ blackboard:
 | Field | Meaning |
 | --- | --- |
 | `key` | Name, unique in the Program; dots group related keys (`perception.grasp_plan`) |
-| `type` | Value type (`bool`, `int64`, `float64`, `string`, a pose, or a structured type with `fields`) |
+| `type` | Value type (`bool`, `int64`, `float64`, `string`, `stored_pose` for a pose, or a structured type with `fields`) |
 | `access` | `read`, `write` or `read_write`: which node and operator operations are allowed |
 | `persistence` | How long the value lives (section 3) |
 | `initial` | Optional starting value, checked against `type` |

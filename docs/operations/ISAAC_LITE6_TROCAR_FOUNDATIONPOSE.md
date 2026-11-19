@@ -310,12 +310,16 @@ The pick planner's pose-construction order is intentional:
 
 `pick_offset_envelope` and `approach_offset_envelope` XYZ values are expressed
 in their paired reference parameters: `pick_offset_reference` and
-`approach_offset_reference`. This scenario currently pins both to
-`robot_link: link_tcp`: the pick offset `[-0.015, 0.0, 0.004]` and approach
-offset `[0.0, 0.0, -0.08]` are expressed in the generated pick TCP basis, not
-the robot's current live TCP pose before planning. If an offset should follow
-the detected trocar heading, set the corresponding reference to `object: graspable`; if it should stay in the planning base, set it to `frame: link_base`. The vertical-pick option rectifies orientation only; it does not
-override the selected translation reference.
+`approach_offset_reference`. This scenario currently pins both to the Lite
+gripper's TCP (`type: component_frame`, frame `lite_gripper` / `tcp`): the
+pick offset `[-0.015, 0.0, 0.004]` and approach offset `[0.0, 0.0, -0.08]`
+are expressed in the generated pick TCP basis, not the robot's current live
+TCP pose before planning. If an offset should follow the detected trocar
+heading, set the corresponding reference to the object (`type:
+scene_resource`, `scene_resource_id: graspable`); if it should stay fixed in
+the cell, set it to `type: cell_frame` or to a `component_frame` of the
+robot's base. The vertical-pick option rectifies orientation only; it does
+not override the selected translation reference.
 
 Robot Control Cartesian candidates preserve explicit frame parity. A manual
 Move To preview planned in `link_base` for TCP `link_tcp` must approve and
@@ -338,12 +342,13 @@ section. **Limit the starting penetration** maps to
 penetration envelope only. Release, final separation, and re-contact checks
 remain active.
 
-If a validation banner shows a compressed pair such as `ground <-> 0`, expand
-the diagnostics. A `collision_object_pair_N` entry of `graspable <-> ground`
-means the raw RoboPlan body name was resolved to the configured support-contact
-pair and the support-contact state machine will evaluate it. If no object-pair
-entry is present, the other body is not the supported object, for example a
-robot link; support contacts must not hide that collision.
+If a validation refusal names a colliding pair, expand its details.
+`collision_result_first_failure_pair` is the pair that failed.
+`collision_result_contact_release_pair` (with
+`collision_result_contact_release_violation`) is present when the
+support-contact check of the configured pair is what failed. If the failing
+pair is not the picked object and its support, for example a robot link,
+support contacts do not cover that collision and must not hide it.
 
 ## Troubleshooting
 
