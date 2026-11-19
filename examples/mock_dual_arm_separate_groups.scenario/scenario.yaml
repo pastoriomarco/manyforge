@@ -13,7 +13,7 @@
   "saved_status": {
     "checked_content_digest": "sha256:00b4d531b29529cc5cdd1ed118c274a500826f060fe240ceb653d025c8a6a4a2",
     "last_known_status": "unknown",
-    "manyforge_version": "0.3.0"
+    "manyforge_version": "0.3.1"
   },
   "scenario_id": "mock_dual_arm_separate_groups",
   "source_snapshot": {

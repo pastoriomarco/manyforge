@@ -7,10 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Before 1.0, a minor release (0.x.0) may change public interfaces and file
 formats; such changes are listed explicitly.
 
-## Unreleased
+## 0.3.1 – 2026-11-19
+
+### Added
+
+- **A ready-made ROS image.** GitHub builds the workbench's ROS image for
+  amd64 and arm64 (Jetson AGX Thor and Orin, JetPack 7.2.1) and publishes it
+  as `ghcr.io/pastoriomarco/manyforge-ros`; `./scripts/compose-dev.sh pull`
+  uses it instead of building it locally (about an hour). Building from
+  source stays available (`build`). The image holds only ROS and
+  dependencies; ManyForge's own programs still build at first start.
+- **Third-party notices.** `THIRD_PARTY_NOTICES.md` lists every component the
+  image redistributes with its licence as its owner declares it; the owners'
+  licence files are in the image under `/usr/share/licenses/manyforge-image/`.
+- **Nightly ROS CI.** The ROS integration and Mock-lane suites run nightly on
+  the published image.
+- **Overview cards** at the top of the README.
 
 ### Changed
 
+- **Operator mode builds its frontend from the checkout.** Composer serving
+  the built GUI (port 9000) no longer falls back to a frontend baked into the
+  image: the workbench build step builds it from the mounted source (only when
+  it changed), and an operator start without a built frontend is refused with
+  the missing file named. `--composer-static-dir` still overrides it.
+- **ROS image 1.85 GB smaller** (4.07 GB): files get their owner where they
+  are created and source trees are build-only mounts; same content.
 - **The debug export's motion trace reaches back about three times further
   (OD-314).** Controller samples are kept as compact rows in the same 1 MiB:
   2,340 samples, about 15 s at 150 Hz for one arm (about 8 s for two),

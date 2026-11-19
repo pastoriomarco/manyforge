@@ -13,7 +13,7 @@
   "saved_status": {
     "checked_content_digest": "sha256:fe2ddd690065332e2e0cdd8e45633894107d3eca3f4a4bf2cf793e9fe00a0548",
     "last_known_status": "unknown",
-    "manyforge_version": "0.3.0"
+    "manyforge_version": "0.3.1"
   },
   "scenario_id": "mock_lite6_intervention_hold",
   "source_snapshot": {

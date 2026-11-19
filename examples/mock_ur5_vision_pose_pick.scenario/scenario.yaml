@@ -13,7 +13,7 @@
   "saved_status": {
     "checked_content_digest": "sha256:5a5c44103b0a64ec8c03dc6f5b9615367c421a1de1bf78b2b1b12a435e432216",
     "last_known_status": "unknown",
-    "manyforge_version": "0.3.0"
+    "manyforge_version": "0.3.1"
   },
   "scenario_id": "mock_ur5_vision_pose_pick",
   "source_snapshot": {

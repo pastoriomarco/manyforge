@@ -421,7 +421,7 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
 
     app = FastAPI(
         title="ManyForge Program Runner",
-        version="0.3.0",
+        version="0.3.1",
         lifespan=lifespan,
     )
     app.add_middleware(

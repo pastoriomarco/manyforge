@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_headless VERSION 0.3.0 LANGUAGES CXX)
+project(manyforge_headless VERSION 0.3.1 LANGUAGES CXX)
 
 cmake_policy(SET CMP0077 NEW)
 

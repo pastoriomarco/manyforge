@@ -13,7 +13,7 @@
   "saved_status": {
     "checked_content_digest": "sha256:db2850ed0852151284284326c385180b174870c00955e2359970ab0f7d78ffd4",
     "last_known_status": "unknown",
-    "manyforge_version": "0.3.0"
+    "manyforge_version": "0.3.1"
   },
   "scenario_id": "sim_lite6_foundationpose_trocar_pick",
   "source_snapshot": {
