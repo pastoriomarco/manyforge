@@ -28,6 +28,11 @@ formats may change between minor releases.
 
 ---
 
+<p align="center">
+  <img src="docs/media/manyforge-overview-1.png" alt="ManyForge overview: authoring and operation in the browser, AI assistant, and Program building blocks" width="900"><br>
+  <img src="docs/media/manyforge-overview-2.png" alt="ManyForge overview: runtime, one Program on Mock, Isaac Sim and Real lanes, 6D pose with NVIDIA Isaac, supported hardware" width="900">
+</p>
+
 ## What is ManyForge?
 
 ManyForge brings the way industrial robots are programmed together with ROS 2

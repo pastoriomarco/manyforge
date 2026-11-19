@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1080" height="1350" viewBox="0 0 1080 1350">
+<title>ManyForge: author and build</title>
+<defs><pattern id="dots" width="27" height="27" patternUnits="userSpaceOnUse"><circle cx="2" cy="2" r="1.1" fill="#ffffff" fill-opacity="0.035"/></pattern><linearGradient id="hi" x1="0" y1="0" x2="1" y2="0"><stop offset="0" stop-color="#e0218a"/><stop offset="1" stop-color="#1fc6e8"/></linearGradient></defs>
+<rect width="1080" height="1350" fill="#0f151e"/>
+<rect width="1080" height="1350" fill="url(#dots)"/>
+<g transform="translate(64,52) scale(1.3750)">
+  
+  <rect width="64" height="64" rx="14" fill="#3b424c"/>
+  <path d="M13 49 L21 17 L32 38 L43 17 L47 33" fill="none" stroke="#1fc6e8" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="21" cy="17" r="4.5" fill="#e0218a"/>
+  <circle cx="32" cy="38" r="4.5" fill="#e0218a"/>
+  <circle cx="43" cy="17" r="4.5" fill="#e0218a"/>
+  <rect x="7" y="48" width="12" height="6" rx="2" fill="#c3c9d1"/>
+  <path d="M42 37 H54 M42 37 V45 M54 37 V45 M42 45 L44.5 48.5 M54 45 L51.5 48.5" fill="none" stroke="#e0218a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</g>
+<text x="176.0" y="114.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="64" font-weight="700" fill="#f5f7fa" text-anchor="start" letter-spacing="0">ManyForge</text>
+<text x="64.0" y="200.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="32" font-weight="500" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Program robot arms visually.</text>
+<text x="64.0" y="242.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="26" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Run the same Program in simulation and on the real robot.</text>
+<rect x="64.0" y="268.0" width="136.4" height="38.0" rx="19.0" fill="#8ee8b0" stroke="none" stroke-width="1.5" />
+<text x="132.2" y="293.5" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="700" fill="#0b0f14" text-anchor="middle" letter-spacing="0">Apache 2.0</text>
+<rect x="212.4" y="268.0" width="167.7" height="38.0" rx="19.0" fill="#c3c9d1" stroke="none" stroke-width="1.5" />
+<text x="296.3" y="293.5" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="700" fill="#0b0f14" text-anchor="middle" letter-spacing="0">ROS 2 Lyrical</text>
+<rect x="392.1" y="268.0" width="219.9" height="38.0" rx="19.0" fill="#e0218a" stroke="none" stroke-width="1.5" />
+<text x="502.1" y="293.5" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="700" fill="#ffffff" text-anchor="middle" letter-spacing="0">Free &amp; open source</text>
+<rect x="64.0" y="356.0" width="56.0" height="36.0" rx="18" fill="none" stroke="#e0218a" stroke-width="2" />
+<text x="92.0" y="381.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="700" fill="#e0218a" text-anchor="middle" letter-spacing="1">01</text>
+<text x="140.0" y="385.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="34" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Author &amp; operate in the browser</text>
+<rect x="64.0" y="418.0" width="468.0" height="96.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="64.0" y="436.0" width="4.0" height="60.0" rx="2" fill="#e0218a" stroke="none" stroke-width="1.5" />
+<circle cx="112.0" cy="466.0" r="28.0" fill="#e0218a" fill-opacity="0.14"/>
+<g transform="translate(97.9,451.9) scale(1.173)" fill="none" stroke="#e0218a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v5M12 9L6 15M12 9l6 6"/><circle cx="12.0" cy="4.0" r="2.0"/><circle cx="6.0" cy="17.0" r="2.0"/><circle cx="18.0" cy="17.0" r="2.0"/></g>
+<text x="158.0" y="461.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="25" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Behaviour-tree editor</text>
+<text x="158.0" y="491.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="19" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Sequence, fallback, parallel</text>
+<rect x="548.0" y="418.0" width="468.0" height="96.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="548.0" y="436.0" width="4.0" height="60.0" rx="2" fill="#e0218a" stroke="none" stroke-width="1.5" />
+<circle cx="596.0" cy="466.0" r="28.0" fill="#e0218a" fill-opacity="0.14"/>
+<g transform="translate(581.9,451.9) scale(1.173)" fill="none" stroke="#e0218a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l9 5-9 5-9-5zM3 13l9 5 9-5"/></g>
+<text x="642.0" y="461.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="25" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Scenes &amp; Deployments</text>
+<text x="642.0" y="491.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="19" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">A cell built from components</text>
+<rect x="64.0" y="530.0" width="468.0" height="96.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="64.0" y="548.0" width="4.0" height="60.0" rx="2" fill="#e0218a" stroke="none" stroke-width="1.5" />
+<circle cx="112.0" cy="578.0" r="28.0" fill="#e0218a" fill-opacity="0.14"/>
+<g transform="translate(97.9,563.9) scale(1.173)" fill="none" stroke="#e0218a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9zM12 12l8-4.5M12 12v9M12 12L4 7.5"/></g>
+<text x="158.0" y="573.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="25" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Live 3D cell view</text>
+<text x="158.0" y="603.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="19" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Robots, scene, planned motion</text>
+<rect x="548.0" y="530.0" width="468.0" height="96.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="548.0" y="548.0" width="4.0" height="60.0" rx="2" fill="#e0218a" stroke="none" stroke-width="1.5" />
+<circle cx="596.0" cy="578.0" r="28.0" fill="#e0218a" fill-opacity="0.14"/>
+<g transform="translate(581.9,563.9) scale(1.173)" fill="none" stroke="#e0218a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l4.5 4.5L19 7.5"/></g>
+<text x="642.0" y="573.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="25" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Draft → Apply</text>
+<text x="642.0" y="603.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="19" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Edit safely, apply on demand</text>
+<rect x="64.0" y="642.0" width="468.0" height="96.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="64.0" y="660.0" width="4.0" height="60.0" rx="2" fill="#e0218a" stroke="none" stroke-width="1.5" />
+<circle cx="112.0" cy="690.0" r="28.0" fill="#e0218a" fill-opacity="0.14"/>
+<g transform="translate(97.9,675.9) scale(1.173)" fill="none" stroke="#e0218a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5l8 7-8 7z"/><rect x="14.0" y="5.0" width="6.0" height="14.0" rx="1"/></g>
+<text x="158.0" y="685.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="25" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Run · Stop · Recovery</text>
+<text x="158.0" y="715.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="19" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Per motion group</text>
+<rect x="548.0" y="642.0" width="468.0" height="96.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="548.0" y="660.0" width="4.0" height="60.0" rx="2" fill="#e0218a" stroke="none" stroke-width="1.5" />
+<circle cx="596.0" cy="690.0" r="28.0" fill="#e0218a" fill-opacity="0.14"/>
+<g transform="translate(581.9,675.9) scale(1.173)" fill="none" stroke="#e0218a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 7v5l3.5 2"/><circle cx="12.0" cy="12.0" r="9.0"/></g>
+<text x="642.0" y="685.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="25" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">History &amp; alarms</text>
+<text x="642.0" y="715.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="19" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Every outcome recorded</text>
+<rect x="62.0" y="752.0" width="956.0" height="100.0" rx="18" fill="url(#hi)" stroke="none" stroke-width="1.5" />
+<rect x="64.0" y="754.0" width="952.0" height="96.0" rx="16" fill="#1d2734" stroke="none" stroke-width="1.5" />
+<circle cx="112.0" cy="802.0" r="28.0" fill="#e0218a" fill-opacity="0.14"/>
+<g transform="translate(97.9,787.9) scale(1.173)" fill="none" stroke="#e0218a" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16v11H10l-5 4v-4H4zM9 10.5h.01M12 10.5h.01M15 10.5h.01"/></g>
+<text x="158.0" y="797.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="25" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">AI assistant</text>
+<text x="158.0" y="827.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="19" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Edits the Draft with Composer's tools: you review, then Apply</text>
+<rect x="64.0" y="902.0" width="56.0" height="36.0" rx="18" fill="none" stroke="#1fc6e8" stroke-width="2" />
+<text x="92.0" y="927.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="700" fill="#1fc6e8" text-anchor="middle" letter-spacing="1">02</text>
+<text x="140.0" y="931.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="34" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Program building blocks</text>
+<rect x="64.0" y="964.0" width="470.0" height="78.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="64.0" y="982.0" width="4.0" height="42.0" rx="2" fill="#1fc6e8" stroke="none" stroke-width="1.5" />
+<circle cx="108.0" cy="1003.0" r="24.0" fill="#1fc6e8" fill-opacity="0.14"/>
+<g transform="translate(96.5,991.5) scale(0.960)" fill="none" stroke="#1fc6e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 18C6 8 14 5 20 6M16 3l4 3-3 4"/></g>
+<text x="150.0" y="998.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="24" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Motion</text>
+<text x="150.0" y="1027.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Move, move-until-signal, probe</text>
+<rect x="546.0" y="964.0" width="470.0" height="78.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="546.0" y="982.0" width="4.0" height="42.0" rx="2" fill="#1fc6e8" stroke="none" stroke-width="1.5" />
+<circle cx="590.0" cy="1003.0" r="24.0" fill="#1fc6e8" fill-opacity="0.14"/>
+<g transform="translate(578.5,991.5) scale(0.960)" fill="none" stroke="#1fc6e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v10M8 9l4 4 4-4M5 15v5h14v-5"/></g>
+<text x="632.0" y="998.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="24" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Pick &amp; place planning</text>
+<text x="632.0" y="1027.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Grasp and place in one node</text>
+<rect x="64.0" y="1054.0" width="470.0" height="78.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="64.0" y="1072.0" width="4.0" height="42.0" rx="2" fill="#1fc6e8" stroke="none" stroke-width="1.5" />
+<circle cx="108.0" cy="1093.0" r="24.0" fill="#1fc6e8" fill-opacity="0.14"/>
+<g transform="translate(96.5,1081.5) scale(0.960)" fill="none" stroke="#1fc6e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4v8h12V4M6 12l2 8M18 12l-2 8M12 12V9"/></g>
+<text x="150.0" y="1088.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="24" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Grippers</text>
+<text x="150.0" y="1117.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Position and pneumatic</text>
+<rect x="546.0" y="1054.0" width="470.0" height="78.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="546.0" y="1072.0" width="4.0" height="42.0" rx="2" fill="#1fc6e8" stroke="none" stroke-width="1.5" />
+<circle cx="590.0" cy="1093.0" r="24.0" fill="#1fc6e8" fill-opacity="0.14"/>
+<g transform="translate(578.5,1081.5) scale(0.960)" fill="none" stroke="#1fc6e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l2-6 4 12 2-6h6"/></g>
+<text x="632.0" y="1088.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="24" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">I/O &amp; signals</text>
+<text x="632.0" y="1117.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Wait, set, edge, rules</text>
+<rect x="64.0" y="1144.0" width="470.0" height="78.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="64.0" y="1162.0" width="4.0" height="42.0" rx="2" fill="#1fc6e8" stroke="none" stroke-width="1.5" />
+<circle cx="108.0" cy="1183.0" r="24.0" fill="#1fc6e8" fill-opacity="0.14"/>
+<g transform="translate(96.5,1171.5) scale(0.960)" fill="none" stroke="#1fc6e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 19V5M5 19h14M5 19l9-9"/><circle cx="5.0" cy="19.0" r="1.5"/></g>
+<text x="150.0" y="1178.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="24" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Geometry &amp; poses</text>
+<text x="150.0" y="1207.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Offsets, bounds, distances</text>
+<rect x="546.0" y="1144.0" width="470.0" height="78.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="546.0" y="1162.0" width="4.0" height="42.0" rx="2" fill="#1fc6e8" stroke="none" stroke-width="1.5" />
+<circle cx="590.0" cy="1183.0" r="24.0" fill="#1fc6e8" fill-opacity="0.14"/>
+<g transform="translate(578.5,1171.5) scale(0.960)" fill="none" stroke="#1fc6e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l2 6 6 2-6 2-2 6-2-6-6-2 6-2z"/></g>
+<text x="632.0" y="1178.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="24" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Model query (AI)</text>
+<text x="632.0" y="1207.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Call AI models from a Program</text>
+<rect x="64.0" y="1234.0" width="470.0" height="78.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="64.0" y="1252.0" width="4.0" height="42.0" rx="2" fill="#1fc6e8" stroke="none" stroke-width="1.5" />
+<circle cx="108.0" cy="1273.0" r="24.0" fill="#1fc6e8" fill-opacity="0.14"/>
+<g transform="translate(96.5,1261.5) scale(0.960)" fill="none" stroke="#1fc6e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4v16M6 8h6a4 4 0 014 4v8M16 20l-3-3M16 20l3-3"/></g>
+<text x="150.0" y="1268.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="24" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Logic &amp; flow</text>
+<text x="150.0" y="1297.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Blackboard, timers, repeat</text>
+<rect x="546.0" y="1234.0" width="470.0" height="78.0" rx="16" fill="#18202b" stroke="none" stroke-width="1.5" />
+<rect x="546.0" y="1252.0" width="4.0" height="42.0" rx="2" fill="#1fc6e8" stroke="none" stroke-width="1.5" />
+<circle cx="590.0" cy="1273.0" r="24.0" fill="#1fc6e8" fill-opacity="0.14"/>
+<g transform="translate(578.5,1261.5) scale(0.960)" fill="none" stroke="#1fc6e8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 12a8 8 0 11-2.4-5.7M20 4v5h-5"/></g>
+<text x="632.0" y="1268.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="24" font-weight="600" fill="#f5f7fa" text-anchor="start" letter-spacing="0">Recovery</text>
+<text x="632.0" y="1297.0" font-family="'Ubuntu Sans','Noto Sans','Segoe UI',Helvetica,Arial,sans-serif" font-size="18" font-weight="400" fill="#bcc5d0" text-anchor="start" letter-spacing="0">Retry, fallback, recovery skills</text>
+</svg>
