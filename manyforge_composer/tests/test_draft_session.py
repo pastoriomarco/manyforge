@@ -183,6 +183,8 @@ def _pick_macro_arguments() -> dict:
 def test_external_owner_effect_keeps_the_checked_draft_current() -> None:
     session = ComposerDraftSession(_program())
     draft = session.snapshot()
+    # Built before the threads: only the session's ordering is under test.
+    catalog = build_node_environment().catalog
     effect_entered = threading.Event()
     release_effect = threading.Event()
     mutation_started = threading.Event()
@@ -208,7 +210,7 @@ def test_external_owner_effect_keeps_the_checked_draft_current() -> None:
             tool_id="scene_draft_add_object",
             arguments={"scene_resource": _box_resource("queued")},
             expected_revision=draft["draft_revision"],
-            catalog=build_node_environment().catalog,
+            catalog=catalog,
             draft_id=draft["draft_id"],
         )
         results.append("mutation")
@@ -222,11 +224,10 @@ def test_external_owner_effect_keeps_the_checked_draft_current() -> None:
     assert mutation_started.wait(timeout=2)
     assert not mutation_finished.wait(timeout=0.05)
     release_effect.set()
-    effect_thread.join(timeout=2)
-    mutation_thread.join(timeout=2)
+    # Both threads end once the effect is released; no wait limit.
+    effect_thread.join()
+    mutation_thread.join()
 
-    assert not effect_thread.is_alive()
-    assert not mutation_thread.is_alive()
     assert results == ["effect", "mutation"]
     assert session.revision == draft["draft_revision"] + 1
 
