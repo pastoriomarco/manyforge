@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Before 1.0, a minor release (0.x.0) may change public interfaces and file
 formats; such changes are listed explicitly.
 
+## Unreleased
+
+### Changed
+
+- **The debug export's motion trace reaches back about three times further
+  (OD-314).** Controller samples are kept as compact rows in the same 1 MiB:
+  2,340 samples, about 15 s at 150 Hz for one arm (about 8 s for two),
+  instead of about 5 s. Recording a sample no longer allocates memory or
+  copies unexported fields; the export format is unchanged. A debug export
+  file may now be up to 5 MiB (was 3 MiB).
+- **The development workbench builds its native programs in one tree.** The
+  execution host, worker, Manager and both Python modules build together, so
+  a clean native build compiles 42 % fewer files (about 21 % faster on a
+  Jetson AGX Thor). Programs are built Release with debug symbols, so crash
+  backtraces name functions and lines.
+- **Faster execution-host answers.** `targets` re-verifies the Stop metadata
+  from disk only when a file changed; the Program Runner asks the host for
+  Reset-position availability once per published status instead of two or
+  more times, and not at all for run readiness; the host no longer clears a
+  1 MiB buffer per request; the controller-state callback allocates less.
+  All host threads have names, visible in traces.
+- **Composer:** the 3D viewer encodes each frame once per delivery, and the
+  Program graph recolours on status updates without recomputing its layout.
+- **Development image:** based on Ubuntu 24.04 (the same base and compiler
+  as the ROS image), instead of Debian 12.
+
 ## 0.3.0 – 2026-11-18
 
 ### Breaking changes

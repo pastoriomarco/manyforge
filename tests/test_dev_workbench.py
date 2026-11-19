@@ -28,8 +28,7 @@ def _built_native_fixture(
 ) -> None:
     """serve only checks the native artifacts; it never runs a build step."""
 
-    for build in ("_ensure_current_backend", "_ensure_current_ros_backend",
-                  "_ensure_activation_preparer", "_ensure_core_bindings"):
+    for build in ("_ensure_current_ros_backend", "_ensure_activation_preparer"):
         monkeypatch.setattr(dev_workbench, build,
                             lambda *_a, _build=build, **_k: pytest.fail(f"serve ran {_build}"))
     monkeypatch.setattr(dev_workbench, "_current_backend", lambda: extension)
@@ -258,49 +257,6 @@ def test_status_command_accepts_an_empty_authoring_workbench(
 
     assert observed == [None]
     assert "another-native-scenario" in capsys.readouterr().out
-
-
-def test_backend_build_uses_current_source_and_only_production_targets(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
-    build = tmp_path / "headless"
-    manager = build / "manyforge_manager_daemon"
-    extension = build / "manyforge_headless_py.fixture.so"
-    observed: list[tuple[str, ...]] = []
-
-    def run(command: tuple[str, ...], **_kwargs: Any) -> None:
-        observed.append(command)
-        if command[0] == "cmake" and command[1] == "--build":
-            manager.parent.mkdir(parents=True, exist_ok=True)
-            manager.write_bytes(b"manager")
-            manager.chmod(0o755)
-            extension.write_bytes(b"headless")
-
-    monkeypatch.setattr(dev_workbench, "HEADLESS_BUILD", build)
-    monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", manager)
-    monkeypatch.setattr(dev_workbench, "_run", run)
-    monkeypatch.setattr(
-        dev_workbench.subprocess,
-        "run",
-        lambda *_args, **_kwargs: SimpleNamespace(
-            returncode=0, stdout="/pybind11/cmake\n"
-        ),
-    )
-    monkeypatch.setenv("MANYFORGE_DEV_BUILD_JOBS", "3")
-
-    assert dev_workbench._ensure_current_backend() == extension
-
-    assert len(observed) == 2
-    assert "-DBUILD_TESTING=OFF" in observed[0]
-    assert observed[1][-5:] == (
-        "manyforge_manager_daemon",
-        "manyforge_headless_py",
-        "--",
-        "-k",
-        "0",
-    )
-    assert "--parallel" in observed[1]
-    assert observed[1][observed[1].index("--parallel") + 1] == "3"
 
 
 def test_stale_socket_cleanup_removes_only_the_named_socket(tmp_path: Path) -> None:
@@ -723,6 +679,7 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
         assert env["MANYFORGE_ROS2_CONTROL_BUILD_TESTING"] == (build_testing or "OFF")
         assert env["CMAKE_BUILD_PARALLEL_LEVEL"] == "2"
         assert env["CMAKE_GENERATOR"] == "Ninja"
+        assert env["MANYFORGE_ROS2_CONTROL_BUILD_KEEP_GOING"] == "ON"
         ros_build.mkdir(parents=True, exist_ok=True)
         targets = ("manyforge_ros2_control_execution_host", "manyforge_roboplan_candidate_worker")
         for name in targets:
@@ -733,6 +690,9 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
         overlay.write_text("overlay", encoding="utf-8")
 
     def source_overlay(command: tuple[str, ...], **kwargs: Any) -> Any:
+        if command[-1] == "import pybind11; print(pybind11.get_cmake_dir())":
+            assert command[0] == dev_workbench.sys.executable
+            return SimpleNamespace(returncode=0, stdout="/pybind11/cmake\n")
         assert command[-1] == str(overlay)
         assert kwargs["env"]["ROS_STATIC_PEERS"] == "orin;laptop"
         return SimpleNamespace(
@@ -742,9 +702,19 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
     monkeypatch.setattr(dev_workbench, "_run", build)
     monkeypatch.setattr(dev_workbench.subprocess, "run", source_overlay)
     targets = dev_workbench._ensure_current_ros_backend()
+    # One graph builds the whole native closure, the Python modules against
+    # the serving interpreter's pybind11.
     assert commands == [(
         str(REPOSITORY_ROOT / "scripts/ros/build-ros2-control-runtime.sh"),
         "--source-dir", str(REPOSITORY_ROOT / "scripts/ros/ros-integration"),
+        "--target", "manyforge_ros2_control_execution_host",
+        "--target", "manyforge_roboplan_candidate_worker",
+        "--target", "manyforge_manager_daemon",
+        "--target", "manyforge_headless_py",
+        "--target", "manyforge_core_py",
+        "--cmake-arg", "-DMANYFORGE_BUILD_PYTHON_MODULES=ON",
+        "--cmake-arg", "-DCMAKE_CXX_FLAGS_RELEASE=-O3 -DNDEBUG -g",
+        "--cmake-arg", "-Dpybind11_DIR=/pybind11/cmake",
     )]
     assert [target.name for target in targets] == [
         "manyforge_roboplan_candidate_worker",
@@ -1291,6 +1261,7 @@ def test_ros_dependency_setups_precede_build_and_application_overlay_is_last(
     monkeypatch.delenv("MANYFORGE_SETUP_ORDER", raising=False)
     build = tmp_path / "build"
     monkeypatch.setattr(dev_workbench, "BUILD_ROOT", build)
+    monkeypatch.setattr(dev_workbench, "_pybind11_cmake_dir", lambda: "/pybind11/cmake")
     monkeypatch.setenv("MANYFORGE_DEV_BUILD_JOBS", "1")
     if dependencies:
         first = tmp_path / "first $literal.bash"
@@ -1341,8 +1312,8 @@ def test_build_command_runs_the_native_steps_in_order_and_records_build_time(
     tmp_path: Path, monkeypatch: Any
 ) -> None:
     calls: list[str] = []
-    for build in ("_ensure_current_backend", "_ensure_current_ros_backend",
-                  "_ensure_activation_preparer", "_ensure_core_bindings"):
+    for build in ("_ensure_current_ros_backend", "_current_backend",
+                  "_current_core_bindings", "_ensure_activation_preparer"):
         monkeypatch.setattr(dev_workbench, build, lambda _build=build: calls.append(_build))
     monkeypatch.setattr(dev_workbench, "_run", lambda command: calls.append(tuple(command)))
     clock = iter((10.0, 52.5))
@@ -1352,8 +1323,10 @@ def test_build_command_runs_the_native_steps_in_order_and_records_build_time(
 
     assert dev_workbench.main(["build"]) == 0
 
-    assert calls[:4] == ["_ensure_current_backend", "_ensure_current_ros_backend",
-                         "_ensure_activation_preparer", "_ensure_core_bindings"]
+    # The one graph builds first; its Manager and modules are checked before
+    # the separately linked authoring tools build.
+    assert calls[:4] == ["_ensure_current_ros_backend", "_current_backend",
+                         "_current_core_bindings", "_ensure_activation_preparer"]
     # Then the served Python packages are compiled by the services' interpreter.
     compile_command = calls[4]
     assert compile_command[:3] == (dev_workbench.sys.executable, "-m", "compileall")
@@ -1367,7 +1340,7 @@ def test_build_command_failure_exits_unavailable(monkeypatch: Any, capsys: Any) 
     def failed_build() -> None:
         raise dev_workbench.WorkbenchError("command failed with exit 1: cmake --build")
 
-    monkeypatch.setattr(dev_workbench, "_ensure_current_backend", failed_build)
+    monkeypatch.setattr(dev_workbench, "_ensure_current_ros_backend", failed_build)
     assert dev_workbench.main(["build"]) == 69
     assert "cmake --build" in capsys.readouterr().err
 
@@ -1381,14 +1354,14 @@ def test_serve_refuses_missing_native_artifacts_with_the_build_step(
 ) -> None:
     build = tmp_path / "build"
     artifacts = {
-        "manager": (build / "headless/manyforge_manager_daemon", True),
-        "headless": (build / "headless/manyforge_headless_py.fixture.so", False),
+        "manager": (build / "ros-integration/headless/manyforge_manager_daemon", True),
+        "headless": (build / "ros-integration/headless/manyforge_headless_py.fixture.so", False),
         "ros_worker": (build / "ros-integration/manyforge_roboplan_candidate_worker", True),
         "ros_host": (build / "ros-integration/manyforge_ros2_control_execution_host", True),
         "ros_overlay": (build / "isaac/ros-overlay/install/setup.bash", False),
         "preparer": (build / "deployment-authoring/manyforge_prepare_activation", True),
         "generator": (build / "deployment-authoring/manyforge_generate_canonical_empty_package", True),
-        "core": (build / "core-python/manyforge_core_py.fixture.so", False),
+        "core": (build / "ros-integration/core-python/manyforge_core_py.fixture.so", False),
     }
     for name, (path, executable) in artifacts.items():
         if name == missing:
@@ -1401,11 +1374,11 @@ def test_serve_refuses_missing_native_artifacts_with_the_build_step(
     monkeypatch.delenv("MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS", raising=False)
     monkeypatch.setenv("MANYFORGE_DEV_BUILD_JOBS", "1")
     monkeypatch.setattr(dev_workbench, "BUILD_ROOT", build)
-    monkeypatch.setattr(dev_workbench, "HEADLESS_BUILD", build / "headless")
+    monkeypatch.setattr(dev_workbench, "HEADLESS_BUILD", build / "ros-integration/headless")
     monkeypatch.setattr(dev_workbench, "MANAGER_BINARY", artifacts["manager"][0])
     monkeypatch.setattr(dev_workbench, "ACTIVATION_PREPARER", artifacts["preparer"][0])
     monkeypatch.setattr(dev_workbench, "CANONICAL_EMPTY_GENERATOR", artifacts["generator"][0])
-    monkeypatch.setattr(dev_workbench, "CORE_PYTHON_BUILD", build / "core-python")
+    monkeypatch.setattr(dev_workbench, "CORE_PYTHON_BUILD", build / "ros-integration/core-python")
     monkeypatch.setattr(dev_workbench, "NATIVE_BUILD_TIMING", build / "native-build-timing.json")
     monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path / "state")
     monkeypatch.setattr(dev_workbench, "_port_available", lambda _port: True)

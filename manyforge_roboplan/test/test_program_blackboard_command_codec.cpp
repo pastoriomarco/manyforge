@@ -536,15 +536,15 @@ TEST(VolatileMotionTraceCommandTest, OrdinaryReadHasBoundedAllowanceAndNoControl
             {"transport", Value("internal")}, {"assurance", Value("unverified")},
             {"principal_id", Value(nullptr)}})}}));
   };
-  const auto command = DecodeCommand(request(3145728.0));
+  const auto command = DecodeCommand(request(5242880.0));
   EXPECT_EQ(command.kind, CommandKind::kReadVolatileMotionTrace);
-  EXPECT_EQ(command.trace_allowance_bytes, 3145728U);
+  EXPECT_EQ(command.trace_allowance_bytes, 5242880U);
   EXPECT_FALSE(IsSubmissionOrdered(command.kind));
   EXPECT_FALSE(ReadsManagerScene(command.kind));
   EXPECT_FALSE(IsStopLaneRead(command.kind));
   EXPECT_FALSE(IsComponentLaneCommand(command.kind));
   EXPECT_FALSE(PreemptsPlanning(command.kind));
-  for (const double invalid : {0.0, -1.0, 0.5, 3145729.0})
+  for (const double invalid : {0.0, -1.0, 0.5, 5242881.0})
     EXPECT_THROW((void)DecodeCommand(request(invalid)), std::exception);
 }
 

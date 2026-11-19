@@ -94,6 +94,8 @@ class FakeRuntime:
         self.control_state_observers: set[Any] = set()
         self.control_revision = 1
         self.node_status_revision = 1
+        self.projections = 0
+        self.reset_reads = 0
 
     def add_control_state_observer(self, observer) -> None:
         self.control_state_observers.add(observer)
@@ -206,6 +208,15 @@ class FakeRuntime:
         }
 
     def cycle_status(self) -> dict[str, Any]:
+        return self.add_reset_robot_position(self.cycle_projection())
+
+    def add_reset_robot_position(self, cycle: dict[str, Any]) -> dict[str, Any]:
+        self.reset_reads += 1
+        cycle["reset_robot_position"] = {"available": False, "reason": "unsupported"}
+        return cycle
+
+    def cycle_projection(self) -> dict[str, Any]:
+        self.projections += 1
         return {
             "cycle_generation": 1,
             "state": "idle_after_reset",
@@ -219,7 +230,7 @@ class FakeRuntime:
             "failure": None,
             "reset_phase": None,
         "reset_options": None,
-        "reset_robot_position": {"available": False, "reason": "unsupported"},
+        "reset_robot_position": {"available": False, "reason": "unsampled"},
             "allowed_commands": [],
             "run_revision": None,
             "node_status_revision": self.node_status_revision,
@@ -375,8 +386,8 @@ def test_control_state_websocket_is_change_driven_and_demand_scoped() -> None:
     class GroupRuntime(FakeRuntime):
         group_state = "running"
 
-        def cycle_status(self) -> dict[str, Any]:
-            cycle = super().cycle_status()
+        def cycle_projection(self) -> dict[str, Any]:
+            cycle = super().cycle_projection()
             cycle["runtime_controls"] = {
                 "execution_selections": {
                     "groups": [{"group_id": "arm", "state": self.group_state}]
@@ -414,6 +425,54 @@ def test_control_state_websocket_is_change_driven_and_demand_scoped() -> None:
                 assert change["program_cycle"]["execution_control_revision"] == 2
 
         assert runtime.control_state_observers == set()
+
+
+def test_control_state_frame_reads_reset_position_once_at_send() -> None:
+    """Classification snapshots skip the host Reset-position read; each sent
+    frame reads it once and equals the complete cycle status."""
+
+    class FakeWebSocket:
+        def __init__(self) -> None:
+            self.inbound: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            self.outbound: asyncio.Queue[str] = asyncio.Queue()
+
+        async def accept(self) -> None:
+            return None
+
+        async def receive(self) -> dict[str, Any]:
+            return await self.inbound.get()
+
+        async def send_text(self, payload: str) -> None:
+            await self.outbound.put(payload)
+
+        async def close(self, *, code: int, reason: str) -> None:
+            del code, reason
+
+    async def exercise() -> None:
+        runtime = FakeRuntime()
+        # A still clock keeps the node-progress window open, so the publisher
+        # always coalesces the node-only wake.
+        source = ProgramControlStateSource(runtime, clock_ns=lambda: 1)
+        websocket = FakeWebSocket()
+        serving = asyncio.create_task(
+            _serve_program_control_state(websocket, source)  # type: ignore[arg-type]
+        )
+        first = json.loads(await asyncio.wait_for(websocket.outbound.get(), timeout=1.0))
+        assert (runtime.projections, runtime.reset_reads) == (1, 1)
+        runtime.publish_control_state(node_only=True)
+        progress = json.loads(await asyncio.wait_for(websocket.outbound.get(), timeout=1.0))
+        assert progress["event_class"] == "node_progress"
+        # Before: one full status per snapshot (here 2 Reset reads per frame).
+        assert (runtime.projections, runtime.reset_reads) == (3, 2)
+        for frame in (first, progress):
+            assert frame["program_cycle"]["reset_robot_position"] == {
+                "available": False, "reason": "unsupported"}
+        assert progress["program_cycle"] == runtime.cycle_status()
+        await websocket.inbound.put({"type": "websocket.disconnect"})
+        await asyncio.wait_for(serving, timeout=1.0)
+        source.close()
+
+    asyncio.run(exercise())
 
 
 def test_control_state_websocket_releases_disconnected_clients_without_owner_wake() -> (

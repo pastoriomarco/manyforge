@@ -8,6 +8,7 @@
 #include <manyforge_core/runtime_collision_lookahead_session.hpp>
 #include <stdexcept>
 #include <utility>
+#include <pthread.h>
 
 namespace manyforge::core {
 namespace {
@@ -415,6 +416,7 @@ RuntimeCollisionLookaheadSession::RuntimeCollisionLookaheadSession(
   required_times_scratch_.reserve(config_.max_samples);
   target_times_scratch_.reserve(config_.max_samples * 2);
   worker_ = std::jthread([this](std::stop_token stop_token) {
+    static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_lookahead"));
     current_lookahead_worker = this;
     worker_loop(stop_token);
     current_lookahead_worker = nullptr;

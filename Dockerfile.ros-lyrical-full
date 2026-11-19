@@ -13,9 +13,9 @@
 #     and the UFactory xArm driver.
 #
 # ROS base (build ARG ROS_BASE):
-#   apt (default) - NVIDIA Isaac ROS apt mirror plus the pinned controller and
+#   apt - NVIDIA Isaac ROS apt mirror plus the pinned controller and
 #       rmw_fastrtps overlays.
-#   source - ROS Lyrical built from source: the release set of the rosdistro
+#   source (default) - ROS Lyrical built from source: the release set of the rosdistro
 #       sync recorded in third_party/ros_lyrical/ros-lyrical.repos
 #       (scripts/ros/generate-lyrical-source-repos.sh), plus version floors.
 #       NOT YET BUILDABLE END TO END: upstream Lyrical removed CMake
@@ -208,6 +208,8 @@ RUN set -eux; \
 # Stock JTC 6.10.1 controller overlay: apt ros2_control plus source JTC and
 # parallel_gripper_controller 6.10.1 (ros2_controllers tag 6.10.1),
 # realtime_tools 5.4.0 and ros2_control_cmake 1.0.0.
+# Like everything under /opt/manyforge, the overlays belong to the image user
+# (UID 1000) from the layer that creates them.
 ARG ROS2_CONTROL_CMAKE_COMMIT=10b9df0d804c2880e7dc50927f8fd82c7198bda4
 ARG REALTIME_TOOLS_COMMIT=f2f8ee08580659e0ee673a8cdbd1a83b274e9d4a
 ARG ROS2_CONTROLLERS_COMMIT=04b74a6f6a98920e97de4b5bc163ccb900839b95
@@ -231,6 +233,7 @@ RUN set -euo pipefail; \
     printf 'ros2_control_cmake %s\nrealtime_tools %s\nros2_controllers %s\n' \
         "${ROS2_CONTROL_CMAKE_COMMIT}" "${REALTIME_TOOLS_COMMIT}" "${ROS2_CONTROLLERS_COMMIT}" \
         > /opt/manyforge/control_overlay/UPSTREAM_COMMITS; \
+    chown -R 1000:1000 /opt/manyforge; \
     rm -rf "${ws}"
 
 # Stock rmw_fastrtps 9.4.11 overlay (OD-63): the Isaac ROS mirror still ships
@@ -251,6 +254,7 @@ RUN set -euo pipefail; \
         --packages-select rmw_fastrtps_shared_cpp rmw_fastrtps_cpp rmw_fastrtps_dynamic_cpp \
         --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF; \
     printf 'rmw_fastrtps %s\n' "${RMW_FASTRTPS_COMMIT}" > /opt/manyforge/rmw_fastrtps_overlay/UPSTREAM_COMMITS; \
+    chown -R 1000:1000 /opt/manyforge/rmw_fastrtps_overlay; \
     rm -rf "${ws}"
 
 # --- Stage 4: selected ROS base ---
@@ -381,6 +385,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # and pip cannot float the new `libpinocchio`/`libcoal` split-out libs or pull a
 # mismatched urdfdom soname. Native XML is privately linked below so that
 # sharing this closure with ROS does not interpose a different XML ABI.
+# Each step that writes under /opt/manyforge ends by giving the entries it
+# created (files, symlinks, ldconfig links, bytecode) to UID 1000:1000, so no
+# later layer rewrites the venv; entries already owned are not touched.
 RUN python3 -m venv --system-site-packages "${MANYFORGE_VENV}" \
     && python -m pip install --no-cache-dir --upgrade pip "setuptools<80" \
     && printf '%s\n' \
@@ -420,7 +427,8 @@ RUN python3 -m venv --system-site-packages "${MANYFORGE_VENV}" \
         mcp==1.27.0 \
     && python -m pip check \
     && CMEEL_LIB=$(python -c "import site; print(site.getsitepackages()[0])")/cmeel.prefix/lib \
-    && if [ -d "$CMEEL_LIB" ]; then echo "$CMEEL_LIB" > /etc/ld.so.conf.d/manyforge-cmeel.conf && ldconfig; fi
+    && if [ -d "$CMEEL_LIB" ]; then echo "$CMEEL_LIB" > /etc/ld.so.conf.d/manyforge-cmeel.conf && ldconfig; fi \
+    && find /opt/manyforge \( ! -uid 1000 -o ! -gid 1000 \) -exec chown -h 1000:1000 {} +
 
 # Keep native XML 11 private to its consumers; ROS retains its XML 10 ABI.
 # Exact released cmeel sources; no dependency-version or ROS middleware change.
@@ -467,24 +475,27 @@ RUN set -eux; \
       done; \
     done; \
     ldconfig; \
+    find /opt/manyforge \( ! -uid 1000 -o ! -gid 1000 \) -exec chown -h 1000:1000 {} +; \
     rm -rf /tmp/native-tinyxml* /tmp/native-urdfdom* /tmp/cmeel_tinyxml2-11.0.0 \
       /tmp/cmeel_urdfdom-6.0.0 /tmp/cmeel_urdfdom_headers-3.0.0
 
 # Exact RoboPlan 0.8 source closure with source-built ProxSuite (configured by
 # exact jrl-cmakemodules, no serialization) and TOPPRA, and exact nanoflann.
-# Prepared on the host by scripts/setup-docker.sh.
-COPY .docker/roboplan/ /tmp/roboplan/
-COPY .docker/proxsuite/ /tmp/proxsuite/
-COPY .docker/jrl-cmakemodules/ /tmp/jrl-cmakemodules/
-COPY .docker/toppra/ /tmp/toppra/
-COPY .docker/nanoflann/ /tmp/nanoflann/
+# Prepared on the host by scripts/setup-docker.sh. The five source trees are
+# bind-mounted for this one build step only (read-write; its writes, such as
+# the RoboPlan patches, are discarded), so they never land in an image layer.
 COPY third_party/roboplan/ /tmp/roboplan-manifest/
 COPY scripts/ci/build-roboplan-source-stack.sh /tmp/build-roboplan-source-stack.sh
 COPY scripts/ci/build-roboplan-source-closure.sh /tmp/build-roboplan-source-closure.sh
 COPY scripts/ci/verify-external-source-closure.py /tmp/verify-external-source-closure.py
 COPY third_party/external_delta_ledger.v1.json /tmp/external-delta-ledger.v1.json
 COPY scripts/ci/check-roboplan-dependency-stack.py /tmp/check-roboplan-dependency-stack.py
-RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1) \
+RUN --mount=type=bind,source=.docker/roboplan,target=/tmp/roboplan,rw \
+    --mount=type=bind,source=.docker/proxsuite,target=/tmp/proxsuite,rw \
+    --mount=type=bind,source=.docker/jrl-cmakemodules,target=/tmp/jrl-cmakemodules,rw \
+    --mount=type=bind,source=.docker/toppra,target=/tmp/toppra,rw \
+    --mount=type=bind,source=.docker/nanoflann,target=/tmp/nanoflann,rw \
+    PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.cmake" -printf '%h\n' 2>/dev/null | head -1) \
     && PINOCCHIO_PREFIX=$(dirname "$(dirname "$(dirname "$PINOCCHIO_CMAKE_DIR")")") \
     && echo "Pinocchio prefix: ${PINOCCHIO_PREFIX}" \
     && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then \
@@ -553,17 +564,17 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
            echo "Native XML symbols escaped private linkage: $native_xml_consumer" >&2; exit 1; \
          fi; \
        done \
-    && rm -rf /tmp/roboplan /tmp/proxsuite /tmp/jrl-cmakemodules /tmp/toppra /tmp/nanoflann \
-         /tmp/roboplan-manifest \
+    && find /opt/manyforge \( ! -uid 1000 -o ! -gid 1000 \) -exec chown -h 1000:1000 {} + \
+    && rm -rf /tmp/roboplan-manifest \
          /tmp/roboplan-build-closure /tmp/roboplan-install-closure \
          /tmp/build-roboplan-source-stack.sh /tmp/build-roboplan-source-closure.sh \
          /tmp/verify-external-source-closure.py /tmp/external-delta-ledger.v1.json \
          /tmp/check-roboplan-dependency-stack.py /tmp/native-xml-needed.txt /tmp/native-xml-symbols.txt
 
 # ROS workspaces built in the clean stage above (no venv/cmeel on any path).
-COPY --from=ros-workspaces /opt/manyforge/topic_based_ros2_control /opt/manyforge/topic_based_ros2_control
-COPY --from=ros-workspaces /opt/manyforge/xarm_description /opt/manyforge/xarm_description
-COPY --from=ros-workspaces /opt/manyforge/xarm_ws /opt/manyforge/xarm_ws
+COPY --from=ros-workspaces --chown=1000:1000 /opt/manyforge/topic_based_ros2_control /opt/manyforge/topic_based_ros2_control
+COPY --from=ros-workspaces --chown=1000:1000 /opt/manyforge/xarm_description /opt/manyforge/xarm_description
+COPY --from=ros-workspaces --chown=1000:1000 /opt/manyforge/xarm_ws /opt/manyforge/xarm_ws
 
 # The venv distributions are the sole RoboPlan runtime/CMake prefix. The
 # disconnected C++ closure is removed in the same layer and cannot compete at
@@ -585,7 +596,7 @@ RUN set -eux; \
     fi; \
     user_home="$(getent passwd 1000 | cut -d: -f6)"; \
     mkdir -p /tmp/manyforge-build /workspace /opt/manyforge-frontend/dist "${user_home}"; \
-    chown -R 1000:1000 /tmp/manyforge-build /workspace "${user_home}" /opt/manyforge
+    chown -R 1000:1000 /tmp/manyforge-build /workspace "${user_home}"
 
 # Node.js 22 for Composer frontend builds in the full ROS image.
 COPY --from=frontend-builder /usr/local/bin/node /usr/local/bin/node

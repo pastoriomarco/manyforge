@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <stop_token>
 #include <thread>
+#include <pthread.h>
 
 namespace manyforge::core {
 namespace {
@@ -289,6 +290,7 @@ class BoundedStopControlExecutor::Impl final {
   }
 
   void Run(const std::stop_token stop_token) noexcept {
+    static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_stop_ctrl"));
     worker_running_.store(true, std::memory_order_release);
     worker_ready_.store(true, std::memory_order_release);
     worker_ready_.notify_all();

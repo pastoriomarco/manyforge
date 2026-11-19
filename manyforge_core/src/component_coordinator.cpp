@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <manyforge_core/component_coordinator.hpp>
+#include <pthread.h>
 
 namespace manyforge::core {
 namespace {
@@ -367,6 +368,7 @@ Result<ComponentActionInProgress> ComponentCoordinator::SubmitRecoveryEnable(
           };
       worker = std::jthread(
           [this, action_body = std::optional{std::move(action_body)}](std::stop_token stop) mutable {
+            static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_comp_recover"));
             ActionCompletion completion{this};
             {
               auto action = std::move(*action_body);
@@ -604,6 +606,7 @@ Result<ComponentActionInProgress> ComponentCoordinator::Submit(const std::string
         };
       worker = std::jthread(
         [this, action_body = std::optional{std::move(action_body)}](const std::stop_token& stop) mutable {
+          static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_comp_action"));
           ActionCompletion completion{this};
           {
             auto run = std::move(*action_body);

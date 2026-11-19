@@ -1734,22 +1734,16 @@ void Ros2ControlExecutionBackend::ReceiveState(
                    sample.measured_positions_rad) ||
       !copy_vector(message.error.positions, *order, sample.error_positions_rad))
     return;
-  for (const auto &source :
-       {message.output.velocities, message.feedback.velocities}) {
-    std::vector<double> check;
-    if (!copy_vector(source, *order, check))
-      return;
-  }
-  if (!message.output.velocities.empty()) {
-    std::vector<double> values;
-    (void)copy_vector(message.output.velocities, *order, values);
-    sample.command_velocities_rad_s = std::move(values);
-  }
-  if (!message.feedback.velocities.empty()) {
-    std::vector<double> values;
-    (void)copy_vector(message.feedback.velocities, *order, values);
-    sample.measured_velocities_rad_s = std::move(values);
-  }
+  // Velocities are optional; present ones must map and be finite.
+  std::vector<double> command_velocities;
+  std::vector<double> measured_velocities;
+  if (!copy_vector(message.output.velocities, *order, command_velocities) ||
+      !copy_vector(message.feedback.velocities, *order, measured_velocities))
+    return;
+  if (!message.output.velocities.empty())
+    sample.command_velocities_rad_s = std::move(command_velocities);
+  if (!message.feedback.velocities.empty())
+    sample.measured_velocities_rad_s = std::move(measured_velocities);
   if (std::isfinite(message.speed_scaling_factor))
     sample.applied_factor = message.speed_scaling_factor;
   sample.source_stamp_ns = nanoseconds(message.header.stamp);

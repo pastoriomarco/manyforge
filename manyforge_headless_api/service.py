@@ -136,8 +136,8 @@ _VOLATILE_MOTION_TRACE_MEMBER_TEXT = f',"{VOLATILE_MOTION_TRACE_MEMBER}":'
 # Fixed slack for the {"available":true,"trace":...} wrapper around the native
 # trace object; the final render is checked against the limit regardless.
 VOLATILE_MOTION_TRACE_MARGIN_BYTES = 1024
-# Recommended native trace object cap (fits the 4 MiB execution IPC envelope).
-VOLATILE_MOTION_TRACE_MAX_BYTES = 3 * 1024 * 1024
+# Native trace object cap (VolatileMotionTrace::kMaximumTraceBytes).
+VOLATILE_MOTION_TRACE_MAX_BYTES = 5 * 1024 * 1024
 # Below this remaining budget no useful trace fits; skip the native read.
 VOLATILE_MOTION_TRACE_MIN_ALLOWANCE_BYTES = 4096
 PROGRAM_RUN_STATUS_VERSION = "manyforge.program_run_status.v5"
@@ -3210,7 +3210,7 @@ class HeadlessService:
           ``HeadlessApiError`` code, or ``read_failed``.
 
         The trace receives only the HTTP budget the unchanged bundle leaves:
-        ``min(3 MiB, MAX_HTTP_RESPONSE_BYTES - baseline - member overhead)``.
+        ``min(5 MiB, MAX_HTTP_RESPONSE_BYTES - baseline - member overhead)``.
         If the final render still exceeds the limit the member becomes the
         ``export_limit`` marker; if even that does not fit, the member is
         omitted so the response equals the baseline. Trace goals are never

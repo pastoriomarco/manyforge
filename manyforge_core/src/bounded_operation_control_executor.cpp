@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <thread>
 #include <utility>
+#include <pthread.h>
 
 namespace manyforge::core {
 namespace {
@@ -470,6 +471,7 @@ class BoundedOperationControlExecutor::Impl final {
   }
 
   void Run(Slot& slot, const std::stop_token worker_stop) noexcept {
+    static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_op_ctrl"));
     slot.phase.store(WorkerPhase::kRunning, std::memory_order_release);
     slot.phase.notify_all();
     SignalStateChange();

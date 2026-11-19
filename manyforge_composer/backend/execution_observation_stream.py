@@ -284,7 +284,8 @@ def _render_signature(frame: dict[str, Any]) -> tuple[Any, ...]:
 @dataclass(eq=False)
 class ExecutionObservationSubscription:
     wake: asyncio.Event
-    payload: str | None = None
+    # The offered frame; its own copy (rows included), encoded once at take.
+    payload: dict[str, Any] | None = None
     # Credit cursor (source_epoch, source_sequence, delivery_sequence); the
     # start is the same for every frame of this backend process.
     last_applied: tuple[str, int, int] | None = None
@@ -336,7 +337,8 @@ class ExecutionObservationSource:
         self._subscriptions: set[ExecutionObservationSubscription] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._condition = threading.Condition()
-        self._last_payload: str | None = None
+        # Validated frame, treated as immutable; deliveries shallow-copy it.
+        self._last_frame: dict[str, Any] | None = None
         self._last_identity: tuple[str, str, int] | None = None
         self._last_render_signature: tuple[Any, ...] | None = None
         self._delivery_sequence = 0
@@ -388,7 +390,7 @@ class ExecutionObservationSource:
             if not self._subscriptions:
                 # Reconnect must read the current owner frame, never replay a
                 # cached frame from the preceding demand interval.
-                self._last_payload = None
+                self._last_frame = None
                 self._last_identity = None
                 self._last_render_signature = None
                 self._execution_read_pending = False
@@ -475,13 +477,12 @@ class ExecutionObservationSource:
             subscription.wake.clear()
             if payload is not None:
                 self._sent += 1
-                frame = json.loads(payload)
                 elapsed = max(0, round((self._monotonic() - subscription.offered_at) * 1_000_000_000))
-                for row in frame["outside_pose_sources"]:
+                for row in payload["outside_pose_sources"]:
                     row["age_at_delivery_ns"] = min(
                         _MAXIMUM_SAFE_INTEGER, row["age_at_delivery_ns"] + elapsed
                     )
-                return encode_execution_observation_frame(frame)
+                return encode_execution_observation_frame(payload)
             return None
 
     def status(self) -> dict[str, Any]:
@@ -538,12 +539,12 @@ class ExecutionObservationSource:
         if (
             not subscription.credit
             or subscription.outstanding is not None
-            or self._last_payload is None
+            or self._last_frame is None
             or self._last_identity is None
             or not _is_newer((*self._last_identity[1:], self._delivery_sequence), subscription.last_applied)
         ):
             return False
-        frame = json.loads(self._last_payload)
+        frame = dict(self._last_frame)
         identity = {key: frame[key] for key in ("cell_id", "retained_bundle_id", "graph_revision")}
         elapsed = max(0, round((self._monotonic() - self._outside_received) * 1_000_000_000))
         frame["outside_pose_sources"] = [
@@ -551,7 +552,7 @@ class ExecutionObservationSource:
             for row in self._outside_sources
         ] if identity == self._outside_identity else []
         frame["delivery_sequence"] = self._delivery_sequence
-        subscription.payload = encode_execution_observation_frame(frame)
+        subscription.payload = frame
         subscription.offered_at = self._monotonic()
         subscription.outstanding = (*self._last_identity[1:], self._delivery_sequence)
         subscription.credit = False
@@ -617,7 +618,6 @@ class ExecutionObservationSource:
                 if self._has_demand_locked():
                     self._execution_read_pending = True
                 return
-            payload = encode_execution_observation_frame(frame)
             if (
                 self._last_identity is not None
                 and identity[:2] == self._last_identity[:2]
@@ -627,7 +627,7 @@ class ExecutionObservationSource:
                 # but do not wake an already-credited browser for a visually
                 # identical freshness publication.
                 self._last_identity = identity
-                self._last_payload = payload
+                self._last_frame = frame
                 self._coalesced += 1
                 self._last_error = None
                 if self._has_demand_locked():
@@ -636,7 +636,7 @@ class ExecutionObservationSource:
                 return
             self._last_identity = identity
             self._last_render_signature = signature
-            self._last_payload = payload
+            self._last_frame = frame
             self._delivery_sequence += 1
             self._published += 1
             self._last_error = None
@@ -809,7 +809,7 @@ class ExecutionObservationSource:
                         # This is a transport failure, not an unchanged robot.
                         # Reuse the existing socket reconnect/current barrier;
                         # no new health stream or cached stale frame is needed.
-                        self._last_payload = None
+                        self._last_frame = None
                         self._last_identity = None
                         self._last_render_signature = None
                         for subscription in self._subscriptions:

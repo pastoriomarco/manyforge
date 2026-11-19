@@ -184,25 +184,34 @@ ExecutionCommandSurface::ExecutionCommandSurface(
 
 int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     const std::stop_callback wake_on_stop(stop_token, [this] { WakeLanes(); });
-    std::jthread control_thread(
-        [this](std::stop_token stop_token) { RunControlLane(stop_token); });
+    std::jthread control_thread([this](std::stop_token stop_token) {
+      ::pthread_setname_np(::pthread_self(), "mf_control_lane");
+      RunControlLane(stop_token);
+    });
     // Speed changes from both sockets; never behind planning, Submit or disk.
     std::jthread runtime_scale_thread([this](std::stop_token stop_token) {
       ::pthread_setname_np(::pthread_self(), "mf_scale_lane");
       RunDeferredLane(runtime_scale_lane_, stop_token);
     });
-    std::jthread observation_thread(
-        [this](std::stop_token stop_token) { RunObservationLane(stop_token); });
-    std::jthread component_thread(
-        [this](std::stop_token stop_token) { RunComponentLane(stop_token); });
+    std::jthread observation_thread([this](std::stop_token stop_token) {
+      ::pthread_setname_np(::pthread_self(), "mf_observe_lane");
+      RunObservationLane(stop_token);
+    });
+    std::jthread component_thread([this](std::stop_token stop_token) {
+      ::pthread_setname_np(::pthread_self(), "mf_comp_lane");
+      RunComponentLane(stop_token);
+    });
     std::jthread reconciliation_thread([this](std::stop_token stop_token) {
+      ::pthread_setname_np(::pthread_self(), "mf_recon_lane");
       RunReconciliationLane(stop_token);
     });
     std::jthread submission_ordered_thread(
         [this](std::stop_token stop_token) {
+          ::pthread_setname_np(::pthread_self(), "mf_submit_lane");
           RunDeferredLane(submission_ordered_lane_, stop_token);
         });
     std::jthread scene_read_thread([this](std::stop_token stop_token) {
+      ::pthread_setname_np(::pthread_self(), "mf_scene_lane");
       RunDeferredLane(scene_read_lane_, stop_token);
     });
     // Output writes wait for the device; never on the ordinary accept thread.
@@ -213,6 +222,7 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
     // Subscriber writers never take a command lane or its locks while they
     // send; a slow subscriber only lags in the journal.
     std::jthread event_stream_thread([this](std::stop_token stop_token) {
+      ::pthread_setname_np(::pthread_self(), "mf_ev_accept");
       event_stream_.Run(event_stream_socket_.get(), stop_token);
     });
     LaneConnections connections;
@@ -4293,7 +4303,8 @@ bool ExecutionCommandSurface::ServeRequest(FileDescriptor &client,
     const bool ordinary = lane == CommandLane::kOrdinary;
     try {
       {
-        std::array<char, kMaximumPacketBytes> buffer{};
+        // Not zeroed: only the `count` received bytes are ever read.
+        std::array<char, kMaximumPacketBytes> buffer;
         iovec vector{buffer.data(), buffer.size()};
         msghdr message{};
         message.msg_iov = &vector;

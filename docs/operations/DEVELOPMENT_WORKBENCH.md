@@ -377,19 +377,26 @@ By default, `start` keeps motion-trace snapshots for debug exports in
 `MANYFORGE_MOTION_TRACE_DIR=` (empty) before starting for no disk snapshots;
 the export then carries the trace inline, newest goals first, bounded by the execution socket's send buffer (twice
 `net.core.wmem_max`, about 416 KiB at the Linux default). The directory survives Workbench restarts;
-files are limited to 3 MiB each and 64 MiB in total, with oldest-first eviction.
-These are snapshots of the bounded volatile window (16 goals, 1,024 controller
-samples), with explicit coverage and omission counts, not complete Run journals.
+files are limited to 5 MiB each and 64 MiB in total, with oldest-first eviction.
+These are snapshots of the bounded volatile window (16 goals and the last 2,340
+controller samples: about 15 s at 150 Hz for one arm, about 8 s for two), with
+explicit coverage and omission counts, not complete Run journals.
 Unavailable or invalid diagnostic files do not fail motion or the debug export.
 
 Frontend source edits update through HMR. Before it starts the workbench
 container, `start` runs the native build step,
 `python3 scripts/dev-workbench.py build`, in a short-lived container with the
 same image, user, build settings and source/cache mounts. It incrementally
-builds the current `manyforge_manager_daemon`, `manyforge_headless_py`,
-`manyforge_ros2_control_execution_host`, `manyforge_roboplan_candidate_worker`,
-Deployment authoring compiler and `manyforge_core_py` targets with their
-dependencies. Its output goes to the `start` console (stderr); if it fails,
+builds the current `manyforge_ros2_control_execution_host`,
+`manyforge_roboplan_candidate_worker`, `manyforge_manager_daemon`,
+`manyforge_headless_py` and `manyforge_core_py` targets with their
+dependencies in one CMake tree (`/runner/build/ros-integration`), so Core,
+Deployment and the other shared packages compile once. Only the Deployment
+authoring tools (`manyforge_prepare_activation`,
+`manyforge_generate_canonical_empty_package`) build in their own tree
+(`/runner/build/deployment-authoring`): they stay statically linked because
+the workbench keys its bootstrap package cache by their bytes. Its output
+goes to the `start` console (stderr); if it fails,
 `start` exits without starting the workbench. Only then does the readiness wait
 (`MANYFORGE_DEV_START_TIMEOUT_SECONDS`) begin. The workbench itself never
 builds: it checks these artifacts and refuses, naming the missing file and the

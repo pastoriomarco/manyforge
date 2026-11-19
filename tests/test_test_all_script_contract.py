@@ -338,6 +338,7 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
         ("ros2", 'case "$*" in\n'
                  '  "pkg prefix topic_based_ros2_control") printf "%s\\n" "$FAKE_TOPIC_INSTALL";;\n'
                  '  "pkg prefix xarm_description") printf "%s/xarm_description\\n" "$FAKE_DATA_INSTALL";;\n'
+                 '  "pkg prefix rmw_test_fixture_implementation") printf "%s\\n" "$FAKE_RMW_FIXTURE";;\n'
                  '  *) exit 98;;\nesac\n'),
         ("colcon", 'printf "ros-overlay-build\\n" >> "$FAKE_LOG"\n'
                    'while [ "$1" != "--install-base" ]; do shift; done\n'
@@ -377,6 +378,11 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
     (fake_bin / "python3").chmod(0o755)
     (fake_bin / "pytest").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     (fake_bin / "pytest").chmod(0o755)
+    rmw_fixture = tmp_path / "rmw_test_fixture"
+    wrapper = rmw_fixture / "lib/rmw_test_fixture_implementation/run_rmw_isolated"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text('#!/bin/sh\nexec "$@"\n', encoding="utf-8")
+    wrapper.chmod(0o755)
 
     environment = {
         **os.environ,
@@ -388,6 +394,7 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
         "FAKE_TOPIC_INSTALL": str(topic),
         "FAKE_DATA_INSTALL": str(data),
         "FAKE_PINOCCHIO_CONFIG": str(tmp_path / "cmeel.prefix/lib/cmake/pinocchio"),
+        "FAKE_RMW_FIXTURE": str(rmw_fixture),
     }
     environment.pop("CMAKE_GENERATOR", None)
     if generator is not None:
@@ -760,6 +767,12 @@ def test_ros_selector_builds_and_tests_the_ros_integration_graph() -> None:
     assert '--topic-install "$ROS_INTEGRATION_TOPIC_INSTALL"' in body
     assert '--data-overlay "$ROS_INTEGRATION_DATA_OVERLAY"' in body
     assert "MANYFORGE_ROS2_CONTROL_BUILD_TESTING=ON" in body
+    # The graph itself supplies the expression engine binding; no second
+    # Headless tree recompiles Core and Deployment for it.
+    assert "--target manyforge_headless_py" in body
+    assert "--cmake-arg -DMANYFORGE_BUILD_PYTHON_MODULES=ON" in body
+    assert 'export PYTHONPATH="$build/headless:${PYTHONPATH:-}"' in body
+    assert "setup_expression_binding" not in body
     # Keep-going follows the configured tree's generator, in the same ROS
     # environment the helper configured it with.
     assert 'set_build_keep_going_args "$build"' in body

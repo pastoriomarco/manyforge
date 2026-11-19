@@ -1596,7 +1596,7 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
     (void)DecodeRequestAttribution(Member(root, "attribution"));
     Command decoded{CommandKind::kReadVolatileMotionTrace};
     decoded.trace_allowance_bytes = Counter(root, "allowance_bytes", 1U);
-    Require(decoded.trace_allowance_bytes <= 3U * 1024U * 1024U,
+    Require(decoded.trace_allowance_bytes <= 5U * 1024U * 1024U,
             "volatile motion trace allowance exceeds its bounded range");
     return decoded;
   }

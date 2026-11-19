@@ -104,6 +104,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <pthread.h>
 #include <thread>
 #include <utility>
 
@@ -168,6 +169,8 @@ public:
             // the subscribe limit, so the "full" error reaches it.
             kSubscribeDeadline},
         [this](const int subscriber, const std::stop_token writer_stop) {
+          // Runs first on the subscriber's own writer thread.
+          static_cast<void>(::pthread_setname_np(::pthread_self(), "mf_ev_writer"));
           Serve(subscriber, writer_stop);
         },
         stop);
