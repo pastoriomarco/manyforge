@@ -971,8 +971,8 @@ def test_an_empty_cell_apply_returns_once_its_scene_clear_ended() -> None:
         {"apply_id": 1, "apply_generation": 1, "state": "succeeded"},  # earlier Apply
         None,
         {"apply_id": 1, "apply_generation": 2, "state": "pending"},
-        {"apply_id": 1, "apply_generation": 2, "state": "partial"},
         {"apply_id": 1, "apply_generation": 2, "state": "succeeded"},
+        {"apply_id": 1, "apply_generation": 2, "state": "pending"},
     )
     _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY)
     assert len(client.reads) == 1  # returned at the first ended clear
@@ -996,14 +996,18 @@ def test_the_scene_clear_wait_ends_when_a_later_apply_replaced_its_status() -> N
     ("unknown", {}, False),
     ("succeeded", {"cause_code": "manager_command_unavailable"}, False),
 ])
-def test_scene_clear_cause_warning_does_not_change_wait(
+def test_scene_clear_cause_warning_is_logged(
     state: str, details: dict[str, Any], logged: bool,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     clear = {"apply_id": 1, "apply_generation": 2, "state": state,
-             "reason": {"details": details}}
+             "reason": {"code": f"scene_clear_{state}", "message": "m", "details": details}}
     client = _SceneClearClient(clear, {"apply_id": 1, "apply_generation": 2, "state": "pending"})
-    assert _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY) is None
+    if state == "unknown":
+        with pytest.raises(ApplyStepFailed):
+            _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY)
+    else:
+        assert _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY) is None
     assert len(client.reads) == 1
     messages = [record.getMessage() for record in caplog.records
                 if record.name == "manyforge_composer.backend.routes_deployment_draft"]
@@ -1014,6 +1018,25 @@ def test_scene_clear_cause_warning_does_not_change_wait(
         ]
     else:
         assert messages == []
+
+
+@pytest.mark.parametrize("state", ["failed", "partial", "unknown"])
+def test_a_scene_clear_that_did_not_succeed_fails_the_apply_typed(state: str) -> None:
+    # The New (and a Load's New) ends failed with the clear's own reason.
+    clear = {"apply_id": 1, "apply_generation": 2, "state": state, "remaining": ["wall"],
+             "reason": {"code": f"scene_clear_{state}", "message": "Some Scene objects remain",
+                        "details": {}}}
+    client = _SceneClearClient(clear)
+    with pytest.raises(ApplyStepFailed) as raised:
+        _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY)
+    assert raised.value.code == f"scene_clear_{state}"
+
+
+@pytest.mark.parametrize("state", ["succeeded", "superseded"])
+def test_a_scene_clear_that_succeeded_or_was_superseded_ends_the_wait(state: str) -> None:
+    client = _SceneClearClient({"apply_id": 1, "apply_generation": 2, "state": state,
+                                "remaining": [], "reason": None})
+    assert _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY) is None
 
 
 @pytest.mark.parametrize("result", [
@@ -1030,7 +1053,7 @@ def test_the_scene_clear_wait_has_no_time_limit() -> None:
     # wait follows it however long the clear takes.
     client = _SceneClearClient(
         *([{"apply_id": 1, "apply_generation": 2, "state": "pending"}] * 500),
-        {"apply_id": 1, "apply_generation": 2, "state": "failed"},
+        {"apply_id": 1, "apply_generation": 2, "state": "succeeded"},
         None,
     )
     _ports(client).wait_for_scene_clear(_ACCEPTED_EMPTY)

@@ -245,6 +245,30 @@ def test_empty_projection_carries_no_model_map_identity() -> None:
     )
 
 
+def test_empty_projection_may_name_its_empty_model_map() -> None:
+    # After New the empty graph's Apply retains one model map without
+    # occurrences; Headless names it.
+    payload = _projection()
+    payload["occurrences"] = []
+    payload["targets"] = []
+    _seal(payload)
+
+    verified = verify_active_source_model(payload, node_environment=_node_environment())
+    assert verified.payload["occurrences"] == []
+    assert verified.payload["model_map_product_id"] == "product.model-map.1"
+
+
+def test_empty_projection_rejects_a_half_named_model_map() -> None:
+    payload = _projection()
+    payload["occurrences"] = []
+    payload["targets"] = []
+    payload["model_map_contract"] = None
+    _seal(payload)
+
+    with pytest.raises(ActiveSourceModelProjectionError):
+        verify_active_source_model(payload, node_environment=_node_environment())
+
+
 def _context() -> tuple[ComposerState, dict]:
     return ComposerState(application_start_id=0x3F9A0000000000A1), {
         "schema_version": "manyforge.source_model_context.v1",

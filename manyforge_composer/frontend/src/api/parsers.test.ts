@@ -2793,6 +2793,25 @@ describe('headless projection parsers', () => {
     expect(parseSceneRuntimeProjection(sceneRuntimeFixture()).state.state).toBe('open');
   });
 
+  it('accepts an empty source model that names its empty model map (after New)', () => {
+    const sourceModel = {
+      ...sourceModelFixture(),
+      components: [],
+      model_map_contract: { contract_id: 'manyforge.composed_model_symbol_role_map', contract_revision: 'sha256:abc' },
+      model_map_product_id: 'cell_composed_model_symbol_role_map',
+    };
+    const parsed = parseSourceModelProjection(sourceModel);
+    expect(parsed.occurrences).toEqual([]);
+    expect(parsed.model_map_product_id).toBe('cell_composed_model_symbol_role_map');
+  });
+
+  it('rejects an empty source model that names only half of its model map', () => {
+    expect(() => parseSourceModelProjection({
+      ...sourceModelFixture(),
+      model_map_product_id: 'cell_composed_model_symbol_role_map',
+    })).toThrow();
+  });
+
   it('accepts an optional positive scene object mass', () => {
     const objectOf = (fixture: Record<string, unknown>) =>
       ((fixture.snapshot as Record<string, unknown>).objects as Array<Record<string, unknown>>)[0]!;

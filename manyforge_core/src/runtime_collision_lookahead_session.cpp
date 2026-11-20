@@ -1145,9 +1145,9 @@ bool RuntimeCollisionLookaheadSession::accept_result_for_current_arm(
 bool RuntimeCollisionLookaheadSession::progress_generation_is_terminal(
     std::uint64_t execution_generation) const noexcept {
   const auto cursor = progress_publication_->acquire();
-  // Only a coherent, explicit terminal marker suppresses authority. A
-  // transiently unreadable or invalid cursor remains fail-closed and is
-  // handled by the normal inconclusive path.
+  // Only an explicit terminal marker suppresses authority. An invalid
+  // (invalidated or retired) cursor remains fail-closed and is handled by
+  // the normal inconclusive path.
   return cursor.valid && cursor.terminal && cursor.execution_generation == execution_generation;
 }
 

@@ -885,7 +885,10 @@ exported references. Do not use Save As as an asset-collection operation.
   Scenario (empty Program, Scene and Deployment). A finished or stopped Program
   run is Reset first, every component of the current cell is disabled and its
   processes are stopped, and the Scene is initialized. New is the one way to
-  empty the cell; it is refused only while motion runs. Save is disabled for
+  empty the cell; it is refused only while motion runs. If objects can't be
+  removed from the Scene, New ends failed with *Scene clear failed*, *Scene
+  partly cleared* or *Scene clear outcome unknown*, and a Load stops there;
+  repeat New or Load. Save is disabled for
   Untitled; Save Scenario as writes it to a project folder and continues
   there. Unsaved Untitled changes are not recovered after a Composer restart.
 - **Load Scenario** is New, then Apply of the chosen project. Its components
@@ -895,6 +898,10 @@ exported references. Do not use Save As as an asset-collection operation.
 - **Apply** (Deployment) makes the Draft the running configuration. Replaced
   and removed components are disabled and stopped first; affected components
   come back prepared. Apply is refused while a Program run is in progress.
+- **Revert** is offered while the Saved Scenario differs from the Applied
+  one. After New, the empty Program has nothing to revert until you edit it;
+  then Revert is offered and does the same as Discard (both return to the
+  empty Program).
 - **Apply** and **Revert**, of the Program or the Deployment, keep the live
   Scene: objects stay where they are; only Load and New initialize it. The
   confirmation offers **Reload initial scene** (off by default) on every

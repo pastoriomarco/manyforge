@@ -485,11 +485,10 @@ export function parseSourceModelProjection(value: unknown): SourceModelProjectio
     .map((item, index) => parseSourceModelTarget(item, `sourceModel.targets[${index}]`));
   let modelMapContract: SourceModelProjection['model_map_contract'] = null;
   let modelMapProductId: string | null = null;
-  if (occurrences.length === 0) {
-    if (record.model_map_contract !== null || record.model_map_product_id !== null) {
-      return fail('sourceModel.model_map_contract', 'null for an empty occurrence set');
-    }
-  } else {
+  // A graph without models may still retain one model map, with no
+  // occurrences (after New); a named map is checked either way.
+  if (occurrences.length > 0 || record.model_map_contract !== null
+      || record.model_map_product_id !== null) {
     const contract = objectAt(record.model_map_contract, 'sourceModel.model_map_contract');
     exactKeysAt(contract, ['contract_id', 'contract_revision'], 'sourceModel.model_map_contract');
     modelMapContract = {

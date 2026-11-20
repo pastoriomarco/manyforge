@@ -202,6 +202,19 @@ def do_new(step: str = "new") -> None:
         st, js = apply_command("/api/scenario/new", {"discard_unsaved": True}, timeout=300)
     LAST["new"] = time.time()
     load_outcome(step, st, js)
+    # New empties the Scene: the clear succeeded, no objects remain, and the
+    # empty cell's source model reads.
+    _, cycle = get("/api/cycle/status")
+    clear = cycle.get("scene_clear") if isinstance(cycle, dict) else None
+    _, scene = get("/api/scene")
+    logical = scene.get("logical_scene") if isinstance(scene, dict) else None
+    snapshot = ((logical or {}).get("payload") or {}).get("snapshot") or {}
+    source_status, source = get("/api/source-model")
+    if (not isinstance(clear, dict) or clear.get("state") != "succeeded"
+            or snapshot.get("objects") != [] or snapshot.get("carried_object_attachments") != []
+            or source_status != 200):
+        raise StepFailed(step, {"scene_clear": clear, "objects": snapshot.get("objects"),
+                                "source_model_http": source_status, "source_model": source})
 
 
 def do_load(scenario: str, step: str = "load") -> None:

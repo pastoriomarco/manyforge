@@ -1778,9 +1778,10 @@ class HeadlessApplyPorts:
 
         Once such an Apply is committed, Headless clears the Scene through
         owner transactions, which hold the cell's authoring admission; the
-        Apply's result returns once that clear has ended (any outcome; it is
-        reported in the cycle status), so the next Load or Preview is
-        admitted. Headless publishes an end for every such Apply (OD-239), so
+        Apply's result returns once that clear has ended, so the next Load or
+        Preview is admitted. A clear that ended `failed`, `partial` or
+        `unknown` fails the Apply with its typed reason (a Load stops at its
+        New); the objects left are in the cycle status. Headless publishes an end for every such Apply (OD-239), so
         the wait has no time limit. It ends at this Apply's end; at a status
         naming a later Apply, or naming no Apply (a direct clear), either of
         which replaced this one's (a direct clear may also have run before
@@ -1828,6 +1829,8 @@ class HeadlessApplyPorts:
                             "Scene clear after Apply %s/%s outcome unknown: cause_code=%s cause_details=%s",
                             *identity, cause, details.get("cause_details"),
                         )
+                if clear.get("state") in ("failed", "partial", "unknown"):
+                    raise ApplyStepFailed(reason["code"], reason["message"])
                 return
             if isinstance(clear, dict):
                 named = clear.get("apply_id")

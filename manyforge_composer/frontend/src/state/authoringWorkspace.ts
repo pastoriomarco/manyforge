@@ -76,9 +76,13 @@ export function programActionUnavailableReason(
   if (action === 'revert') {
     // Revert reloads Saved and applies it, so it exists only while Saved
     // differs from Applied; Draft-only edits over that baseline are Discard.
+    // Saved matches Applied by revision, or both match the Draft (an empty
+    // Program, after New, has no revision).
     return !workspace.saved.available ? 'No Saved Program is available.'
-      : workspace.applied.available && workspace.saved.programRevision !== null
-        && workspace.saved.programRevision === workspace.applied.programRevision
+      : workspace.applied.available && (
+        (workspace.saved.programRevision !== null
+          && workspace.saved.programRevision === workspace.applied.programRevision)
+        || (workspace.saved.matchesDraft && workspace.applied.matchesDraft === true))
         ? 'Nothing to revert: the Saved Program matches Applied.' : null;
   }
   return !workspace.draft.program || !workspace.applicability.applyReady

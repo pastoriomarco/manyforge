@@ -52,6 +52,23 @@ formats; such changes are listed explicitly.
 
 ### Fixed
 
+- **New empties the Scene again.** Since 0.3.0 each New removed only one
+  object from the Scene: the Program Runner's check of each removal's receipt
+  expected the wrong request key, so the clear stopped after the first object
+  and reported nothing. The 3D view also kept the previous Scenario's
+  objects, with "Applied robot model unavailable": Composer and the GUI
+  refused the empty cell's robot-model data (also seen with a Deployment of
+  only I/O devices). Revert was offered right after New with nothing to
+  revert.
+- **No spurious collision Stop from a busy progress cursor.** A reader of the
+  motion progress cursor gave up after three attempts overlapped by writes
+  and reported the cursor invalid; the collision lookahead then Stopped an
+  active motion as a collision, and a take-over could be refused. A read now
+  retries until it gets a published cursor (retries only while writes
+  complete during it); seen live and in the TSan nightly.
+- **A Scene clear that fails is shown:** New ends failed with *Scene clear
+  failed*, *Scene partly cleared* or *Scene clear outcome unknown*, and a Load
+  stops at its New.
 - **xArm: Enable after an e-stop works the first time, and the control loop
   no longer stalls.** The vendor hardware plugin switched every controller off
   and on by itself from its control loop at each change of the robot's

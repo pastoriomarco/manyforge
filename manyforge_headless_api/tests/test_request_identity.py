@@ -517,3 +517,16 @@ def test_a_group_stop_reply_is_displayed_by_its_stop_event() -> None:
         },
     }
     assert identified(reply, A)["display"] == "3f9a/stop6"
+
+
+def test_runner_and_headless_form_the_same_http_key() -> None:
+    """The Program Runner predicts the key Headless forms for its HTTP
+    requests (its Scene-clear receipt check); both packages keep the rule."""
+
+    from manyforge_behavior.request_keys import RUNNER_KEYS, format_request_key, http_client_key
+    from manyforge_headless_api.identity import http_request_key
+
+    for _ in range(3):
+        sent = RUNNER_KEYS.next_key()
+        assert http_client_key(sent) == http_request_key(format_request_key(sent))
+        assert http_client_key(sent) != sent

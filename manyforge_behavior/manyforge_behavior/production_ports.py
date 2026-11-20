@@ -55,6 +55,7 @@ from manyforge_behavior.request_keys import (
     Part,
     Phase,
     format_request_key,
+    http_client_key,
     parse_request_key,
     program_key,
     with_part,
@@ -6116,12 +6117,16 @@ class HeadlessSceneProgramPort:
                     body["request_context"]["request_key"] = format_request_key(
                         key_for_generation(generation)
                     )
+        # The owner names the key Headless formed for this HTTP request (class 3).
+        receipt_key = (
+            format_request_key(http_client_key(
+                parse_request_key(body["request_context"]["request_key"])))
+            if verify_receipt else None
+        )
         try:
             response = self._scene.commit(body)
         except SceneTransactionRejectedError as error:
-            if verify_receipt and (
-                error.response.get("request_key") != body["request_context"]["request_key"]
-            ):
+            if verify_receipt and error.response.get("request_key") != receipt_key:
                 raise SceneOutcomeUnknownError("Scene refusal names another request") from error
             raise
         except SceneOutcomeUnknownError as error:
@@ -6158,9 +6163,7 @@ class HeadlessSceneProgramPort:
             raise OwnerInvocationPendingError(
                 "Scene transaction outcome is unconfirmed", observe
             ) from error
-        if verify_receipt and (
-            response.get("request_key") != body["request_context"]["request_key"]
-        ):
+        if verify_receipt and response.get("request_key") != receipt_key:
             raise SceneOutcomeUnknownError("Scene receipt names another request")
         return self._committed_revision(context, expected_projection_revision, response), response
 

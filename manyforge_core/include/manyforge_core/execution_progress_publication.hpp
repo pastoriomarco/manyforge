@@ -54,8 +54,9 @@ enum class ExecutionProgressHazardClaimResult {
 };
 
 /// Scalar, latest-only execution-progress publication.
-/// Writers serialize on one leaf mutex; readers perform bounded atomic
-/// snapshots and never take that mutex. The publication owns no trajectory and
+/// Writers serialize on one leaf mutex; readers take lock-free atomic
+/// snapshots, never take that mutex and never wait for a writer; a read
+/// always returns a published cursor. The publication owns no trajectory and
 /// cannot infer authority: the backend constructor fixes source/profile for its
 /// lifetime.
 class ExecutionProgressPublication final {
@@ -136,7 +137,8 @@ class ExecutionProgressPublication final {
   };
   // One seqlock slot. The writer fills the slot readers are not directed to,
   // then flips latest_slot_, so a reader overlapping one write still reads the
-  // previous complete cursor instead of failing closed.
+  // previous complete cursor; a reader overlapped by a further write retries
+  // on the newer slot (see acquire()).
   struct Slot {
     std::atomic<std::uint64_t> epoch{0};
     std::atomic<std::uint64_t> sequence{0};

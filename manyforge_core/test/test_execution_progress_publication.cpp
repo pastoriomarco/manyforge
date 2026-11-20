@@ -249,11 +249,64 @@ TEST(ExecutionProgressPublicationTest, ReaderOverlappingFeedbackWritesKeepsTheLa
   }
   writer.join();
 
-  EXPECT_GT(reads, kWrites);
+  // No assertion on the read count: it compares the speed of two threads,
+  // not a property of the publication (the next test covers overlap).
+  (void)reads;
   EXPECT_EQ(invalid, 0);
   const auto last = publication.acquire();
   EXPECT_TRUE(last.valid);
   EXPECT_EQ(last.trajectory_time_ns, kWrites);
+}
+
+TEST(ExecutionProgressPublicationTest, ReaderCompletesEveryReadAgainstAWriterThatNeverPauses) {
+  // Progress guarantee of acquire(): a read is retried only when a publication
+  // completed during it, so every read completes, with a published cursor,
+  // against a writer that publishes without pause (far above any feedback
+  // rate). The writer stops only when the reader has finished: a reader that
+  // could be starved would hang this test instead of passing it.
+  ExecutionProgressPublication publication(ExecutionProgressSourceKind::kBackendCommanded,
+                                           ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                           "mock_command_authority", 0);
+  constexpr std::uint64_t kGeneration = 9;
+  constexpr std::int64_t kReads = 200000;
+  ASSERT_TRUE(publication.publish(kGeneration, 0, 0, 0).published);
+
+  std::atomic<bool> writer_started{false};
+  std::atomic<bool> reader_done{false};
+  std::atomic<std::int64_t> writes{0};
+  std::thread writer([&]() {
+    std::int64_t time_ns = 0;
+    while (!reader_done.load(std::memory_order_acquire)) {
+      ++time_ns;
+      (void)publication.publish(kGeneration, time_ns, time_ns, time_ns);
+      writer_started.store(true, std::memory_order_release);
+    }
+    writes.store(time_ns, std::memory_order_release);
+  });
+  while (!writer_started.load(std::memory_order_acquire)) {
+    std::this_thread::yield();
+  }
+
+  std::int64_t wrong = 0;
+  std::int64_t previous_time_ns = 0;
+  for (std::int64_t read = 0; read < kReads; ++read) {
+    const auto cursor = publication.acquire();
+    if (!cursor.valid || cursor.execution_generation != kGeneration ||
+        cursor.trajectory_time_ns < previous_time_ns ||
+        cursor.source_timestamp_ns != cursor.trajectory_time_ns ||
+        cursor.received_timestamp_ns != cursor.trajectory_time_ns) {
+      ++wrong;
+      continue;
+    }
+    previous_time_ns = cursor.trajectory_time_ns;
+  }
+  reader_done.store(true, std::memory_order_release);
+  writer.join();
+
+  EXPECT_EQ(wrong, 0);
+  const auto last = publication.acquire();
+  EXPECT_TRUE(last.valid);
+  EXPECT_EQ(last.trajectory_time_ns, writes.load(std::memory_order_acquire));
 }
 
 }  // namespace

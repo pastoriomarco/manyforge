@@ -24,6 +24,17 @@ describe('document action prerequisites shared by controls and handlers', () => 
     expect(programActionUnavailableReason(workspace, 'revert', null)).toBe(null);
   });
 
+  it('disables Program Revert after New: an empty Program has no revision', () => {
+    const workspace = {
+      saved: { available: true, matchesDraft: true, programRevision: null },
+      applied: { available: true, matchesDraft: true, programRevision: null },
+    } as ProgramWorkspaceResponse;
+    expect(programActionUnavailableReason(workspace, 'revert', null))
+      .toBe('Nothing to revert: the Saved Program matches Applied.');
+    workspace.applied.matchesDraft = false;
+    expect(programActionUnavailableReason(workspace, 'revert', null)).toBe(null);
+  });
+
   it('allows Discard of an invalid Program Draft but refuses Apply', () => {
     const workspace = {
       draft: { program: null }, applicability: { applyReady: false },

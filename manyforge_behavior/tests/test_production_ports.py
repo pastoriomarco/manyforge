@@ -19,6 +19,7 @@ from manyforge_behavior.request_keys import (
     Part,
     Phase,
     format_request_key,
+    http_client_key,
     parse_request_key,
     program_key,
     request_key,
@@ -3628,13 +3629,20 @@ class _SceneTransport:
             "ok": True,
             "projection_status": "committed",
             "replay_status": "accepted_new",
-            "request_key": context["request_key"],
+            # As Headless: the owner names the class 3 key it formed.
+            "request_key": _headless_key(context["request_key"]),
             "transaction_sequence": len(self.submissions),
             "update_status": "geometry_changed",
         }
 
     def scene_transaction_status(self, body):
         return {"api_version": "manyforge.manager_command_response.v3", "ok": True, "result": None}
+
+
+def _headless_key(sent: str) -> str:
+    """The key Headless forms for an HTTP request (class 3)."""
+
+    return format_request_key(http_client_key(parse_request_key(sent)))
 
 
 def _scene_port(transport):
@@ -4176,7 +4184,7 @@ def test_empty_apply_refused_detach_keeps_part_and_its_support() -> None:
                 self.submissions.append(dict(body))
                 return {
                     "api_version": "manyforge.manager_command_response.v3",
-                    "request_key": body["request_context"]["request_key"],
+                    "request_key": _headless_key(body["request_context"]["request_key"]),
                     "ok": False, "projection_status": "not_attempted",
                     "error": {"code": "missing_reference", "message": "carrier unavailable"},
                 }

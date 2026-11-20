@@ -750,7 +750,10 @@ def verify_active_source_model(
     _targets(projection["targets"], occurrences)
     contract = projection["model_map_contract"]
     product_id = projection["model_map_product_id"]
-    if occurrences:
+    # A graph without models may still retain one model map, with no
+    # occurrences (Headless `ActiveSourceModelProjection::Project`): a named
+    # map is checked either way.
+    if occurrences or contract is not None or product_id is not None:
         contract_row = _object(contract, "model_map_contract")
         _closed(
             contract_row,
@@ -763,8 +766,6 @@ def verify_active_source_model(
             "model_map_contract.contract_revision",
         )
         _text(product_id, "model_map_product_id")
-    elif contract is not None or product_id is not None:
-        raise _invalid("an empty source model projection cannot name a model map")
     semantic = {key: value for key, value in projection.items() if key != "source"}
     if source["source_content_digest"] != _framed_digest(semantic):
         raise _invalid("source model source digest does not match the projection")

@@ -236,7 +236,13 @@ ExecutionProgressCursorSnapshotDTO ExecutionProgressPublication::acquire() const
   snapshot.source_kind = source_kind_;
   snapshot.authority_profile = authority_profile_id_;
   snapshot.freshness_budget_ns = freshness_budget_ns_;
-  for (int attempt = 0; attempt < 3; ++attempt) {
+  // No attempt limit. An attempt fails only when a publication completed
+  // after this attempt chose its slot, and the retry then reads that newer
+  // slot: retries are bounded by the publications completed during this call.
+  // A writer stopped mid-write costs none, because readers are never directed
+  // to the slot it is filling. The result is always a published cursor, never
+  // an invented invalid one.
+  for (;;) {
     const Slot& slot = slots_[latest_slot_.load(std::memory_order_acquire)];
     const auto before = slot.epoch.load(std::memory_order_acquire);
     if ((before & 1u) != 0u) {
@@ -255,8 +261,6 @@ ExecutionProgressCursorSnapshotDTO ExecutionProgressPublication::acquire() const
       return snapshot;
     }
   }
-  snapshot.valid = false;
-  return snapshot;
 }
 
 }  // namespace manyforge::core
