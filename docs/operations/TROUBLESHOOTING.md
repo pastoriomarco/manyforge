@@ -467,3 +467,25 @@ docker logs --tail 2000 manyforge-development-workbench > workbench.log   # ./ma
 
 Attach also the start command (`./scripts/compose-dev.sh start --project …`)
 and the `./scripts/compose-dev.sh status` output.
+
+### Debug information for a crash
+
+The prebuilt image (`./manyforge run`) ships its programs **without debug
+information**, to keep the download small (about 0.15 GB on top of the ROS
+image instead of about 2.4 GB). They keep their symbols, so a crash backtrace
+from it still names the functions, but not the source files and lines.
+
+For a backtrace with files and lines, run the same version from a source
+checkout ([install option 2](DEVELOPMENT_WORKBENCH.md#install)): it builds
+the same programs with the same flags and keeps the debug information.
+
+```bash
+git clone --branch v<VERSION> https://github.com/pastoriomarco/manyforge.git
+cd manyforge
+./scripts/compose-dev.sh pull
+./scripts/compose-dev.sh start --project <your Scenario folder>
+```
+
+Stop `./manyforge` first (`./manyforge stop`): the two don't run at the same
+time. Then reproduce the crash and capture it as above, with the log of the
+container `manyforge-development-workbench`.

@@ -18,7 +18,10 @@ formats; such changes are listed explicitly.
   Python 3, the image and their Scenario folders: copy the launcher kit out
   of the image and `./manyforge run [--project <folder>]` starts it with
   nothing to compile and Composer serving the GUI at port 9000;
-  `./manyforge status`, `logs` and `stop` inspect and stop it. `./manyforge`
+  `./manyforge status`, `logs` and `stop` inspect and stop it. Its programs
+  ship without debug information (about 0.15 GB on top of the ROS image
+  instead of 2.4 GB); a source checkout of the same version builds them with
+  it (TROUBLESHOOTING, "Debug information for a crash"). `./manyforge`
   reads product variable names (`MANYFORGE_SITE_SETTINGS`,
   `MANYFORGE_DATA_DIR`, `MANYFORGE_RUNTIME_STATE_ROOT`,
   `MANYFORGE_CONTAINER_NAME`, `MANYFORGE_START_TIMEOUT_SECONDS`); it runs as

@@ -607,6 +607,8 @@ def test_manyforge_image_builds_from_the_digest_pinned_ros_image() -> None:
     assert ("COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_NOTICES_MANYFORGE_IMAGE.md \\\n"
             "    /usr/share/licenses/manyforge-image/manyforge/") in final
     assert "RUN apt" not in dockerfile and "apt-get" not in dockerfile
+    # The shipped binaries carry symbols but no debug information.
+    assert "strip --strip-debug" in dockerfile
     # The context carries no version-control data, local build trees or
     # installed npm packages.
     ignored = (_REPO_ROOT / "Dockerfile.manyforge.dockerignore").read_text(encoding="utf-8").split()

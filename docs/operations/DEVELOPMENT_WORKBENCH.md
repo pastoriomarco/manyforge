@@ -58,7 +58,10 @@ GitHub builds the complete application with each release, for linux/amd64
 and linux/arm64 (Jetson AGX Thor and Orin, JetPack 7.2.1), on that release's
 ROS image (option 2), and publishes it as
 `ghcr.io/pastoriomarco/manyforge:<VERSION>`. It holds ManyForge's programs,
-Python modules and built GUI, so nothing compiles at start. Pulling needs
+Python modules and built GUI, so nothing compiles at start. Its programs carry
+no debug information, which keeps the download small; for a crash backtrace
+with source lines, see
+[Debug information for a crash](TROUBLESHOOTING.md#debug-information-for-a-crash). Pulling needs
 network access to `ghcr.io`; no login. Copy the launcher kit out of the image
 into an empty folder (the first command pulls the image), then run it from
 there:

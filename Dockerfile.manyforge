@@ -50,12 +50,17 @@ ENV MANYFORGE_BUILD_DIR=/runner/build
 RUN /usr/local/bin/docker-entrypoint.ros-jazzy-full.sh \
         python3 scripts/dev-workbench.py build --frontend
 RUN scripts/ci/frontend-bundle-licences.sh manyforge_composer/frontend /runner/licences/frontend
-# The build trees, without what only building and testing read.
+# The build trees, without what only building and testing read, and without
+# debug information (`-g`: 2.26 GB of 2.35 GB); symbols stay, so a backtrace
+# still names functions. Full debug information: build the same tag with
+# scripts/compose-dev.sh (docs/operations/TROUBLESHOOTING.md).
 RUN find /runner/build -name CMakeFiles -type d -prune -exec rm -rf {} + \
     && find /runner/build -type f \( -name '*.o' -o -name '*.a' -o -name '*.ninja' \
         -o -name '.ninja_*' -o -name CMakeCache.txt -o -name cmake_install.cmake \
         -o -name CTestTestfile.cmake \) -delete \
-    && rm -rf /runner/build/isaac/ros-overlay/log
+    && rm -rf /runner/build/isaac/ros-overlay/log \
+    && find /runner/build -type f \( -name '*.so*' -o -perm -u+x \) -exec sh -c \
+        'for f; do [ "$(head -c 4 "$f")" = "$(printf "\177ELF")" ] && strip --strip-debug "$f"; done; true' sh {} +
 # The source files the application reads at run time. ./manyforge,
 # scripts/compose-dev.sh and its helpers are the launcher kit users copy out
 # of the image.
