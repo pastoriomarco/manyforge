@@ -1694,6 +1694,22 @@ def test_wrapper_status_stop_and_logs_use_the_launcher(
         environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
 
 
+def test_wrapper_names_the_product_when_it_is_stopped(tmp_path: Path) -> None:
+    wrapper = _launcher_kit(tmp_path)
+    environment = _fake_docker_environment(
+        tmp_path, FAKE_WORKSPACE=str(wrapper.parent), MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_CONTAINER_PRESENT="false")
+    stopped = subprocess.run([str(wrapper), "stop"], cwd=tmp_path, env=environment,
+        capture_output=True, text=True, check=False)
+    assert stopped.returncode == 0, stopped.stderr
+    assert stopped.stdout.strip() == "ManyForge is stopped."
+    status = subprocess.run([str(wrapper), "status"], cwd=tmp_path, env=environment,
+        capture_output=True, text=True, check=False)
+    assert status.returncode == 69
+    assert "ManyForge is stopped." in status.stderr
+    assert "Development workbench" not in stopped.stdout + status.stderr
+
+
 @pytest.mark.parametrize("arguments", [(), ("start",), ("build",), ("pull",)])
 def test_wrapper_offers_only_the_product_commands(tmp_path: Path, arguments: tuple[str, ...]) -> None:
     wrapper = _launcher_kit(tmp_path)

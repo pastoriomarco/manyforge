@@ -29,6 +29,8 @@ operator_digest=${MANYFORGE_DEV_LAUNCH_INPUT_DIGEST:-}
 operator_mode=false
 # true for `run`: the prebuilt manyforge image, not the source checkout.
 product=false
+# What status and stop messages call this installation (./manyforge sets it).
+display_name=${MANYFORGE_DEV_DISPLAY_NAME:-Development workbench}
 container_ref=${MANYFORGE_DEV_EXPECTED_CONTAINER_ID:-$container_name}
 
 # Read the host project folders from the same site file used by the Manager.
@@ -274,7 +276,7 @@ stop_with_evidence() {
     return 69
   fi
   if [[ "$running" != false ]]; then
-    echo "Development workbench is still running; no evidence was copied." >&2
+    echo "$display_name is still running; no evidence was copied." >&2
     return 69
   fi
 
@@ -735,7 +737,8 @@ case "$command" in
         exit 69
       fi
       if [[ "$operator_mode" == true || "$product" == true ]]; then
-        if current=$(operator_status true); then
+        # Not yet ready is expected while it starts: only a timeout reports.
+        if current=$(operator_status true 2>/dev/null); then
           echo "$current"
           [[ "$product" != true ]] || echo "ManyForge: http://localhost:9000"
           started_container=false
@@ -780,11 +783,11 @@ print(any(ref in line.split() for line in sys.stdin), end="")
     fi
     (($# == 0)) || { usage; exit 64; }
     docker inspect "$container_ref" >/dev/null 2>&1 || {
-      echo "Development workbench is stopped." >&2
+      echo "$display_name is stopped." >&2
       exit 69
     }
     [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") == true ]] || {
-      echo "Development workbench container is not running." >&2
+      echo "$display_name container is not running." >&2
       exit 69
     }
     if [[ $(docker inspect -f '{{index .Config.Labels "manyforge.product"}}' "$container_ref") == true ]]; then
@@ -803,10 +806,14 @@ print(any(ref in line.split() for line in sys.stdin), end="")
     if docker inspect "$container_ref" >/dev/null 2>&1; then
       stop_with_evidence
     elif [[ "$keep_evidence" == true || "$operator_mode" == true ]]; then
-      echo "Cannot preserve evidence: development workbench container does not exist." >&2
+      echo "Cannot preserve evidence: the $display_name container does not exist." >&2
       exit 69
     fi
-    echo "Development workbench is stopped. Build and npm caches were retained."
+    if [[ "$display_name" == "Development workbench" ]]; then
+      echo "Development workbench is stopped. Build and npm caches were retained."
+    else
+      echo "$display_name is stopped."
+    fi
     ;;
   logs)
     docker logs "$@" "$container_ref"

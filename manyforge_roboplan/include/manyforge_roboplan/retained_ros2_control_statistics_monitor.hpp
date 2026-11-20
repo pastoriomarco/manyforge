@@ -29,8 +29,6 @@ struct RetainedControllerStatisticsConfig final {
   /// The controller's nominal update rate; warning margin: a worst
   /// observed period beyond two controller periods.
   double controller_update_rate_hz{0.0};
-  /// Warning throttle (as the controller manager's own overrun warnings).
-  core::Duration warning_throttle_ns{1'000'000'000};
 };
 
 struct RetainedControllerStatisticsSnapshot final {
@@ -87,7 +85,10 @@ private:
   mutable std::mutex mutex_;
   RetainedControllerStatisticsSnapshot snapshot_;
   std::optional<core::TimePoint> last_receipt_ns_;
-  std::optional<core::TimePoint> last_warning_ns_;
+  /// The worst period last warned about: the statistic is a since-activation
+  /// worst, so each value is warned about once (a new worst, or a new
+  /// activation's), not repeated on every update.
+  std::optional<double> last_warned_period_s_;
 };
 
 } // namespace manyforge::roboplan_backend

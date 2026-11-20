@@ -6583,15 +6583,19 @@ class HeadlessSceneProgramPort:
                 return unknown
             return None
 
+        # The empty Apply has already released every component, so a carrier's
+        # frame no longer resolves: each carried object is detached in the
+        # cell frame (at the cell origin; it is removed right after), not at
+        # its carrier's current pose.
         for attachment in view.attachments:
             resource_id = _text(attachment.get("scene_resource_id"), field="scene_resource_id")
             result = commit({
-                "kind": "detach_carried_object_at_current_pose",
+                "kind": "detach_carried_object",
                 "carried_object_attachment_id": attachment["carried_object_attachment_id"],
                 "expected_carried_object_attachment_revision": attachment["carried_object_attachment_revision"],
-                "expected_scene_resource_id": resource_id,
-                "expected_controllable_component_id": attachment["controllable_component_id"],
-                "expected_command_target_id": attachment["command_target_id"],
+                "frame_ref": {"kind": "cell_frame", "cell_id": view.cell_id},
+                "pose": {"position_m": {"x_m": 0.0, "y_m": 0.0, "z_m": 0.0},
+                         "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0}},
             }, resource_id)
             if result is not None:
                 if result.get("owner_refused") is not True:

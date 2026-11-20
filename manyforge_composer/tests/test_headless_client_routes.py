@@ -50,6 +50,14 @@ def _key(number: int) -> str:
     return f"{number:032x}"
 
 
+def _headless_key(sent: str) -> str:
+    """The key Headless forms for an HTTP request (class 3)."""
+
+    from manyforge_headless_api.identity import format_request_key, http_request_key
+
+    return format_request_key(http_request_key(sent))
+
+
 _BINDING_FIXTURE = (
     Path(__file__).resolve().parents[2]
     / "manyforge_deployment/resources/program_binding_lite6_native.fixture.json"
@@ -583,7 +591,8 @@ def headless_client() -> (
                         "ok": False,
                         "projection_status": "not_attempted",
                         "replay_status": "accepted_new",
-                        "request_key": _key(0x5C2),
+                        # As Headless: the class 3 key it formed.
+                        "request_key": _headless_key(body["request_context"]["request_key"]),
                         "transaction_sequence": None,
                         "update_status": None,
                     },
@@ -2013,7 +2022,7 @@ def test_composer_preserves_complete_scene_rejection(
         "ok": False,
         "projection_status": "not_attempted",
         "replay_status": "accepted_new",
-        "request_key": _key(0x5C2),
+        "request_key": _headless_key(_key(0x5C2)),
         "transaction_sequence": None,
         "update_status": None,
     }

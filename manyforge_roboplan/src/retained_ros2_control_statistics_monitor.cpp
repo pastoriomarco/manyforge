@@ -19,8 +19,7 @@ RetainedControllerStatisticsMonitor::RetainedControllerStatisticsMonitor(
   if (!clock_ || config_.controller_manager.empty() ||
       config_.controller_name.empty() ||
       !std::isfinite(config_.controller_update_rate_hz) ||
-      config_.controller_update_rate_hz <= 0.0 ||
-      config_.warning_throttle_ns <= 0)
+      config_.controller_update_rate_hz <= 0.0)
     throw std::invalid_argument(
         "controller statistics monitor requires the controller manager, the "
         "controller and its update rate");
@@ -56,9 +55,8 @@ void RetainedControllerStatisticsMonitor::Observe(
         *snapshot_.since_activation_worst_period_s >
             snapshot_.warning_margin_period_s) {
       ++snapshot_.observed_updates_beyond_margin;
-      if (!last_warning_ns_.has_value() ||
-          receipt_ns - *last_warning_ns_ >= config_.warning_throttle_ns) {
-        last_warning_ns_ = receipt_ns;
+      if (last_warned_period_s_ != snapshot_.since_activation_worst_period_s) {
+        last_warned_period_s_ = snapshot_.since_activation_worst_period_s;
         std::ostringstream text;
         text << "observed controller statistics: '" << config_.controller_name
              << "' worst period since activation "

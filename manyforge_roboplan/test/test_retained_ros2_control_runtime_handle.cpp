@@ -1398,7 +1398,7 @@ Statistics(const std::vector<std::pair<std::string, double>> &values) {
   return message;
 }
 
-TEST(RetainedControllerStatisticsMonitorTest, ReportsSinceActivationWorstPeriodAndThrottlesItsWarning) {
+TEST(RetainedControllerStatisticsMonitorTest, ReportsSinceActivationWorstPeriodAndWarnsOncePerWorstValue) {
   auto clock = std::make_shared<core::FakeClock>();
   clock->set(1'000'000'000);
   std::vector<std::string> warnings;
@@ -1426,8 +1426,9 @@ TEST(RetainedControllerStatisticsMonitorTest, ReportsSinceActivationWorstPeriodA
   EXPECT_EQ(snapshot.observed_updates_beyond_margin, 0U);
   EXPECT_TRUE(warnings.empty());
 
-  // Beyond the margin (40 Hz: 25 ms > 20 ms): one throttled warning per second
-  // of observed updates, each labelled as observed statistics.
+  // Beyond the margin (40 Hz: 25 ms > 20 ms). The statistic is the worst
+  // period since activation, so it stays there: one warning for the value,
+  // none for its repetitions, labelled as observed statistics.
   for (int update = 0; update < 5; ++update) {
     monitor.Observe(Statistics({{"arm_controller.stats/periodicity/min", 40.0}}), clock->now());
     clock->advance(100'000'000);
@@ -1437,18 +1438,26 @@ TEST(RetainedControllerStatisticsMonitorTest, ReportsSinceActivationWorstPeriodA
   EXPECT_NE(warnings.front().find("not late-cycle counts"), std::string::npos);
   clock->advance(1'000'000'000);
   monitor.Observe(Statistics({{"arm_controller.stats/periodicity/min", 40.0}}), clock->now());
-  EXPECT_EQ(warnings.size(), 2U);
+  EXPECT_EQ(warnings.size(), 1U);
+  // A worse worst period is new information: warned once.
+  monitor.Observe(Statistics({{"arm_controller.stats/periodicity/min", 30.0}}), clock->now());
+  monitor.Observe(Statistics({{"arm_controller.stats/periodicity/min", 30.0}}), clock->now());
+  ASSERT_EQ(warnings.size(), 2U);
+  EXPECT_NE(warnings.back().find("0.0333"), std::string::npos);
   snapshot = monitor.Read();
-  EXPECT_EQ(snapshot.observed_statistics_updates, 7U);
-  EXPECT_EQ(snapshot.observed_updates_beyond_margin, 6U);
-  EXPECT_DOUBLE_EQ(*snapshot.since_activation_worst_period_s, 0.025);
+  EXPECT_EQ(snapshot.observed_statistics_updates, 9U);
+  EXPECT_EQ(snapshot.observed_updates_beyond_margin, 8U);
+  EXPECT_DOUBLE_EQ(*snapshot.since_activation_worst_period_s, 1.0 / 30.0);
 
   // After a reactivation the controller manager resets the collector: no
-  // cycle yet (NaN) clears the worst period instead of keeping an old one.
+  // cycle yet (NaN) clears the worst period instead of keeping an old one,
+  // and a slow cycle of the new activation is warned about again.
   monitor.Observe(Statistics({{"arm_controller.stats/periodicity/min",
                                std::numeric_limits<double>::quiet_NaN()}}),
                   clock->now());
   EXPECT_FALSE(monitor.Read().since_activation_worst_period_s.has_value());
+  monitor.Observe(Statistics({{"arm_controller.stats/periodicity/min", 40.0}}), clock->now());
+  EXPECT_EQ(warnings.size(), 3U);
   EXPECT_THROW(RetainedControllerStatisticsMonitor({"/cm", "arm_controller", 0.0}, clock, {}),
                std::invalid_argument);
 }

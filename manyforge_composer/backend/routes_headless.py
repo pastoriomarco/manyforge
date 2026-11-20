@@ -17,6 +17,7 @@ from manyforge_headless_api.execution import (
     _canonical_json,
     _motion_path_preview_valid,
 )
+from manyforge_headless_api.identity import format_request_key, http_request_key
 from manyforge_headless_api.native import HeadlessApiError, strict_json_object
 from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
@@ -330,7 +331,10 @@ def _call_scene(callback, body: SceneTransactionRequest):
             and set(response) == _SCENE_RESULT_FIELDS
             and response.get("api_version") == "manyforge.manager_command_response.v3"
             and response.get("ok") is False
-            and response.get("request_key") == context.request_key
+            # Headless forms a class 3 key for every HTTP request; the
+            # owner's refusal names that key.
+            and response.get("request_key")
+            == format_request_key(http_request_key(context.request_key))
             and isinstance(response.get("error"), dict)
             and response["error"].get("code") == error.code
         ):

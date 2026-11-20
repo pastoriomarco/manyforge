@@ -3551,6 +3551,15 @@ class _SceneTransport:
             self.objects[operation["expected_scene_resource_id"]]["placement"] = (
                 _fixed_scene_object(operation["expected_scene_resource_id"])["placement"]
             )
+        elif kind == "detach_carried_object":
+            detached = next(
+                row for row in self.attachments
+                if row["carried_object_attachment_id"] == operation["carried_object_attachment_id"]
+            )
+            self.attachments.remove(detached)
+            self.objects[detached["scene_resource_id"]]["placement"] = (
+                _fixed_scene_object(detached["scene_resource_id"])["placement"]
+            )
         elif kind == "remove_object":
             self.objects.pop(operation["scene_resource_id"])
         elif kind in {"add_object", "upsert_object"}:
@@ -4069,8 +4078,12 @@ def test_empty_apply_clears_scene_through_owner_transactions() -> None:
     assert result["state"] == "succeeded"
     assert result["last_observed_remaining"] == []
     assert [request["operation"]["kind"] for request in transport.submissions] == [
-        "detach_carried_object_at_current_pose", "remove_object", "remove_object",
+        "detach_carried_object", "remove_object", "remove_object",
     ]
+    # Every component is already released: the carried part is detached in
+    # the cell frame, which needs no carrier frame.
+    detach = transport.submissions[0]["operation"]
+    assert detach["frame_ref"]["kind"] == "cell_frame"
     assert [request["operation"].get("scene_resource_id") for request in transport.submissions[1:]] == [
         "old-part", "old-support",
     ]
@@ -4180,7 +4193,7 @@ def test_empty_apply_foreign_receipt_is_unknown(refused):
 def test_empty_apply_refused_detach_keeps_part_and_its_support() -> None:
     class RefusedDetach(_SceneTransport):
         def commit_scene_transaction(self, body):
-            if body["operation"]["kind"] == "detach_carried_object_at_current_pose":
+            if body["operation"]["kind"] == "detach_carried_object":
                 self.submissions.append(dict(body))
                 return {
                     "api_version": "manyforge.manager_command_response.v3",

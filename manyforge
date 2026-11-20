@@ -28,6 +28,8 @@ for pair in \
 done
 export MANYFORGE_DEV_CONTAINER_NAME="${MANYFORGE_DEV_CONTAINER_NAME:-manyforge}"
 export MANYFORGE_DEV_CACHE_BASE="${MANYFORGE_DEV_CACHE_BASE:-$kit/.manyforge}"
+# The launcher's messages name the product, not the development workbench.
+export MANYFORGE_DEV_DISPLAY_NAME=ManyForge
 
 case "${1:-}" in
   run | status | stop | logs) exec "$launcher" "$@" ;;
