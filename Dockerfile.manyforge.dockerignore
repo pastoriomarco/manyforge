@@ -14,7 +14,6 @@ qualification
 **/node_modules
 **/dist
 **/build
-**/build_*
 **/install
 **/log
 **/__pycache__

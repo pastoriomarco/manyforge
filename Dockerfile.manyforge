@@ -41,7 +41,7 @@ RUN case "${MANYFORGE_ROS_IMAGE}" in \
         *@sha256:*) ;; \
         *) echo "MANYFORGE_ROS_IMAGE must name the ROS image by digest (<name>@sha256:<digest>)" >&2; exit 1 ;; \
     esac \
-    && install -d -o 1000 -g 1000 /runner /runner/home
+    && install -d -o 1000 -g 1000 /runner /runner/home /runner/build
 USER 1000:1000
 COPY --chown=1000:1000 . /workspace
 # As scripts/compose-dev.sh runs the build step: home and build root in /runner.

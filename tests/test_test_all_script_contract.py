@@ -616,8 +616,10 @@ def test_manyforge_image_builds_from_the_digest_pinned_ros_image() -> None:
     # the compose-dev.sh `run` it calls) is among them.
     staged = re.search(r"cp -a --parents -t \"\$stage\" \\\n(.*?);", dockerfile, re.DOTALL).group(1)
     paths = staged.replace("\\", " ").split()
+    # The built frontend is the build stage's output, not part of a checkout.
     for path in paths:
-        assert (_REPO_ROOT / path).exists(), path
+        if path != "manyforge_composer/frontend/dist":
+            assert (_REPO_ROOT / path).exists(), path
     for path in ("VERSION", "manyforge", "scripts/compose-dev.sh", "scripts/lib", "manyforge_operator",
                  "manyforge_composer/frontend/dist"):
         assert path in paths, path
