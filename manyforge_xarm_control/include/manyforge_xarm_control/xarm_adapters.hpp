@@ -29,6 +29,7 @@
 #include <manyforge_xarm_control/xarm_io_states_transport.hpp>
 #include <manyforge_xarm_control/xarm_launch_contribution.hpp>
 #include <manyforge_xarm_control/xarm_owner_adapter.hpp>
+#include <manyforge_xarm_control/xarm_plugin_controllers.hpp>
 #include <manyforge_xarm_control/xarm_robot_states_transport.hpp>
 
 namespace manyforge::xarm_control {
@@ -54,6 +55,9 @@ struct XArmMachineInputs final {
   /// Whether the machine's launch is still starting (owner port of the same
   /// name).
   std::function<bool()> launch_settling;
+  /// The machine's controller manager node
+  /// (`<component namespace>/controller_manager`).
+  std::string controller_manager;
 };
 
 /// One machine: the owner adapter with the driver services
@@ -63,10 +67,14 @@ struct XArmMachine final {
   std::shared_ptr<XArmDriverServices> driver;
   std::shared_ptr<XArmOwnerAdapter> owner;
   std::shared_ptr<XArmIoStatesTransport> io_states;
+  /// The vendor plugin's controller calls, answered here, and the arm's
+  /// deactivation on lost readiness.
+  std::shared_ptr<XArmPluginControllers> plugin_controllers;
 };
 
-/// Creates the subscriptions and service clients on `node` (stamping receipt
-/// on `clock`); both outlive the machine.
+/// Creates the subscriptions, service clients and the plugin's stand-in
+/// services on `node` (stamping receipt on `clock`); both outlive the
+/// machine.
 [[nodiscard]] XArmMachine make_xarm_machine(rclcpp::Node &node, core::IClock &clock,
                                             XArmMachineInputs inputs,
                                             const XArmRosOwner *ros_owner = nullptr);

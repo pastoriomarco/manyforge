@@ -65,8 +65,9 @@ namespace core = manyforge::core;
 /// Between reads of the arm's waits (20 ms).
 constexpr std::chrono::milliseconds kXArmPollInterval{20};
 
-/// How long the driver takes to reactivate its controllers after the re-arm
-/// of a TCP offset send (`set_state(0)`); the handle binds them within it.
+/// The handle's bound for seeing the controllers active after the re-arm of a
+/// TCP offset send (`set_state(0)`) before it binds them; they stay active
+/// through the re-arm (no ManyForge or plugin switch then).
 constexpr std::chrono::nanoseconds kXArmRearmBound = std::chrono::seconds(5);
 
 [[nodiscard]] std::filesystem::path vendor_dir() {
@@ -102,6 +103,7 @@ struct Machine final : manyforge::roboplan_backend::AdapterTransportConsumer {
   xarm::XArmVendorSettings settings;
   xarm::XArmMachine parts;
   std::string driver_namespace;
+  std::string controller_manager;
   std::weak_ptr<Owner> transport_owner;
   mutable std::mutex mutex;
 
@@ -112,6 +114,7 @@ struct Machine final : manyforge::roboplan_backend::AdapterTransportConsumer {
     std::shared_ptr<xarm::XArmRobotStatesTransport> robot;
     std::shared_ptr<xarm::XArmDriverServices> driver;
     std::shared_ptr<xarm::XArmIoStatesTransport> io;
+    std::shared_ptr<xarm::XArmPluginControllers> plugin;
   };
 
   std::shared_ptr<void> Stage(const std::shared_ptr<Owner> &expected,
@@ -151,6 +154,8 @@ struct Machine final : manyforge::roboplan_backend::AdapterTransportConsumer {
         *ros.node, driver_namespace, &ros);
     next->io = std::make_shared<xarm::XArmIoStatesTransport>(
         *ros.node, driver_namespace, *clock, parts.owner, &ros);
+    next->plugin = std::make_shared<xarm::XArmPluginControllers>(
+        *ros.node, driver_namespace, controller_manager, &ros);
     return next;
   }
   bool Validate(const std::shared_ptr<void> &staged) const override {
@@ -166,6 +171,7 @@ struct Machine final : manyforge::roboplan_backend::AdapterTransportConsumer {
     parts.owner->ForgetMemberEstops();
     parts.driver->SwapRosState(*next->driver);
     parts.io_states.swap(next->io);
+    parts.plugin_controllers->SwapRosState(*next->plugin);
     transport_owner = next->new_owner;
   }
 };
@@ -195,6 +201,9 @@ std::shared_ptr<Machine> make_machine(const ComponentAdapterContext &context) {
   machine->clock = context.clock;
   machine->transport_owner = context.ros_entity_owner;
   machine->driver_namespace = context.ros_namespace + "/xarm";
+  machine->controller_manager =
+      context.ros_namespace + "/" +
+      std::string(manyforge::roboplan_backend::kControllerManagerNodeName);
   machine->settings = value_or_throw(xarm::load_xarm_vendor_settings(vendor_dir()));
   // The callbacks are used only while constructing the family entities. The
   // retirement handle does not retain the transport owner.
@@ -227,7 +236,8 @@ std::shared_ptr<Machine> make_machine(const ComponentAdapterContext &context) {
                                           const auto locked = handle.lock();
                                           return locked && locked->ControllerLaunchSettling();
                                         })
-                                  : std::function<bool()>{}},
+                                  : std::function<bool()>{},
+                              machine->controller_manager},
       context.ros_entity_owner ? &ros_owner : nullptr);
   return machine;
 }
@@ -263,6 +273,19 @@ std::shared_ptr<xarm::XArmArmAdapter> make_arm(const ComponentAdapterContext &co
             return activity.controller_manager_present && activity.observed &&
                    activity.controller_loaded && activity.broadcaster_loaded &&
                    !activity.controller_active && !activity.broadcaster_active;
+          },
+          [handle = context.ros2_control] {
+            const auto activity = handle->arm_activity();
+            return activity.controller_active || activity.broadcaster_active;
+          },
+          // The trajectory controller and the joint state broadcaster, as
+          // the vendor plugin switched them off.
+          [plugin = machine.parts.plugin_controllers,
+           controllers = std::vector<std::string>{
+               context.row.controller,
+               std::string(manyforge::roboplan_backend::kJointStateBroadcasterControllerName)}](
+              std::function<void()> answered) {
+            return plugin->Deactivate(controllers, std::move(answered));
           }});
 }
 
@@ -324,6 +347,11 @@ ComponentAdapters make_xarm(const ComponentAdapterContext &context) {
   if (context.role == xarm::kXArmArmRole) {
     const auto arm = member_of(machine, make_arm(context, *machine));
     owner.AddMember({context.role, id, arm, {}, arm});
+    // Each `robot_states` report goes to the arm's readiness rule.
+    machine->parts.robot_states->SetReportListener(
+        [weak = std::weak_ptr(arm)](const xarm::XArmObservedState &report) {
+          if (const auto adapter = weak.lock()) adapter->OnReport(report);
+        });
     auto result = with_arm_hooks(arm, context, arm);
     if (context.ros_entity_owner) result.ros_transport_consumer = machine;
     return result;

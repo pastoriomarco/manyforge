@@ -56,7 +56,9 @@ case "$command" in
     [[ ${FAKE_INSPECT_FAIL:-false} != true ]] || exit 1
     [[ ${FAKE_CONTAINER_PRESENT:-true} == true || -e ${FAKE_DOCKER_STARTED:-/nonexistent} || ${1:-} == other-owned-container ]] || exit 1
     if [[ ${1:-} == --format && ${2:-} == '{{json .}}' ]]; then
-      python3 -c 'import json,os;print(json.dumps({"Id":os.environ.get("FAKE_ACTUAL_ID","d"*64),"Image":os.environ["MANYFORGE_DEV_IMAGE"],"Config":{"Labels":{"manyforge.launch-instance":os.environ.get("FAKE_ACTUAL_INSTANCE",os.environ["MANYFORGE_DEV_LAUNCH_INSTANCE_ID"]),"manyforge.launch-input-digest":os.environ["MANYFORGE_DEV_LAUNCH_INPUT_DIGEST"]}},"State":{"Running":os.environ.get("FAKE_EXIT_AFTER_RUN")!="true" and os.environ.get("FAKE_INITIAL_EXITED")!="true" and not os.path.exists(os.environ["FAKE_DOCKER_STOPPED"])}}))'
+      python3 -c 'import json,os;print(json.dumps({"Id":os.environ.get("FAKE_ACTUAL_ID","d"*64),"Image":os.environ["MANYFORGE_DEV_IMAGE"],"Config":{"Labels":{"manyforge.launch-instance":os.environ.get("FAKE_ACTUAL_INSTANCE",os.environ.get("MANYFORGE_DEV_LAUNCH_INSTANCE_ID","")),"manyforge.launch-input-digest":os.environ.get("MANYFORGE_DEV_LAUNCH_INPUT_DIGEST","")}},"State":{"Running":os.environ.get("FAKE_EXIT_AFTER_RUN")!="true" and os.environ.get("FAKE_INITIAL_EXITED")!="true" and not os.path.exists(os.environ["FAKE_DOCKER_STOPPED"])}}))'
+    elif [[ ${1:-} == -f && ${2:-} == *manyforge.product* ]]; then
+      printf '%s\\n' "${FAKE_PRODUCT_LABEL:-false}"
     elif [[ ${1:-} == -f && ${2:-} == *Config.Labels* ]]; then
       printf '%s\\n' "${FAKE_ROS_LABEL:-true}"
     elif [[ ${1:-} == -f ]]; then
@@ -83,7 +85,10 @@ case "$command" in
     ;;
   container)
     [[ ${FAKE_LIST_FAIL:-false} != true ]] || exit 1
-    if [[ "$*" == *--quiet* ]]; then
+    if [[ "$*" == *manyforge.product* ]]; then
+      # Running workbenches as "<name> <manyforge.product label>" lines.
+      [[ -z ${FAKE_RUNNING_WORKBENCHES:-} ]] || printf '%s\\n' "$FAKE_RUNNING_WORKBENCHES"
+    elif [[ "$*" == *--quiet* ]]; then
       if [[ "$*" == *status=running* ]]; then
         [[ -z ${FAKE_BOUND_STATE_ROOT:-} ]] || printf 'other-owned-container\\n'
       elif [[ -n ${FAKE_OLDER_ID:-} ]]; then
@@ -93,7 +98,11 @@ case "$command" in
       printf '%s %s\\n' "${FAKE_ACTUAL_ID:-dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd}" "$MANYFORGE_DEV_CONTAINER_NAME"
     fi
     ;;
-  image) printf '%s\\n' "$MANYFORGE_DEV_IMAGE" ;;
+  image)
+    # A plain `image inspect <reference>` checks presence; -f reads the ID.
+    [[ ${FAKE_IMAGE_ABSENT:-false} != true || "$*" == *-f* || -e "$FAKE_DOCKER_CALLS.pulled" ]] || exit 1
+    printf '%s\\n' "$MANYFORGE_DEV_IMAGE" ;;
+  pull) : > "$FAKE_DOCKER_CALLS.pulled" ;;
   run)
     if [[ ${1:-} == --rm ]]; then
       printf 'native build output\\n'
@@ -1461,3 +1470,236 @@ def test_build_native_runs_only_the_start_build_step(tmp_path: Path, fails: bool
     else:
         assert completed.returncode == 0, completed.stderr
         assert completed.stdout == "Native build complete.\n"
+
+
+@pytest.mark.parametrize("argument,reference,absent", [
+    (None, "ghcr.io/pastoriomarco/manyforge:9.8.7", False),
+    (None, "ghcr.io/pastoriomarco/manyforge:9.8.7", True),
+    ("sha256:" + "a" * 64, "ghcr.io/pastoriomarco/manyforge@sha256:" + "a" * 64, False),
+])
+def test_run_starts_the_prebuilt_image_as_operator_mode_without_building(
+    tmp_path: Path, argument: str | None, reference: str, absent: bool
+) -> None:
+    launcher = _copy_writable_launcher(tmp_path)
+    (launcher.parents[1] / "VERSION").write_text("9.8.7\n")
+    environment = _fake_docker_environment(tmp_path,
+        FAKE_WORKSPACE=str(launcher.parents[1]), MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_CONTAINER_PRESENT="false", FAKE_IMAGE_ABSENT=str(absent).lower(),
+        MANYFORGE_DEV_RUNTIME_STATE_ROOT=str(tmp_path / "runtime"), ROS_DOMAIN_ID="7")
+    arguments = ["run"] if argument is None else ["run", argument]
+    completed = subprocess.run(["bash", str(launcher), *arguments], cwd=tmp_path,
+        env=environment, capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+    assert "ManyForge: http://localhost:9000" in completed.stdout
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    assert calls[0] == f"image inspect {reference}"
+    assert (f"pull {reference}" in calls) == absent
+    # Nothing is built: the image holds the programs and the built GUI.
+    assert not any(call.startswith("run --rm ") for call in calls)
+    serve = next(call for call in calls if call.startswith("run -d "))
+    cache = tmp_path / "cache/images/test"
+    for part in ("--label manyforge.product=true", "--network host",
+                 f"--user {os.getuid()}:{os.getgid()}", "--env HOME=/runner/home",
+                 f"-v {cache / 'home'}:/runner/home",
+                 f"-v {cache / 'repository-bootstrap-package'}:/runner/repository-bootstrap-package",
+                 f"-v {tmp_path / 'runtime'}:/tmp/manyforge-state", "--env ROS_DOMAIN_ID"):
+        assert part in serve, part
+    for absent_part in (":/workspace", "MANYFORGE_BUILD_DIR", "node_modules"):
+        assert absent_part not in serve, absent_part
+    assert serve.endswith(
+        "sha256:test python3 scripts/dev-workbench.py serve --composer-port 9000 "
+        "--composer-bind-host 0.0.0.0 "
+        "--composer-static-dir /workspace/manyforge_composer/frontend/dist")
+    # Readiness is the operator mode's: every owner, Composer on 9000.
+    assert any("status --operator-runtime --composer-port 9000" in call for call in calls)
+
+
+def test_run_refuses_extra_arguments(tmp_path: Path) -> None:
+    completed, environment = _run_launcher(tmp_path, "run", "one", "two")
+    assert completed.returncode == 64
+    assert not Path(environment["FAKE_DOCKER_CALLS"]).exists()
+
+
+@pytest.mark.parametrize("command,running,message", [
+    # Different names: the product's `manyforge`, the development default.
+    ("run", "manyforge-development-workbench false", "A development workbench is running"),
+    # A workbench started before the manyforge.product label is development.
+    ("run", "isolated-workbench ", "A development workbench is running"),
+    ("start", "manyforge true", "ManyForge is running (container manyforge)"),
+    # Same name: the product container under the development default name.
+    ("start", "manyforge-development-workbench true", "ManyForge is running"),
+])
+def test_run_and_start_refuse_a_running_workbench_of_the_other_kind(
+    tmp_path: Path, command: str, running: str, message: str
+) -> None:
+    completed, environment = _run_launcher(
+        tmp_path, command, MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_RUNNING_WORKBENCHES=running)
+    assert completed.returncode == 69
+    assert message in completed.stderr
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    # Refused before the own-name container is touched or anything starts.
+    assert not any(call.startswith(("run ", "stop ", "rm ", "inspect ")) for call in calls)
+
+
+def test_start_ignores_a_running_workbench_of_the_same_kind_under_another_name(
+    tmp_path: Path,
+) -> None:
+    completed, _ = _run_launcher(
+        tmp_path, "start", MANYFORGE_DEV_IMAGE="sha256:test", FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_RUNTIME_STATE_ROOT=str(tmp_path / "runtime"),
+        FAKE_RUNNING_WORKBENCHES="isolated-workbench false")
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_status_of_the_prebuilt_image_reads_every_owner_on_9000(tmp_path: Path) -> None:
+    completed, environment = _run_launcher(
+        tmp_path, "status", MANYFORGE_DEV_IMAGE="sha256:test", FAKE_PRODUCT_LABEL="true")
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["workbench"] == {"ready": True}
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text()
+    assert "status --operator-runtime --composer-port 9000" in calls
+
+
+@pytest.mark.parametrize("project", [
+    "examples/mock_lite6_pick_and_place.scenario",
+    "/home/user/Projects/cell.scenario",
+])
+def test_run_loads_a_project_like_start_and_waits_for_it(tmp_path: Path, project: str) -> None:
+    completed, environment = _run_launcher(
+        tmp_path, "run", "--project", project, "sha256:" + "a" * 64,
+        MANYFORGE_DEV_IMAGE="sha256:test", FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_RUNTIME_STATE_ROOT=str(tmp_path / "runtime"))
+    assert completed.returncode == 0, completed.stderr
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    assert calls[0] == "image inspect ghcr.io/pastoriomarco/manyforge@sha256:" + "a" * 64
+    # The same serve option start passes; the container maps a host path under
+    # a project folder (dev-workbench.py), and ready requires that Scenario.
+    serve = next(call for call in calls if call.startswith("run -d "))
+    assert serve.endswith(
+        "--composer-static-dir /workspace/manyforge_composer/frontend/dist --project " + project)
+    assert any(call.endswith("status --operator-runtime --composer-port 9000 --project " + project)
+               for call in calls)
+
+
+@pytest.mark.parametrize("arguments", [
+    ("--bootstrap-project", "examples/x.scenario"),
+    ("--project",),
+    ("--project", "examples/x.scenario", "one", "two"),
+])
+def test_run_refuses_options_start_alone_takes(tmp_path: Path, arguments: tuple[str, ...]) -> None:
+    completed, environment = _run_launcher(tmp_path, "run", *arguments)
+    assert completed.returncode == 64
+    assert not Path(environment["FAKE_DOCKER_CALLS"]).exists()
+
+
+def test_logs_reads_the_workbench_container(tmp_path: Path) -> None:
+    completed, environment = _run_launcher(
+        tmp_path, "logs", "--tail", "5", MANYFORGE_DEV_CONTAINER_NAME="named-workbench")
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout == "preserved log\n"
+    assert Path(environment["FAKE_DOCKER_CALLS"]).read_text() == "logs --tail 5 named-workbench\n"
+
+
+WRAPPER = REPOSITORY_ROOT / "manyforge"
+
+
+def _launcher_kit(tmp_path: Path) -> Path:
+    """The kit Dockerfile.manyforge ships: ./manyforge beside scripts/compose-dev.sh."""
+
+    launcher = _copy_writable_launcher(tmp_path)
+    (launcher.parents[1] / "VERSION").write_text("9.8.7\n")
+    wrapper = launcher.parents[1] / "manyforge"
+    wrapper.write_text(WRAPPER.read_text(encoding="utf-8"), encoding="utf-8")
+    wrapper.chmod(0o755)
+    launcher.chmod(0o755)
+    return wrapper
+
+
+def test_wrapper_maps_product_names_onto_the_launcher_settings(tmp_path: Path) -> None:
+    wrapper = _launcher_kit(tmp_path)
+    folder = tmp_path / "Projects"
+    folder.mkdir()
+    site = tmp_path / "site" / "manyforge.site.json"
+    site.parent.mkdir()
+    site.write_text(json.dumps({"schema": "manyforge.site.v2", "project_folders": [str(folder)]}))
+    environment = _fake_docker_environment(
+        tmp_path, FAKE_WORKSPACE=str(wrapper.parent), MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_SITE_SETTINGS=str(site),
+        MANYFORGE_DATA_DIR=str(tmp_path / "data"),
+        MANYFORGE_RUNTIME_STATE_ROOT=str(tmp_path / "runtime"),
+        MANYFORGE_CONTAINER_NAME="manyforge-product",
+        MANYFORGE_START_TIMEOUT_SECONDS="5",
+        # The launcher's own names are not read through the wrapper.
+        MANYFORGE_DEV_CONTAINER_NAME="ignored-name",
+        MANYFORGE_DEV_START_TIMEOUT_SECONDS="0")
+    completed = subprocess.run([str(wrapper), "run", "--project", str(folder / "cell.scenario")],
+        cwd=tmp_path, env=environment, capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+    assert "ManyForge: http://localhost:9000" in completed.stdout
+    calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+    assert calls[0] == "image inspect ghcr.io/pastoriomarco/manyforge:9.8.7"
+    serve = next(call for call in calls if call.startswith("run -d "))
+    data = tmp_path / "data/images/test"
+    for part in ("--name manyforge-product", "--label manyforge.product=true",
+                 f"-v {site.parent}:{site.parent}:ro", f"--site-settings {site}",
+                 f"-v {folder}:/projects/Projects",
+                 f"-v {data / 'home'}:/runner/home",
+                 f"-v {tmp_path / 'runtime'}:/tmp/manyforge-state",
+                 f"-v {tmp_path / 'data/state/composer'}:/var/lib/manyforge/composer",
+                 f"--project {folder / 'cell.scenario'}"):
+        assert part in serve, part
+    assert "ignored-name" not in "\n".join(calls)
+
+
+def test_wrapper_without_product_names_uses_the_product_defaults(tmp_path: Path) -> None:
+    wrapper = _launcher_kit(tmp_path)
+    environment = _fake_docker_environment(
+        tmp_path, FAKE_WORKSPACE=str(wrapper.parent), MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_CONTAINER_PRESENT="false",
+        MANYFORGE_DEV_SITE_SETTINGS=str(tmp_path / "ignored.json"))
+    completed = subprocess.run([str(wrapper), "run"], cwd=tmp_path, env=environment,
+        capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+    serve = next(call for call in Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+                 if call.startswith("run -d "))
+    # Product defaults: container `manyforge`, data under .manyforge/ in the
+    # launcher folder (compose-dev.sh alone keeps its development defaults).
+    data = wrapper.parent / ".manyforge"
+    assert "--name manyforge " in serve
+    assert f"-v {data / 'images/test/home'}:/runner/home" in serve
+    assert f"-v {data / 'runtime/manyforge'}:/tmp/manyforge-state" in serve
+    assert f"-v {data / 'state/composer'}:/var/lib/manyforge/composer" in serve
+    assert "--site-settings" not in serve and "ignored.json" not in serve
+
+
+@pytest.mark.parametrize("arguments,expected", [
+    (("status",), "exec {} python3 scripts/dev-workbench.py status --operator-runtime --composer-port 9000"),
+    (("stop",), "stop --time 30 {}"),
+    (("logs", "--follow"), "logs --follow {}"),
+])
+@pytest.mark.parametrize("name", [None, "manyforge-product"])
+def test_wrapper_status_stop_and_logs_use_the_launcher(
+    tmp_path: Path, arguments: tuple[str, ...], expected: str, name: str | None
+) -> None:
+    wrapper = _launcher_kit(tmp_path)
+    environment = _fake_docker_environment(
+        tmp_path, FAKE_WORKSPACE=str(wrapper.parent), MANYFORGE_DEV_IMAGE="sha256:test",
+        FAKE_PRODUCT_LABEL="true", **({"MANYFORGE_CONTAINER_NAME": name} if name else {}))
+    completed = subprocess.run([str(wrapper), *arguments], cwd=tmp_path, env=environment,
+        capture_output=True, text=True, check=False)
+    assert completed.returncode == 0, completed.stderr
+    assert expected.format(name or "manyforge") in Path(
+        environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
+
+
+@pytest.mark.parametrize("arguments", [(), ("start",), ("build",), ("pull",)])
+def test_wrapper_offers_only_the_product_commands(tmp_path: Path, arguments: tuple[str, ...]) -> None:
+    wrapper = _launcher_kit(tmp_path)
+    environment = _fake_docker_environment(tmp_path)
+    completed = subprocess.run([str(wrapper), *arguments], cwd=tmp_path, env=environment,
+        capture_output=True, text=True, check=False)
+    assert completed.returncode == 64
+    assert completed.stderr.startswith("Usage: ")
+    assert not Path(environment["FAKE_DOCKER_CALLS"]).exists()

@@ -37,13 +37,20 @@ struct XArmRobotStatesTransport::Cache final {
     report.joint_angles_rad.assign(message.angle.begin(), message.angle.end());
     // The tool context compares it at Enable.
     report.tcp_offset.assign(message.offset.begin(), message.offset.end());
-    std::lock_guard lock(mutex);
-    latest = report;
+    XArmReportListener notify;
+    {
+      std::lock_guard lock(mutex);
+      latest = report;
+      notify = listener;
+    }
+    // Outside the lock: the listener may read the cache.
+    if (notify) notify(report);
   }
 
   core::IClock &clock;
   mutable std::mutex mutex;
   XArmObservedState latest;
+  XArmReportListener listener;
 };
 
 std::string xarm_robot_states_topic(const std::string_view driver_namespace) {
@@ -99,8 +106,20 @@ void XArmRobotStatesTransport::Receive(const xarm_msgs::msg::RobotMsg &message) 
   cache->Store(message);
 }
 
+void XArmRobotStatesTransport::SetReportListener(XArmReportListener listener) {
+  std::lock_guard lock(state_mutex_);
+  std::lock_guard cache_lock(cache_->mutex);
+  cache_->listener = std::move(listener);
+}
+
 void XArmRobotStatesTransport::SwapRosState(XArmRobotStatesTransport &replacement) noexcept {
   std::scoped_lock lock(state_mutex_, replacement.state_mutex_);
+  {
+    // The listener moves to the new subscription's cache.
+    std::scoped_lock caches(cache_->mutex, replacement.cache_->mutex);
+    replacement.cache_->listener = std::move(cache_->listener);
+    cache_->listener = nullptr;
+  }
   cache_.swap(replacement.cache_);
   subscription_.swap(replacement.subscription_);
 }

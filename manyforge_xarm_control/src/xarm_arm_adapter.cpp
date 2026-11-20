@@ -35,10 +35,6 @@ namespace {
 /// mode and the ready state within this bound (5 Hz reports).
 constexpr std::int64_t kXArmTcpOffsetReadyNs = 3'000'000'000LL;
 
-/// The plugin's controller cycle after an arming: its deactivation and its
-/// reactivation each block its write loop for up to its 1 s service timeout.
-constexpr std::int64_t kXArmControllerCycleNs = 3'000'000'000LL;
-
 [[nodiscard]] ActionResult result(const ComponentAction action, const ActionOutcome outcome,
                                   std::optional<core::ActionError> error = std::nullopt) {
   ActionResult made;
@@ -104,13 +100,9 @@ private:
 class XArmArmAdapter::ArmingScope final {
 public:
   explicit ArmingScope(XArmArmAdapter &adapter) : adapter_(adapter) {
-    std::lock_guard lock(adapter_.mutex_);
-    ++adapter_.arming_;
+    adapter_.arming_.fetch_add(1, std::memory_order_acq_rel);
   }
-  ~ArmingScope() {
-    std::lock_guard lock(adapter_.mutex_);
-    --adapter_.arming_;
-  }
+  ~ArmingScope() { adapter_.arming_.fetch_sub(1, std::memory_order_acq_rel); }
   ArmingScope(const ArmingScope &) = delete;
   ArmingScope &operator=(const ArmingScope &) = delete;
 
@@ -161,9 +153,25 @@ void XArmArmAdapter::ForgetOwnerEstop() noexcept {
   stopped_by_estop_.store(false, std::memory_order_release);
 }
 
-bool XArmArmAdapter::Arming() const {
-  std::lock_guard lock(mutex_);
-  return arming_ > 0;
+bool XArmArmAdapter::Arming() const { return arming_.load(std::memory_order_acquire) > 0; }
+
+void XArmArmAdapter::OnReport(const XArmObservedState &report) {
+  // The plugin's readiness (`_xarm_is_ready_write`): no error, a state up to
+  // ready, joint-servo mode. Ready: nothing to do (only Enable switches the
+  // controllers on).
+  if (report.error_code == 0 && report.state <= kXArmReadyState &&
+      report.mode == kXArmJointServoMode)
+    return;
+  // Its own arming changes mode and state itself; its controllers stay.
+  if (Arming() || !ports_.controllers_active || !ports_.deactivate_controllers) return;
+  // As the plugin: only with the hardware on (its write loop runs), and only
+  // when there is something to switch off.
+  if (!ports_.hardware_active() || !ports_.controllers_active()) return;
+  // At most one request outstanding; no lock across the send.
+  if (deactivation_pending_->exchange(true, std::memory_order_acq_rel)) return;
+  if (!ports_.deactivate_controllers(
+          [pending = deactivation_pending_] { pending->store(false, std::memory_order_release); }))
+    deactivation_pending_->store(false, std::memory_order_release);
 }
 
 std::int64_t XArmArmAdapter::Now() const { return ports_.clock->now(); }
@@ -234,14 +242,14 @@ core::ComponentState XArmArmAdapter::State(const std::int64_t now_ns) const {
     const bool inactive = ports_.controllers_inactive && ports_.controllers_inactive();
     std::lock_guard lock(mutex_);
     const auto current = ports_.status->observe();
-    if (arming_ > 0) {
-      // Its own arming: the driver's controller cycle pauses the streams
-      // (they still show stale); the action verifies them before it
-      // succeeds and fails typed if they never return.
+    if (Arming()) {
+      // Its own arming: its hardware switch pauses the streams (they still
+      // show stale); the action verifies them before it succeeds and fails
+      // typed if they never return.
       state.fault.reset();
       state.lifecycle = ComponentLifecycle::kPrepared;
       state.reason = core::ComponentStateReason{
-          "xarm_arming", "Arming: the driver restarts its controllers"};
+          "xarm_arming", "Arming: the robot's hardware restarts"};
     } else if (stopped_by_estop_.load(std::memory_order_acquire) && Fresh(current, now_ns)) {
       if (current.error_code >= 1 && current.error_code <= 3) {
         state.fault.reset();
@@ -362,6 +370,9 @@ ActionResult XArmArmAdapter::Arm(const std::stop_token stop) {
   // `set_state(0)`, with the joint state broadcaster.
   constexpr auto action = ComponentAction::kEnable;
   const ArmingScope arming(*this);
+  // A deactivation left unanswered (its controller manager gone with a
+  // driver restart) no longer holds back the next one.
+  deactivation_pending_->store(false, std::memory_order_release);
   const auto deadline = Now() + config_.action_timeout.count();
   // The same lifecycle command time bounds the hardware switch's
   // controller-manager calls (they wait on the steady clock): one left
@@ -373,23 +384,17 @@ ActionResult XArmArmAdapter::Arm(const std::stop_token stop) {
   if (made.outcome != ActionOutcome::kSucceeded) return made;
   made = Hardware(true, action, step_deadline, stop);
   if (made.outcome != ActionOutcome::kSucceeded) return made;
-  const auto mark_armed = [this] {
+  {
     std::lock_guard lock(mutex_);
     armed_ = true;
     prepared_ = false;
-  };
-  mark_armed();
+  }
   const auto armed_at = Now();
   const auto interrupted = [&](const char *what) {
     return failed(action, "component_action_interrupted_by_stop",
                   std::string("a Stop interrupted the wait for ") + what + " after the arming");
   };
-  // The plugin (`UFRobotSystemHardware::write`): until it sees the robot
-  // ready it switches every active controller off from its write loop, and
-  // switches them all back on once ready (the trajectory controller too).
-  // No ManyForge switch may overlap that cycle: its reactivation's
-  // `list_controllers` then times out and nothing is switched back on. So
-  // first a report received after the arming that shows the robot ready.
+  // First a report received after the arming that shows the robot ready.
   const int axes = (1 << config_.axis_count) - 1;
   std::int64_t ready_at = 0;
   for (;;) {
@@ -411,40 +416,23 @@ ActionResult XArmArmAdapter::Arm(const std::stop_token stop) {
                         std::to_string(observed.state));
     ports_.pause();
   }
-  // Then joint states stamped after that report (the broadcaster on again
-  // after the plugin's cycle, if it ran). Not back within the plugin's cycle
-  // (its reactivation failed): the broadcaster is requested once.
-  const auto flowing = [&] { return FlowingSince(ready_at); };
-  bool requested = false;
-  while (!flowing()) {
+  // Then joint states stamped after that report.
+  while (!FlowingSince(ready_at)) {
     if (stop.stop_requested()) return interrupted("joint states");
     if (Now() >= deadline)
       return failed(action, "xarm_joint_angles_unavailable",
                     "no joint states arrived after the arming within the component's "
                     "lifecycle timeout");
-    if (!requested && Now() - ready_at >= kXArmControllerCycleNs) {
-      requested = true;
-      made = Hardware(true, action, step_deadline, stop);
-      if (made.outcome != ActionOutcome::kSucceeded) return made;
-    }
     ports_.pause();
-  }
-  // The plugin's reactivation switched the trajectory controller on too,
-  // without an Enable: off again; the Enable switches it on.
-  if (ports_.lane->State(Now()).lifecycle == ComponentLifecycle::kEnabled) {
-    made = Lane(ComponentAction::kDisable, action, stop);
-    if (made.outcome != ActionOutcome::kSucceeded) return made;
-    mark_armed();
   }
   return made;
 }
 
 bool XArmArmAdapter::FlowingSince(const std::int64_t ready_at_ns) const {
-  // Joint states stamped after `ready_at_ns`, and the controller manager's
-  // activity showing the broadcaster active: the plugin's reactivation
-  // (broadcaster and trajectory controller in one switch) has then been
-  // reported, so the cached trajectory controller state is not the one from
-  // before its cycle.
+  // Joint states stamped after `ready_at_ns` (the plugin freezes its joint
+  // states while an error is present: older ones may be the pose from
+  // before the arming), and the controller manager's activity showing the
+  // broadcaster active.
   const auto now = Now();
   const auto streams = ports_.lane->State(now).streams;
   const auto joints = std::find_if(streams.begin(), streams.end(), [](const auto &stream) {
@@ -502,8 +490,12 @@ XArmArmAdapter::CheckEnableGate(const std::optional<std::int64_t> since_ns,
       observed = ports_.status->observe();
     }
     if (!(observed.received_timestamp_ns && *observed.received_timestamp_ns > *since_ns))
-      return refuse("xarm_status_unavailable",
-                    "the robot controller sent no status report after its re-arm");
+      return stop.stop_requested()
+                 ? refuse("component_action_interrupted_by_stop",
+                          "a Stop interrupted the wait for the robot controller's status report "
+                          "after its re-arm")
+                 : refuse("xarm_status_unavailable",
+                          "the robot controller sent no status report after its re-arm");
   }
   if (!Fresh(observed, Now()))
     return refuse("xarm_status_unavailable",
@@ -566,41 +558,11 @@ XArmArmAdapter::ApplyToolContext(const std::optional<core::Pose3DTO> &offset,
     ++rearms_;
   }
   auto applied = tool_context_.Apply(offset, payload, at_enable, bound);
-  std::optional<std::int64_t> ready_at;
   {
     std::lock_guard lock(mutex_);
     --rearms_;
-    ready_at = offset_ready_at_ns_;
   }
-  if (!at_enable || !applied.ok() || !applied.value() || !ready_at) return applied;
-  // At Enable the host switches the trajectory controller on right after
-  // this hook. The offset's state 5 and the ready after `set_state(0)` made
-  // the plugin cycle every controller off and on from its write loop (as
-  // after Arm's arming): no switch may overlap that cycle (its
-  // reactivation's `list_controllers` then times out and nothing comes back
-  // on). So the hook returns only once joint states stamped after the ready
-  // report flow and the broadcaster is reported active, within the plugin's
-  // cycle and the step's time.
-  for (;;) {
-    if (FlowingSince(*ready_at)) return applied;
-    const auto not_back = [&](std::string code, std::string message) {
-      auto error = offset_error("xarm_reengage_not_ready", std::move(message), true);
-      error.code = std::move(code);
-      error.details.insert_or_assign("effect", "observed");
-      return core::Result<bool>::Err(std::move(error));
-    };
-    if (bound.cancellation.stop_requested())
-      return not_back("component_action_interrupted_by_stop",
-                      "a Stop interrupted the wait for joint states after the TCP offset");
-    if (bound.step_deadline && std::chrono::steady_clock::now() >= *bound.step_deadline)
-      return not_back("component_lifecycle_deadline_expired",
-                      "no time was left to see joint states after the TCP offset");
-    if (Now() - *ready_at >= kXArmControllerCycleNs)
-      return not_back(std::string(core::to_string(core::ErrorCode::kExecutionRejected)),
-                      "the driver did not bring the joint state broadcaster back after the "
-                      "TCP offset; Recover the robot");
-    ports_.pause();
-  }
+  return applied;
 }
 
 XArmTcpOffsetSent XArmArmAdapter::SendTcpOffset(const core::Pose3DTO &tcp,
@@ -647,10 +609,6 @@ XArmTcpOffsetSent XArmArmAdapter::SendTcpOffset(const core::Pose3DTO &tcp,
     return sent;
   }
   const auto since = Now();
-  {
-    std::lock_guard lock(mutex_);
-    offset_ready_at_ns_.reset();
-  }
   const int axes = (1 << config_.axis_count) - 1;
   for (;;) {
     const auto observed = ports_.status->observe();
@@ -663,10 +621,6 @@ XArmTcpOffsetSent XArmArmAdapter::SendTcpOffset(const core::Pose3DTO &tcp,
       if (observed.tcp_offset.size() == 6U) {
         reported.emplace();
         std::copy(observed.tcp_offset.begin(), observed.tcp_offset.end(), reported->begin());
-      }
-      {
-        std::lock_guard lock(mutex_);
-        offset_ready_at_ns_ = *observed.received_timestamp_ns;
       }
       return {true, std::nullopt, reported};
     }
@@ -682,8 +636,12 @@ XArmTcpOffsetSent XArmArmAdapter::SendTcpOffset(const core::Pose3DTO &tcp,
                                 "the robot did not report joint-servo mode and the ready state "
                                 "in time after its tcp_offset",
                                 true);
-      if (!bound.cancellation.stop_requested() &&
-          !(observed.received_timestamp_ns && *observed.received_timestamp_ns > since)) {
+      if (bound.cancellation.stop_requested()) {
+        error.code = "component_action_interrupted_by_stop";
+        error.message = "a Stop interrupted the wait for the robot to report ready after its "
+                        "tcp_offset";
+      } else if (!(observed.received_timestamp_ns &&
+                   *observed.received_timestamp_ns > since)) {
         error.code = std::string(kRobotControllerUnresponsiveCode);
         error.message = "the robot controller sent no status report in time";
       }

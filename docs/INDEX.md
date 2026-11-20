@@ -7,7 +7,7 @@ workbench.
 
 | Task | Guide |
 | --- | --- |
-| Install ManyForge (pull or build the image), check it, update, fall back | [Development workbench: Install](operations/DEVELOPMENT_WORKBENCH.md#install) |
+| Install ManyForge (run the prebuilt image, or pull or build the ROS image), check it, update, fall back | [Development workbench: Install](operations/DEVELOPMENT_WORKBENCH.md#install) |
 | Start, inspect and stop the workbench | [Development workbench](operations/DEVELOPMENT_WORKBENCH.md) |
 | Connect a real robot (xArm, Lite 6) | [Real robot setup](operations/REAL_ROBOT_SETUP.md) |
 | Check a fresh-checkout setup | [Fresh-checkout checklist](operations/FRESH_CHECKOUT_CHECKLIST.md) |

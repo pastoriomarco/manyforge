@@ -84,8 +84,28 @@ Other robots are added as components with a vendor adapter; see
 ## Quick start
 
 You need a Linux host (amd64 or arm64, Jetson AGX Thor and Orin included)
-with Docker, Git and Python 3; see the
+with Docker and Python 3; see the
 [prerequisites](docs/operations/DEVELOPMENT_WORKBENCH.md#prerequisites).
+The prebuilt ManyForge image, published with each release as
+`ghcr.io/pastoriomarco/manyforge:<VERSION>`, holds the complete application:
+no checkout, nothing compiles at start. Copy its launcher kit into an empty
+folder and run it:
+
+```bash
+mkdir -p ~/manyforge && cd ~/manyforge
+docker run --rm --entrypoint tar ghcr.io/pastoriomarco/manyforge:<VERSION> \
+  -c -C /workspace VERSION manyforge scripts/compose-dev.sh scripts/lib manyforge_operator/run_session.py \
+  | tar -x
+./manyforge run --project examples/mock_lite6_pick_and_place.scenario
+```
+
+Open **http://localhost:9000**, press **Execute**, then **Run**: the Lite 6
+picks the part and places it. `./manyforge status` inspects it,
+`./manyforge logs` shows its log and `./manyforge stop` stops it. It runs as
+the container `manyforge` and keeps its data under `.manyforge/` in that
+folder.
+
+To develop ManyForge, work from a checkout instead (Git also needed):
 
 ```bash
 git clone https://github.com/pastoriomarco/manyforge.git
@@ -94,19 +114,18 @@ cd manyforge
 ./scripts/compose-dev.sh start --project examples/mock_lite6_pick_and_place.scenario
 ```
 
-Open **http://localhost:3000**, press **Execute**, then **Run**: the Lite 6
-picks the part and places it.
-
-`pull` fetches the ROS image published for this release
+and open **http://localhost:3000** (the GUI with hot reload). `pull` fetches
+the ROS image published for this release
 (`ghcr.io/pastoriomarco/manyforge-ros:<VERSION>`, ROS 2 and dependencies,
 about 4.1 GB). `start` then builds ManyForge's own programs from the
 checkout, so the first start takes a while; later starts are incremental.
 
-| Install option | Commands (from the repository root) | Use it when |
+| Install option | Commands | Use it when |
 | --- | --- | --- |
-| **1. Pull the published image** (default) | `./scripts/compose-dev.sh pull`, then `start` | You want to run ManyForge. |
-| **2. Build the image from source** | `./scripts/compose-dev.sh build` (about an hour), then `start` | You changed the Dockerfile, run a checkout that is not a release, or cannot reach `ghcr.io`. |
-| **3. Operator launcher** (advanced) | [Operator runbook](docs/operations/MANYFORGE_OPERATOR_RUNBOOK.md) | The stack must run from a digest-checked package, served on the LAN at port 9000. |
+| **1. Run the prebuilt ManyForge image** (default) | `./manyforge run` from the launcher folder | You want to use ManyForge. |
+| **2. Pull the ROS image, build ManyForge from the checkout** | `./scripts/compose-dev.sh pull`, then `start` | You develop ManyForge. |
+| **3. Build the ROS image from source** | `./scripts/compose-dev.sh build` (about an hour), then `start` | You changed the ROS Dockerfile, run a checkout that is not a release, or cannot reach `ghcr.io`. |
+| **4. Operator launcher** (advanced) | [Operator runbook](docs/operations/MANYFORGE_OPERATOR_RUNBOOK.md) | The stack must run from a digest-checked package, served on the LAN at port 9000. |
 
 The [workbench guide](docs/operations/DEVELOPMENT_WORKBENCH.md#install) has
 each option in full: what to check after the first start, how to update to a
@@ -123,7 +142,8 @@ new version and how to fall back.
 
 Machine facts (robot addresses, extra project folders) go in a site settings
 file, `{"schema":"manyforge.site.v2","device_addresses":{"lite6_main":"192.168.1.31"}}`;
-export its absolute path as `MANYFORGE_DEV_SITE_SETTINGS` before `start`.
+export its absolute path as `MANYFORGE_SITE_SETTINGS` before `./manyforge run`
+(`MANYFORGE_DEV_SITE_SETTINGS` before `./scripts/compose-dev.sh start`).
 Scenarios name the address key, never the address. Physical robot use
 requires attended sessions and the integrator's own safety system; a
 simulated run does not qualify a physical robot. See

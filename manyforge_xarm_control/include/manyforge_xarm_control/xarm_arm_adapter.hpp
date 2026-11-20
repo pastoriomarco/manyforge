@@ -83,6 +83,14 @@ struct XArmArmAdapterPorts final {
   /// The observed controller-manager activity explicitly shows both the
   /// trajectory controller and broadcaster loaded and inactive.
   std::function<bool()> controllers_inactive{};
+  /// The controller manager's latest activity shows the trajectory
+  /// controller or the joint state broadcaster active (none: the arm never
+  /// switches them off on lost readiness).
+  std::function<bool()> controllers_active{};
+  /// Sends one best-effort `switch_controller` deactivating the trajectory
+  /// controller and the joint state broadcaster, without waiting; `answered`
+  /// runs once the controller manager answers. False when not sent.
+  std::function<bool(std::function<void()> answered)> deactivate_controllers{};
 };
 
 /// The arm member of an xArm machine (xArm 5/6/7, Lite 6,
@@ -104,6 +112,12 @@ struct XArmArmAdapterPorts final {
 ///   joint states stamped after it; then the Enable gate, then the lane's
 ///   enable.
 /// - `disable`: the lane's disable, then the hardware off.
+/// - Lost readiness (`OnReport`): the vendor plugin's own controller
+///   switching is answered without effect (`XArmPluginControllers`), so the
+///   arm switches the trajectory controller and the joint state broadcaster
+///   off itself when a report shows the robot not ready (an error, an
+///   e-stop, a mode or state change) with the hardware on, outside its own
+///   arming. Only Enable switches them on again.
 ///
 /// State: the lane's; with the hardware off after its own Prepare, Recover
 /// or Disable it is `prepared` (Enable arms); during its own arming the
@@ -120,9 +134,8 @@ enum class XArmJointSampleUse : std::uint8_t {
   /// The display only.
   kDisplay,
   /// Also the measured stream: while the hardware is off (Prepared, motors
-  /// off: the driver publishes the true pose, e-stop included), and while
-  /// ManyForge's own re-arm has the joint state broadcaster off (a TCP
-  /// offset send) on an error-free report.
+  /// off: the driver publishes the true pose, e-stop included), and during
+  /// ManyForge's own re-arm of a TCP offset send on an error-free report.
   kLeads,
 };
 
@@ -134,10 +147,18 @@ public:
   void ObserveOwnerEstop() const;
   /// The installed transport owner was replaced; prior presentation is stale.
   void ForgetOwnerEstop() noexcept;
-  /// Its own arming runs (Enable's `Arm`, a TCP offset's re-arm): the
-  /// driver's controller cycle pauses the machine's streams meanwhile, which
-  /// is not a fault (the action verifies its streams before it succeeds).
+  /// Its own arming runs (Enable's `Arm`, a TCP offset's re-arm): its
+  /// hardware switch pauses the machine's streams meanwhile, which is not a
+  /// fault (the action verifies its streams before it succeeds).
   [[nodiscard]] bool Arming() const;
+
+  /// Each received report (the `robot_states` callback; never blocks): one
+  /// not ready for commands as the plugin reads it (an error, a state above
+  /// ready, out of joint-servo mode), with the hardware on, the trajectory
+  /// controller or the joint state broadcaster active and no own arming
+  /// running, sends their deactivation (`deactivate_controllers`), unless
+  /// an earlier one is unanswered.
+  void OnReport(const XArmObservedState &report);
 
   [[nodiscard]] core::ComponentState State(std::int64_t now_ns) const override;
   [[nodiscard]] core::ActionResult Run(core::ComponentAction action,
@@ -164,10 +185,8 @@ public:
   /// Active TCP (event driven): the TCP offset (with the re-arm the
   /// controller needs after it and the post-send check) and the total
   /// payload; see `XArmToolContextSender`. True when an offset was sent and
-  /// the robot re-armed. The offset's own state 5 is never external control.
-  /// At Enable, after a sent offset it returns only once the plugin's
-  /// controller cycle is over (`FlowingSince` the ready report), within the
-  /// plugin's cycle bound and the step's time and cancellation.
+  /// the robot re-armed. The offset's own state 5 is never external control
+  /// and doesn't switch the controllers off (an own arming).
   [[nodiscard]] core::Result<bool>
   ApplyToolContext(const std::optional<core::Pose3DTO> &offset,
                    const std::optional<core::ToolContextPointMassDTO> &payload, bool at_enable,
@@ -185,19 +204,16 @@ private:
   [[nodiscard]] bool NeedsArming() const;
   /// Enable's arming: the arm controller off, the hardware off (when on),
   /// the hardware on (the plugin's arming sequence and the joint state
-  /// broadcaster). Then, outside the plugin's controller cycle (it switches
-  /// every controller off until it sees the robot ready, then all back on):
-  /// a report after the arming showing the robot ready (else
-  /// `xarm_not_ready`), then a broadcaster sample stamped after that report
-  /// (the lane's `measured_joints` stream) with the measured joints there
-  /// (else `xarm_joint_angles_unavailable`); the broadcaster is requested
-  /// once more when none arrives within the plugin's cycle, and a trajectory
-  /// controller its reactivation switched on is switched off. All within
+  /// broadcaster). Then a report after the arming showing the robot ready
+  /// (else `xarm_not_ready`), then a broadcaster sample stamped after that
+  /// report (the lane's `measured_joints` stream) with the measured joints
+  /// there (else `xarm_joint_angles_unavailable`). All within
   /// `action_timeout` from its start.
   [[nodiscard]] core::ActionResult Arm(std::stop_token stop);
-  /// The plugin's controller cycle after a ready report at `ready_at_ns` is
-  /// over: fresh joint states stamped after it, and the broadcaster
-  /// reported active.
+  /// Joint states stamped after a ready report at `ready_at_ns` (the plugin
+  /// freezes its joint states while an error is present, so older ones may
+  /// be the pose from before the arming), and the broadcaster reported
+  /// active.
   [[nodiscard]] bool FlowingSince(std::int64_t ready_at_ns) const;
   /// The Enable gate: a fresh report (received after `since_ns` when given,
   /// waiting at most one freshness window) that accepts commands, and every
@@ -249,11 +265,13 @@ private:
   int rearms_{0};
   /// Its own armings in progress (`Arm`, `ApplyToolContext`): a lane
   /// `fault_stream_stale` meanwhile is reported as `prepared`, reason
-  /// `xarm_arming`.
-  int arming_{0};
-  /// The receipt of the ready report that ended the last confirmed TCP
-  /// offset send.
-  std::optional<std::int64_t> offset_ready_at_ns_;
+  /// `xarm_arming`, and a not-ready report doesn't switch the controllers
+  /// off. Atomic: the report callback reads it without the mutex.
+  std::atomic<int> arming_{0};
+  /// A deactivation was sent and is not answered yet (shared with its
+  /// response callback, which may outlive the adapter).
+  const std::shared_ptr<std::atomic<bool>> deactivation_pending_ =
+      std::make_shared<std::atomic<bool>>(false);
 };
 
 } // namespace manyforge::xarm_control

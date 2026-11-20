@@ -334,9 +334,11 @@ def test_ros_bootstrap_selection_leaves_the_composer_startup_empty() -> None:
     assert "--startup-scenario-document" not in workbench._composer_command("http://headless")
 
 
-def test_no_project_ros_start_selects_repository_empty_with_original_identity(
-    monkeypatch: Any, tmp_path: Path
-) -> None:
+def _no_project_ros_workbench(
+    monkeypatch: Any, tmp_path: Path, **options: Any
+) -> tuple[Any, list[tuple[str, ...]]]:
+    """A no-project ROS Workbench whose native artifacts are fixtures."""
+
     monkeypatch.setenv("MANYFORGE_STATE_DIR", str(tmp_path / "installation-state"))
     for variable in ("MANYFORGE_LOG_EVIDENCE_MAX_DISK_PERCENT", "MANYFORGE_LOG_EVIDENCE_MIN_FREE_BYTES"):
         monkeypatch.delenv(variable, raising=False)
@@ -370,8 +372,15 @@ def test_no_project_ros_start_selects_repository_empty_with_original_identity(
     monkeypatch.setattr(dev_workbench, "_run", generate)
     workbench = dev_workbench.Workbench(
         project_path=None,
-        headless_port=1, runner_port=2, composer_port=3, frontend_port=4,
+        headless_port=1, runner_port=2, composer_port=3, frontend_port=4, **options,
     )
+    return workbench, generator_commands
+
+
+def test_no_project_ros_start_selects_repository_empty_with_original_identity(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    workbench, generator_commands = _no_project_ros_workbench(monkeypatch, tmp_path)
     commands, prepared = _prepared_start(workbench, monkeypatch)
 
     assert len(generator_commands) == 1
@@ -440,6 +449,37 @@ def test_no_project_ros_start_selects_repository_empty_with_original_identity(
         "MANYFORGE_COMPOSER_URL": "http://127.0.0.1:3",
         "MANYFORGE_HEADLESS_API_URL": "http://127.0.0.1:1",
     }
+
+
+def test_named_built_frontend_is_served_by_composer_without_vite(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    # The prebuilt manyforge image: no operator package, the built GUI on
+    # Composer's port and no Vite, npm or frontend port.
+    static = tmp_path / "dist"
+    static.mkdir()
+    (static / "index.html").write_text("built fixture frontend")
+    workbench, _ = _no_project_ros_workbench(
+        monkeypatch, tmp_path, composer_static_dir=static, composer_bind_host="0.0.0.0")
+    monkeypatch.setattr(dev_workbench, "_ensure_frontend_dependencies",
+                        lambda: pytest.fail("a built frontend needs no npm dependencies"))
+    checked_ports: list[int] = []
+    monkeypatch.setattr(dev_workbench, "_port_available",
+                        lambda port: checked_ports.append(port) or True)
+    commands, _ = _prepared_start(workbench, monkeypatch)
+
+    assert workbench._vite_command is None
+    assert checked_ports == [1, 2, 3]
+    composer = commands["Composer backend"]
+    assert composer[composer.index("--static-dir") + 1] == str(static)
+    assert composer[composer.index("--host") + 1] == "0.0.0.0"
+
+
+def test_named_built_frontend_must_hold_an_index(monkeypatch: Any, tmp_path: Path) -> None:
+    workbench, _ = _no_project_ros_workbench(
+        monkeypatch, tmp_path, composer_static_dir=tmp_path / "missing")
+    with pytest.raises(dev_workbench.WorkbenchError, match="built Composer frontend"):
+        workbench.start()
 
 
 def test_process_stack_stages_only_selected_host_without_starting_services(
@@ -532,13 +572,13 @@ def test_ros_start_guard_admits_model_free_components_beside_ros2_control(
              else "a ros2_control execution component")
     with pytest.raises(dev_workbench.WorkbenchError, match=error):
         dev_workbench._capture_ros_bootstrap_project(
-            "/fixture", allowed_root=REPOSITORY_ROOT / "examples")
+            "/fixture", allowed_roots=[REPOSITORY_ROOT / "examples"])
 
 
 def test_ros_bootstrap_captures_io_provider_scenario() -> None:
     captured, source = dev_workbench._capture_ros_bootstrap_project(
         str(REPOSITORY_ROOT / "examples/real_lite6_pneumatic_pick_and_place.scenario"),
-        allowed_root=REPOSITORY_ROOT / "examples",
+        allowed_roots=[REPOSITORY_ROOT / "examples"],
     )
     assert source.endswith("/examples/real_lite6_pneumatic_pick_and_place.scenario")
     # Machine and member components carry no runtime kind.
@@ -557,7 +597,7 @@ def test_ros_bootstrap_captures_authored_program_and_uses_production_preparer(
 
     captured, source = dev_workbench._capture_ros_bootstrap_project(
         str(REPOSITORY_ROOT / "examples/sim_ur10e_pick_and_place.scenario"),
-        allowed_root=REPOSITORY_ROOT / "examples",
+        allowed_roots=[REPOSITORY_ROOT / "examples"],
     )
     assert source.endswith("/examples/sim_ur10e_pick_and_place.scenario")
     assert captured["program"]["api_version"] == "manyforge.program.v3"
@@ -756,7 +796,7 @@ def test_project_status_reads_only_the_bounded_manifest_identity(tmp_path: Path)
     )
 
     assert dev_workbench._project_scenario_id(
-        str(project), allowed_root=tmp_path
+        str(project), allowed_roots=[tmp_path]
     ) == "My_Cell-2"
 
 
@@ -768,7 +808,43 @@ def test_project_status_refuses_legacy_v2_project(tmp_path: Path) -> None:
         '"scenario_id":"legacy","name":"legacy"}', encoding="utf-8"
     )
     with pytest.raises(dev_workbench.WorkbenchError, match="re-author.*direct references"):
-        dev_workbench._project_scenario_id(str(project), allowed_root=tmp_path)
+        dev_workbench._project_scenario_id(str(project), allowed_roots=[tmp_path])
+
+
+def test_project_status_accepts_examples_and_mounted_project_folders(
+    monkeypatch: Any, tmp_path: Path
+) -> None:
+    examples, mounted, other = (tmp_path / name for name in ("examples", "mounted", "other"))
+    for root in (examples, mounted, other):
+        project = root / "cell.scenario"
+        project.mkdir(parents=True)
+        (project / "scenario.yaml").write_text(
+            '{"api_version":"manyforge.scenario.project.v3","scenario_id":"cell","name":"cell"}',
+            encoding="utf-8")
+    monkeypatch.setenv("MANYFORGE_DEV_PROJECT_ROOTS", str(mounted))
+    roots = dev_workbench._project_roots(examples)
+    assert roots == [examples, mounted]
+    for root in (examples, mounted):
+        assert dev_workbench._project_scenario_id(str(root / "cell.scenario"), allowed_roots=roots) == "cell"
+    with pytest.raises(dev_workbench.WorkbenchError, match="outside the workbench project root"):
+        dev_workbench._project_scenario_id(str(other / "cell.scenario"), allowed_roots=roots)
+
+
+def test_host_project_paths_map_onto_their_mounted_folder(monkeypatch: Any) -> None:
+    monkeypatch.setenv("MANYFORGE_PROJECT_ROOT_MAPPINGS", json.dumps([
+        {"hostPath": "/home/user/Projects", "containerPath": "/projects/Projects"},
+        {"hostPath": "/data/Projects", "containerPath": "/projects/Projects-2"},
+    ]))
+    mapped = dev_workbench._container_project_path
+    assert mapped("/home/user/Projects/cell.scenario") == "/projects/Projects/cell.scenario"
+    assert mapped("/data/Projects/a/cell.scenario/") == "/projects/Projects-2/a/cell.scenario"
+    # Container paths and paths outside every folder stay as given; the
+    # project-root check refuses the latter.
+    for unchanged in ("examples/cell.scenario", "/projects/Projects/cell.scenario",
+                      "/home/user/Projects-old/cell.scenario"):
+        assert mapped(unchanged) == unchanged
+    monkeypatch.delenv("MANYFORGE_PROJECT_ROOT_MAPPINGS")
+    assert mapped("/home/user/Projects/cell.scenario") == "/home/user/Projects/cell.scenario"
 
 
 def test_composer_roots_include_launcher_mounted_folders(
@@ -807,7 +883,7 @@ def test_project_status_refuses_names_outside_the_one_name_rule(
     )
 
     with pytest.raises(dev_workbench.WorkbenchError, match="<name>.scenario"):
-        dev_workbench._project_scenario_id(str(project), allowed_root=tmp_path)
+        dev_workbench._project_scenario_id(str(project), allowed_roots=[tmp_path])
 
 
 def test_workbench_selects_a_project_only_through_the_composer_loader() -> None:
@@ -1087,6 +1163,40 @@ def test_g_status_uses_fresh_manager_health_without_cccl_apply_permission(tmp_pa
     assert status["ready"] is expected
     assert status["manager"] == manager
     assert status["timing"]["build_elapsed_seconds"] == 999
+
+
+@pytest.mark.parametrize("current,scenario_ready,expected", [
+    ("cell", True, True), ("cell", False, False), ("other", True, False)])
+def test_operator_status_with_a_scenario_requires_it_current_and_ready(
+    tmp_path, monkeypatch, current, scenario_ready, expected
+):
+    # The prebuilt image's `run --project`: every owner ready, and the named
+    # Scenario is the current, ready one.
+    class Client:
+        def __init__(self, url, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def manager_status(self):
+            return {"source": {"available": True, "freshness": "fresh", "known_gaps": []},
+                    "status": {"manager_ready": True}}
+        def health(self):
+            return {"status": "ready", "headless_projection_ready": True}
+        def request(self, method, path):
+            if path == "/api/scenarios/current":
+                return {"ready": scenario_ready, "current_scenario": {"scenario_id": current}}
+            return {"started": True, "closed": False}
+    monkeypatch.setattr(dev_workbench, "HeadlessHttpClient", Client)
+    monkeypatch.setattr(dev_workbench, "STATE_ROOT", tmp_path)
+    status = dev_workbench.query_operator_status(
+        headless_port=9010, runner_port=9011, composer_port=9000, scenario_id="cell")
+    assert status["ready"] is expected
+    assert status["scenario"]["current_scenario"] == (
+        {"scenario_id": current} if current == "cell" else None)
+    assert dev_workbench.query_operator_status(
+        headless_port=9010, runner_port=9011, composer_port=9000)["ready"] is True
 
 
 def test_g_package_mismatch_refuses_before_artifact_checks_or_process_start(tmp_path, monkeypatch):

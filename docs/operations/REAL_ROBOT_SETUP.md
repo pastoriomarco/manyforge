@@ -50,6 +50,14 @@ Scenario. It lives in the site settings file, a JSON document:
   ./scripts/compose-dev.sh start
   ```
 
+  With the prebuilt image (`./manyforge`), the variable is
+  `MANYFORGE_SITE_SETTINGS`:
+
+  ```bash
+  export MANYFORGE_SITE_SETTINGS=/home/USER/manyforge.site.json
+  ./manyforge run
+  ```
+
 - The file is read when the workbench starts. After changing it, run
   `./scripts/compose-dev.sh stop`, then `start` again. A missing file or an
   invalid one stops `start` with its reason
@@ -98,6 +106,7 @@ enabled.
 | Arm | Prepare, Recover | **The motors stay off.** Wait for the arm controller to be loaded (Recover switches it off), keep the arm's hardware off, and wait for a recent status report. The Scene shows the real pose from the driver's joint topic. |
 | Arm | Enable | **The motors switch on here.** The arm's hardware is switched on, which runs the driver's arming sequence `clean_error`, `clean_warn`, `motion_enable`, `set_mode(1)`, `set_state(0)` (also when the robot isn't ready after a takeover or an error: the hardware is switched off and on again); then fresh joint states. Then the check: a recent report with no error, mode 1, state ready or moving, all motors enabled, and every measured joint close to the controller's reported angle. Then the arm controller is switched on: the arm accepts motion. |
 | Arm | Disable | Arm controller off, then hardware off. The arm stays prepared; Enable re-arms it. |
+| Arm | (robot not ready) | When a status report shows the robot not ready while the arm controller or its joint states are on (an e-stop, an error, a takeover from Studio): both are switched off. Only Enable switches them on again. The vendor driver's own controller switching is answered without effect. |
 | I/O | Prepare, Enable, Disable | Needs the driver's I/O stream; Enable allows output writes. |
 
 Controller errors become faults of the machine (owner), naming the members

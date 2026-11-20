@@ -7,6 +7,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Before 1.0, a minor release (0.x.0) may change public interfaces and file
 formats; such changes are listed explicitly.
 
+## Unreleased
+
+### Added
+
+- **A prebuilt ManyForge image.** GitHub builds the complete application
+  (native programs, Python modules, the built GUI) for amd64 and arm64 on the
+  release's ROS image and publishes it as
+  `ghcr.io/pastoriomarco/manyforge:<VERSION>`. A user needs only Docker,
+  Python 3, the image and their Scenario folders: copy the launcher kit out
+  of the image and `./manyforge run [--project <folder>]` starts it with
+  nothing to compile and Composer serving the GUI at port 9000;
+  `./manyforge status`, `logs` and `stop` inspect and stop it. `./manyforge`
+  reads product variable names (`MANYFORGE_SITE_SETTINGS`,
+  `MANYFORGE_DATA_DIR`, `MANYFORGE_RUNTIME_STATE_ROOT`,
+  `MANYFORGE_CONTAINER_NAME`, `MANYFORGE_START_TIMEOUT_SECONDS`); it runs as
+  the container `manyforge` with its data under `.manyforge/` in the launcher
+  folder, and it and the development workbench refuse to run at the same
+  time, whatever their container names. Developing
+  keeps the ROS image with the source checkout (`pull`, then `start`). The
+  image records its source commit and ROS image digest, with build
+  provenance; the licence files of the frontend's npm packages are in it,
+  described in `THIRD_PARTY_NOTICES_MANYFORGE_IMAGE.md`.
+- **Release images publish themselves.** Pushing a `vX.Y.Z` tag runs the ROS
+  image workflow (which only adds the version tag when its inputs are
+  unchanged); its success builds and publishes the ManyForge image of that
+  tagged commit. Both refuse a tag other than `v<VERSION>` on the commit built.
+- **`./scripts/compose-dev.sh logs`** shows the workbench container's log,
+  passing its options to `docker logs`.
+
+### Changed
+
+- **Install options renumbered**: 1 runs the prebuilt image, 2 pulls the ROS
+  image and builds from the checkout, 3 builds the ROS image from source, 4 is
+  the operator launcher.
+- **A named built frontend runs without Vite.** `dev-workbench.py serve
+  --composer-static-dir` now serves only that build from Composer, as operator
+  mode does.
+- **`start --project` also accepts a project in a project folder**, by its
+  absolute host path, besides `examples/`.
+
+### Fixed
+
+- **xArm: Enable after an e-stop works the first time, and the control loop
+  no longer stalls.** The vendor hardware plugin switched every controller off
+  and on by itself from its control loop at each change of the robot's
+  readiness, blocking the loop for about 1 s each time, racing ManyForge's
+  Enable ("already active") and switching the trajectory controller on without
+  an Enable. Its requests now go to a stand-in in the execution host that
+  answers at once without effect, and ManyForge switches the controllers
+  itself: off when a status report shows the robot not ready (e-stop, error,
+  takeover), on only at Enable. The 3 s wait for the plugin's cycle at Enable
+  and after a TCP offset is gone; during a TCP offset in a Program the
+  controllers stay on. The vendor driver is unchanged.
+- **A Stop during the xArm's wait for a status report after a re-arm or a TCP
+  offset** now ends with `component_action_interrupted_by_stop`.
+- **E-stop warning:** a pressed e-stop shows as a warning notice with a link to
+  Components.
+
 ## 0.3.1 – 2026-11-19
 
 ### Added

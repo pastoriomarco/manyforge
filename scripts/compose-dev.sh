@@ -2,6 +2,10 @@
 # One supported D0 development workbench: explicit start/status/stop, exact
 # backend-owned scenario activation, and Vite HMR. It never runs qualification,
 # tests, sanitizers, release packaging, or Stop-proof generation.
+# `run` starts the prebuilt manyforge image instead (Dockerfile.manyforge): the
+# same serve path, with nothing built and Composer serving the GUI on 9000.
+# Users reach `run`, `status`, `stop` and `logs` through ../manyforge, which
+# maps its product variable names onto the MANYFORGE_DEV_* names read here.
 
 set -euo pipefail
 # Runtime journals refuse group/other-writable directories; create every host
@@ -23,6 +27,8 @@ stopped_container_receipt=
 operator_instance=${MANYFORGE_DEV_LAUNCH_INSTANCE_ID:-}
 operator_digest=${MANYFORGE_DEV_LAUNCH_INPUT_DIGEST:-}
 operator_mode=false
+# true for `run`: the prebuilt manyforge image, not the source checkout.
+product=false
 container_ref=${MANYFORGE_DEV_EXPECTED_CONTAINER_ID:-$container_name}
 
 # Read the host project folders from the same site file used by the Manager.
@@ -135,7 +141,8 @@ operator_status() {
   current=null
   code=69
   if [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") == true ]]; then
-    if current=$(docker exec "$container_ref" python3 scripts/dev-workbench.py status --operator-runtime --composer-port 9000); then
+    # `run --project`: ready also requires that Scenario to be current.
+    if current=$(docker exec "$container_ref" python3 scripts/dev-workbench.py status --operator-runtime --composer-port 9000 ${project:+--project "$project"}); then
       code=0
     else
       code=$?
@@ -173,7 +180,7 @@ cleanup_failed_start() {
 trap cleanup_failed_start EXIT
 
 usage() {
-  echo "Usage: $0 build | pull [<image reference>] | build-native | start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] | status | stop [--keep-evidence]" >&2
+  echo "Usage: $0 build | pull [<image reference>] | build-native | start [--project <scenario-project-folder> | --bootstrap-project <first-ros-scenario-folder>] | run [--project <scenario-project-folder>] [<manyforge image reference> | sha256:<digest>] | status | stop [--keep-evidence] | logs [<docker logs option>...]" >&2
 }
 
 # The native build container's image, image-keyed cache, identity, build and
@@ -188,9 +195,17 @@ prepare_native_build() {
   cache_root="$cache_base/images/$image_key"
   # The full ROS image has its own development UID. Keep all bind-mounted
   # writes with the launching user's ownership, including npm/ROS caches.
-  mkdir -p "$cache_root/build" "$cache_root/home" "$cache_root/node_modules"
   local directory variable
-  for directory in "$repo_root" "$cache_root" "$cache_root/build" "$cache_root/home"; do
+  local -a writable=("$repo_root" "$cache_root" "$cache_root/build" "$cache_root/home")
+  if [[ "$product" == true ]]; then
+    # The prebuilt image holds the programs and the built GUI; only its home
+    # and the empty-startup package cache are host directories.
+    writable=("$cache_root/home" "$cache_root/repository-bootstrap-package")
+    mkdir -p "${writable[@]}"
+  else
+    mkdir -p "$cache_root/build" "$cache_root/home" "$cache_root/node_modules"
+  fi
+  for directory in "${writable[@]}"; do
     if [[ ! -w "$directory" ]]; then
       echo "ROS workbench requires a writable host-owned directory: $directory" >&2
       return 69
@@ -203,9 +218,9 @@ prepare_native_build() {
   # requests (Fast DDS 3.6.2). An explicit value is kept. rmw_fastrtps
   # always adds SHM under ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST.
   export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS-UDPv4}"
-  native_container=(--network host --init
-    -e MANYFORGE_DEV_BUILD_JOBS="${MANYFORGE_DEV_BUILD_JOBS:-}"
-    --user "$(id -u):$(id -g)" --env HOME=/runner/home --env MANYFORGE_BUILD_DIR=/runner/build)
+  native_container=(--network host --init --user "$(id -u):$(id -g)" --env HOME=/runner/home)
+  [[ "$product" == true ]] || native_container+=(
+    -e MANYFORGE_DEV_BUILD_JOBS="${MANYFORGE_DEV_BUILD_JOBS:-}" --env MANYFORGE_BUILD_DIR=/runner/build)
   # Preserve explicitly configured DDS and build inputs. The image entrypoint owns
   # ROS/venv setup; this launcher neither sources a topology nor picks peers.
   for variable in ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_AUTOMATIC_DISCOVERY_RANGE \
@@ -217,6 +232,11 @@ prepare_native_build() {
       native_container+=(--env "$variable")
     fi
   done
+  if [[ "$product" == true ]]; then
+    native_container+=(-v "$cache_root/home:/runner/home"
+      -v "$cache_root/repository-bootstrap-package:/runner/repository-bootstrap-package")
+    return 0
+  fi
   native_container+=(-v "$repo_root:/workspace" -v "$cache_root:/runner" -w /workspace
     -v "$cache_root/node_modules:/workspace/manyforge_composer/frontend/node_modules")
 }
@@ -397,6 +417,36 @@ command=${1:-}
 if [[ -n "$command" ]]; then
   shift
 fi
+if [[ "$command" == run ]]; then
+  [[ "$operator_mode" != true ]] || { usage; exit 64; }
+  start_args=()
+  reference=
+  while (($#)); do
+    case "$1" in
+      --project)
+        [[ $# -ge 2 ]] || { usage; exit 64; }
+        start_args+=(--project "$2")
+        shift 2
+        ;;
+      -*) usage; exit 64 ;;
+      *)
+        [[ -z "$reference" ]] || { usage; exit 64; }
+        reference=$1
+        shift
+        ;;
+    esac
+  done
+  # The prebuilt manyforge image GitHub builds from this repository
+  # (.github/workflows/manyforge-image.yml): this release's tag by default, or
+  # an explicit reference or digest. Pulled once when absent.
+  published=ghcr.io/pastoriomarco/manyforge
+  image=${reference:-$published:$(<"$repo_root/VERSION")}
+  [[ $image != sha256:* ]] || image=$published@$image
+  docker image inspect "$image" >/dev/null 2>&1 || docker pull "$image" >&2
+  product=true
+  command=start
+  set -- "${start_args[@]}"
+fi
 case "$command" in
   build)
     (($# == 0)) || { usage; exit 64; }
@@ -457,6 +507,27 @@ case "$command" in
         exit 64
       fi
     done
+    # The development workbench and the manyforge product container (`run`)
+    # never run at the same time, whatever their names: both serve on the
+    # host network. Every workbench container carries the
+    # manyforge.dev.ros2-control label; manyforge.product=true marks the product.
+    running_workbenches=$(docker container ls --filter label=manyforge.dev.ros2-control \
+      --filter status=running --filter status=paused --filter status=restarting \
+      --format '{{.Names}} {{.Label "manyforge.product"}}') || {
+      echo "Could not list running ManyForge containers." >&2
+      exit 69
+    }
+    while read -r other other_product; do
+      [[ -n "$other" ]] || continue
+      [[ "$other_product" == true ]] || other_product=false
+      [[ "$other_product" != "$product" ]] || continue
+      if [[ "$product" == true ]]; then
+        echo "A development workbench is running (container $other); stop it with scripts/compose-dev.sh stop before ./manyforge run." >&2
+      else
+        echo "ManyForge is running (container $other); stop it with ./manyforge stop before starting the development workbench." >&2
+      fi
+      exit 69
+    done <<<"$running_workbenches"
     if docker inspect "$container_ref" >/dev/null 2>&1; then
       assert_owned_container || return $?
       if [[ $(docker inspect -f '{{.State.Running}}' "$container_ref") == true ]]; then
@@ -470,7 +541,7 @@ case "$command" in
           echo "A workbench is already running; use status, or stop it before selecting an empty ROS bootstrap." >&2
           exit 69
         fi
-        if [[ "$operator_mode" == true ]]; then
+        if [[ "$operator_mode" == true || "$product" == true ]]; then
           operator_status true
           exit $?
         fi
@@ -551,6 +622,11 @@ case "$command" in
       operator_labels=(--log-driver json-file --label "manyforge.launch-instance=$operator_instance"
         --label "manyforge.launch-input-digest=$operator_digest")
     fi
+    if [[ "$product" == true ]]; then
+      # As in operator mode: Composer serves the image's built GUI on 9000.
+      serve_args+=(--composer-port 9000 --composer-bind-host 0.0.0.0
+        --composer-static-dir /workspace/manyforge_composer/frontend/dist)
+    fi
     # Generic machine site facts (manyforge.site.v2), independent of Isaac.
     if [[ "$operator_mode" != true && -n ${MANYFORGE_DEV_SITE_SETTINGS:-} ]]; then
       path=$MANYFORGE_DEV_SITE_SETTINGS
@@ -583,7 +659,9 @@ case "$command" in
       project_mappings=$(python3 -c 'import json,sys; print(json.dumps([{"hostPath": a, "containerPath": b} for a,b in zip(sys.argv[1::2],sys.argv[2::2])], separators=(",", ":")))' "${project_mapping_arguments[@]}")
       project_environment+=(-e "MANYFORGE_PROJECT_ROOT_MAPPINGS=$project_mappings")
     fi
-    for directory in "$runtime_root" "$cache_root/node_modules" "$composer_state" "$runner_state"; do
+    writable_state=("$runtime_root" "$composer_state" "$runner_state")
+    [[ "$product" == true ]] || writable_state+=("$cache_root/node_modules")
+    for directory in "${writable_state[@]}"; do
       if [[ ! -w "$directory" ]]; then
         echo "ROS workbench requires a writable host-owned directory: $directory" >&2
         exit 69
@@ -596,7 +674,7 @@ case "$command" in
       serve_args+=(--bootstrap-project "$bootstrap_project")
     fi
     # The readiness deadline below starts only after this build step.
-    run_native_build || exit $?
+    [[ "$product" == true ]] || run_native_build || exit $?
     rotate_quiescent_root "$runtime_root"
     # Same inode lock as the child launcher: hold it across the final old-
     # process proof, durable session switch and creation of the new container.
@@ -628,6 +706,7 @@ case "$command" in
     container_ref=$(docker run -d \
       --name "$container_name" \
       --label "manyforge.dev.ros2-control=$ros2_control" \
+      --label "manyforge.product=$product" \
       --label "manyforge.workbench-session=$session_id" \
       "${operator_labels[@]}" \
       "${native_container[@]}" \
@@ -655,9 +734,10 @@ case "$command" in
         docker logs --tail 200 "$container_ref" >&2
         exit 69
       fi
-      if [[ "$operator_mode" == true ]]; then
+      if [[ "$operator_mode" == true || "$product" == true ]]; then
         if current=$(operator_status true); then
           echo "$current"
+          [[ "$product" != true ]] || echo "ManyForge: http://localhost:9000"
           started_container=false
           exit 0
         fi
@@ -707,6 +787,10 @@ print(any(ref in line.split() for line in sys.stdin), end="")
       echo "Development workbench container is not running." >&2
       exit 69
     }
+    if [[ $(docker inspect -f '{{index .Config.Labels "manyforge.product"}}' "$container_ref") == true ]]; then
+      operator_status true
+      exit $?
+    fi
     docker exec "$container_ref" python3 scripts/dev-workbench.py status
     ;;
   stop)
@@ -723,6 +807,9 @@ print(any(ref in line.split() for line in sys.stdin), end="")
       exit 69
     fi
     echo "Development workbench is stopped. Build and npm caches were retained."
+    ;;
+  logs)
+    docker logs "$@" "$container_ref"
     ;;
   *) usage; exit 64 ;;
 esac

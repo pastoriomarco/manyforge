@@ -11,6 +11,7 @@ import {
   acknowledgeActions,
   alarmWarningNotices,
   composerWarningNotices,
+  estopWarningNotices,
   locallyAcknowledgedWarnings,
   resetReachedIdle,
   viewerConditionWarning,
@@ -133,5 +134,34 @@ describe('warnings: what blocks nothing stays until acknowledged', () => {
     expect(resetReachedIdle(undefined, 'idle_after_reset')).toBe(false);
     expect(resetReachedIdle('idle_after_reset', 'idle_after_reset')).toBe(false);
     expect(resetReachedIdle('idle_after_reset', 'running')).toBe(false);
+  });
+});
+
+describe('e-stop: an amber notice while the cell latch reports it', () => {
+  const stopCause = {
+    component_id: 'lite6', kind: 'stop' as const,
+    stop: { code: 'estop' as const, message: 'Emergency stop reported by the robot controller', vendor_code: 'C2', since_ns: 1 },
+  };
+
+  it('shows each e-stopped machine with Open Components and no Acknowledge', () => {
+    const open = vi.fn();
+    const notices = estopWarningNotices({
+      latched: true,
+      causes: [stopCause, { component_id: 'gripper', kind: 'offline' }],
+    }, open);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toMatchObject({
+      id: 'estop.lite6', severity: 'warning', domain: 'recovery', title: 'E-stop: lite6',
+      message: 'Emergency stop reported by the robot controller (C2)',
+    });
+    expect(labels(notices[0])).toEqual(['Open Components']);
+    expect(acknowledgeActions(notices)).toEqual([]);
+    notices[0]?.actions?.[0]?.run();
+    expect(open).toHaveBeenCalledOnce();
+  });
+
+  it('is gone when the latch no longer reports the e-stop', () => {
+    expect(estopWarningNotices({ latched: false, causes: [] }, vi.fn())).toEqual([]);
+    expect(estopWarningNotices(null, vi.fn())).toEqual([]);
   });
 });

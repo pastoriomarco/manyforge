@@ -163,7 +163,14 @@ TEST(XArmLaunchContribution, EverySupportedModelGeneratesItsTemplate) {
     EXPECT_EQ(driver["io_states"]["tgpio_monitor_frequency"].as<int>(), 100);
 
     ASSERT_EQ(contribution.remappings.size(), 3U);
-    EXPECT_EQ(contribution.remappings[0].to, "${namespace}/controller_manager/list_controllers");
+    // The plugin's controller switching goes to the execution host's
+    // stand-in below the driver namespace (`XArmPluginControllers`).
+    EXPECT_EQ(contribution.remappings[0].from, "/controller_manager/list_controllers");
+    EXPECT_EQ(contribution.remappings[0].to,
+              "${namespace}/xarm/plugin_controllers/list_controllers");
+    EXPECT_EQ(contribution.remappings[1].from, "/controller_manager/switch_controller");
+    EXPECT_EQ(contribution.remappings[1].to,
+              "${namespace}/xarm/plugin_controllers/switch_controller");
     std::filesystem::remove_all(share);
   }
 }

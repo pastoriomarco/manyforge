@@ -4,11 +4,14 @@ name: ros-image
 # own amd64 and arm64 runners (native, no emulation) and pushed to GHCR as one
 # multi-arch image tagged inputs-<hash> (scripts/ci/ros-image-inputs.sh). A run
 # whose inputs-<hash> already exists builds nothing. A run on a v* tag ref also
-# tags the release version from VERSION. The package keeps the visibility
-# GitHub gives it.
-# Manual only for now: the push and v* tag triggers return once the package is
-# public, pending the third-party notices review (OD-315).
+# tags the release version from VERSION (a run on any tag ref is refused
+# unless it is vVERSION at the commit built): pushing a release tag runs it, and
+# with unchanged inputs it builds nothing and only adds that tag. Its success
+# on a v* tag starts manyforge-image.yml. Rerun by hand with
+#   gh workflow run ros-image.yml --ref vX.Y.Z
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
 
 permissions:
@@ -36,13 +39,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # On a tag ref (a tag push, or a manual run on a tag) the tag must be
+      # the release tag vVERSION and name exactly the commit checked out, as in
+      # manyforge-image.yml. Branch runs add no version tag and are not checked.
       - id: key
+        env:
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          version=$(<VERSION)
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            if [[ "$TAG" != "v$version" ]] ||
+                ! git fetch --quiet --no-tags --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG" ||
+                [[ $(git rev-parse "refs/tags/$TAG^{commit}") != "$SHA" ]]; then
+              echo "Run this workflow on the release tag v$version; $TAG is not that tag at $SHA." >&2
+              exit 1
+            fi
+          fi
           {
             echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/manyforge-ros"
             echo "key=$(scripts/ci/ros-image-inputs.sh)"
-            echo "version=$(<VERSION)"
+            echo "version=$version"
           } | tee -a "$GITHUB_OUTPUT"
 
       - uses: docker/login-action@v3

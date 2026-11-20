@@ -92,11 +92,13 @@ controllers:
         # `arrival_tolerance_rad`.
         decelerate_on_cancel: true
 
-# The plugin calls absolute controller-manager and RViz names; these send them
-# to this component's own.
+# The plugin calls absolute controller-manager and RViz names. Its controller
+# switching goes to the execution host's stand-in (`XArmPluginControllers`),
+# which answers without effect: ManyForge switches the controllers itself.
+# Its RViz goal update goes to this component's own namespace.
 remappings:
-  - {from: /controller_manager/list_controllers, to: "${namespace}/controller_manager/list_controllers"}
-  - {from: /controller_manager/switch_controller, to: "${namespace}/controller_manager/switch_controller"}
+  - {from: /controller_manager/list_controllers, to: "${namespace}/xarm/plugin_controllers/list_controllers"}
+  - {from: /controller_manager/switch_controller, to: "${namespace}/xarm/plugin_controllers/switch_controller"}
   - {from: /rviz/moveit/update_goal_state, to: "${namespace}/update_goal_state"}
 
 reboot:

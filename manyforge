@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# ManyForge: start, inspect and stop the prebuilt ManyForge image
+# (ghcr.io/pastoriomarco/manyforge, Dockerfile.manyforge). It ships in the
+# image's launcher kit beside scripts/compose-dev.sh, which does the work:
+# this only maps the product variable names below onto that launcher's
+# MANYFORGE_DEV_* names, with the product's own defaults (container
+# `manyforge`, data under .manyforge/ here). Development uses
+# scripts/compose-dev.sh directly, with its development defaults.
+#
+#   ./manyforge run [--project <folder>] [<image reference> | sha256:<digest>]
+#   ./manyforge status | stop | logs [<docker logs option>...]
+set -euo pipefail
+kit="$(cd "$(dirname "$0")" && pwd)"
+launcher="$kit/scripts/compose-dev.sh"
+
+# <product name>:<compose-dev.sh name>. Only the product names are read.
+for pair in \
+    MANYFORGE_SITE_SETTINGS:MANYFORGE_DEV_SITE_SETTINGS \
+    MANYFORGE_DATA_DIR:MANYFORGE_DEV_CACHE_BASE \
+    MANYFORGE_RUNTIME_STATE_ROOT:MANYFORGE_DEV_RUNTIME_STATE_ROOT \
+    MANYFORGE_CONTAINER_NAME:MANYFORGE_DEV_CONTAINER_NAME \
+    MANYFORGE_START_TIMEOUT_SECONDS:MANYFORGE_DEV_START_TIMEOUT_SECONDS; do
+  product=${pair%%:*} launcher_name=${pair#*:}
+  unset "$launcher_name"
+  if [[ -v $product ]]; then
+    export "$launcher_name=${!product}"
+  fi
+done
+export MANYFORGE_DEV_CONTAINER_NAME="${MANYFORGE_DEV_CONTAINER_NAME:-manyforge}"
+export MANYFORGE_DEV_CACHE_BASE="${MANYFORGE_DEV_CACHE_BASE:-$kit/.manyforge}"
+
+case "${1:-}" in
+  run | status | stop | logs) exec "$launcher" "$@" ;;
+  *)
+    echo "Usage: $0 run [--project <scenario-project-folder>] [<image reference> | sha256:<digest>] | status | stop | logs [<docker logs option>...]" >&2
+    exit 64
+    ;;
+esac

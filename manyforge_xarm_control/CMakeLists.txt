@@ -9,6 +9,7 @@ add_compile_options(-Wall -Wextra -Werror -pedantic)
 
 find_package(ament_cmake REQUIRED)
 find_package(ament_index_cpp REQUIRED)
+find_package(controller_manager_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(xarm_msgs REQUIRED)
 find_package(yaml-cpp REQUIRED)
@@ -43,7 +44,8 @@ set(
 
 # The xArm vendor adapter: the machine owner,
 # arm and I/O member adapters, the driver services, the status and I/O
-# subscriptions and the launch contribution.
+# subscriptions, the vendor plugin's controller-manager stand-in and the
+# launch contribution.
 add_library(${PROJECT_NAME}
   src/xarm_adapters.cpp
   src/xarm_arm_adapter.cpp
@@ -53,6 +55,7 @@ add_library(${PROJECT_NAME}
   src/xarm_io_states_transport.cpp
   src/xarm_launch_contribution.cpp
   src/xarm_owner_adapter.cpp
+  src/xarm_plugin_controllers.cpp
   src/xarm_robot_states_transport.cpp
   src/xarm_tool_context.cpp
 )
@@ -63,6 +66,7 @@ target_include_directories(${PROJECT_NAME} PUBLIC
 )
 target_link_libraries(${PROJECT_NAME}
   rclcpp::rclcpp
+  ${controller_manager_msgs_TARGETS}
   ${xarm_msgs_TARGETS}
 )
 target_link_libraries(${PROJECT_NAME} yaml-cpp)
@@ -117,6 +121,7 @@ if(BUILD_TESTING)
       test_xarm_io_component
       test_xarm_robot_states_transport
       test_xarm_driver_services
+      test_xarm_plugin_controllers
       test_xarm_tool_context)
     ament_add_ros_isolated_gtest(${test_name} test/${test_name}.cpp ${MANYFORGE_ROS_TEST_ENV})
     target_link_libraries(${test_name} ${PROJECT_NAME} manyforge_core)
@@ -144,6 +149,7 @@ endif()
 
 ament_export_dependencies(
   ament_index_cpp
+  controller_manager_msgs
   rclcpp
   xarm_msgs
   yaml-cpp

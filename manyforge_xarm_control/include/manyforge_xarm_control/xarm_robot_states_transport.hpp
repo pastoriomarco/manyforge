@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -33,6 +34,10 @@ namespace manyforge::xarm_control {
 /// (`<component namespace>/<hw_ns>`).
 [[nodiscard]] std::string xarm_robot_states_topic(std::string_view driver_namespace);
 
+/// Called with each received report, on the subscription's callback thread,
+/// after the cache holds it; it must not block.
+using XArmReportListener = std::function<void(const XArmObservedState &)>;
+
 /// The production transport: one subscription to the driver's
 /// `robot_states` (standard `xarm_msgs/msg/RobotMsg`). It keeps the status
 /// fields of the latest report, stamped at receipt on the given clock; the
@@ -49,6 +54,10 @@ public:
 
   /// The subscription's reception, applied to the cache (also the test seam).
   void Receive(const xarm_msgs::msg::RobotMsg &message);
+
+  /// Replaces the listener of each received report (the arm member's
+  /// readiness rule); it follows an owner rebind.
+  void SetReportListener(XArmReportListener listener);
 
   [[nodiscard]] const std::string &topic() const noexcept { return topic_; }
 

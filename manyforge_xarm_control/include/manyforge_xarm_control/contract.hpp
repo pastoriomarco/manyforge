@@ -67,9 +67,7 @@ inline constexpr std::int64_t kXArmStatusFreshnessNs = 1'000'000'000;
 inline constexpr std::int64_t kXArmReportPeriodNs = 200'000'000;
 /// An own operation explains the robot's mode and state changes until a
 /// report received after it shows joint-servo mode out of state 5, or for
-/// at most this long after it ended (the vendor plugin deactivates and
-/// reactivates its controllers after an activation through blocking
-/// controller-manager calls; the former `kOwnPrimitiveSettleNs`).
+/// at most this long after it ended (the former `kOwnPrimitiveSettleNs`).
 inline constexpr std::int64_t kXArmOwnOperationSettleNs = 5'000'000'000LL;
 /// The Enable gate's default largest difference between a measured joint and
 /// the controller's reported angle of the same axis while stopped (per robot:

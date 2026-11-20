@@ -64,7 +64,20 @@ struct World final {
                             [this] {
                               if (on_activity) on_activity();
                               return controllers_inactive;
+                            },
+                            [this] { return controllers_active; },
+                            [this](std::function<void()> answered) {
+                              if (!switch_discovered) return false;
+                              unanswered.push_back(std::move(answered));
+                              return true;
                             }});
+  }
+  /// The controller manager answers the oldest unanswered deactivation.
+  void Answer() {
+    ASSERT_FALSE(unanswered.empty());
+    auto answered = std::move(unanswered.front());
+    unanswered.erase(unanswered.begin());
+    answered();
   }
   [[nodiscard]] core::ActionResult Run(const ComponentAction action) {
     return adapter->Run(action, std::stop_token{});
@@ -111,35 +124,19 @@ struct World final {
   bool broadcaster{true};
   bool controllers_inactive{false};
   std::function<void()> on_activity;
+  /// The activity shows the trajectory controller or the broadcaster active.
+  bool controllers_active{true};
+  /// The controller manager's `switch_controller` is discovered.
+  bool switch_discovered{true};
+  /// The deactivations sent and not answered yet (their `answered`).
+  std::vector<std::function<void()>> unanswered;
   /// The controller keeps reporting.
   bool reporting{true};
-  /// The plugin's own controller switching, after a hardware switch and on
-  /// each pause.
+  /// Runs after each successful hardware switch, with its direction.
   std::function<void(bool)> on_hardware;
   std::function<void()> on_pause;
   std::unique_ptr<XArmArmAdapter> adapter;
 };
-
-/// The plugin's controller cycle after an arming (live 2026-11-02, Real
-/// Lite 6): every controller off at once (the broadcaster's samples stop);
-/// `reactivates` after `cycle_ns`: all back on, the trajectory controller too.
-void CycleControllersAfterTheArming(World &world, const bool reactivates,
-                                    const std::int64_t cycle_ns = 2'000'000'000LL) {
-  auto until = std::make_shared<std::optional<std::int64_t>>();
-  world.on_hardware = [&world, until, cycle_ns](const bool active) {
-    if (!active || world.hardware.size() > 2U) return;
-    world.lane->state.streams = {{"measured_joints", core::StreamFreshness::kStale,
-                                  1'000'000'000LL}};
-    *until = world.clock.now() + cycle_ns;
-  };
-  world.on_pause = [&world, until, reactivates] {
-    if (!*until || world.clock.now() < **until) return;
-    until->reset();
-    if (!reactivates) return;
-    world.lane->state.streams = {{"measured_joints", core::StreamFreshness::kFresh, 0}};
-    world.lane->state.lifecycle = ComponentLifecycle::kEnabled;
-  };
-}
 
 using Actions = std::vector<ComponentAction>;
 using Ids = std::vector<std::string>;
@@ -254,8 +251,8 @@ TEST(XArmArmAdapter, EstopFlagOnlyReplacesStaleForKnownInactiveControllers) {
             core::FaultCode::kStreamStale);
 }
 
-// OD-310 (live 2026-11-18, Real Lite 6): the plugin's controller cycle
-// during its own arming paused `measured_joints` and the lane's
+// OD-310 (live 2026-11-18, Real Lite 6): its own arming (the hardware
+// switched off and on) paused `measured_joints` and the lane's
 // `fault_stream_stale` latched the cell. Meanwhile it is `prepared`, reason
 // `xarm_arming` (the stream still shows stale); the Enable verifies the
 // stream and fails typed when it never returns, and the fault shows again.
@@ -517,48 +514,37 @@ TEST(XArmArmAdapter, EnablesArmingWaitsForJointStatesWithinTheLifecycleTimeout) 
   EXPECT_EQ(world.lane->actions, (Actions{ComponentAction::kDisable, ComponentAction::kEnable}));
 }
 
-// Live 2026-11-02 (Real Lite 6): no ManyForge switch overlaps the plugin's
-// controller cycle; its reactivation switched the trajectory controller on
-// without an Enable: off again, then the Enable.
-TEST(XArmArmAdapter, EnableWaitsOutThePluginsControllerCycle) {
+// The vendor plugin's controller switching is answered without effect
+// (`XArmPluginControllers`): after the arming Enable waits only for the
+// ready report and joint states stamped after it, then switches the
+// trajectory controller on once; no cycle bound, no second request.
+TEST(XArmArmAdapter, EnableArmsWithoutWaitingForThePluginsControllerCycle) {
   World world;
   world.status->Set(report(world.clock.now(), 0, 0, 4, 0));
   ASSERT_EQ(world.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
   world.lane->actions.clear();
   world.hardware.clear();
-  CycleControllersAfterTheArming(world, true);
+  // The broadcaster's samples resume two report periods after the hardware
+  // is on.
+  auto pauses = std::make_shared<int>(-1);
+  world.on_hardware = [&world, pauses](const bool active) {
+    if (!active) return;
+    world.lane->state.streams = {{"measured_joints", core::StreamFreshness::kStale,
+                                  1'000'000'000LL}};
+    *pauses = 0;
+  };
+  world.on_pause = [&world, pauses] {
+    if (*pauses >= 0 && ++*pauses == 2)
+      world.lane->state.streams = {{"measured_joints", core::StreamFreshness::kFresh, 0}};
+  };
   const auto started = world.clock.now();
   const auto enabled = world.Run(ComponentAction::kEnable);
   EXPECT_EQ(enabled.outcome, ActionOutcome::kSucceeded);
-  EXPECT_GE(world.clock.now() - started, 2'000'000'000LL);
+  // Two report periods for the joints, then one for the gate's report.
+  EXPECT_LE(world.clock.now() - started, 3 * kXArmReportPeriodNs);
   EXPECT_EQ(world.hardware, (Ids{"off", "on"}));
-  EXPECT_EQ(world.lane->actions, (Actions{ComponentAction::kDisable, ComponentAction::kDisable,
-                                          ComponentAction::kEnable}));
-  const auto state = world.adapter->State(world.clock.now());
-  EXPECT_EQ(state.lifecycle, ComponentLifecycle::kEnabled);
-  EXPECT_EQ(state.streams.front().freshness, core::StreamFreshness::kFresh);
-}
-
-// Live 2026-11-02: the plugin's reactivation failed (its list_controllers
-// timed out): the broadcaster is requested once, then the Enable.
-TEST(XArmArmAdapter, EnableRequestsTheBroadcasterWhenThePluginsReactivationFailed) {
-  World world;
-  world.status->Set(report(world.clock.now(), 0, 0, 4, 0));
-  ASSERT_EQ(world.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
-  world.lane->actions.clear();
-  world.hardware.clear();
-  CycleControllersAfterTheArming(world, false);
-  const auto on_hardware = world.on_hardware;
-  world.on_hardware = [&world, on_hardware](const bool active) {
-    on_hardware(active);
-    // The repeated request with the hardware on: the broadcaster on.
-    if (active && world.hardware.size() == 3U)
-      world.lane->state.streams = {{"measured_joints", core::StreamFreshness::kFresh, 0}};
-  };
-  const auto enabled = world.Run(ComponentAction::kEnable);
-  EXPECT_EQ(enabled.outcome, ActionOutcome::kSucceeded);
-  EXPECT_EQ(world.hardware, (Ids{"off", "on", "on"}));
   EXPECT_EQ(world.lane->actions, (Actions{ComponentAction::kDisable, ComponentAction::kEnable}));
+  EXPECT_TRUE(world.unanswered.empty());
   EXPECT_EQ(world.adapter->State(world.clock.now()).lifecycle, ComponentLifecycle::kEnabled);
 }
 
@@ -718,140 +704,235 @@ TEST(XArmArmAdapter, ToolOffsetRearmsAndItsOwnStateFiveIsNotExternalControl) {
   EXPECT_NE(world.adapter->State(world.clock.now()).lifecycle, ComponentLifecycle::kFault);
 }
 
-// Review 2026-11-02: the joint states come back before the controller
-// manager's activity reports the plugin's reactivation; the trajectory
-// controller state is read only once the activity shows the broadcaster
-// active again, so the controller the plugin switched on is switched off.
-TEST(XArmArmAdapter, EnableReadsTheTrajectoryControllerOnlyAfterTheActivityShowsTheBroadcaster) {
+// The joint states come back before the controller manager's activity
+// reports the broadcaster active: Enable waits for both, then switches the
+// trajectory controller on once.
+TEST(XArmArmAdapter, EnableWaitsForTheBroadcasterReportedActive) {
   World world;
   world.status->Set(report(world.clock.now(), 0, 0, 4, 0));
   ASSERT_EQ(world.Run(ComponentAction::kPrepare).outcome, ActionOutcome::kSucceeded);
   world.lane->actions.clear();
   world.hardware.clear();
-  auto until = std::make_shared<std::optional<std::int64_t>>();
   auto lag = std::make_shared<int>(-1);
-  world.on_hardware = [&world, until](const bool active) {
+  world.on_hardware = [&world, lag](const bool active) {
     if (!active) return;
     world.broadcaster = false;
-    world.lane->state.streams = {{"measured_joints", core::StreamFreshness::kStale,
-                                  1'000'000'000LL}};
-    *until = world.clock.now() + 2'000'000'000LL;
+    *lag = 2;
   };
-  world.on_pause = [&world, until, lag] {
-    if (*until && world.clock.now() >= **until) {
-      until->reset();
-      // The joints flow at once; the activity sample lags two reads.
-      world.lane->state.streams = {{"measured_joints", core::StreamFreshness::kFresh, 0}};
-      *lag = 2;
-      return;
-    }
-    if (*lag > 0 && --*lag == 0) {
-      world.broadcaster = true;
-      world.lane->state.lifecycle = ComponentLifecycle::kEnabled;
-    }
+  bool enabled_early = false;
+  world.on_pause = [&world, lag, &enabled_early] {
+    enabled_early = enabled_early ||
+                    std::find(world.lane->actions.begin(), world.lane->actions.end(),
+                              ComponentAction::kEnable) != world.lane->actions.end();
+    if (*lag > 0 && --*lag == 0) world.broadcaster = true;
   };
   const auto enabled = world.Run(ComponentAction::kEnable);
   EXPECT_EQ(enabled.outcome, ActionOutcome::kSucceeded);
-  EXPECT_EQ(world.lane->actions, (Actions{ComponentAction::kDisable, ComponentAction::kDisable,
-                                          ComponentAction::kEnable}));
+  EXPECT_FALSE(enabled_early);
+  EXPECT_EQ(world.lane->actions, (Actions{ComponentAction::kDisable, ComponentAction::kEnable}));
 }
 
-/// An adapter on `world` whose pause is one report period with a fresh
-/// ready report carrying `offset_mm` once the driver took `set_tcp_offset`,
-/// and the plugin's controller cycle after it: the broadcaster and its
-/// joint states off at the first pause after the send, back after `cycle_ns`
-/// when `reactivates`.
-std::unique_ptr<XArmArmAdapter> OffsetAdapter(World &world, const double offset_mm,
-                                              const bool reactivates,
-                                              const std::int64_t cycle_ns = 2'000'000'000LL) {
-  auto until = std::make_shared<std::optional<std::int64_t>>();
-  return std::make_unique<XArmArmAdapter>(
-      XArmArmAdapterConfig{6, kXArmJointAgreementToleranceRad, std::chrono::seconds(10)},
-      XArmArmAdapterPorts{world.status, world.driver, world.lane, world.Hardware(),
-                          [&world] { return world.hardware_on; },
-                          [&world, until, offset_mm, reactivates, cycle_ns] {
-                            world.clock.advance(kXArmReportPeriodNs);
-                            auto next = report(world.clock.now());
-                            const auto calls = world.driver->Calls();
-                            const bool sent = std::find(calls.begin(), calls.end(),
-                                                        "set_tcp_offset") != calls.end();
-                            if (sent) next.tcp_offset = {offset_mm, 0, 0, 0, 0, 0};
-                            world.status->Set(next);
-                            if (!sent) return;
-                            if (!*until && world.broadcaster) {
-                              world.broadcaster = false;
-                              world.lane->state.streams = {{"measured_joints",
-                                                            core::StreamFreshness::kStale,
-                                                            1'000'000'000LL}};
-                              *until = world.clock.now() + cycle_ns;
-                            } else if (*until && reactivates && world.clock.now() >= **until) {
-                              world.broadcaster = true;
-                              world.lane->state.streams = {
-                                  {"measured_joints", core::StreamFreshness::kFresh, 0}};
-                            }
-                          },
-                          [&world] { return world.measured; }, &world.clock,
-                          [&world] { return world.broadcaster; }});
+// A Stop ends each wait of the arm's actions with the typed
+// `component_action_interrupted_by_stop`.
+TEST(XArmArmAdapter, AStopEndsEachWaitTyped) {
+  const auto interrupted = [](const core::ActionResult &made) {
+    return made.outcome == ActionOutcome::kFailed && made.error &&
+           made.error->code == "component_action_interrupted_by_stop";
+  };
+  {
+    // Prepare: the status report.
+    World world;
+    world.reporting = false;
+    world.clock.advance(kXArmStatusFreshnessNs + 1);
+    std::stop_source stop;
+    world.on_pause = [&stop] { stop.request_stop(); };
+    EXPECT_TRUE(interrupted(world.adapter->Run(ComponentAction::kPrepare, stop.get_token())));
+  }
+  {
+    // Enable: the ready report after the arming.
+    World world;
+    world.arms_robot = false;
+    world.status->Set(report(world.clock.now(), 0, 0, kXArmConfigChangedState));
+    std::stop_source stop;
+    world.on_pause = [&stop] { stop.request_stop(); };
+    EXPECT_TRUE(interrupted(world.adapter->Run(ComponentAction::kEnable, stop.get_token())));
+    EXPECT_EQ(world.lane->actions, Actions{ComponentAction::kDisable});
+  }
+  {
+    // Enable: joint states stamped after the ready report.
+    World world;
+    world.lane->state.streams = {{"measured_joints", core::StreamFreshness::kStale,
+                                  1'000'000'000LL}};
+    std::stop_source stop;
+    world.on_pause = [&world, &stop] {
+      // The first pause brings the ready report; the Stop comes after it.
+      if (world.clock.now() > 10'000'000'000LL + kXArmReportPeriodNs) stop.request_stop();
+    };
+    EXPECT_TRUE(interrupted(world.adapter->Run(ComponentAction::kEnable, stop.get_token())));
+    EXPECT_EQ(world.lane->actions, Actions{ComponentAction::kDisable});
+  }
+  {
+    // Enable: the gate's report after the re-arm.
+    World world;
+    std::stop_source stop;
+    int pauses = 0;
+    world.on_pause = [&world, &stop, &pauses] {
+      // The first pause brings the ready report; the controller then falls
+      // silent and a Stop comes.
+      if (++pauses < 2) return;
+      world.reporting = false;
+      stop.request_stop();
+    };
+    EXPECT_TRUE(interrupted(world.adapter->Run(ComponentAction::kEnable, stop.get_token())));
+    EXPECT_EQ(world.lane->actions, Actions{ComponentAction::kDisable});
+  }
+  {
+    // A TCP offset: the ready report after `set_state(0)`.
+    World world;
+    world.hardware_on = true;
+    ASSERT_EQ(world.Run(ComponentAction::kEnable).outcome, ActionOutcome::kSucceeded);
+    world.reporting = false;
+    std::stop_source stop;
+    world.on_pause = [&stop] { stop.request_stop(); };
+    const auto stopped = world.adapter->ApplyToolContext(
+        core::Pose3DTO{{0.01, 0, 0}, {0, 0, 0, 1}}, std::nullopt, false,
+        XArmToolContextBound{std::nullopt, stop.get_token()});
+    ASSERT_FALSE(stopped.ok());
+    EXPECT_EQ(stopped.error().code, "component_action_interrupted_by_stop");
+    EXPECT_EQ(stopped.error().details.at("reason"), "xarm_reengage_not_ready");
+  }
 }
 
-// Review 2026-11-02: at Enable the host switches the trajectory controller
-// on right after the hook; a sent TCP offset made the plugin cycle every
-// controller off and on, so the hook returns only once that cycle is over.
-TEST(XArmArmAdapter, AnOffsetSentAtEnableWaitsOutThePluginsControllerCycle) {
+// Lost readiness as the plugin reads it (an e-stop, a controller error, a
+// state above ready, out of joint-servo mode) with the hardware on switches
+// the trajectory controller and the broadcaster off: one request, sent again
+// only after the controller manager answered and while the activity still
+// shows them active.
+TEST(XArmArmAdapter, LostReadinessSwitchesTheControllersOffOncePerAnswer) {
+  for (const auto &not_ready :
+       {report(0, 2, 0, 4, 0), report(0, 31), report(0, 0, 0, kXArmReadyState),
+        report(0, 0, kXArmJointServoMode, 4), report(0, 0, kXArmJointServoMode,
+                                                     kXArmConfigChangedState)}) {
+    World world;
+    world.hardware_on = true;
+    ASSERT_EQ(world.Run(ComponentAction::kEnable).outcome, ActionOutcome::kSucceeded);
+    // Ready (state 1 or 2, joint-servo mode, no error): nothing.
+    world.adapter->OnReport(report(world.clock.now()));
+    world.adapter->OnReport(report(world.clock.now(), 0, kXArmJointServoMode, kXArmMovingState));
+    EXPECT_TRUE(world.unanswered.empty());
+    world.adapter->OnReport(not_ready);
+    EXPECT_EQ(world.unanswered.size(), 1U);
+    // Unanswered: no second request.
+    world.adapter->OnReport(not_ready);
+    EXPECT_EQ(world.unanswered.size(), 1U);
+    // Answered while the activity still shows them active: sent again.
+    world.Answer();
+    world.adapter->OnReport(not_ready);
+    EXPECT_EQ(world.unanswered.size(), 1U);
+    // Answered and reported off: nothing more.
+    world.Answer();
+    world.controllers_active = false;
+    world.adapter->OnReport(not_ready);
+    EXPECT_TRUE(world.unanswered.empty());
+  }
+}
+
+// As the plugin: nothing with the hardware off (its write loop doesn't run)
+// or nothing active; an undiscovered service sends nothing and the next
+// report tries again.
+TEST(XArmArmAdapter, LostReadinessSendsNothingWithTheHardwareOrTheControllersOff) {
+  World world;
+  const auto estop = report(world.clock.now(), 2, 0, 4, 0);
+  world.adapter->OnReport(estop);
+  EXPECT_TRUE(world.unanswered.empty());
+  world.hardware_on = true;
+  world.controllers_active = false;
+  world.adapter->OnReport(estop);
+  EXPECT_TRUE(world.unanswered.empty());
+  world.controllers_active = true;
+  world.switch_discovered = false;
+  world.adapter->OnReport(estop);
+  EXPECT_TRUE(world.unanswered.empty());
+  world.switch_discovered = true;
+  world.adapter->OnReport(estop);
+  EXPECT_EQ(world.unanswered.size(), 1U);
+}
+
+// Its own arming (Enable's hardware switch, a TCP offset's re-arm) changes
+// mode and state itself: its reports never switch the controllers off.
+TEST(XArmArmAdapter, ItsOwnArmingAndTcpOffsetNeverSwitchTheControllersOff) {
   World world;
   world.hardware_on = true;
-  auto adapter = OffsetAdapter(world, 10.0, true);
-  const auto started = world.clock.now();
-  const auto applied = adapter->ApplyToolContext(core::Pose3DTO{{0.01, 0, 0}, {0, 0, 0, 1}},
-                                                 core::ToolContextPointMassDTO{0.5, {0, 0, 0}},
-                                                 true);
+  world.status->Set(report(world.clock.now(), 0, 0, 4, 0));
+  const auto configuring = [&world] {
+    return report(world.clock.now(), 0, kXArmJointServoMode, kXArmConfigChangedState);
+  };
+  // Its arming reports state 5 with the hardware on (from the hardware's
+  // activation until the ready report) and so does the offset's re-arm.
+  world.on_hardware = [&world, configuring](const bool active) {
+    if (active) world.adapter->OnReport(configuring());
+  };
+  world.on_pause = [&world, configuring] {
+    if (world.adapter->Arming()) world.adapter->OnReport(configuring());
+  };
+  ASSERT_EQ(world.Run(ComponentAction::kEnable).outcome, ActionOutcome::kSucceeded);
+  EXPECT_TRUE(world.unanswered.empty());
+
+  // The offset's own state 5 before its ready report.
+  world.on_hardware = nullptr;
+  const auto applied = world.adapter->ApplyToolContext(
+      core::Pose3DTO{{0, 0, 0}, {0, 0, 0, 1}}, std::nullopt, false);
   ASSERT_TRUE(applied.ok()) << applied.error().message;
   EXPECT_TRUE(applied.value());
-  EXPECT_TRUE(world.broadcaster);
-  EXPECT_GE(world.clock.now() - started, 2'000'000'000LL);
-  EXPECT_EQ(world.driver->Calls(),
-            (std::vector<std::string>{"set_tcp_offset", "set_state(0)", "set_tcp_load"}));
+  EXPECT_TRUE(world.unanswered.empty());
 
-  // Outside Enable the host rebinds after the re-arm itself: no wait.
-  World rest;
-  rest.hardware_on = true;
-  auto at_rest = OffsetAdapter(rest, 10.0, true);
-  const auto rest_started = rest.clock.now();
-  const auto sent =
-      at_rest->ApplyToolContext(core::Pose3DTO{{0.01, 0, 0}, {0, 0, 0, 1}}, std::nullopt, false);
-  ASSERT_TRUE(sent.ok()) << sent.error().message;
-  EXPECT_LT(rest.clock.now() - rest_started, 2'000'000'000LL);
+  // The same report outside its own operations: switched off.
+  world.on_pause = nullptr;
+  world.adapter->OnReport(configuring());
+  EXPECT_EQ(world.unanswered.size(), 1U);
 
-  // No offset to send (the report already shows it): nothing to wait for.
-  World same;
-  same.hardware_on = true;
-  auto unchanged = OffsetAdapter(same, 0.0, false);
-  const auto kept = unchanged->ApplyToolContext(core::Pose3DTO{{0, 0, 0}, {0, 0, 0, 1}},
-                                                std::nullopt, true);
-  ASSERT_TRUE(kept.ok());
-  EXPECT_FALSE(kept.value());
+  // Enable's arming forgets a deactivation never answered (its controller
+  // manager gone): the next one is sent.
+  world.status->Set(report(world.clock.now(), 0, 0, 4, 0));
+  ASSERT_EQ(world.Run(ComponentAction::kEnable).outcome, ActionOutcome::kSucceeded);
+  world.adapter->OnReport(configuring());
+  EXPECT_EQ(world.unanswered.size(), 2U);
 }
 
-TEST(XArmArmAdapter, AnOffsetSentAtEnableFailsTypedWhenTheBroadcasterNeverComesBack) {
+// A TCP offset sent at Enable returns on its ready report: the
+// controllers stay as they are (no plugin cycle to wait out).
+TEST(XArmArmAdapter, AnOffsetSentAtEnableReturnsOnItsReadyReport) {
   World world;
   world.hardware_on = true;
-  auto adapter = OffsetAdapter(world, 10.0, false);
-  const auto failed = adapter->ApplyToolContext(core::Pose3DTO{{0.01, 0, 0}, {0, 0, 0, 1}},
-                                                std::nullopt, true);
-  ASSERT_FALSE(failed.ok());
-  EXPECT_EQ(failed.error().details.at("effect"), "observed");
-  EXPECT_EQ(failed.error().details.at("reason"), "xarm_reengage_not_ready");
+  // The ready report after `set_state(0)` shows the sent offset.
+  world.on_pause = [&world] {
+    const auto calls = world.driver->Calls();
+    if (std::find(calls.begin(), calls.end(), "set_tcp_offset") == calls.end()) return;
+    auto next = world.status->observe();
+    next.tcp_offset = {10.0, 0, 0, 0, 0, 0};
+    world.status->Set(next);
+  };
+  const auto started = world.clock.now();
+  const auto applied = world.adapter->ApplyToolContext(
+      core::Pose3DTO{{0.01, 0, 0}, {0, 0, 0, 1}}, core::ToolContextPointMassDTO{0.5, {0, 0, 0}},
+      true);
+  ASSERT_TRUE(applied.ok()) << applied.error().message;
+  EXPECT_TRUE(applied.value());
+  EXPECT_LE(world.clock.now() - started, kXArmReportPeriodNs);
+  EXPECT_EQ(world.driver->Calls(),
+            (std::vector<std::string>{"set_tcp_offset", "set_state(0)", "set_tcp_load"}));
+  EXPECT_TRUE(world.hardware.empty());
+  EXPECT_TRUE(world.lane->actions.empty());
+  EXPECT_TRUE(world.unanswered.empty());
 
-  // The step's own deadline bounds the wait.
-  World bounded;
-  bounded.hardware_on = true;
-  auto in_step = OffsetAdapter(bounded, 10.0, false);
-  std::stop_source stop;
-  stop.request_stop();
-  const auto stopped = in_step->ApplyToolContext(core::Pose3DTO{{0.01, 0, 0}, {0, 0, 0, 1}},
-                                                 std::nullopt, true,
-                                                 XArmToolContextBound{std::nullopt, stop.get_token()});
-  ASSERT_FALSE(stopped.ok());
+  // No offset to send (the report already shows it): nothing sent.
+  World same;
+  same.hardware_on = true;
+  const auto kept = same.adapter->ApplyToolContext(core::Pose3DTO{{0, 0, 0}, {0, 0, 0, 1}},
+                                                   std::nullopt, true);
+  ASSERT_TRUE(kept.ok());
+  EXPECT_FALSE(kept.value());
+  EXPECT_TRUE(same.driver->Calls().empty());
 }
 
 } // namespace

@@ -5,11 +5,12 @@ materialized, digest-checked package, and serves Composer on the network at
 port 9000. It keeps a launch record so that `status` and `stop` act only on the
 processes or container it started.
 
-This is install option 3 of the
+This is install option 4 of the
 [workbench guide](DEVELOPMENT_WORKBENCH.md#install). For everyday use, follow
-that guide's option 1 or 2 instead: the workbench builds from your checkout,
-serves Composer with hot reload at `http://localhost:3000`, covers the Mock,
-Isaac and Real lanes, and needs no package preparation. This page covers only
+that guide's option 1 (the prebuilt ManyForge image, Composer at
+`http://localhost:9000`) or, for development, option 2 or 3 (built from your
+checkout, Composer with hot reload at `http://localhost:3000`) instead: they
+cover the Mock, Isaac and Real lanes and need no package preparation. This page covers only
 what differs for the operator launcher.
 
 Use the operator launcher when you need one of these:

@@ -127,6 +127,7 @@ import {
 import {
   alarmWarningNotices,
   composerWarningNotices,
+  estopWarningNotices,
   locallyAcknowledgedWarnings,
   resetReachedIdle,
   viewerConditionWarning,
@@ -1163,11 +1164,16 @@ export default function App() {
   const acknowledgeWarning = useCallback((id: string) => {
     setAcknowledgedWarnings((current) => new Set(current).add(id));
   }, []);
+  const estopWarnings = useMemo(
+    () => estopWarningNotices(programRuntime.cellLatch, () => setActiveWorkspace('components')),
+    [programRuntime.cellLatch],
+  );
   const warningNotices = useMemo<WorkbenchNotice[]>(() => [
+    ...estopWarnings,
     ...locallyAcknowledgedWarnings(localWarnings, acknowledgedWarnings, acknowledgeWarning),
     ...composerWarnings,
     ...alarmWarnings,
-  ], [acknowledgeWarning, acknowledgedWarnings, alarmWarnings, composerWarnings, localWarnings]);
+  ], [acknowledgeWarning, acknowledgedWarnings, alarmWarnings, composerWarnings, estopWarnings, localWarnings]);
   const activityNotices = useMemo(
     () => noticesOfSeverity(classifiedNotices, 'info'),
     [classifiedNotices],

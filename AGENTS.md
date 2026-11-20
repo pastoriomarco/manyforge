@@ -19,12 +19,11 @@ for installation, supported entrypoints and operation.
 
 ### Install and start the available runtime
 
-The current checkout runs as a **development workbench** built from source,
-with three lanes, all ros2_control with the stock joint trajectory controller:
-Mock, Isaac (a separately running Isaac Sim; the workbench never starts it)
-and Real (UFACTORY xArm-family robots; Lite 6 measured on hardware). There is
-no packaged installer, and physical execution is not qualified. Do not infer
-physical authorization from a green UI.
+ManyForge runs as one **workbench** container, with three lanes, all
+ros2_control with the stock joint trajectory controller: Mock, Isaac (a
+separately running Isaac Sim; the workbench never starts it) and Real
+(UFACTORY xArm-family robots; Lite 6 measured on hardware). Physical execution
+is not qualified. Do not infer physical authorization from a green UI.
 
 Read [the workbench runbook](docs/operations/DEVELOPMENT_WORKBENCH.md) first.
 It is the public source for prerequisites, install options, startup, ports,
@@ -32,21 +31,44 @@ caches and diagnosis. Despite its name, operating this workbench requires no
 private development docs.
 
 **Prerequisites.** A Linux host, amd64 or arm64 (Jetson AGX Thor and Orin
-with JetPack 7.2.1 included), with Docker Engine, Git and Python 3, network
-access, 16 GB of RAM for the C++ build and at least 10 GB of free disk.
-Option 2 also needs the Compose v2 plugin and BuildKit.
+with JetPack 7.2.1 included), with Docker Engine and Python 3, network access
+and at least 10 GB of free disk. Options 2 and 3 also need Git and 16 GB of
+RAM for the C++ build; option 3 also needs the Compose v2 plugin and BuildKit.
 
-**Install options.** Options 1 and 2 give the same local image,
-`manyforge-ros-lyrical-full` (ROS 2 Lyrical and dependencies only), and
-then use the same `start`. Use option 1 unless a row below says otherwise.
+**Install options.** Use option 1 unless a row below says otherwise.
 
-| Option | Use it when | Commands, from the repository root |
+| Option | Use it when | Commands |
 | --- | --- | --- |
-| 1. Pull the published image (default) | The checkout is a release (`main` or a `vX.Y.Z` tag) and the host reaches `ghcr.io`. | `./scripts/compose-dev.sh pull`, then `./scripts/compose-dev.sh start` |
-| 2. Build the image from source | `Dockerfile.ros-lyrical-full` or what it installs was changed, the checkout is not a release, or `pull` fails. Takes about an hour. | `./scripts/compose-dev.sh build`, then `./scripts/compose-dev.sh start` |
-| 3. Operator launcher (advanced) | Only when the user asks for a digest-checked package served on the LAN at port 9000, or a remote Docker host next to Isaac Sim. | [Operator runbook](docs/operations/MANYFORGE_OPERATOR_RUNBOOK.md) |
+| 1. Run the prebuilt ManyForge image (default) | Using ManyForge. No checkout; nothing compiles. The host reaches `ghcr.io`. | Copy the launcher kit out of `ghcr.io/pastoriomarco/manyforge:<VERSION>` (below), then `./manyforge run` |
+| 2. Pull the ROS image, build from the checkout | Developing ManyForge from a release checkout (`main` or a `vX.Y.Z` tag). | `./scripts/compose-dev.sh pull`, then `./scripts/compose-dev.sh start` |
+| 3. Build the ROS image from source | `Dockerfile.ros-lyrical-full` or what it installs was changed, the checkout is not a release, or `pull` fails. Takes about an hour. | `./scripts/compose-dev.sh build`, then `./scripts/compose-dev.sh start` |
+| 4. Operator launcher (advanced) | Only when the user asks for a digest-checked package served on the LAN at port 9000, or a remote Docker host next to Isaac Sim. | [Operator runbook](docs/operations/MANYFORGE_OPERATOR_RUNBOOK.md) |
 
-From a new checkout, after authorization to install/start (option 1):
+Option 1, after authorization to install/start, in an empty folder:
+
+```bash
+mkdir -p ~/manyforge && cd ~/manyforge
+docker run --rm --entrypoint tar ghcr.io/pastoriomarco/manyforge:<VERSION> \
+  -c -C /workspace VERSION manyforge scripts/compose-dev.sh scripts/lib manyforge_operator/run_session.py \
+  | tar -x
+./manyforge run --project examples/mock_lite6_pick_and_place.scenario
+./manyforge status
+```
+
+`ghcr.io/pastoriomarco/manyforge:<VERSION>` is published with each release
+(amd64 and arm64; no login). It holds ManyForge's programs and built GUI on
+the reference ROS image. `./manyforge run` starts the image of the folder's
+`VERSION` (pulling it when absent; `run <reference>` or `run sha256:<digest>`
+names one exact image), with Composer serving the GUI and API at
+**http://localhost:9000**. `--project` loads a Scenario at start: a bundled
+`examples/<name>.scenario` (read-only in the image) or the absolute host path
+of a project in one of the `project_folders` of the site settings, where
+Scenarios are saved; without it the workspace starts empty.
+`./manyforge status`, `./manyforge logs` and `./manyforge stop` inspect, show
+the log of and stop it. To update: `stop`, copy the launcher kit out of the new
+version's image, `run`.
+
+Options 2 and 3, from a new checkout:
 
 ```bash
 git clone https://github.com/pastoriomarco/manyforge.git
@@ -57,7 +79,7 @@ cd manyforge
 ./scripts/compose-dev.sh status
 ```
 
-For option 2, run `./scripts/compose-dev.sh build` in place of the `pull`
+For option 3, run `./scripts/compose-dev.sh build` in place of the `pull`
 line. What the commands do:
 
 - `pull` fetches `ghcr.io/pastoriomarco/manyforge-ros:<VERSION>` (the version
@@ -70,19 +92,21 @@ line. What the commands do:
   run it over dependency edits you need to preserve. On a Jetson it needs no
   extra argument.
 - `start` first builds ManyForge's own programs from the checkout in a
-  separate step (the image holds none; the first start takes much longer than
-  later ones, and the start timeout bounds readiness only), then starts one
-  workbench. An optional project is loaded through the ordinary application
-  path. It does not run tests or qualify a release. A selected Scenario is an
-  ordinary project folder under `examples/`; without `--project` it opens an
-  empty authoring workspace.
+  separate step (the ROS image holds none; the first start takes much longer
+  than later ones, and the start timeout bounds readiness only), then starts
+  one workbench. An optional project is loaded through the ordinary
+  application path. It does not run tests or qualify a release. A selected
+  Scenario is an ordinary project folder under `examples/`; without
+  `--project` it opens an empty authoring workspace.
 - The `dev` Compose service is the ROS-free test toolchain, not the workbench.
 
-**Verify.** `start` and `status` print the current Scenario as JSON: check
-`"ready": true`, `"unavailable_reasons": []` and the reported Scenario and
-convergence, not just whether the page loads. Then open
-**http://localhost:3000**. Do not start a second stack to work around an
-unhealthy one. Subsequent starts reuse the cache:
+**Verify.** `run`, `start` and `status` print the current state as JSON:
+check `"ready": true` (for `run --project`, also the reported `scenario`; for
+`start`, `"unavailable_reasons": []` and the reported Scenario and
+convergence), not just whether the page loads. Then open
+**http://localhost:9000** (option 1) or **http://localhost:3000** (options 2
+and 3). Do not start a second stack to work around an unhealthy one.
+Subsequent starts reuse the cache:
 
 ```bash
 ./scripts/compose-dev.sh start
@@ -90,15 +114,17 @@ unhealthy one. Subsequent starts reuse the cache:
 ./scripts/compose-dev.sh status
 ```
 
-**Update to a new version**, after authorization: `./scripts/compose-dev.sh
-stop`, `git pull`, `./scripts/compose-dev.sh pull` (option 2: `build`, needed
-only when the Dockerfile or what it installs changed), then `start`. A new
-image compiles ManyForge's programs again at its first start.
+**Update to a new version** (options 2 and 3), after authorization:
+`./scripts/compose-dev.sh stop`, `git pull`, `./scripts/compose-dev.sh pull`
+(option 3: `build`, needed only when the Dockerfile or what it installs
+changed), then `start`. A new image compiles ManyForge's programs again at its
+first start.
 
-**Fall back.** If `pull` fails (no network, or no image published for the
-checkout's `VERSION`), use option 2: both write the same image tag, and the
-one run last is what `start` uses. If `start` fails, read its output and the
-runbook's troubleshooting table before changing anything.
+**Fall back.** If `run` cannot pull its image, use option 2 or 3 from a
+checkout. If `pull` fails (no network, or no image published for the
+checkout's `VERSION`), use option 3: both write the same image tag, and the
+one run last is what `start` uses. If `run` or `start` fails, read its output
+and the runbook's troubleshooting table before changing anything.
 
 ### Configure
 
@@ -107,8 +133,9 @@ runbook's troubleshooting table before changing anything.
   optionally with `project_folders` (absolute host paths) and the disk limits
   (`disk_max_percent`, `disk_always_free_bytes`, `disk_machine_minimum_bytes`;
   built-in defaults apply when absent). Export its absolute
-  path as `MANYFORGE_DEV_SITE_SETTINGS` before `start`; it is read only at
-  start. A Real machine's card names the `device_addresses` key
+  path as `MANYFORGE_SITE_SETTINGS` before `./manyforge run` (option 1) or as
+  `MANYFORGE_DEV_SITE_SETTINGS` before `./scripts/compose-dev.sh start`; it is
+  read only at start. A Real machine's card names the `device_addresses` key
   (`configuration.device_address_ref`), never the address.
 - **ROS/DDS**: `ROS_DOMAIN_ID` (default 0) must match Isaac Sim and other ROS
   machines; leave `ROS_AUTOMATIC_DISCOVERY_RANGE` unset or `SUBNET` to reach
@@ -133,7 +160,7 @@ runbook's troubleshooting table before changing anything.
   confirmation before proceeding. Motion requires separate explicit
   authorization and readiness.
 - Component states, the cell latch and Execute readiness: `GET /api/components`,
-  `GET /api/cell/latch`, `GET /api/program/readiness` on Composer (9020).
+  `GET /api/cell/latch`, `GET /api/program/readiness` on Composer (9020; 9000 with option 1).
   A C2 error after an e-stop is normal: Recover the machine once the e-stop is
   released (with authorization). On Isaac, "Simulation not playing" never
   blocks Execute; new motion is refused until the simulation plays.
@@ -142,7 +169,8 @@ runbook's troubleshooting table before changing anything.
   new motion requests and inspect owner status when observation is uncertain.
 - For API work, use the generated contracts linked below or the running schemas:
   Headless `http://localhost:9010/openapi.json`, Composer
-  `http://localhost:9020/openapi.json`. Do not guess endpoints.
+  `http://localhost:9020/openapi.json` (option 1: port 9000). Do not guess
+  endpoints.
 - First diagnosis is read-only:
 
 ```bash
@@ -151,13 +179,18 @@ docker logs --tail 200 manyforge-development-workbench
 docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' manyforge-development-workbench
 ```
 
-The default container name can be overridden with `MANYFORGE_DEV_CONTAINER_NAME`;
-use that same name for diagnosis. Capture logs before stopping: stop removes the
+With option 1, `./manyforge status` and `./manyforge logs --tail 200` do the
+first two; its container is `manyforge` and its data folder `.manyforge/` in
+the launcher folder (options 2 and 3: `.manyforge-dev/`). The default
+container name can be overridden with `MANYFORGE_DEV_CONTAINER_NAME`
+(`MANYFORGE_CONTAINER_NAME` with option 1); use that same name for diagnosis.
+Option 1 and the development workbench never run at the same time: each
+launcher refuses while the other kind is running. Capture logs before stopping: stop removes the
 container while keeping its durable runtime root. Save wanted artifacts through the UI first.
 After explicit shutdown authorization:
 
 ```bash
-./scripts/compose-dev.sh stop
+./scripts/compose-dev.sh stop     # option 1: ./manyforge stop
 ```
 
 Closing the browser does not stop execution. Container shutdown is not a substitute

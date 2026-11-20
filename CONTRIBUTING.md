@@ -28,10 +28,14 @@ host-only results are not qualification evidence. Detailed commands, lane
 selection and checkpoint requirements belong in the development workflow
 linked from AGENTS.md.
 
-Keep two public documents current with your change. `THIRD_PARTY_NOTICES.md`
+Keep these public documents current with your change. `THIRD_PARTY_NOTICES.md`
 (and `NOTICE`) must match what the published ROS image redistributes: when you
 add, remove or re-pin anything `Dockerfile.ros-lyrical-full` installs, update
-them, quoting each licence as its owner declares it. The README overview cards
+them, quoting each licence as its owner declares it.
+`THIRD_PARTY_NOTICES_MANYFORGE_IMAGE.md` must match what the ManyForge image
+adds to it: update it when `Dockerfile.manyforge` adds third-party software
+other than the frontend's npm packages, or changes where their licence files
+go. The README overview cards
 must stay accurate: when a change affects what they state, edit
 `docs/media/src/overview_cards.py`, run `docs/media/src/render.sh` (needs
 Firefox) and commit the regenerated SVGs and PNGs.
@@ -116,10 +120,17 @@ without explicit authorization.
    `vX.Y.Z` (for this release `v0.3.1`; `v0.3.0` is `main` at `3fc751bc`,
    `v0.2.1` is `main` at `34bb5f4a`, `v0.2.0` is `main` at `3cc3e5d5`,
    `v0.1.0` is `main` at `8ae05265`).
-5. Publish the reference ROS image for the release: run the `ros-image`
-   workflow on the tag (`gh workflow run ros-image.yml --ref vX.Y.Z`). It
-   publishes `ghcr.io/pastoriomarco/manyforge-ros:<VERSION>`, the image
-   `./scripts/compose-dev.sh pull` fetches.
+5. Pushing the tag publishes the images; there is no manual image step. The
+   `ros-image` workflow runs on the tag and publishes
+   `ghcr.io/pastoriomarco/manyforge-ros:<VERSION>`, the image
+   `./scripts/compose-dev.sh pull` fetches (when its inputs are unchanged it
+   builds nothing and only adds the version tag). When it succeeds, the
+   `manyforge-image` workflow builds ManyForge from the tagged commit on that
+   ROS image (by digest) and publishes
+   `ghcr.io/pastoriomarco/manyforge:<VERSION>`, the image `./manyforge run`
+   starts. Check both runs. To run either again by hand:
+   `gh workflow run ros-image.yml --ref vX.Y.Z` (its success starts
+   `manyforge-image` again) or `gh workflow run manyforge-image.yml --ref vX.Y.Z`.
 6. Tag the maintainer's private specification repository with the same `vX.Y.Z`
    at the commit that matches the release.
 

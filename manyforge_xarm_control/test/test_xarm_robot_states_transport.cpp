@@ -18,10 +18,13 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdint>
 #include <memory>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <rclcpp/executors/single_threaded_executor.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -164,6 +167,38 @@ TEST(XArmRobotStatesTransport, ReceiveKeepsTheStatusAndOffsetOfTheLatestReport) 
   ASSERT_EQ(observed.tcp_offset.size(), 6U);
   EXPECT_DOUBLE_EQ(observed.tcp_offset[1], 2.0);
   EXPECT_DOUBLE_EQ(observed.tcp_offset[5], static_cast<double>(0.5F));
+}
+
+// Each report goes to the listener once the cache holds it; an owner rebind
+// moves the listener to the new subscription's cache.
+TEST(XArmRobotStatesTransport, TheListenerGetsEachReportAndFollowsARebind) {
+  core::FakeClock clock;
+  clock.set(1'000);
+  auto node = std::make_shared<rclcpp::Node>("xarm_transport_listener_test");
+  const auto ns = unique_namespace();
+  XArmRobotStatesTransport transport(*node, ns, clock);
+  std::vector<XArmObservedState> heard;
+  std::vector<std::optional<std::int64_t>> cached;
+  transport.SetReportListener([&](const XArmObservedState &report) {
+    heard.push_back(report);
+    // The listener may read the cache: it already holds this report.
+    cached.push_back(transport.observe().received_timestamp_ns);
+  });
+  transport.Receive(emergency_stop_report());
+  ASSERT_EQ(heard.size(), 1U);
+  EXPECT_EQ(heard[0].error_code, 2);
+  EXPECT_EQ(heard[0].received_timestamp_ns, 1'000);
+  EXPECT_EQ(cached[0], 1'000);
+
+  XArmRobotStatesTransport replacement(*node, ns, clock);
+  transport.SwapRosState(replacement);
+  clock.set(2'000);
+  transport.Receive(emergency_stop_report());
+  ASSERT_EQ(heard.size(), 2U);
+  EXPECT_EQ(heard[1].received_timestamp_ns, 2'000);
+  // The retired cache no longer calls it.
+  replacement.Receive(emergency_stop_report());
+  EXPECT_EQ(heard.size(), 2U);
 }
 
 } // namespace

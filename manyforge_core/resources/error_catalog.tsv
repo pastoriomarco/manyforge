@@ -3579,7 +3579,7 @@ worker_retirement_in_progress	Motion controller is shutting down	The motion cont
 worker_retirement_self_thread	Cannot start from execution worker	An execution cannot be started from the active execution worker. Start it from a normal request.
 wrong_argument_count	Wrong number of arguments	A function in the expression is called with the wrong number of arguments. Correct the expression.
 wrong_state	Wrong execution state	Only a computed completion can be acknowledged, and the execution is in another state. Wait until the motion has completed.
-xarm_arming	Arming the robot	The robot's driver restarts its controllers while it arms; its streams pause and come back by themselves.
+xarm_arming	Arming the robot	The robot's hardware restarts while it arms; its streams pause and come back by themselves.
 xarm_joint_angles_unavailable	Robot joint angles not available	The robot's reported or measured joint angles are missing or invalid, so the robot controller was not activated. Check the robot connection and the xArm controller, then activate again.
 xarm_measured_joints_disagree	Measured and reported joints disagree	A measured joint angle differs from the angle the xArm controller reports, so the robot controller was not activated. Check the robot and its joint readings, then activate again.
 xarm_not_ready	Robot not ready for commands	The xArm controller is not ready for commands (error, mode, state or motors not enabled), so the arm was not enabled. Recover the machine, then Enable the arm again.

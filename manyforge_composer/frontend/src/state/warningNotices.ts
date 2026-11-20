@@ -1,13 +1,18 @@
 /**
- * The warning row: everything that blocks nothing. Each item stays until the
- * operator acknowledges it, or until Reset or Scenario New clears it.
+ * The warning row: everything that blocks nothing, plus a machine's e-stop
+ * (a stop, not a fault: it blocks motion but has its own amber state). Each
+ * item stays until the operator acknowledges it, or until Reset or Scenario
+ * New clears it; an e-stop notice has no Acknowledge and lasts as long as the
+ * cell latch reports the e-stop.
  * Composer-side warnings are acknowledged locally (per browser session);
  * alarms through the owner's exact acknowledgement. Red stays for what blocks
  * now (see `HeadlessRuntimeSurfaces`).
  */
 
 import type { ProgramCycleStatus } from '../types/api';
+import type { CellLatch } from '../types/components';
 import type { OperatorAlarmRecord } from '../types/headless';
+import { stopText } from './componentPresentation';
 import type { ClientOperationalError } from './operationalErrors';
 import type { WorkbenchNotice } from './workbenchNotices';
 
@@ -106,6 +111,22 @@ export function alarmWarningNotices(
 }
 
 /** A Reset reached Idle: the cycle entered `idle_after_reset` from another state. */
+/** One amber notice per machine the cell latch reports e-stopped. */
+export function estopWarningNotices(
+  latch: CellLatch | null,
+  openComponents: () => void,
+): WorkbenchNotice[] {
+  return (latch?.causes ?? []).flatMap((cause) => (cause.kind !== 'stop' ? [] : [{
+    id: `estop.${cause.component_id}`,
+    severity: 'warning' as const,
+    domain: 'recovery' as const,
+    title: `E-stop: ${cause.component_id}`,
+    message: cause.stop === undefined ? 'Emergency stop' : stopText(cause.stop),
+    details: 'Motion is blocked until the e-stop is released and the machine is recovered.',
+    actions: [{ id: 'open_components', label: 'Open Components', run: openComponents }],
+  }]));
+}
+
 export function resetReachedIdle(
   previous: ProgramCycleStatus['state'] | undefined,
   current: ProgramCycleStatus['state'] | undefined,

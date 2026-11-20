@@ -8,11 +8,14 @@ prerequisites, commands and troubleshooting.
 1. Start from a fresh clone. Record the checked-out commit, host architecture,
    Linux version and Docker/Compose versions with the test result.
 2. Follow the guide's prerequisites and one of its
-   [install options](DEVELOPMENT_WORKBENCH.md#install) exactly: option 1
-   (`./scripts/compose-dev.sh pull`) or option 2 (`./scripts/compose-dev.sh
+   [install options](DEVELOPMENT_WORKBENCH.md#install) exactly: option 2
+   (`./scripts/compose-dev.sh pull`) or option 3 (`./scripts/compose-dev.sh
    build`). Record the option, the command, the image ID
    (`docker image inspect --format '{{.Id}}' manyforge-ros-lyrical-full`) and
-   whether it succeeds.
+   whether it succeeds. The prebuilt image (option 1) has no checkout: to
+   check it, copy its launcher kit out and run `./manyforge run` as the guide
+   shows, then follow steps 3 to 7 with `./manyforge status`, `./manyforge
+   stop` and `http://localhost:9000`.
 3. Follow the guide to start an empty workbench. Record the start result and
    verify that `./scripts/compose-dev.sh status` reports it ready.
 4. Open `http://localhost:3000`. Verify that the page opens with an empty
@@ -31,7 +34,8 @@ prerequisites, commands and troubleshooting.
    qualification from this mock setup check.
 
 The workbench keeps previous runs under
-`.manyforge-dev/runtime/<container-name>/previous-runs/`: at most five runs,
+`.manyforge-dev/runtime/<container-name>/previous-runs/` (with `./manyforge`,
+`.manyforge/runtime/manyforge/previous-runs/` in the launcher folder): at most five runs,
 counting the current one, and at most 2 GiB of archived runs and older History
 files together, oldest deleted first, and fewer when ManyForge's files exceed
 their [disk limits](DEVELOPMENT_WORKBENCH.md#disk-limits). If

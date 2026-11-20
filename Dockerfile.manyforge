@@ -1,0 +1,111 @@
+# ManyForge product image: the complete application, built FROM the reference
+# ROS image of the same version (Dockerfile.ros-lyrical-full, published as
+# ghcr.io/<owner>/manyforge-ros:<VERSION>). A user needs only Docker, this image
+# and their Scenario folders: nothing compiles at start. GitHub builds it
+# (.github/workflows/manyforge-image.yml); `./manyforge run`, from the
+# launcher kit copied out of the image, starts it
+# (docs/operations/DEVELOPMENT_WORKBENCH.md). Development keeps the ROS image
+# with the source checkout (`./scripts/compose-dev.sh start`).
+#
+#   docker build -f Dockerfile.manyforge \
+#     --build-arg MANYFORGE_ROS_IMAGE=ghcr.io/<owner>/manyforge-ros@sha256:<digest> .
+#
+# The build stage runs the workbench's own build step (scripts/dev-workbench.py
+# build --frontend: the single ros-integration tree in Release with its
+# RELEASE_CXX_FLAGS, the Python modules, the deployment-authoring tools and
+# the frontend). The final stage is the same ROS image plus:
+#   /workspace     the source files the application reads at run time (Python
+#                  packages, catalogs, resources, examples, built frontend),
+#                  at the paths the serve code uses
+#   /runner/build  the build trees without objects and build-system files:
+#                  binaries, libraries and the adapter index keep their build
+#                  paths, which their run paths and links name
+#   /usr/share/licenses/manyforge-image/
+#                  manyforge/ (this checkout's LICENSE, NOTICE,
+#                  THIRD_PARTY_NOTICES.md for the ROS image and
+#                  THIRD_PARTY_NOTICES_MANYFORGE_IMAGE.md for what this image
+#                  adds) and frontend/ (the licence files of the npm packages
+#                  in the frontend bundle)
+# Nothing runs as root and nothing in the image is writable by the runtime
+# user: state, the home and the empty-startup package cache are host
+# directories the launcher mounts.
+
+# Digest-pinned reference ROS image, e.g.
+# ghcr.io/pastoriomarco/manyforge-ros@sha256:<digest>.
+ARG MANYFORGE_ROS_IMAGE
+
+FROM ${MANYFORGE_ROS_IMAGE} AS build
+ARG MANYFORGE_ROS_IMAGE
+USER root
+RUN case "${MANYFORGE_ROS_IMAGE}" in \
+        *@sha256:*) ;; \
+        *) echo "MANYFORGE_ROS_IMAGE must name the ROS image by digest (<name>@sha256:<digest>)" >&2; exit 1 ;; \
+    esac \
+    && install -d -o 1000 -g 1000 /runner /runner/home
+USER 1000:1000
+COPY --chown=1000:1000 . /workspace
+# As scripts/compose-dev.sh runs the build step: home and build root in /runner.
+ENV HOME=/runner/home
+ENV MANYFORGE_BUILD_DIR=/runner/build
+RUN /usr/local/bin/docker-entrypoint.ros-jazzy-full.sh \
+        python3 scripts/dev-workbench.py build --frontend
+RUN scripts/ci/frontend-bundle-licences.sh manyforge_composer/frontend /runner/licences/frontend
+# The build trees, without what only building and testing read.
+RUN find /runner/build -name CMakeFiles -type d -prune -exec rm -rf {} + \
+    && find /runner/build -type f \( -name '*.o' -o -name '*.a' -o -name '*.ninja' \
+        -o -name '.ninja_*' -o -name CMakeCache.txt -o -name cmake_install.cmake \
+        -o -name CTestTestfile.cmake \) -delete \
+    && rm -rf /runner/build/isaac/ros-overlay/log
+# The source files the application reads at run time. ./manyforge,
+# scripts/compose-dev.sh and its helpers are the launcher kit users copy out
+# of the image.
+RUN set -eu; \
+    stage=/runner/stage/workspace; \
+    mkdir -p "$stage"; \
+    cp -a --parents -t "$stage" \
+        VERSION LICENSE NOTICE THIRD_PARTY_NOTICES.md \
+        manyforge scripts/dev-workbench.py scripts/compose-dev.sh scripts/lib \
+        manyforge_behavior/manyforge_behavior manyforge_behavior/resources \
+        manyforge_example_nodes \
+        manyforge_headless_api \
+        manyforge_headless/resources \
+        manyforge_program_runner \
+        manyforge_composer/__init__.py manyforge_composer/__main__.py \
+        manyforge_composer/backend manyforge_composer/frontend/dist \
+        manyforge_assistant_bridge \
+        manyforge_ros/manyforge_ros \
+        manyforge_operator \
+        manyforge_ros_bringup \
+        manyforge_deployment/resources/maintained manyforge_deployment/resources/catalog \
+        components \
+        manyforge_example_models/models \
+        manyforge_xarm_control/vendor \
+        manyforge_isaac_adapter/lane \
+        examples; \
+    rm -rf "$stage/components/templates"; \
+    find "$stage" -path "$stage/examples" -prune -o -type d \
+        \( -name tests -o -name process_tests -o -name __pycache__ \) -prune -exec rm -rf {} +
+
+FROM ${MANYFORGE_ROS_IMAGE}
+ARG MANYFORGE_ROS_IMAGE
+ARG MANYFORGE_VERSION=
+ARG MANYFORGE_REVISION=
+ARG MANYFORGE_SOURCE=https://github.com/pastoriomarco/manyforge
+LABEL org.opencontainers.image.title="ManyForge" \
+      org.opencontainers.image.source="${MANYFORGE_SOURCE}" \
+      org.opencontainers.image.revision="${MANYFORGE_REVISION}" \
+      org.opencontainers.image.version="${MANYFORGE_VERSION}" \
+      org.opencontainers.image.base.name="${MANYFORGE_ROS_IMAGE}"
+# The image has no build root: the entrypoint's default one would refuse a
+# runtime user other than the image's.
+USER root
+RUN rmdir /tmp/manyforge-build
+COPY --from=build /runner/stage/workspace /workspace
+COPY --from=build /runner/build /runner/build
+COPY --from=build /runner/licences/frontend /usr/share/licenses/manyforge-image/frontend
+COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_NOTICES_MANYFORGE_IMAGE.md \
+    /usr/share/licenses/manyforge-image/manyforge/
+USER 1000:1000
+# Bytecode where the entrypoint's PYTHONPYCACHEPREFIX finds it: a first start
+# reaches readiness as fast as later ones.
+RUN PYTHONPYCACHEPREFIX=/tmp/manyforge-pycache python3 -m compileall -q -j 0 /workspace

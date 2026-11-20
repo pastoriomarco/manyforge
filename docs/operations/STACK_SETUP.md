@@ -20,9 +20,12 @@ For runtime/operator-facing reference docs see:
 
 The [workbench guide's Install section](DEVELOPMENT_WORKBENCH.md#install)
 is the reference for the install options, what to check, updating and
-falling back; this is the short order. On a Jetson with a small eMMC root,
-place the workbench caches on the NVMe (`MANYFORGE_DEV_CACHE_BASE`) as
-described in [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md).
+falling back; this is the short order for options 2 and 3, from a checkout
+(option 1 runs the prebuilt ManyForge image without one: `./manyforge run`
+from its launcher kit). On a Jetson with a small eMMC root, place the
+workbench caches on the NVMe (`MANYFORGE_DEV_CACHE_BASE`; `MANYFORGE_DATA_DIR`
+with `./manyforge`) as described in
+[`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md).
 
 1. Prepare the host ([Prerequisites](#prerequisites) below): Docker Engine,
    `git`, Python 3, and enough disk for the image and build caches.

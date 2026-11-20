@@ -1,10 +1,11 @@
 # Development workbench
 
-Status: current development-only entrypoint. This is not an installed product
-launcher and does not authorize physical execution.
+Status: current entrypoint, for running the prebuilt ManyForge image and for
+development from source. It does not authorize physical execution.
 
-The workbench starts the current frontend with Vite hot reload and an empty
-ROS execution host. It may activate one exact Scenario project folder.
+The workbench starts an empty ROS execution host with the current frontend:
+with Vite hot reload from a source checkout, or the built GUI of the prebuilt
+image. It may activate one exact Scenario project folder.
 One command owns file placement, ports, process order, readiness checks,
 optional project activation, diagnostics, and cleanup.
 Browser mount, reload, and disconnect are read-only reconstruction events.
@@ -12,48 +13,114 @@ Browser mount, reload, and disconnect are read-only reconstruction events.
 ## Prerequisites
 
 This public runbook is sufficient for operation; no private documentation
-checkout is needed. This is a source-based workbench, not a packaged
-production installer.
+checkout is needed.
 
 - **Host**: Linux with Docker host networking, x86_64 (amd64) or arm64.
   Ubuntu 24.04 is the reference; Jetson AGX Thor and Orin run JetPack 7.2.1.
   Docker Desktop on macOS or Windows is not supported.
-- **Software**: Docker Engine, Git and Python 3. Building the image
-  ([option 2](#option-2-build-the-image-from-source)) also needs the Compose
-  v2 plugin and BuildKit.
-- **Network**: to pull or build the image, and at the first start, which
-  downloads the frontend's npm packages.
-- **Memory**: 16 GB for the C++ build at the first start; lower
-  `MANYFORGE_DEV_BUILD_JOBS` if compilation runs out of memory.
-- **Disk**: the image is about 4.1 GB; build caches and runtime state grow
-  under `.manyforge-dev/` in the checkout. `start` refuses to run with less
-  than 10 GB free ([Disk limits](#disk-limits)).
+- **Software**: Docker Engine and Python 3 (the launcher's helpers). Options 2
+  and 3 also need Git; building the ROS image
+  ([option 3](#option-3-build-the-ros-image-from-source)) also needs the
+  Compose v2 plugin and BuildKit.
+- **Network**: to pull or build an image; with options 2 and 3 also at the
+  first start, which downloads the frontend's npm packages.
+- **Memory**: options 2 and 3 compile ManyForge at the first start and need
+  16 GB; lower `MANYFORGE_DEV_BUILD_JOBS` if compilation runs out of memory.
+- **Disk**: the ROS image is about 4.1 GB, the ManyForge image somewhat more;
+  caches and runtime state grow in the folder the launcher runs from, under
+  `.manyforge/` (option 1) or `.manyforge-dev/` (options 2 and 3). `start` and `run` refuse to run with less than 10 GB free
+  ([Disk limits](#disk-limits)).
 
 <a id="install-one-build-one-start"></a>
 
 ## Install
 
-Get the source. `main` holds the latest release (`dev` is the integration
-branch). Run every command in this guide from the repository root:
+| Option | For | You need | Commands |
+| --- | --- | --- | --- |
+| **1. Run the prebuilt ManyForge image** (default) | Using ManyForge: nothing compiles, no checkout. | Docker, Python 3, your Scenario folders | `./manyforge run` from the launcher folder ([option 1](#option-1-run-the-prebuilt-manyforge-image)) |
+| **2. Pull the ROS image, build ManyForge from the checkout** | Developing ManyForge: the GUI with hot reload, programs built from your source. | A release checkout (`main` or a `vX.Y.Z` tag) | `./scripts/compose-dev.sh pull`, then `./scripts/compose-dev.sh start` |
+| **3. Build the ROS image from source** | You changed `Dockerfile.ros-lyrical-full` or what it installs, your checkout is not a release, or the host cannot reach `ghcr.io`. About an hour. | Any checkout | `./scripts/compose-dev.sh build`, then `./scripts/compose-dev.sh start` |
+| **4. Operator launcher** (advanced) | A digest-checked package with Composer served on the LAN at port 9000, or a remote Docker host next to Isaac Sim. | The image from option 2 or 3, plus the package preparation | `manyforge-operator start …` ([operator runbook](MANYFORGE_OPERATOR_RUNBOOK.md)) |
+
+Options 2 and 3 run the same source workbench and differ only in where its
+ROS image, tagged locally `manyforge-ros-lyrical-full`, comes from. Get the
+source for them (`main` holds the latest release, `dev` is the integration
+branch) and run every command in this guide from the repository root:
 
 ```bash
 git clone https://github.com/pastoriomarco/manyforge.git
 cd manyforge
 ```
 
-ManyForge runs in one container image, tagged locally
-`manyforge-ros-lyrical-full`. Options 1 and 2 differ only in where that image
-comes from; both then use the same `start`.
+### Option 1: run the prebuilt ManyForge image
 
-| Option | Use it when | Commands | Before the first start |
-| --- | --- | --- | --- |
-| **1. Pull the published image** (default) | You want to run ManyForge on amd64 or arm64 (Jetson AGX Thor and Orin included). | `./scripts/compose-dev.sh pull`, then `./scripts/compose-dev.sh start` | The download (the image is about 4.1 GB). |
-| **2. Build the image from source** | You changed `Dockerfile.ros-lyrical-full` or what it installs, your checkout is not a release (for example `dev` after such a change), or the host cannot reach `ghcr.io`. | `./scripts/compose-dev.sh build`, then `./scripts/compose-dev.sh start` | About an hour of building. |
-| **3. Operator launcher** (advanced) | The stack must run from a digest-checked package with Composer served on the LAN at port 9000, or on a remote Docker host next to Isaac Sim. | `manyforge-operator start …` ([operator runbook](MANYFORGE_OPERATOR_RUNBOOK.md)) | The image from option 1 or 2, plus the package preparation in the runbook. |
+GitHub builds the complete application with each release, for linux/amd64
+and linux/arm64 (Jetson AGX Thor and Orin, JetPack 7.2.1), on that release's
+ROS image (option 2), and publishes it as
+`ghcr.io/pastoriomarco/manyforge:<VERSION>`. It holds ManyForge's programs,
+Python modules and built GUI, so nothing compiles at start. Pulling needs
+network access to `ghcr.io`; no login. Copy the launcher kit out of the image
+into an empty folder (the first command pulls the image), then run it from
+there:
 
-### Option 1: pull the published image
+```bash
+mkdir -p ~/manyforge && cd ~/manyforge
+docker run --rm --entrypoint tar ghcr.io/pastoriomarco/manyforge:<VERSION> \
+  -c -C /workspace VERSION manyforge scripts/compose-dev.sh scripts/lib manyforge_operator/run_session.py \
+  | tar -x
+./manyforge run --project examples/mock_lite6_pick_and_place.scenario
+```
 
-GitHub builds the reference image from this repository with each release,
+Replace `<VERSION>` with the release, for example the version in the
+[CHANGELOG](../../CHANGELOG.md). The kit is the `./manyforge` command and the
+launcher it uses (`scripts/compose-dev.sh` with its helpers):
+
+```text
+./manyforge run [--project <folder>] [<image reference> | sha256:<digest>]
+./manyforge status
+./manyforge logs [<docker logs option>...]
+./manyforge stop
+```
+
+`run` starts the image of the folder's `VERSION` (pulling it when absent);
+`run <reference>` or `run sha256:<digest>` starts one exact image instead. It
+runs like the operator mode: Composer serves the GUI and its API at
+**http://localhost:9000** on all interfaces, without Vite. `--project` loads
+one Scenario project at start through the ordinary Load, as `start --project`
+does: a bundled `examples/<name>.scenario`, or the absolute host path of a
+project inside one of the [project folders](#project-folders). Without it the
+workspace starts empty. The bundled `examples/` are read-only in the image:
+your Scenarios live, and are saved, in the host folders listed under
+`project_folders` in the [site settings](#site-settings) file. `status` prints
+the JSON of every owner (with `--project`, also the Scenario), `logs` passes
+its options to `docker logs` (for example `--tail 200` or `--follow`), and
+`stop` keeps the evidence as for the other options. The container is named
+`manyforge`; Composer settings and runtime state stay under `.manyforge/` in
+the launcher folder. ManyForge and the development workbench of options 2 and
+3 never run at the same time, whatever their container names: `run` refuses
+while a development workbench is running, and `start` while ManyForge is.
+
+`./manyforge` reads these variables, each the product name of the
+[launcher variable](#environment-variables) in the second column; it ignores
+the `MANYFORGE_DEV_*` names:
+
+| Variable | Launcher variable | Effect |
+| --- | --- | --- |
+| `MANYFORGE_SITE_SETTINGS` | `MANYFORGE_DEV_SITE_SETTINGS` | Absolute host path of the [site settings](#site-settings) file. |
+| `MANYFORGE_DATA_DIR` | `MANYFORGE_DEV_CACHE_BASE` | Where state, runtime and evidence are kept (default `.manyforge/` in the launcher folder). |
+| `MANYFORGE_RUNTIME_STATE_ROOT` | `MANYFORGE_DEV_RUNTIME_STATE_ROOT` | Absolute host path of the runtime state root. |
+| `MANYFORGE_CONTAINER_NAME` | `MANYFORGE_DEV_CONTAINER_NAME` | Container name (default `manyforge`). |
+| `MANYFORGE_START_TIMEOUT_SECONDS` | `MANYFORGE_DEV_START_TIMEOUT_SECONDS` | How long `run` waits for readiness (default 900). |
+
+The ROS/DDS variables, `MANYFORGE_AI_*` and `MANYFORGE_MOTION_TRACE_DIR`
+keep their names.
+
+To update: `./manyforge stop`, copy the launcher kit out of the new version's
+image into the same folder as above, then `./manyforge run`.
+
+### Option 2: pull the ROS image, build ManyForge from the checkout
+
+GitHub builds the reference ROS image from this repository with each release,
 for linux/amd64 and linux/arm64 (Jetson AGX Thor and Orin, JetPack 7.2.1),
 and publishes it as `ghcr.io/pastoriomarco/manyforge-ros:<VERSION>`. Pulling
 needs Docker and network access to `ghcr.io`; no login.
@@ -77,7 +144,7 @@ docker image inspect --format '{{index .RepoDigests 0}}' manyforge-ros-lyrical-f
 The first command prints the digest of the image a `pull` fetched; the other
 two (equivalent) fetch exactly that image again, on this or another machine.
 
-### Option 2: build the image from source
+### Option 3: build the ROS image from source
 
 ```bash
 ./scripts/compose-dev.sh build
@@ -109,12 +176,21 @@ Building the default image by hand (BuildKit required):
 docker build -f Dockerfile.ros-lyrical-full -t manyforge-ros-lyrical-full .
 ```
 
-### Option 3: operator launcher (advanced)
+The ManyForge image of option 1 builds from a checkout on top of a ROS image
+named by digest (`Dockerfile.manyforge`, BuildKit required):
+
+```bash
+docker build -f Dockerfile.manyforge -t manyforge \
+  --build-arg MANYFORGE_ROS_IMAGE=ghcr.io/pastoriomarco/manyforge-ros@sha256:<digest> .
+./manyforge run manyforge
+```
+
+### Option 4: operator launcher (advanced)
 
 `manyforge-operator` starts the same application from a digest-checked
 package and serves the built Composer on the network at port 9000, without
 Vite. Use it only for the cases in the table above; it needs the image from
-option 1 or 2 on its runtime host (`isaac` profile) or a host ROS install
+option 2 or 3 on its runtime host (`isaac` profile) or a host ROS install
 (`standard` profile), and it cannot configure real-robot addresses. Follow
 the [operator runbook](MANYFORGE_OPERATOR_RUNBOOK.md).
 
@@ -125,7 +201,7 @@ the [operator runbook](MANYFORGE_OPERATOR_RUNBOOK.md).
 ./scripts/compose-dev.sh status
 ```
 
-Omit `--project` for an empty authoring workspace. The image holds no
+Omit `--project` for an empty authoring workspace. The ROS image holds no
 ManyForge program: before it starts the workbench, `start` compiles
 ManyForge's C++ programs and Python modules from the checkout into the
 image-keyed cache under `.manyforge-dev/images/<image id>/`, and the first
@@ -145,6 +221,11 @@ Check that it works:
 1. `docker image inspect --format '{{.Id}}' manyforge-ros-lyrical-full`
    names the image in use.
 
+With option 1, `./manyforge run --project
+examples/mock_lite6_pick_and_place.scenario` ends with the JSON of every
+owner and the Scenario (`"ready": true`), then `ManyForge:
+http://localhost:9000`; open that page, press **Execute**, then **Run**.
+
 Starting the workbench runs no tests and authorizes no robot motion. Stop it
 with `./scripts/compose-dev.sh stop`. The
 [fresh-checkout checklist](FRESH_CHECKOUT_CHECKLIST.md) is a recorded
@@ -155,35 +236,38 @@ version of these checks.
 ```bash
 ./scripts/compose-dev.sh stop
 git pull
-./scripts/compose-dev.sh pull     # option 2: ./scripts/compose-dev.sh build
+./scripts/compose-dev.sh pull     # option 3: ./scripts/compose-dev.sh build
 ./scripts/compose-dev.sh start
 ```
 
 `git pull` on `main` moves to the latest release; `pull` then fetches that
-version's image. With option 2, `build` is needed only when the Dockerfile
+version's image. With option 3, `build` is needed only when the Dockerfile
 or what it installs changed. A new image has a new ID, so the first start
 on it compiles ManyForge's programs again into its own cache folder; the
 previous image's folder stays in `.manyforge-dev/images/` and can be deleted
 while the workbench is stopped. Saved Scenarios are kept, and so are the
-Composer settings and runtime state under `.manyforge-dev/`.
+Composer settings and runtime state under `.manyforge-dev/`. Option 1 updates
+as described [there](#option-1-run-the-prebuilt-manyforge-image).
 
 ### Fall back
 
+- **`run` cannot pull the ManyForge image** (no network, or none published
+  for that version): use option 2 or 3 from a checkout.
 - **`pull` fails** (no network, `ghcr.io` unreachable, or no image published
-  for the checkout's `VERSION`): use option 2. `pull` and `build` write the
+  for the checkout's `VERSION`): use option 3. `pull` and `build` write the
   same tag, so the one run last is the image `start` uses.
 - **`start` fails after an image change**: read the start output first
   ([troubleshooting table](#operation-and-troubleshooting)). To return to
-  the image you had, pull it again by its digest (option 1), or check out the
+  the image you had, pull it again by its digest (option 2), or check out the
   previous source and `build`. Each image keeps its own build cache, so going
   back reuses it.
 - **To return to an earlier release**: stop the workbench, check out its tag
   (`git checkout vX.Y.Z`) and follow the guide in that checkout. Releases
-  before 0.3.1 have no published image and are built with option 2.
+  before 0.3.1 have no published image and are built with option 3.
 
-### What the image holds
+### What the images hold
 
-The one image serves every lane. It holds Ubuntu 24.04, ROS 2 Lyrical built
+The ROS image serves every lane. It holds Ubuntu 24.04, ROS 2 Lyrical built
 from source with ros2_control and the stock joint_trajectory_controller
 6.10.1, `topic_based_ros2_control` for Isaac, the UFACTORY xArm driver,
 RoboPlan with its dependencies, the Python environment, and Node.js with
@@ -192,6 +276,18 @@ from the mounted checkout. The owners' licence files are in the image under
 `/usr/share/licenses/manyforge-image/`, and
 [THIRD_PARTY_NOTICES.md](../../THIRD_PARTY_NOTICES.md) lists every component
 it redistributes.
+
+The ManyForge image (option 1) is that ROS image, named by digest, plus the
+application built by the same build step `start` runs: the native programs
+and Python modules under `/runner/build`, the source files the application
+reads at run time (Python packages, catalogs, component and model resources,
+examples) and the built GUI under `/workspace`, and the launcher. Its labels
+name the source commit (`org.opencontainers.image.revision`) and the ROS image
+(`org.opencontainers.image.base.name`), and GitHub attests its build
+provenance. The licence files of the frontend's npm packages are added under
+`/usr/share/licenses/manyforge-image/frontend/`;
+[THIRD_PARTY_NOTICES_MANYFORGE_IMAGE.md](../../THIRD_PARTY_NOTICES_MANYFORGE_IMAGE.md)
+describes what the image adds to the ROS image.
 
 The xArm driver comes from the fork
 `https://github.com/pastoriomarco/xarm_ros2`, branch `lyrical-no-gazebo`
@@ -226,7 +322,10 @@ member (arm, controller I/O, tool I/O) runs on its owner's lane.
 ### Environment variables
 
 Export them in the shell that runs `./scripts/compose-dev.sh`; `start` reads
-them once, when it creates the container.
+them once, when it creates the container. `./manyforge` (option 1) reads the
+product names listed [there](#option-1-run-the-prebuilt-manyforge-image)
+instead of the `MANYFORGE_DEV_*` names, with its own defaults for the
+container name and the data folder.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
@@ -271,7 +370,8 @@ changes; without a file every default applies. A `manyforge.site.v1` file is
 still accepted and uses the default disk limits; a file with a disk member
 must say `manyforge.site.v2`. A Scenario names a `device_addresses` key (for
 example `lite6_main`), never the address. Set `MANYFORGE_DEV_SITE_SETTINGS`
-to the file's absolute host path before `start`. The file is read when the
+to the file's absolute host path before `start` (`MANYFORGE_SITE_SETTINGS`
+before `./manyforge run`). The file is read when the
 workbench starts: after editing it, `stop` and `start` again. `start` refuses
 a relative path, a missing file and an invalid file (see
 [Site file errors](TROUBLESHOOTING.md#site-file-errors)). Example:
@@ -328,8 +428,10 @@ the picker.
 When entering a path in the picker, use the displayed container path or a path
 relative to the current folder. Pasting a host path is not supported. The
 site-file `project_folders` setting shows which host folders are available.
-`start --project` still accepts only projects under the repository's `examples/`
-directory.
+`start --project` (and `run --project`) accepts a project under `examples/`
+(relative to the repository root, or to `/workspace` in the prebuilt image) or
+the absolute host path of a project inside one of these folders, for example
+`--project /home/USER/Projects/cell.scenario`.
 
 After changing `project_folders`, stop the workbench and start it again. Calling
 `start` while it is already running does not update the folder mounts.
@@ -746,8 +848,10 @@ defaults, keeps settings read-only and offers a reset that keeps the file as a
 `settings.json.bak-<time>` backup.
 
 The current fixed ports are frontend `3000`, Headless API `9010`, Program
-runner `9011`, and internal Composer API `9020`. If one is occupied, startup
-fails with a direct diagnostic rather than taking over the process.
+runner `9011`, and internal Composer API `9020`; `./manyforge run` (option 1) has no
+frontend port and serves the GUI and Composer's API on `9000`. If one is
+occupied, startup fails with a direct diagnostic rather than taking over the
+process.
 
 ## Operation and troubleshooting
 
@@ -1032,7 +1136,8 @@ docker logs --tail 200 manyforge-development-workbench
 docker inspect --format '{{.State.Status}} {{.State.ExitCode}}' manyforge-development-workbench
 ```
 
-Use the selected `MANYFORGE_DEV_CONTAINER_NAME` if overridden. Child-process
+With option 1 the container is `manyforge`. Use the selected
+`MANYFORGE_DEV_CONTAINER_NAME` (`MANYFORGE_CONTAINER_NAME`) if overridden. Child-process
 output is inherited by the container log. Stop keeps durable runtime state
 and captures the bounded console tail before removal. Capture any additional
 logs/status needed for investigation explicitly. Failed developer startup uses
@@ -1097,6 +1202,7 @@ procedure for physical equipment.
 | Symptom | Action |
 | --- | --- |
 | `start` says `Development image is unavailable: manyforge-ros-lyrical-full` (exit 69) | No local image yet: run `./scripts/compose-dev.sh pull` or `build` ([Install](#install)). |
+| `./manyforge run` fails to pull `ghcr.io/pastoriomarco/manyforge:<VERSION>` | No ManyForge image is published for the launcher folder's `VERSION`, or `ghcr.io` is unreachable. Copy the launcher kit out of a published version's image ([option 1](#option-1-run-the-prebuilt-manyforge-image)), or use option 2 or 3. |
 | `pull` fails (`manifest unknown`, `denied`, or a network error) | No image is published for the version in `VERSION` (a checkout that is not a release), or `ghcr.io` is unreachable. Check `cat VERSION` and the network, or use `./scripts/compose-dev.sh build` ([Fall back](#fall-back)). |
 | The first start on a new image compiles everything again | Expected: each image has its own build cache under `.manyforge-dev/images/<image id>/` ([Update](#update-to-a-new-version)). |
 | Start fails with `command failed with exit …: npm ci` | The first start on an image downloads the frontend's npm packages: check the network, then start again. |
@@ -1104,6 +1210,7 @@ procedure for physical equipment.
 | Site settings refused at start | See [Site file errors](TROUBLESHOOTING.md#site-file-errors). |
 | Project source missing, invalid or changed | Preserve the diagnostic, inspect the named project/source path, and review changes before retrying. Do not bypass identity checks or delete caches blindly. |
 | Port occupied | Identify the listener on 3000/9010/9011/9020; do not kill an unrelated process. |
+| `run` refuses with `A development workbench is running (container …)`, or `start` with `ManyForge is running (container …)` (exit 69) | ManyForge (option 1) and the development workbench never run at the same time. Stop the named one (`./scripts/compose-dev.sh stop` or `./manyforge stop`, with its container name variable if it was overridden), then start the other. |
 | Different or unhealthy workbench already running | Read status/logs first. Stop only with authorization before switching scenarios; do not spawn another stack to hide the failure. |
 | Slow first start | Inspect build output. Lower `MANYFORGE_DEV_BUILD_JOBS` if compilation exhausts memory; avoid repeated startup attempts. |
 | `status` says stopped after a failed start | The launcher removed the container it created, with its logs. Read the start output you kept (`tee`), or start again with its output captured. |

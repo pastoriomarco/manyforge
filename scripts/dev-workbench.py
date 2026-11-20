@@ -114,7 +114,7 @@ class NativeBuildMissingError(WorkbenchError):
     """serve found a native artifact the separate build step must produce."""
 
 
-def _project_scenario_id(raw_path: str, *, allowed_root: Path) -> str:
+def _project_scenario_id(raw_path: str, *, allowed_roots: Sequence[Path]) -> str:
     """Read only the bounded project identity needed by launcher status."""
 
     from manyforge_behavior.canonical_artifact import (
@@ -122,13 +122,13 @@ def _project_scenario_id(raw_path: str, *, allowed_root: Path) -> str:
         load_strict_json_yaml,
     )
 
-    root = allowed_root.resolve(strict=True)
+    roots = [root.resolve(strict=True) for root in allowed_roots]
     candidate = Path(raw_path).expanduser()
     project = candidate.resolve(strict=True)
     if (
         candidate.is_symlink()
         or not project.is_dir()
-        or not project.is_relative_to(root)
+        or not any(project.is_relative_to(root) for root in roots)
     ):
         raise WorkbenchError("Scenario project is outside the workbench project root")
     manifest = project / "scenario.yaml"
@@ -165,11 +165,36 @@ def _json(value: Any) -> str:
     return json.dumps(value, allow_nan=False, indent=2, sort_keys=True)
 
 
+def _project_roots(artifact_root: Path) -> list[Path]:
+    """The examples and the project folders the launcher mounted."""
+
+    extra_roots = os.environ.get("MANYFORGE_DEV_PROJECT_ROOTS", "")
+    return [artifact_root, *(Path(root) for root in extra_roots.split(",") if root)]
+
+
 def _composer_filesystem_roots(artifact_root: Path) -> str:
     """Keep examples available alongside folders mounted by the launcher."""
 
-    extra_roots = os.environ.get("MANYFORGE_DEV_PROJECT_ROOTS", "")
-    return f"{artifact_root},{extra_roots}" if extra_roots else str(artifact_root)
+    return ",".join(str(root) for root in _project_roots(artifact_root))
+
+
+def _container_project_path(raw_path: str) -> str:
+    """A host path under a mounted project folder, as this container sees it.
+
+    The launcher mounts each site-settings project folder and records the
+    host and container paths (MANYFORGE_PROJECT_ROOT_MAPPINGS); any other
+    path is already a container path (for example examples/<name>.scenario).
+    """
+
+    if not os.path.isabs(raw_path):
+        return raw_path
+    path = os.path.normpath(raw_path)
+    for mapping in json.loads(os.environ.get("MANYFORGE_PROJECT_ROOT_MAPPINGS") or "[]"):
+        host = os.path.normpath(mapping["hostPath"])
+        if os.path.commonpath((host, path)) == host:
+            return os.path.normpath(
+                os.path.join(mapping["containerPath"], os.path.relpath(path, host)))
+    return raw_path
 
 
 def _run(
@@ -454,7 +479,7 @@ def _ensure_repository_bootstrap_package() -> Path:
 
 
 def _capture_ros_bootstrap_project(
-    project_path: str, *, allowed_root: Path
+    project_path: str, *, allowed_roots: Sequence[Path]
 ) -> tuple[dict[str, Any], str]:
     """Capture the intended first Load through the ordinary authoring owners."""
 
@@ -477,7 +502,7 @@ def _capture_ros_bootstrap_project(
 
     try:
         scenario, source_path, source_digest = capture_scenario_artifact(
-            project_path, allowed_roots=[str(allowed_root)]
+            project_path, allowed_roots=[str(root) for root in allowed_roots]
         )
         deployment = scenario["deployment_draft"]
         runtime_kinds = {
@@ -697,8 +722,12 @@ def _operator_manager_ready(manager: dict[str, Any]) -> bool:
 
 
 def query_operator_status(*, headless_port: int, runner_port: int,
-                          composer_port: int) -> dict[str, Any]:
-    """Read real owner payloads; timing is never a readiness predicate."""
+                          composer_port: int, scenario_id: str | None = None) -> dict[str, Any]:
+    """Read real owner payloads; timing is never a readiness predicate.
+
+    With a Scenario named (the prebuilt image's `run --project`), ready also
+    requires it to be the current, ready Scenario, as `query_status` reads it.
+    """
     with HeadlessHttpClient(f"http://127.0.0.1:{headless_port}", timeout_seconds=1.0) as client:
         headless = client.health()
         manager = client.manager_status()
@@ -717,8 +746,12 @@ def query_operator_status(*, headless_port: int, runner_port: int,
         timing = json.loads((STATE_ROOT / "current/workbench-startup-timing.json").read_text())
     except (OSError, ValueError):
         timing = None
-    return {"ready": ready, "manager": manager, "headless": headless,
-            "program_runner": runner, "composer": composer, "timing": timing}
+    result = {"ready": ready, "manager": manager, "headless": headless,
+              "program_runner": runner, "composer": composer, "timing": timing}
+    if scenario_id is not None:
+        scenario = query_status(scenario_id=scenario_id, composer_port=composer_port)
+        result.update(ready=ready and scenario.get("ready") is True, scenario=scenario)
+    return result
 
 
 class Workbench:
@@ -859,6 +892,10 @@ class Workbench:
             if package_aggregate_sha256(self.operator_install_root) != self.package_aggregate_digest:
                 raise WorkbenchError("qualified operator package aggregate mismatch")
             _regular_file(self.operator_install_root / self.operator_admission, "qualified operator admission")
+        # Composer serves the built GUI, without Vite, in operator mode and
+        # whenever a built frontend is named (the prebuilt manyforge image).
+        built_gui = operator_mode or self.composer_static_dir is not None
+        if built_gui:
             # The build step built FRONTEND_DIST unless a static dir is given.
             _regular_file((self.composer_static_dir or FRONTEND_DIST) / "index.html",
                           "built Composer frontend")
@@ -867,7 +904,7 @@ class Workbench:
             intended_project = self.bootstrap_project_path or self.project_path
             if intended_project is not None:
                 ros_capture, source_path = _capture_ros_bootstrap_project(
-                    intended_project, allowed_root=self.artifact_root
+                    intended_project, allowed_roots=_project_roots(self.artifact_root)
                 )
                 if self.project_path is not None:
                     self.project_path = source_path
@@ -876,7 +913,7 @@ class Workbench:
             self.headless_port,
             self.runner_port,
             self.composer_port,
-            *((self.frontend_port,) if not operator_mode else ()),
+            *((self.frontend_port,) if not built_gui else ()),
         ):
             if not _port_available(port):
                 raise WorkbenchError(
@@ -912,7 +949,7 @@ class Workbench:
         os.environ["PYTHONPATH"] = (
             f"{HEADLESS_BUILD}:{CORE_PYTHON_BUILD}:{os.environ.get('PYTHONPATH', '')}"
         )
-        if not operator_mode:
+        if not built_gui:
             _ensure_frontend_dependencies()
         paths = self._paths()
         readiness_started = time.monotonic()
@@ -928,7 +965,7 @@ class Workbench:
         _remove_stale_socket(runner_socket, "Program runner liveness socket")
         if ros_capture is not None:
             current_capture, _ = _capture_ros_bootstrap_project(
-                source_path, allowed_root=self.artifact_root
+                source_path, allowed_roots=_project_roots(self.artifact_root)
             )
             if current_capture != ros_capture:
                 raise WorkbenchError(
@@ -1040,7 +1077,7 @@ class Workbench:
                 START_AFTER_BASELINE,
             ),
         ]
-        if not operator_mode:
+        if not built_gui:
             # Vite is development tooling, not an application process: the
             # list holds only the three roles of contract 1.1. This launcher
             # starts it once Composer is ready and keeps it as its own child.
@@ -1094,7 +1131,7 @@ class Workbench:
                 "MANYFORGE_HEADLESS_API_URL": base_url,
             },
         )
-        self._operator_mode = operator_mode
+        self._built_gui = built_gui
         self._timing = timing
         self._timing_path = timing_path
         self._readiness_started = readiness_started
@@ -1131,10 +1168,11 @@ class Workbench:
         if self._ready_reported:
             return
         try:
-            if self._operator_mode:
+            if self._built_gui:
                 if not query_operator_status(headless_port=self.headless_port,
                                              runner_port=self.runner_port,
-                                             composer_port=self.composer_port)["ready"]:
+                                             composer_port=self.composer_port,
+                                             scenario_id=self.scenario_id)["ready"]:
                     return
                 self._timing["readiness_elapsed_seconds"] = time.monotonic() - self._readiness_started
                 self._timing_path.write_text(_json(self._timing) + "\n", encoding="utf-8")
@@ -1303,7 +1341,8 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument("--node-catalog-path", type=Path)
             command.add_argument("--alarm-catalog-path", type=Path)
             command.add_argument("--canonical-empty-admission-filename")
-            command.add_argument("--composer-static-dir", type=Path)
+            command.add_argument("--composer-static-dir", type=Path,
+                                 help="built frontend Composer serves; no Vite runs")
             command.add_argument("--composer-bind-host", default="127.0.0.1")
             command.add_argument("--simulation-control-config", type=Path)
             command.add_argument("--site-settings", type=Path)
@@ -1317,32 +1356,33 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.command == "build":
             build_native(frontend=args.frontend)
             return 0
-        if args.command == "status" and args.operator_runtime:
-            result = query_operator_status(headless_port=args.headless_port,
-                                           runner_port=args.runner_port,
-                                           composer_port=args.composer_port)
-            print(_json(result))
-            return 0 if result["ready"] else 69
+        project = _container_project_path(args.project) if args.project else None
         if args.command == "status":
             scenario_id = None
-            if args.project is not None:
+            if project is not None:
                 try:
                     scenario_id = _project_scenario_id(
-                        args.project,
-                        allowed_root=WORKSPACE / "examples",
+                        project,
+                        allowed_roots=_project_roots(WORKSPACE / "examples"),
                     )
                 except (OSError, ValueError) as error:
                     raise WorkbenchError(str(error)) from error
-            result = query_status(
-                scenario_id=scenario_id,
-                composer_port=args.composer_port,
-            )
+            if args.operator_runtime:
+                result = query_operator_status(headless_port=args.headless_port,
+                                               runner_port=args.runner_port,
+                                               composer_port=args.composer_port,
+                                               scenario_id=scenario_id)
+            else:
+                result = query_status(
+                    scenario_id=scenario_id,
+                    composer_port=args.composer_port,
+                )
             print(_json(result))
             return 0 if result["ready"] else 69
         if args.operator_runtime != (args.operator_install_root is not None):
             raise WorkbenchError("operator runtime requires its qualified install root and explicit startup mode")
         Workbench(
-            project_path=args.project,
+            project_path=project,
             headless_port=args.headless_port,
             runner_port=args.runner_port,
             composer_port=args.composer_port,

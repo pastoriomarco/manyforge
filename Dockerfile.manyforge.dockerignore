@@ -1,0 +1,26 @@
+# Build context of Dockerfile.manyforge (it replaces .dockerignore for that
+# Dockerfile): the checkout without version-control data, local build, cache
+# and dependency trees (the image builds and installs its own), documentation
+# and CI configuration.
+.git
+**/.git
+.github
+.docker
+.manyforge
+.manyforge-dev
+.manyforge-diagnostic
+.manyforge-var
+qualification
+**/node_modules
+**/dist
+**/build
+**/build_*
+**/install
+**/log
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+**/.pytest_cache
+docs
+agent-skills
+exts

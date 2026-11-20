@@ -1,0 +1,230 @@
+name: manyforge-image
+
+# Prebuilt ManyForge image (Dockerfile.manyforge): the complete application,
+# built FROM the reference ROS image of the same version
+# (ghcr.io/<owner>/manyforge-ros:<VERSION>, resolved to its digest; no ROS
+# rebuild) on GitHub's own amd64 and arm64 runners, pushed by digest and
+# published as one multi-arch image ghcr.io/<owner>/manyforge:<VERSION>.
+# It runs by itself when ros-image succeeds on a release tag vX.Y.Z (GitHub
+# runs workflow_run from this file on the default branch) and builds exactly
+# that tagged commit. Rerun by hand on the tag with
+#   gh workflow run manyforge-image.yml --ref vX.Y.Z
+on:
+  workflow_run:
+    workflows: [ros-image]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One release tag at a time, queued, not cancelled. A workflow_run's own ref is
+# the default branch; its tag is the triggering run's head_branch.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_branch || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  inputs:
+    name: Resolve image inputs
+    # A successful ros-image run on a v* ref (a tag-triggered run reports its
+    # tag as head_branch), or a manual run; the key step checks the tag.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      image: ${{ steps.key.outputs.image }}
+      version: ${{ steps.key.outputs.version }}
+      sha: ${{ steps.key.outputs.sha }}
+      ros_image: ${{ steps.ros.outputs.ros_image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      # The release tag vVERSION must name exactly the commit checked out.
+      - id: key
+        env:
+          TAG: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          set -euo pipefail
+          version=$(<VERSION)
+          if [[ "$TAG" != "v$version" ]] ||
+              ! git fetch --quiet --no-tags --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG" ||
+              [[ $(git rev-parse "refs/tags/$TAG^{commit}") != "$SHA" ]]; then
+            echo "Run this workflow on the release tag v$version; $TAG is not that tag at $SHA." >&2
+            exit 1
+          fi
+          {
+            echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/manyforge"
+            echo "version=$version"
+            echo "sha=$SHA"
+          } | tee -a "$GITHUB_OUTPUT"
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: ros
+        env:
+          ROS: ghcr.io/${{ github.repository_owner }}/manyforge-ros
+          VERSION: ${{ steps.key.outputs.version }}
+        run: |
+          set -euo pipefail
+          ros=${ROS,,}
+          digest=$(docker buildx imagetools inspect "$ros:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          [[ "$digest" == sha256:* ]]
+          echo "ros_image=$ros@$digest" | tee -a "$GITHUB_OUTPUT"
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: inputs
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      # The ROS base image and the native build need more than the ~14 GB a
+      # hosted runner starts with.
+      - name: Free runner disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache
+          docker image prune -af
+          df -h /
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.inputs.outputs.sha }}
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Pushed by digest only; the merge job tags the multi-arch index.
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.manyforge
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            MANYFORGE_ROS_IMAGE=${{ needs.inputs.outputs.ros_image }}
+            MANYFORGE_VERSION=${{ needs.inputs.outputs.version }}
+            MANYFORGE_REVISION=${{ needs.inputs.outputs.sha }}
+            MANYFORGE_SOURCE=${{ github.server_url }}/${{ github.repository }}
+          outputs: type=image,name=${{ needs.inputs.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=manyforge-${{ matrix.arch }}
+          cache-to: type=gha,scope=manyforge-${{ matrix.arch }},mode=max,ignore-error=true
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ needs.inputs.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+      - name: Record digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+          df -h /
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-arch image
+    needs: [inputs, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - id: publish
+        env:
+          IMAGE: ${{ needs.inputs.outputs.image }}
+          VERSION: ${{ needs.inputs.outputs.version }}
+          ROS_IMAGE: ${{ needs.inputs.outputs.ros_image }}
+          REVISION: ${{ needs.inputs.outputs.sha }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          sources=()
+          for digest in "$RUNNER_TEMP"/digests/*; do
+            sources+=("$IMAGE@sha256:$(basename "$digest")")
+          done
+          docker buildx imagetools create --tag "$IMAGE:$VERSION" \
+            --annotation "index:org.opencontainers.image.source=$SOURCE" \
+            --annotation "index:org.opencontainers.image.revision=$REVISION" \
+            --annotation "index:org.opencontainers.image.version=$VERSION" \
+            --annotation "index:org.opencontainers.image.base.name=$ROS_IMAGE" \
+            "${sources[@]}"
+          digest=$(docker buildx imagetools inspect "$IMAGE:$VERSION" --format '{{json .Manifest}}' | jq -r .digest)
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          {
+            echo "### ManyForge image"
+            echo
+            echo "- Image: \`$IMAGE@$digest\`"
+            echo "- Release tag: \`$IMAGE:$VERSION\` (commit \`$REVISION\`)"
+            echo "- Built FROM: \`$ROS_IMAGE\`"
+            echo
+            echo '```'
+            docker buildx imagetools inspect "$IMAGE@$digest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ needs.inputs.outputs.image }}
+          subject-digest: ${{ steps.publish.outputs.digest }}
+          push-to-registry: true

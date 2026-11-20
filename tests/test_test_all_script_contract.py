@@ -551,16 +551,34 @@ def test_current_build_lanes_use_fresh_container_local_products() -> None:
 
 
 
-def test_ros_image_workflow_is_manual_and_hashes_existing_inputs() -> None:
+def test_ros_image_workflow_runs_on_release_tags_and_hashes_existing_inputs() -> None:
     script = _REPO_ROOT / "scripts" / "ci" / "ros-image-inputs.sh"
     paths = subprocess.run(["bash", str(script), "--paths"], check=True,
         capture_output=True, text=True).stdout.split()
     workflow = yaml.safe_load(
         (_REPO_ROOT / ".github/workflows/ros-image.yml").read_text(encoding="utf-8"))
-    # PyYAML reads the `on:` key as True. Manual only until the package is
-    # public (OD-315); a returning push trigger needs a paths filter equal to
-    # `--paths`.
-    assert set(workflow[True]) == {"workflow_dispatch"}
+    # PyYAML reads the `on:` key as True. A release tag push runs it (with
+    # unchanged inputs it only adds the version tag), and it can run by hand.
+    assert workflow[True] == {"push": {"tags": ["v*"]}, "workflow_dispatch": None}
+    # On a tag ref, as in manyforge-image.yml: the tag must be vVERSION and
+    # name exactly the commit built; branch runs are not checked.
+    key = next(step for step in workflow["jobs"]["inputs"]["steps"] if step.get("id") == "key")
+    assert key["env"] == {"TAG": "${{ github.ref_name }}", "SHA": "${{ github.sha }}"}
+    guard = key["run"]
+    assert 'if [[ "$GITHUB_REF" == refs/tags/* ]]; then' in guard
+    for line in ('[[ "$TAG" != "v$version" ]]',
+                 '! git fetch --quiet --no-tags --depth=1 origin "+refs/tags/$TAG:refs/tags/$TAG"',
+                 '[[ $(git rev-parse "refs/tags/$TAG^{commit}") != "$SHA" ]]',
+                 'echo "Run this workflow on the release tag v$version; $TAG is not that tag at $SHA." >&2'):
+        assert line in guard, line
+        assert line in (_REPO_ROOT / ".github/workflows/manyforge-image.yml").read_text(encoding="utf-8"), line
+    assert guard.index("refs/tags/*") < guard.index("exit 1") < guard.index("ros-image-inputs.sh")
+    publish = next(step for step in workflow["jobs"]["merge"]["steps"] if step.get("id") == "publish")
+    assert 'if [[ "$GITHUB_REF" == refs/tags/v* ]]' in publish["run"]
+    assert 'docker buildx imagetools create "${release[@]}" "$IMAGE:$KEY"' in publish["run"]
+    assert "'skipped'" in workflow["jobs"]["merge"]["if"]
+    # The ManyForge image's own notices are not a ROS image input.
+    assert "THIRD_PARTY_NOTICES_MANYFORGE_IMAGE.md" not in paths
     for path in paths:
         assert (_REPO_ROOT / path).exists(), path
     # Every repository file the image COPYs is hashed (bind mounts come from
@@ -572,6 +590,81 @@ def test_ros_image_workflow_is_manual_and_hashes_existing_inputs() -> None:
     assert "manyforge_composer" not in dockerfile and "/opt/manyforge-frontend" not in dockerfile
     integration = (_REPO_ROOT / ".github/workflows/ros-integration.yml").read_text(encoding="utf-8")
     assert "scripts/ci/ros-image-inputs.sh" in integration
+
+def test_manyforge_image_builds_from_the_digest_pinned_ros_image() -> None:
+    dockerfile = (_REPO_ROOT / "Dockerfile.manyforge").read_text(encoding="utf-8")
+    # Both stages are the ROS image named by the one build argument, which the
+    # build stage refuses unless it is pinned by digest.
+    assert re.findall(r"^FROM (\S+)", dockerfile, re.MULTILINE) == [
+        "${MANYFORGE_ROS_IMAGE}", "${MANYFORGE_ROS_IMAGE}"]
+    assert "*@sha256:*) ;;" in dockerfile
+    # The same build step as the workbench, then only run-time files.
+    assert "scripts/dev-workbench.py build --frontend" in dockerfile
+    for label in ("source", "revision", "version", "base.name"):
+        assert f"org.opencontainers.image.{label}=" in dockerfile
+    final = dockerfile[dockerfile.rindex("\nFROM "):]
+    assert "/usr/share/licenses/manyforge-image/frontend" in final
+    assert ("COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md THIRD_PARTY_NOTICES_MANYFORGE_IMAGE.md \\\n"
+            "    /usr/share/licenses/manyforge-image/manyforge/") in final
+    assert "RUN apt" not in dockerfile and "apt-get" not in dockerfile
+    # The context carries no version-control data, local build trees or
+    # installed npm packages.
+    ignored = (_REPO_ROOT / "Dockerfile.manyforge.dockerignore").read_text(encoding="utf-8").split()
+    for entry in (".git", "**/.git", ".manyforge", ".manyforge-dev", ".docker", "**/node_modules", "**/build", "**/dist"):
+        assert entry in ignored, entry
+    # Every staged source path exists, and the launcher kit (./manyforge and
+    # the compose-dev.sh `run` it calls) is among them.
+    staged = re.search(r"cp -a --parents -t \"\$stage\" \\\n(.*?);", dockerfile, re.DOTALL).group(1)
+    paths = staged.replace("\\", " ").split()
+    for path in paths:
+        assert (_REPO_ROOT / path).exists(), path
+    for path in ("VERSION", "manyforge", "scripts/compose-dev.sh", "scripts/lib", "manyforge_operator",
+                 "manyforge_composer/frontend/dist"):
+        assert path in paths, path
+
+
+def test_manyforge_image_workflow_publishes_the_release_from_the_ros_image() -> None:
+    text = (_REPO_ROOT / ".github/workflows/manyforge-image.yml").read_text(encoding="utf-8")
+    workflow = yaml.safe_load(text)
+    # Started by a successful ros-image run on a release tag, or by hand.
+    assert workflow[True] == {
+        "workflow_run": {"workflows": ["ros-image"], "types": ["completed"]},
+        "workflow_dispatch": None,
+    }
+    assert set(workflow["jobs"]) == {"inputs", "build", "merge"}
+    inputs = workflow["jobs"]["inputs"]
+    assert "github.event.workflow_run.conclusion == 'success'" in inputs["if"]
+    assert "startsWith(github.event.workflow_run.head_branch, 'v')" in inputs["if"]
+    assert "github.event.workflow_run.head_branch" in workflow["concurrency"]["group"]
+    assert workflow["concurrency"]["cancel-in-progress"] is False
+    # Exactly the tagged commit: the tag vVERSION must name the commit checked
+    # out, and every job builds and labels that commit.
+    sha = "${{ github.event.workflow_run.head_sha || github.sha }}"
+    assert inputs["steps"][0]["with"]["ref"] == sha
+    key = next(step for step in inputs["steps"] if step.get("id") == "key")
+    assert key["env"] == {"TAG": "${{ github.event.workflow_run.head_branch || github.ref_name }}",
+                          "SHA": sha}
+    assert '[[ "$TAG" != "v$version" ]]' in key["run"]
+    assert '[[ $(git rev-parse "refs/tags/$TAG^{commit}") != "$SHA" ]]' in key["run"]
+    checkout = next(step for step in workflow["jobs"]["build"]["steps"]
+                    if step.get("uses", "").startswith("actions/checkout"))
+    assert checkout["with"]["ref"] == "${{ needs.inputs.outputs.sha }}"
+    assert "github.sha" not in text.replace(sha, "")
+    assert "GITHUB_SHA" not in text
+    runners = {row["runner"] for row in workflow["jobs"]["build"]["strategy"]["matrix"]["include"]}
+    assert runners == {"ubuntu-24.04", "ubuntu-24.04-arm"}
+    # FROM the same version's ROS image, resolved to its digest.
+    assert "manyforge-ros" in text and "imagetools inspect" in text
+    build = next(step for step in workflow["jobs"]["build"]["steps"]
+                 if step.get("uses", "").startswith("docker/build-push-action"))
+    assert build["with"]["file"] == "Dockerfile.manyforge"
+    assert "MANYFORGE_ROS_IMAGE=${{ needs.inputs.outputs.ros_image }}" in build["with"]["build-args"]
+    assert "push-by-digest=true" in build["with"]["outputs"]
+    assert "MANYFORGE_REVISION=${{ needs.inputs.outputs.sha }}" in build["with"]["build-args"]
+    # Only the release version is published; both digests and the index are attested.
+    assert '--tag "$IMAGE:$VERSION"' in text
+    assert text.count("actions/attest-build-provenance") == 2
+
 
 def test_hermes_gateway_matrix_cannot_activate_the_deleted_bridge() -> None:
     matrix_path = _REPO_ROOT / "scripts" / "hermes" / "managed-tool-gateway-matrix.json"

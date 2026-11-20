@@ -14,6 +14,7 @@ API, `http://127.0.0.1:9020`.
 | `./scripts/compose-dev.sh pull` fails | No image published for the version in the checkout's `VERSION`, `ghcr.io` unreachable, Docker daemon down | Check `cat VERSION` and the network; build the image instead with `./scripts/compose-dev.sh build` ([Fall back](DEVELOPMENT_WORKBENCH.md#fall-back)) |
 | `./scripts/compose-dev.sh start` fails | Image missing (`Development image is unavailable`: run `pull` or `build`), port occupied, Docker daemon down, no network for the first start's npm packages | Read the start output; see the [workbench troubleshooting table](DEVELOPMENT_WORKBENCH.md#operation-and-troubleshooting) |
 | Operator-mode start refused with `built Composer frontend is not a regular file` | The frontend that Composer serves on port 9000 was not built | Run the build step or pass `--composer-static-dir`; see the [workbench troubleshooting table](DEVELOPMENT_WORKBENCH.md#operation-and-troubleshooting) |
+| `start` refused with `ManyForge is running`, or `./manyforge run` with `A development workbench is running` | ManyForge (`./manyforge run`, container `manyforge`) and the development workbench never run at the same time | Stop the named container's launcher (`./manyforge stop` or `./scripts/compose-dev.sh stop`), then start the other |
 | `start` refuses the site settings | Relative path, missing file, unknown field, bad folder or address | See [§Site file errors](#site-file-errors) below |
 | `start` fails with `disk_space_below_floor` | The disk that holds ManyForge's runtime state has less free space than ManyForge needs, or no free inodes | Free the amount the message names on that disk; see [Disk limits](DEVELOPMENT_WORKBENCH.md#disk-limits) |
 | `start` succeeds but Execute is disabled | A component not enabled, in fault or offline; the cell latched | Read Execute's tooltip, or `GET /api/program/readiness` and `GET /api/cell/latch`; Execute offers **Activate and execute** when components only need Prepare/Enable |
@@ -196,13 +197,14 @@ prepared or offline after Load.
 1. `./scripts/compose-dev.sh status` — readiness and
    `unavailable_reasons` of the current Scenario.
 1. Composer's Components page, or `GET /api/components`.
-1. `docker logs --tail 200 manyforge-development-workbench`.
+1. `docker logs --tail 200 manyforge-development-workbench` (`./manyforge
+   logs --tail 200` with `./manyforge run`).
 
 **ROS graph checks**, run inside the workbench container (the image entrypoint
 sources ROS):
 
 ```bash
-W=manyforge-development-workbench
+W=manyforge-development-workbench   # ./manyforge run: W=manyforge
 docker exec $W docker-entrypoint.ros-jazzy-full.sh ros2 topic list
 docker exec $W docker-entrypoint.ros-jazzy-full.sh ros2 control list_controllers
 docker exec $W docker-entrypoint.ros-jazzy-full.sh ros2 action list
@@ -220,8 +222,9 @@ docker exec $W docker-entrypoint.ros-jazzy-full.sh ros2 action list
 
 ### Site file errors
 
-`./scripts/compose-dev.sh start` reads `MANYFORGE_DEV_SITE_SETTINGS` and stops
-with a message (exit 64) before it starts anything:
+`./scripts/compose-dev.sh start` reads `MANYFORGE_DEV_SITE_SETTINGS`
+(`./manyforge run`: `MANYFORGE_SITE_SETTINGS`) and stops with a message
+(exit 64) before it starts anything:
 
 | Message | Fix |
 | --- | --- |
@@ -459,7 +462,7 @@ curl -s "$API/api/debug/export?run_id=${RUN_ID}&application_start_id=${START}" >
 curl -s "$API/api/execution/history?program_run_id=${RUN_ID}&application_start_id=${START}" > history.json
 curl -s "$API/api/execution/alarms" > alarms.json
 curl -s "$API/api/cycle/status" > cycle-status.json
-docker logs --tail 2000 manyforge-development-workbench > workbench.log
+docker logs --tail 2000 manyforge-development-workbench > workbench.log   # ./manyforge run: container manyforge
 ```
 
 Attach also the start command (`./scripts/compose-dev.sh start --project …`)

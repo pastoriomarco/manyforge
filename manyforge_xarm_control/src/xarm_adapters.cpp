@@ -61,6 +61,8 @@ XArmMachine make_xarm_machine(rclcpp::Node &node, core::IClock &clock,
   made.robot_states =
       std::make_shared<XArmRobotStatesTransport>(node, inputs.driver_namespace, clock, ros_owner);
   made.driver = std::make_shared<XArmDriverServices>(node, inputs.driver_namespace, ros_owner);
+  made.plugin_controllers = std::make_shared<XArmPluginControllers>(
+      node, inputs.driver_namespace, inputs.controller_manager, ros_owner);
   made.owner = std::make_shared<XArmOwnerAdapter>(XArmOwnerAdapterPorts{
       made.robot_states, made.driver, std::move(inputs.lane), std::move(inputs.restart_driver),
       [address = inputs.address, probe = inputs.settings.reboot_probe_interval] {
