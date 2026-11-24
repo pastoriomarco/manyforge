@@ -748,8 +748,15 @@ def gen_headless_rest_api() -> str:
     body.append(
         "The `request_key` of a Scene request (`/api/scene/transactions`) is "
         "recognised, and the request sent again is answered with its first "
-        "result, until the Scene store folds its history into a snapshot; a "
-        "request sent again after that is treated as a new request.\n\n"
+        "result, until the Scene store folds its history into a snapshot. A "
+        "request sent again after that is treated as a new request, with one "
+        "exception: an authoring edit (or a Program node's Scene edit) whose "
+        "admission is still the newest one settled for its owner is refused "
+        "with `request_result_expired` and changes nothing.\n\n"
+        "A Scene request that finds the Scene changed by another request since "
+        "it was checked, or another Scene commit still in progress, is refused "
+        "with `stale_revision` and has no effect; refresh the Scene and send it "
+        "again as a new request (a new `request_key`).\n\n"
     )
     body.append(
         "A successful Scene commit is answered once Headless's own view of the "

@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-11-18 13:43:30 UTC
+  Last regenerated: 2026-11-24 16:42:25 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 

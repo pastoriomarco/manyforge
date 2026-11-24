@@ -106,7 +106,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             ninja-build ccache pkg-config \
             libsqlite3-dev libssl-dev libexpat1-dev zlib1g-dev libyaml-dev \
-            libdouble-conversion-dev libutf8proc-dev
+            libdouble-conversion-dev libutf8proc-dev libassimp-dev
       # The deployment configure runs the node-environment check, which
       # imports the behavior package: install the test jobs' pin set.
       - uses: actions/setup-python@v5
@@ -204,7 +204,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libsqlite3-dev libssl-dev libexpat1-dev zlib1g-dev libyaml-dev \
-            libdouble-conversion-dev libutf8proc-dev
+            libdouble-conversion-dev libutf8proc-dev libassimp-dev
       - name: Download the expression binding
         if: matrix.binding
         uses: actions/download-artifact@v4
